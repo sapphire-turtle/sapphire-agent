@@ -839,8 +839,10 @@ const NULL_ID_ERROR_RESPONSE_PREFIX: &str = r#"{"jsonrpc":"2.0","id":null,"error
 ///
 /// Per the ACP transport RFD one JSON-RPC message rides in one text frame,
 /// and `Lines` hands the sink one JSON-RPC message per `String` with no
-/// trailing newline — so a text frame *is* a line and neither direction
-/// needs reframing, buffering or splitting.
+/// trailing newline — so a text frame *is* a line and the outgoing direction
+/// needs no reframing at all. The incoming direction still runs every text
+/// frame through [`reassemble_split_messages`] first: see that function for
+/// why a frame is not always trustworthy as a complete message on its own.
 ///
 /// Everything that is not a text frame is dropped on the floor: binary
 /// frames carry no ACP meaning, axum answers incoming pings itself, and a
@@ -914,8 +916,65 @@ fn lines_transport(
             Err(e) => Some(Err(std::io::Error::other(e))),
         }
     });
+    let frames = reassemble_split_messages(frames);
 
     Lines::new(outgoing, cancel_when_exhausted(frames, connection_cancel))
+}
+
+/// Bound on how much text [`reassemble_split_messages`] holds across frames
+/// while waiting for a JSON-RPC message's tail to arrive. A peer that never
+/// completes the value it started would otherwise make this grow without
+/// limit; no legitimate ACP message needs anywhere near this much, so
+/// hitting it is itself treated as the fragment being invalid rather than
+/// merely incomplete.
+const MAX_REASSEMBLY_BYTES: usize = 64 * 1024 * 1024;
+
+/// Reassemble a JSON-RPC message a peer split across multiple WebSocket text
+/// frames, back into the single complete line [`Lines`] requires.
+///
+/// [`lines_transport`]'s doc says a text frame *is* a line per the ACP
+/// transport RFD, which holds for a peer that honors "one JSON-RPC message
+/// per text frame". One observed in production does not: a subagent tool
+/// result carrying an ~80KB code-review diff arrived as several consecutive
+/// text frames that only parse as JSON once concatenated, so each fragment
+/// alone was handed to the SDK as its own "line", and each failed with
+/// `-32700 Parse error` — a burst of error responses to requests that were
+/// never split in the first place, since nothing on this side ever asked
+/// for a reply to a reply. This sits in front of that: a frame that already
+/// parses on its own passes straight through (the common case, and the only
+/// one before this existed), so this changes nothing for a conforming peer.
+///
+/// A held-back fragment is flushed — concatenated so far, whatever shape
+/// that is — the moment appending a frame does *not* leave the buffer
+/// failing to parse for the specific reason of ending before the value was
+/// complete (`serde_json::Error::is_eof`). Any other parse failure means the
+/// fragment was simply invalid, not incomplete, and buffering further would
+/// only delay reporting the same error while holding memory for no benefit.
+/// [`MAX_REASSEMBLY_BYTES`] is the same policy applied to a peer that keeps
+/// extending a value without ever finishing it.
+fn reassemble_split_messages(
+    frames: impl futures_util::Stream<Item = std::io::Result<String>>,
+) -> impl futures_util::Stream<Item = std::io::Result<String>> {
+    frames
+        .scan(String::new(), |pending, item| {
+            let text = match item {
+                Err(e) => {
+                    pending.clear();
+                    return std::future::ready(Some(Some(Err(e))));
+                }
+                Ok(text) => text,
+            };
+            pending.push_str(&text);
+
+            match serde_json::from_str::<serde_json::Value>(pending) {
+                Ok(_) => std::future::ready(Some(Some(Ok(std::mem::take(pending))))),
+                Err(e) if e.is_eof() && pending.len() < MAX_REASSEMBLY_BYTES => {
+                    std::future::ready(Some(None))
+                }
+                Err(_) => std::future::ready(Some(Some(Ok(std::mem::take(pending))))),
+            }
+        })
+        .filter_map(|item| async move { item })
 }
 
 /// Own the socket's write half: forward ACP messages, and ping on the
@@ -1875,6 +1934,71 @@ mod tests {
             Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => Some(resp.status().as_u16()),
             Err(e) => panic!("unexpected transport error: {e}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_frame_that_already_parses_passes_through_unchanged() {
+        let line = r#"{"jsonrpc":"2.0","id":1,"method":"session/cancel"}"#.to_string();
+        let frames = futures_util::stream::iter([Ok(line.clone())]);
+        let out: Vec<_> = reassemble_split_messages(frames).collect().await;
+        assert_eq!(
+            out.into_iter().map(Result::unwrap).collect::<Vec<_>>(),
+            [line]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_message_split_across_frames_is_reassembled_into_one_line() {
+        let full =
+            r#"{"jsonrpc":"2.0","id":1,"result":{"content":"line one\nline two"}}"#.to_string();
+        let (first, second) = full.split_at(30);
+        let frames = futures_util::stream::iter([Ok(first.to_string()), Ok(second.to_string())]);
+        let out: Vec<_> = reassemble_split_messages(frames).collect().await;
+        let lines = out.into_iter().map(Result::unwrap).collect::<Vec<_>>();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0], full);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&lines[0]).unwrap(),
+            serde_json::from_str::<serde_json::Value>(&full).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_message_split_across_three_frames_is_reassembled_into_one_line() {
+        let full = r#"{"jsonrpc":"2.0","id":1,"result":{"content":"one\ntwo\nthree"}}"#;
+        let a = &full[..20];
+        let b = &full[20..45];
+        let c = &full[45..];
+        let frames =
+            futures_util::stream::iter([Ok(a.to_string()), Ok(b.to_string()), Ok(c.to_string())]);
+        let out: Vec<_> = reassemble_split_messages(frames).collect().await;
+        let lines = out.into_iter().map(Result::unwrap).collect::<Vec<_>>();
+        assert_eq!(lines, [full.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_frame_that_is_invalid_rather_than_incomplete_is_not_held_back() {
+        // Trailing comma: a syntax error once the array closes, not an
+        // end-of-input while a value was still open, so it must not wait
+        // for a frame that would never complete it.
+        let line = "[1, 2,]".to_string();
+        let frames = futures_util::stream::iter([Ok(line.clone()), Ok("next".to_string())]);
+        let out: Vec<_> = reassemble_split_messages(frames).collect().await;
+        assert_eq!(
+            out.into_iter().map(Result::unwrap).collect::<Vec<_>>(),
+            [line, "next".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transport_error_flushes_any_held_fragment_and_passes_through() {
+        let frames = futures_util::stream::iter([
+            Ok(r#"{"jsonrpc":"2.0","#.to_string()),
+            Err(std::io::Error::other("peer gone")),
+        ]);
+        let out: Vec<_> = reassemble_split_messages(frames).collect().await;
+        assert_eq!(out.len(), 1);
+        assert!(out[0].is_err());
     }
 
     #[tokio::test]
