@@ -1,6 +1,6 @@
 [package]
 name = "sapphire-agent-server"
-version = "0.8.0"
+version = "0.8.1"
 edition.workspace = true
 description = "A personal AI assistant agent that works on file-based, local-first sapphire-framework workspaces together with you"
 license.workspace = true
