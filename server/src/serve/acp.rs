@@ -360,9 +360,14 @@ impl AcpProgress {
 #[async_trait::async_trait]
 impl super::TurnHost for AcpProgress {
     /// The provider's own tool-call id becomes ACP's `toolCallId`, so the
-    /// completion below can name the call it completes. There is no input to
-    /// report — `TurnHost` does not carry one — so the tool's name serves
-    /// as the title.
+    /// completion below can name the call it completes. The tool's name
+    /// serves as the title.
+    ///
+    /// `rawInput` carries the arguments the model asked for, which is what
+    /// lets an editor render a call's details rather than just its name.
+    /// It is deliberately `raw_input` and not a shaped `content` diff:
+    /// the provider's JSON is exactly what the model wrote, and a client
+    /// that understands the tool needs nothing more.
     ///
     /// `Pending`, not `InProgress`. This fires *before* the permission
     /// gate, so at this moment the call may be waiting on the user's
@@ -370,9 +375,11 @@ impl super::TurnHost for AcpProgress {
     /// `Pending` means. It said `InProgress` when nothing could stand
     /// between the executor and the call; that stopped being true when
     /// the gate landed.
-    async fn tool_start(&self, id: &str, name: &str) {
+    async fn tool_start(&self, id: &str, name: &str, input: &serde_json::Value) {
         self.notify(SessionUpdate::ToolCall(
-            AcpToolCall::new(ToolCallId::new(id), name).status(ToolCallStatus::Pending),
+            AcpToolCall::new(ToolCallId::new(id), name)
+                .status(ToolCallStatus::Pending)
+                .raw_input(input.clone()),
         ));
     }
 
@@ -2994,6 +3001,15 @@ mod tests {
         // so a client can correlate every later update with the start.
         assert_eq!(updates[started]["toolCallId"], "call-1");
         assert_eq!(updates[started]["title"], "echo");
+        // The arguments reach the client verbatim, which is the whole
+        // point: an editor can show what the call is about to do rather
+        // than just which tool was picked.
+        assert_eq!(
+            updates[started]["rawInput"],
+            serde_json::json!({ "text": "ping" }),
+            "the tool call must carry the model's own input: {}",
+            updates[started]
+        );
         // `Pending` is the schema's default, so it is omitted from the
         // wire rather than sent — a client seeing no status reads it as
         // pending. Absent is therefore the correct assertion here, and

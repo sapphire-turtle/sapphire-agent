@@ -1887,7 +1887,14 @@ fn apply_input_kind_label(mut msg: ChatMessage) -> ChatMessage {
 /// neither and keeps behaving exactly as it did.
 #[async_trait::async_trait]
 pub(crate) trait TurnHost: Send + Sync {
-    async fn tool_start(&self, id: &str, name: &str);
+    /// A tool call is about to run, carrying the arguments the model
+    /// asked for.
+    ///
+    /// `input` is the provider's own [`crate::provider::ToolCall::input`],
+    /// threaded through so a transport that can show details has them at
+    /// hand — ACP reports it as the tool call's `rawInput`. Transports
+    /// with no such field (the SSE `{id, name}` shape) ignore it.
+    async fn tool_start(&self, id: &str, name: &str, input: &Value);
     async fn tool_end(&self, id: &str, name: &str);
     async fn turn_error(&self, message: &str);
 
@@ -2027,7 +2034,9 @@ impl SseProgress {
 
 #[async_trait::async_trait]
 impl TurnHost for SseProgress {
-    async fn tool_start(&self, id: &str, name: &str) {
+    /// `_input` is ignored: the SSE payload is pinned to `{id, name}` and
+    /// predates the argument being available here.
+    async fn tool_start(&self, id: &str, name: &str, _input: &Value) {
         let _ = self
             .tx
             .send(Ok(notification_event(
@@ -2061,7 +2070,7 @@ pub(crate) struct NullProgress;
 
 #[async_trait::async_trait]
 impl TurnHost for NullProgress {
-    async fn tool_start(&self, _id: &str, _name: &str) {}
+    async fn tool_start(&self, _id: &str, _name: &str, _input: &Value) {}
     async fn tool_end(&self, _id: &str, _name: &str) {}
     async fn turn_error(&self, _message: &str) {}
 }
@@ -2085,7 +2094,7 @@ pub(crate) struct AutonomousHost {
 
 #[async_trait::async_trait]
 impl TurnHost for AutonomousHost {
-    async fn tool_start(&self, _id: &str, _name: &str) {}
+    async fn tool_start(&self, _id: &str, _name: &str, _input: &Value) {}
     async fn tool_end(&self, _id: &str, _name: &str) {}
     async fn turn_error(&self, message: &str) {
         warn!("Autonomous turn error: {message}");
@@ -2603,7 +2612,7 @@ impl TurnLoop<'_> {
 
                     // Notify client of each tool starting
                     for call in &tool_calls {
-                        progress.tool_start(&call.id, &call.name).await;
+                        progress.tool_start(&call.id, &call.name, &call.input).await;
                     }
 
                     // Permission gate.
@@ -3987,7 +3996,7 @@ mod tests {
         }
         #[async_trait::async_trait]
         impl TurnHost for ChannelHost {
-            async fn tool_start(&self, id: &str, _name: &str) {
+            async fn tool_start(&self, id: &str, _name: &str, _input: &Value) {
                 self.started.lock().unwrap().push(id.to_string());
             }
             async fn tool_end(&self, id: &str, _name: &str) {
@@ -4359,7 +4368,7 @@ mod tests {
         struct AskExceptRiskyHost;
         #[async_trait::async_trait]
         impl TurnHost for AskExceptRiskyHost {
-            async fn tool_start(&self, _id: &str, _name: &str) {}
+            async fn tool_start(&self, _id: &str, _name: &str, _input: &Value) {}
             async fn tool_end(&self, _id: &str, _name: &str) {}
             async fn turn_error(&self, _message: &str) {}
             fn origin(&self) -> Origin {
@@ -5408,7 +5417,9 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         let progress = SseProgress::new(tx, json!(7));
 
-        progress.tool_start("call-1", "recall").await;
+        progress
+            .tool_start("call-1", "recall", &json!({ "query": "x" }))
+            .await;
         progress.tool_end("call-1", "recall").await;
         drop(progress);
 
@@ -5532,7 +5543,7 @@ mod tests {
         // NullProgress holds no channel to observe directly, so the
         // absence of a panic across all three methods is the assertion.
         let progress = NullProgress;
-        progress.tool_start("recall", "call-1").await;
+        progress.tool_start("recall", "call-1", &json!({})).await;
         progress.tool_end("recall", "call-1").await;
         progress.turn_error("ignored").await;
     }
@@ -6249,7 +6260,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl TurnHost for AcpHostForGateTests {
-        async fn tool_start(&self, _id: &str, _name: &str) {}
+        async fn tool_start(&self, _id: &str, _name: &str, _input: &Value) {}
         async fn tool_end(&self, _id: &str, _name: &str) {}
         async fn turn_error(&self, _message: &str) {}
         fn origin(&self) -> crate::tools::policy::Origin {
@@ -6592,7 +6603,7 @@ mod tests {
         }
         #[async_trait::async_trait]
         impl TurnHost for ChunkRecorder {
-            async fn tool_start(&self, _id: &str, _name: &str) {}
+            async fn tool_start(&self, _id: &str, _name: &str, _input: &Value) {}
             async fn tool_end(&self, _id: &str, _name: &str) {}
             async fn turn_error(&self, _message: &str) {}
             async fn message_chunk(&self, text: &str) {
@@ -6650,7 +6661,7 @@ mod tests {
         }
         #[async_trait::async_trait]
         impl TurnHost for ChunkRecorder {
-            async fn tool_start(&self, _id: &str, _name: &str) {}
+            async fn tool_start(&self, _id: &str, _name: &str, _input: &Value) {}
             async fn tool_end(&self, _id: &str, _name: &str) {}
             async fn turn_error(&self, _message: &str) {}
             async fn message_chunk(&self, text: &str) {
@@ -6742,7 +6753,7 @@ mod tests {
         struct InteractiveHost;
         #[async_trait::async_trait]
         impl TurnHost for InteractiveHost {
-            async fn tool_start(&self, _id: &str, _name: &str) {}
+            async fn tool_start(&self, _id: &str, _name: &str, _input: &Value) {}
             async fn tool_end(&self, _id: &str, _name: &str) {}
             async fn turn_error(&self, _message: &str) {}
             fn round_budget(&self) -> RoundBudget {
