@@ -13,6 +13,18 @@ wake / VAD / TTS plumbing, and earlier feature work live in the root
 
 ## [Unreleased]
 
+## [0.8.1](https://github.com/sapphire-turtle/sapphire-agent/compare/sapphire-agent-cli-v0.8.0...sapphire-agent-cli-v0.8.1) - 2026-09-24
+
+### Changed
+
+- *(audio)* Remove redundant clone on Copy SupportedStreamConfig
+
+### Fixed
+
+- *(audio)* Adapt to cpal 0.18 API changes
+
+
+
 ## [0.8.0] - 2026-09-07
 
 ### Changed
