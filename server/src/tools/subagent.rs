@@ -335,8 +335,8 @@ struct SubagentHost(std::sync::Arc<dyn crate::serve::TurnHost>);
 
 #[async_trait]
 impl crate::serve::TurnHost for SubagentHost {
-    async fn tool_start(&self, id: &str, name: &str) {
-        self.0.tool_start(id, name).await;
+    async fn tool_start(&self, id: &str, name: &str, input: &serde_json::Value) {
+        self.0.tool_start(id, name, input).await;
     }
 
     async fn tool_end(&self, id: &str, name: &str) {
@@ -1449,7 +1449,7 @@ mod tests {
 
     #[async_trait]
     impl crate::serve::TurnHost for RecordingHost {
-        async fn tool_start(&self, id: &str, _name: &str) {
+        async fn tool_start(&self, id: &str, _name: &str, _input: &serde_json::Value) {
             self.tool_starts.lock().unwrap().push(id.to_string());
         }
         async fn tool_end(&self, _id: &str, _name: &str) {}
@@ -1489,7 +1489,7 @@ mod tests {
         }
         #[async_trait]
         impl crate::serve::TurnHost for ChunkRecorder {
-            async fn tool_start(&self, _id: &str, _name: &str) {}
+            async fn tool_start(&self, _id: &str, _name: &str, _input: &serde_json::Value) {}
             async fn tool_end(&self, _id: &str, _name: &str) {}
             async fn turn_error(&self, _message: &str) {}
             async fn message_chunk(&self, text: &str) {
@@ -1515,7 +1515,7 @@ mod tests {
         struct InteractiveParent;
         #[async_trait]
         impl crate::serve::TurnHost for InteractiveParent {
-            async fn tool_start(&self, _id: &str, _name: &str) {}
+            async fn tool_start(&self, _id: &str, _name: &str, _input: &serde_json::Value) {}
             async fn tool_end(&self, _id: &str, _name: &str) {}
             async fn turn_error(&self, _message: &str) {}
             fn round_budget(&self) -> crate::serve::RoundBudget {
@@ -1546,7 +1546,7 @@ mod tests {
             "origin() must be the parent's own, unchanged"
         );
 
-        crate::serve::TurnHost::tool_start(&wrapped, "call-1", "some_tool").await;
+        crate::serve::TurnHost::tool_start(&wrapped, "call-1", "some_tool", &json!({})).await;
         assert_eq!(
             inner.tool_starts.lock().unwrap().as_slice(),
             ["call-1".to_string()],
@@ -1563,7 +1563,7 @@ mod tests {
 
     #[async_trait]
     impl crate::serve::TurnHost for AcpParentHost {
-        async fn tool_start(&self, _id: &str, _name: &str) {}
+        async fn tool_start(&self, _id: &str, _name: &str, _input: &serde_json::Value) {}
         async fn tool_end(&self, _id: &str, _name: &str) {}
         async fn turn_error(&self, _message: &str) {}
         fn acp_client(&self) -> Option<std::sync::Arc<dyn crate::tools::acp_client::AcpClient>> {
