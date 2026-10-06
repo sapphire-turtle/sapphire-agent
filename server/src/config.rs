@@ -1136,6 +1136,11 @@ pub struct AnthropicConfig {
     /// `crate::provider::http::default_stream_idle_timeout_secs`.
     #[serde(default = "crate::provider::http::default_stream_idle_timeout_secs")]
     pub stream_idle_timeout_secs: u64,
+    /// How many times a response that came back unusable — cut off at
+    /// `max_tokens`, empty, or a stream that ended early — is retried
+    /// before the call fails. `0` disables. See `crate::provider::retry`.
+    #[serde(default = "crate::provider::retry::default_incomplete_retries")]
+    pub incomplete_retries: u32,
 }
 
 /// Env var consulted when `[anthropic].api_key` is absent.

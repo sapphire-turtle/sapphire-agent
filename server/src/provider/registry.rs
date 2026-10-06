@@ -10,6 +10,7 @@ use crate::provider::Provider;
 use crate::provider::anthropic::AnthropicProvider;
 use crate::provider::fallback::FallbackProvider;
 use crate::provider::openai_compatible::OpenAICompatibleProvider;
+use crate::provider::retry::RetryProvider;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -35,10 +36,17 @@ impl ProviderRegistry {
             );
         }
 
+        // Every provider is wrapped in its own `RetryProvider`, beneath any
+        // `FallbackProvider` a profile adds: a primary that keeps coming
+        // back truncated or empty exhausts its own retries first, and only
+        // then does the fallback see it as the error it is.
         let mut providers: HashMap<String, Arc<dyn Provider>> = HashMap::new();
         providers.insert(
             ANTHROPIC_PROVIDER_NAME.to_string(),
-            Arc::new(AnthropicProvider::new(&config.anthropic)?),
+            Arc::new(RetryProvider::new(
+                Arc::new(AnthropicProvider::new(&config.anthropic)?),
+                config.anthropic.incomplete_retries,
+            )),
         );
 
         for (name, pcfg) in &config.providers {
@@ -53,7 +61,10 @@ impl ProviderRegistry {
                     if cfg.provider_name.is_none() {
                         cfg.provider_name = Some(name.clone());
                     }
-                    Arc::new(OpenAICompatibleProvider::new(&cfg))
+                    Arc::new(RetryProvider::new(
+                        Arc::new(OpenAICompatibleProvider::new(&cfg)),
+                        cfg.incomplete_retries,
+                    ))
                 }
             };
             providers.insert(name.clone(), provider);
