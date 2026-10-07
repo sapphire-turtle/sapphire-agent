@@ -8107,7 +8107,7 @@ dependencies = [
 
 [[package]]
 name = "sapphire-agent-cli"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "bzip2 0.6.1",
@@ -8177,7 +8177,7 @@ dependencies = [
 
 [[package]]
 name = "sapphire-agent-server"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "a2a-lf",
  "agent-client-protocol",
