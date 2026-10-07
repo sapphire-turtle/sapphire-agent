@@ -4,6 +4,7 @@
 //! against llama.cpp's `llama-server`, Ollama (`/v1`), vLLM, and the OpenAI
 //! API itself. Tool calls follow the OpenAI `tools` / `tool_calls` shape.
 
+use crate::provider::retry::IncompleteStream;
 use crate::provider::{
     ChatMessage, ChatResponse, ContentPart, PromptUsage, Provider, Role, ToolCall, ToolSpec, http,
 };
@@ -50,6 +51,11 @@ pub struct OpenAICompatibleConfig {
     /// `crate::provider::http::default_stream_idle_timeout_secs`.
     #[serde(default = "crate::provider::http::default_stream_idle_timeout_secs")]
     pub stream_idle_timeout_secs: u64,
+    /// How many times a response that came back unusable — cut off at
+    /// `max_tokens`, empty, or a stream that ended early — is retried
+    /// before the call fails. `0` disables. See `crate::provider::retry`.
+    #[serde(default = "crate::provider::retry::default_incomplete_retries")]
+    pub incomplete_retries: u32,
 }
 
 fn default_max_tokens() -> u32 {
@@ -498,9 +504,13 @@ impl Provider for OpenAICompatibleProvider {
         let mut tool_acc: BTreeMap<usize, ToolCallAccum> = BTreeMap::new();
         let mut stop_reason: Option<String> = None;
         let mut prompt_tokens: Option<u32> = None;
+        let mut saw_done = false;
 
         while let Some(chunk) = http::idle(idle, stalled, stream.next()).await? {
-            let chunk = chunk.context("Error reading SSE stream")?;
+            let chunk = chunk.map_err(|e| IncompleteStream {
+                provider: self.name.clone(),
+                detail: format!("error reading the SSE stream: {e}"),
+            })?;
             buffer.push_str(&String::from_utf8_lossy(&chunk));
 
             while let Some(pos) = buffer.find("\n\n") {
@@ -513,6 +523,7 @@ impl Provider for OpenAICompatibleProvider {
                     };
                     let data = data.trim();
                     if data == "[DONE]" {
+                        saw_done = true;
                         break;
                     }
                     let parsed: StreamChunk = match serde_json::from_str(data) {
@@ -555,6 +566,19 @@ impl Provider for OpenAICompatibleProvider {
                     }
                 }
             }
+        }
+
+        // A server that closed the stream without a finish reason or the
+        // `[DONE]` sentinel did not finish its answer — it died, or was
+        // killed, part way through. Reported as an error rather than as
+        // whatever had arrived, which is usually nothing and used to end
+        // the turn silently. `RetryProvider` retries it.
+        if stop_reason.is_none() && !saw_done {
+            return Err(IncompleteStream {
+                provider: self.name.clone(),
+                detail: "the stream closed without a finish_reason or [DONE]".to_string(),
+            }
+            .into());
         }
 
         let tool_calls: Vec<ToolCall> = tool_acc
@@ -676,6 +700,7 @@ mod tests {
             max_tokens: 4096,
             connect_timeout_secs: 15,
             stream_idle_timeout_secs: 300,
+            incomplete_retries: 2,
         });
         assert_eq!(p.endpoint(), "http://localhost:8080/v1/chat/completions");
     }
@@ -690,6 +715,7 @@ mod tests {
             max_tokens: 1,
             connect_timeout_secs: 15,
             stream_idle_timeout_secs: 300,
+            incomplete_retries: 2,
         });
         assert_eq!(default.name(), "openai_compatible");
 
@@ -701,6 +727,7 @@ mod tests {
             max_tokens: 1,
             connect_timeout_secs: 15,
             stream_idle_timeout_secs: 300,
+            incomplete_retries: 2,
         });
         assert_eq!(custom.name(), "llama_cpp");
     }
@@ -804,6 +831,7 @@ mod tests {
             max_tokens: 1,
             connect_timeout_secs: 15,
             stream_idle_timeout_secs: 300,
+            incomplete_retries: 2,
         });
         p.stream_idle_timeout = Some(Duration::from_millis(200));
         p
@@ -865,6 +893,36 @@ mod tests {
         assert!(
             format!("{err:#}").contains("sent nothing"),
             "the error must say the upstream stalled: {err:#}"
+        );
+    }
+
+    /// A server that dies part way through its answer: one content chunk,
+    /// then the stream ends cleanly with no `finish_reason` and no
+    /// `[DONE]`. That is not a reply, and must not be read as an empty one.
+    #[tokio::test]
+    async fn a_stream_that_ends_without_a_finish_reason_is_incomplete() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 8192];
+            let _ = socket.read(&mut buf).await;
+            let event = "data: {\"choices\":[{\"delta\":{\"content\":\"hal\"}}]}\n\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                 transfer-encoding: chunked\r\n\r\n{:x}\r\n{event}\r\n0\r\n\r\n",
+                event.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let err = stalling_target(addr)
+            .chat(None, &[ChatMessage::user("hi")], None)
+            .await
+            .expect_err("a stream cut off mid-answer must be an error");
+        assert!(
+            err.downcast_ref::<IncompleteStream>().is_some(),
+            "must be an IncompleteStream so RetryProvider retries it: {err:#}"
         );
     }
 

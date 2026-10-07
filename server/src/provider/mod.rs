@@ -3,6 +3,7 @@ pub mod fallback;
 pub mod http;
 pub mod openai_compatible;
 pub mod registry;
+pub mod retry;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

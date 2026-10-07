@@ -1,4 +1,5 @@
 use crate::config::AnthropicConfig;
+use crate::provider::retry::IncompleteStream;
 use crate::provider::{
     ChatMessage, ChatResponse, ContentPart, PromptUsage, Provider, Role, ToolCall, ToolSpec, http,
 };
@@ -444,7 +445,10 @@ impl Provider for AnthropicProvider {
         let mut prompt_tokens: Option<u32> = None;
 
         while let Some(chunk) = http::idle(idle, stalled, stream.next()).await? {
-            let chunk = chunk.context("Error reading SSE stream")?;
+            let chunk = chunk.map_err(|e| IncompleteStream {
+                provider: self.name().to_string(),
+                detail: format!("error reading the SSE stream: {e}"),
+            })?;
             buffer.push_str(&String::from_utf8_lossy(&chunk));
 
             while let Some(pos) = buffer.find("\n\n") {
@@ -515,6 +519,17 @@ impl Provider for AnthropicProvider {
                     }
                 }
             }
+        }
+
+        // `message_delta` carries the stop reason just before
+        // `message_stop`; a stream that closed without one did not finish.
+        // See the matching check in `openai_compatible`.
+        if stop_reason.is_none() {
+            return Err(IncompleteStream {
+                provider: self.name().to_string(),
+                detail: "the stream closed without a stop_reason".to_string(),
+            }
+            .into());
         }
 
         // Assemble final response from accumulated blocks.
