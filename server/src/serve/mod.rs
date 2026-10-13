@@ -4208,9 +4208,7 @@ mod tests {
         let mut config = state.config.clone();
         config.tools.admin.room_profiles = profiles;
         let sw = sapphire_framework::workspace::Workspace::from_root(ctx, &root).unwrap();
-        let ws = Arc::new(std::sync::Mutex::new(
-            sapphire_framework::workspace::WorkspaceState::open(sw).unwrap(),
-        ));
+        let ws = Arc::new(sapphire_framework::workspace::WorkspaceState::open(sw).unwrap());
 
         state
             .tools

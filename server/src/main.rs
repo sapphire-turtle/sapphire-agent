@@ -72,7 +72,7 @@ fn init_app_ctx() {
 }
 use session::SessionStore;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tracing_subscriber::{EnvFilter, fmt};
 use workspace::Workspace;
 
@@ -500,7 +500,7 @@ async fn main() -> Result<()> {
             if let Err(e) = ws_state.sync_retrieve() {
                 tracing::warn!("Initial workspace re-index failed: {e}");
             }
-            let ws_state = Arc::new(Mutex::new(ws_state));
+            let ws_state = Arc::new(ws_state);
 
             // ── Timer manager (single-slot, in-memory) ──────────────────────
             // Built before the tool set so the timer_* tools can hold an
@@ -1075,7 +1075,7 @@ async fn main() -> Result<()> {
                         loop {
                             tick.tick().await;
                             {
-                                let state = ws.lock().expect("ws_state mutex poisoned");
+                                let state = &ws;
                                 match state.sync_retrieve() {
                                     Ok((u, r)) => tracing::info!(
                                         "Periodic ws sync: {u} upserted, {r} removed"

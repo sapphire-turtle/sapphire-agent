@@ -22,7 +22,7 @@ use crate::session::{SessionMeta, SessionStore, StoredMessage};
 use chrono::{Datelike, Duration, Local, NaiveDate, Weekday};
 use sapphire_framework::workspace::WorkspaceState;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tracing::{info, warn};
 
 // ---------------------------------------------------------------------------
@@ -295,7 +295,7 @@ pub async fn generate_daily_log<F>(
     session_store: &SessionStore,
     acp_store: Option<&AcpSessionStore>,
     provider: &dyn Provider,
-    ws_state: &Arc<Mutex<WorkspaceState>>,
+    ws_state: &Arc<WorkspaceState>,
     workspace_dir: &Path,
     namespace: &str,
     date: NaiveDate,
@@ -349,7 +349,7 @@ where
 /// exist (no work to do).
 pub async fn generate_weekly_log(
     provider: &dyn Provider,
-    ws_state: &Arc<Mutex<WorkspaceState>>,
+    ws_state: &Arc<WorkspaceState>,
     workspace_dir: &Path,
     namespace: &str,
     iso_year: i32,
@@ -396,7 +396,7 @@ pub async fn generate_weekly_log(
 /// `Ok(false)` if no dailies exist for that month.
 pub async fn generate_monthly_log(
     provider: &dyn Provider,
-    ws_state: &Arc<Mutex<WorkspaceState>>,
+    ws_state: &Arc<WorkspaceState>,
     workspace_dir: &Path,
     namespace: &str,
     year: i32,
@@ -442,7 +442,7 @@ pub async fn generate_monthly_log(
 /// logs exist for the target year.
 pub async fn generate_yearly_log(
     provider: &dyn Provider,
-    ws_state: &Arc<Mutex<WorkspaceState>>,
+    ws_state: &Arc<WorkspaceState>,
     workspace_dir: &Path,
     namespace: &str,
     year: i32,
@@ -539,7 +539,7 @@ pub fn digest_items(raw: &str, n: usize) -> Option<Vec<String>> {
 #[allow(clippy::too_many_arguments)]
 async fn write_log_with_digest(
     provider: &dyn Provider,
-    ws_state: &Arc<Mutex<WorkspaceState>>,
+    ws_state: &Arc<WorkspaceState>,
     workspace_dir: &Path,
     namespace: &str,
     kind: LogKind,
@@ -611,10 +611,7 @@ Japanese). Emit raw Markdown, not a fenced code block."
     let file = serialize_log_file(&digest, &format!("{heading}{}\n", body.trim_end()))?;
 
     let rel = log_rel_path(namespace, kind, stem);
-    ws_state
-        .lock()
-        .expect("WorkspaceState mutex poisoned")
-        .write_file(&rel, &file)?;
+    ws_state.write_file(&rel, &file)?;
     info!("{} written: {}", label, rel.display());
     Ok(())
 }
@@ -827,7 +824,7 @@ pub fn body_without_frontmatter(raw: &str) -> String {
 /// not stall the pass. Returns the number of files successfully updated.
 pub async fn catchup_missing_daily_digests(
     provider: &dyn Provider,
-    ws_state: &Arc<Mutex<WorkspaceState>>,
+    ws_state: &Arc<WorkspaceState>,
     workspace_dir: &Path,
     namespace: &str,
 ) -> usize {
@@ -882,11 +879,7 @@ pub async fn catchup_missing_daily_digests(
             .strip_prefix(workspace_dir)
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|_| path.clone());
-        match ws_state
-            .lock()
-            .expect("WorkspaceState mutex poisoned")
-            .write_file(&rel, &new_raw)
-        {
+        match ws_state.write_file(&rel, &new_raw) {
             Ok(()) => {
                 filled += 1;
                 info!("Digest added: {}", rel.display());
@@ -910,7 +903,7 @@ pub async fn catchup_pending_daily_logs<F>(
     session_store: &SessionStore,
     acp_store: Option<&AcpSessionStore>,
     provider: &dyn Provider,
-    ws_state: &Arc<Mutex<WorkspaceState>>,
+    ws_state: &Arc<WorkspaceState>,
     workspace_dir: &Path,
     namespace: &str,
     boundary_hour: u8,
@@ -1103,7 +1096,7 @@ pub fn pending_years(workspace_dir: &Path, namespace: &str, today: NaiveDate) ->
 /// logged but not propagated. Returns the count successfully generated.
 pub async fn catchup_pending_weekly_logs(
     provider: &dyn Provider,
-    ws_state: &Arc<Mutex<WorkspaceState>>,
+    ws_state: &Arc<WorkspaceState>,
     workspace_dir: &Path,
     namespace: &str,
     today: NaiveDate,
@@ -1144,7 +1137,7 @@ pub async fn catchup_pending_weekly_logs(
 /// but no monthly file, strictly before the current calendar month.
 pub async fn catchup_pending_monthly_logs(
     provider: &dyn Provider,
-    ws_state: &Arc<Mutex<WorkspaceState>>,
+    ws_state: &Arc<WorkspaceState>,
     workspace_dir: &Path,
     namespace: &str,
     today: NaiveDate,
@@ -1177,7 +1170,7 @@ pub async fn catchup_pending_monthly_logs(
 /// but no yearly file, strictly before the current calendar year.
 pub async fn catchup_pending_yearly_logs(
     provider: &dyn Provider,
-    ws_state: &Arc<Mutex<WorkspaceState>>,
+    ws_state: &Arc<WorkspaceState>,
     workspace_dir: &Path,
     namespace: &str,
     today: NaiveDate,

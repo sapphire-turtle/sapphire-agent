@@ -911,7 +911,7 @@ mod tests {
 
     static TEST_CTX: AppContext = AppContext::new("sapphire-agent").allow_external_paths();
 
-    fn test_workspace() -> Arc<Mutex<WorkspaceState>> {
+    fn test_workspace() -> Arc<WorkspaceState> {
         // `AppContext` panics on `cache_dir()` access until this is set,
         // and `Workspace::from_root` reads it. First writer wins, so
         // calling it on every invocation is safe.
@@ -921,7 +921,7 @@ mod tests {
         let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
         std::fs::create_dir_all(dir.path().join(".sapphire-agent")).unwrap();
         let ws = Workspace::from_root(&TEST_CTX, dir.path()).unwrap();
-        Arc::new(Mutex::new(WorkspaceState::open(ws).unwrap()))
+        Arc::new(WorkspaceState::open(ws).unwrap())
     }
 
     /// Six calls, run through the channel gate under both `host_access`

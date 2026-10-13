@@ -22,7 +22,7 @@ use crate::session::SessionStore;
 use chrono::{Datelike, Duration, Local, NaiveTime, Timelike, Weekday};
 use sapphire_framework::workspace::WorkspaceState;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use tracing::{info, warn};
 
@@ -42,7 +42,7 @@ struct DueTask {
 
 pub struct Heartbeat {
     pub workspace_dir: PathBuf,
-    pub ws_state: Arc<Mutex<WorkspaceState>>,
+    pub ws_state: Arc<WorkspaceState>,
     pub day_boundary_hour: u8,
     pub daily_log_enabled: bool,
     pub memory_compaction_enabled: bool,
