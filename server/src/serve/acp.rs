@@ -12,7 +12,7 @@
 //!
 //! Framing follows the ACP transport RFD: one JSON-RPC message per WebSocket
 //! text frame. That is exactly the newline framing the SDK's `Lines`
-//! transport expects, so [`lines_transport`] adapts the socket without
+//! transport expects, so [`websocket_lines`] adapts the socket without
 //! reframing anything.
 //!
 //! `initialize`, `session/new`, `session/prompt`, `session/cancel`,
@@ -839,17 +839,46 @@ pub async fn handle_acp_ws(
         .map(|c| c.keepalive_secs)
         .filter(|secs| *secs > 0)
         .map(Duration::from_secs);
-    ws.on_upgrade(move |socket| serve_connection(socket, state, profile_name, keepalive))
+    ws.on_upgrade(move |socket| async move {
+        let (outgoing, incoming) = websocket_lines(socket, keepalive);
+        serve_connection(outgoing, incoming, state, profile_name).await
+    })
 }
 
 /// Prefix of a JSON-RPC error response whose `id` is `null` — the shape the
 /// spec reserves for "a response to a request whose id could not be
 /// determined" (a peer answering something it could not parse enough of to
-/// correlate). See [`lines_transport`] for why this text is matched and
+/// correlate). See [`drop_null_id_errors`] for why this text is matched and
 /// dropped before it ever reaches the SDK's transport.
 const NULL_ID_ERROR_RESPONSE_PREFIX: &str = r#"{"jsonrpc":"2.0","id":null,"error"#;
 
-/// Wrap the socket as the SDK's line transport.
+/// Drop every incoming line shaped like [`NULL_ID_ERROR_RESPONSE_PREFIX`],
+/// whichever transport carried it.
+///
+/// That shape is a JSON-RPC response, not a request — the SDK has no request
+/// of its own with a `null` id to match it against, so it can only log the
+/// response as unroutable and move on. Answering it anyway would itself be a
+/// response to a response, and a peer that treats *that* as needing an
+/// answer in turn echoes forever: the two sides trade the same error back
+/// and forth with no request underneath either send, which is the frame
+/// storm this exists to stop before it starts.
+fn drop_null_id_errors(
+    lines: impl futures_util::Stream<Item = std::io::Result<String>> + Send + 'static,
+) -> impl futures_util::Stream<Item = std::io::Result<String>> + Send + 'static {
+    lines.filter(|line| {
+        let drop = matches!(line, Ok(text) if text.starts_with(NULL_ID_ERROR_RESPONSE_PREFIX));
+        if drop {
+            debug!(
+                "ACP: dropping a null-id error response instead of relaying it, to avoid an \
+                 echo storm"
+            );
+        }
+        std::future::ready(!drop)
+    })
+}
+
+/// Split the socket into the two halves of the SDK's line transport: a
+/// sink of outgoing lines and a stream of incoming ones.
 ///
 /// Per the ACP transport RFD one JSON-RPC message rides in one text frame,
 /// and `Lines` hands the sink one JSON-RPC message per `String` with no
@@ -862,18 +891,6 @@ const NULL_ID_ERROR_RESPONSE_PREFIX: &str = r#"{"jsonrpc":"2.0","id":null,"error
 /// frames carry no ACP meaning, axum answers incoming pings itself, and a
 /// close frame is followed by the end of the stream, which is what actually
 /// ends the connection.
-///
-/// A text frame shaped like [`NULL_ID_ERROR_RESPONSE_PREFIX`] is dropped the
-/// same way. That shape is a JSON-RPC response, not a request — the SDK has
-/// no request of its own with a `null` id to match it against, so it can
-/// only log the response as unroutable and move on. Answering it anyway
-/// would itself be a response to a response, and a peer that treats *that*
-/// as needing an answer in turn echoes forever: the two sides trade the same
-/// error back and forth with no request underneath either send, which is
-/// the frame storm this branch exists to stop before it starts.
-///
-/// `connection_cancel` is cancelled when this socket stops delivering
-/// frames — see [`cancel_when_exhausted`].
 ///
 /// `keepalive` is how often to put a ping on the wire, and is the reason
 /// the sink is not simply the socket's own write half. A reverse proxy in
@@ -891,14 +908,13 @@ const NULL_ID_ERROR_RESPONSE_PREFIX: &str = r#"{"jsonrpc":"2.0","id":null,"error
 /// ping timer. Backpressure survives the indirection — the channel is
 /// bounded, so a client that has stopped reading still blocks the sink
 /// rather than growing a queue.
-fn lines_transport(
+fn websocket_lines(
     socket: WebSocket,
-    connection_cancel: CancellationToken,
     keepalive: Option<Duration>,
-) -> Lines<
+) -> (
     impl futures_util::Sink<String, Error = std::io::Error> + Send + 'static,
     impl futures_util::Stream<Item = std::io::Result<String>> + Send + 'static,
-> {
+) {
     let (tx, rx) = socket.split();
 
     let (lines_tx, lines_rx) = tokio::sync::mpsc::channel::<Message>(32);
@@ -915,13 +931,6 @@ fn lines_transport(
 
     let frames = rx.filter_map(|frame| async move {
         match frame {
-            Ok(Message::Text(text)) if text.starts_with(NULL_ID_ERROR_RESPONSE_PREFIX) => {
-                debug!(
-                    "ACP: dropping a null-id error response instead of relaying it, to avoid \
-                     an echo storm"
-                );
-                None
-            }
             Ok(Message::Text(text)) => Some(Ok(text.to_string())),
             // Not ACP: no reply, and the connection carries on.
             Ok(Message::Binary(_) | Message::Ping(_) | Message::Pong(_)) => None,
@@ -930,9 +939,7 @@ fn lines_transport(
             Err(e) => Some(Err(std::io::Error::other(e))),
         }
     });
-    let frames = reassemble_split_messages(frames);
-
-    Lines::new(outgoing, cancel_when_exhausted(frames, connection_cancel))
+    (outgoing, reassemble_split_messages(frames))
 }
 
 /// Bound on how much text [`reassemble_split_messages`] holds across frames
@@ -946,7 +953,7 @@ const MAX_REASSEMBLY_BYTES: usize = 64 * 1024 * 1024;
 /// Reassemble a JSON-RPC message a peer split across multiple WebSocket text
 /// frames, back into the single complete line [`Lines`] requires.
 ///
-/// [`lines_transport`]'s doc says a text frame *is* a line per the ACP
+/// [`websocket_lines`]'s doc says a text frame *is* a line per the ACP
 /// transport RFD, which holds for a peer that honors "one JSON-RPC message
 /// per text frame". One observed in production does not: a subagent tool
 /// result carrying an ~80KB code-review diff arrived as several consecutive
@@ -1218,14 +1225,24 @@ async fn adopt_session(
 }
 
 /// Drive one ACP connection until the peer goes away.
-async fn serve_connection(
-    socket: WebSocket,
+///
+/// The transport is any pair of line halves — one JSON-RPC message per
+/// `String`, no trailing newline: a WebSocket (`/acp`, see
+/// [`websocket_lines`]) or the IPC tunnel behind `sapphire-agent acp`
+/// (`super::acp_tunnel`). Both reach the same handlers. The peer is already
+/// authenticated by whichever transport carried it, and `profile_name` is
+/// the room profile that decided.
+pub(crate) async fn serve_connection<O, I>(
+    outgoing: O,
+    incoming: I,
     state: Arc<ServeState>,
     profile_name: String,
-    keepalive: Option<Duration>,
-) {
+) where
+    O: futures_util::Sink<String, Error = std::io::Error> + Send + 'static,
+    I: futures_util::Stream<Item = std::io::Result<String>> + Send + 'static,
+{
     let sessions = Arc::new(AcpSessions::default());
-    // Cancelled when the socket goes away (see `lines_transport`). Every
+    // Cancelled when the peer stops sending (see `cancel_when_exhausted`). Every
     // turn's token is a child of this one, so one client leaving stops every
     // turn it left running — including turns on sessions created later.
     let connection_cancel = CancellationToken::new();
@@ -1281,9 +1298,10 @@ async fn serve_connection(
                         ProtocolVersion::V1
                     };
 
-                    // `authMethods` is empty because the bearer token checked
-                    // above already authenticated the peer, so ACP never sees
-                    // an unauthenticated client.
+                    // `authMethods` is empty because the transport already
+                    // authenticated the peer — the bearer token on `/acp`,
+                    // the IPC endpoint's owner check on the stdio tunnel —
+                    // so ACP never sees an unauthenticated client.
                     responder.respond(
                         InitializeResponse::new(version).agent_capabilities(
                             AgentCapabilities::new()
@@ -1855,10 +1873,9 @@ async fn serve_connection(
             },
             on_receive_request!(),
         )
-        .connect_to(lines_transport(
-            socket,
-            connection_cancel.clone(),
-            keepalive,
+        .connect_to(Lines::new(
+            outgoing,
+            cancel_when_exhausted(drop_null_id_errors(incoming), connection_cancel.clone()),
         ))
         .await;
 

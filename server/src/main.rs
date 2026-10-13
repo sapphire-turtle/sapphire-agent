@@ -115,6 +115,10 @@ enum Command {
     },
     /// Validate the config file and exit
     Verify,
+    /// Speak ACP on stdio, for an editor to start as its agent: relayed to
+    /// the agent running on this host, which runs the conversation. Needs
+    /// `[acp].stdio_room_profile` in the host config.
+    Acp,
     /// The framework's verbs: serve, status, service, workspace, workgroup,
     /// device, embedding, external-device.
     #[command(flatten)]
@@ -273,6 +277,11 @@ async fn main() -> Result<()> {
     if let Some(Command::Init { path }) = &cli.command {
         return cli_init::run(path.clone());
     }
+    // A relay to the running agent, which holds the config: nothing to load
+    // here, and stdout belongs to ACP.
+    if let Some(Command::Acp) = &cli.command {
+        return serve::acp_tunnel::run_stdio().await;
+    }
 
     // The framework's verbs other than `serve` talk to the running server
     // or the bridge, and need no agent config either.
@@ -377,6 +386,7 @@ async fn main() -> Result<()> {
     match cli.command {
         // Returned above, before the config was loaded.
         Some(Command::Init { .. }) => unreachable!("`init` is dispatched ahead of the config load"),
+        Some(Command::Acp) => unreachable!("`acp` is dispatched ahead of the config load"),
         Some(Command::Framework(_)) => {
             unreachable!("the framework's verbs are dispatched ahead of the config load")
         }
@@ -559,7 +569,14 @@ async fn main() -> Result<()> {
             // another workspace (which is a restart — see `app_server`).
             let shutdown = CancellationToken::new();
             let restart = Arc::new(AtomicBool::new(false));
-            let (server, sync_parts) = app_server::with_sync(app_server::build()).await?;
+            // `sapphire-agent acp` reaches the agent through the server's
+            // IPC endpoint; the agent it reaches is attached once built.
+            let acp_tunnel = serve::acp_tunnel::AcpTunnel::default();
+            let server = app_server::build().extend({
+                let tunnel = acp_tunnel.clone();
+                move |router| tunnel.router(router)
+            });
+            let (server, sync_parts) = app_server::with_sync(server).await?;
             let host = Arc::clone(server.host());
             let server_task = {
                 let shutdown = shutdown.clone();
@@ -993,6 +1010,7 @@ async fn main() -> Result<()> {
             // Wire serve_state into the timer manager so voice-origin
             // timers can push fire messages back to their satellite.
             timer_manager.set_serve_state(Arc::downgrade(&serve_state));
+            acp_tunnel.attach(Arc::clone(&serve_state));
 
             // ── Autonomous sessions (off unless configured) ─────────────────
             // Spawned outside the channel block on purpose: this loop needs
@@ -1845,6 +1863,10 @@ mod tests {
         assert!(matches!(
             parse(&["sapphire-agent", "init"]),
             Some(Command::Init { .. })
+        ));
+        assert!(matches!(
+            parse(&["sapphire-agent", "acp"]),
+            Some(Command::Acp)
         ));
     }
 

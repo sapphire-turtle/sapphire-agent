@@ -7432,6 +7432,7 @@ dependencies = [
  "sapphire-framework",
  "sapphire-framework-bridge-api",
  "sapphire-framework-bridge-client",
+ "sapphire-framework-server-api",
  "serde",
  "serde_ignored",
  "serde_json",

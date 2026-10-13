@@ -21,7 +21,7 @@ A personal AI assistant agent that works on file-based, local-first [`sapphire-f
 - **Agent-to-agent**: `/a2a` endpoint speaks the v1 A2A protocol (JSON-RPC `SendMessage`, AgentCard) with per-device bearer-token auth — enable via `[a2a].enabled = true`.
 - **Subagents**: `<workspace>/agents/<name>.md` definitions the main agent can delegate a task to via the `subagent` tool — its own system prompt, its own tool loop, only the final answer comes back, it can be resumed by handle for a later round, and a delegated agent can itself delegate up to `[tools.subagent] max_depth` deep. See [Subagents](#subagents) below.
 - **Skills**: written procedures (planning, TDD, debugging, code review, …) loaded on request from a checkout on the *editor's* machine, over ACP. Requires an ACP client that declared terminal support — off entirely for Matrix, Discord and voice. See [Skills](#skills) below.
-- **Editor integration**: `/acp` endpoint speaks the Agent Client Protocol over WebSocket, so Zed can drive the running agent — enable via `[acp].enabled = true`; see [Zed / ACP](#zed--acp) below.
+- **Editor integration**: Zed (or any ACP client) drives the running agent over the Agent Client Protocol — on the agent's own machine by starting `sapphire-agent acp` (stdio, relayed to the running agent over its local IPC endpoint), from elsewhere over the `/acp` WebSocket endpoint (`[acp].enabled = true`); see [Zed / ACP](#zed--acp) below.
 - **Commands**:
   - `sapphire-agent` — start the channel listeners + JSON-RPC HTTP control API (`/rpc`, `/a2a`, `/acp`)
   - `sapphire-agent-server init [PATH]` — seed a workspace with the files the agent reads (`AGENTS.md`, `SOUL.md`, …), then print the host-local config to paste; never overwrites an existing file
@@ -368,6 +368,40 @@ agent. Its sessions do get their own store, though: a separate directory
 tree and line format from `/rpc`, Matrix and Discord, not a `cwd`-tagged row
 folded into one of theirs. See
 [Loading past sessions](#loading-past-sessions) below for the layout.
+
+There are two ways in. On a machine where the agent runs — every synced host
+runs one — the editor starts `sapphire-agent acp` itself. From a machine that
+does not, it connects to `/acp` over the network.
+
+### On the agent's machine: `sapphire-agent acp`
+
+`sapphire-agent acp` speaks ACP on stdio, which is the transport editors
+expect, and relays every line to the agent already running on this host over
+its local IPC endpoint. The conversation runs in that agent, on this host; the
+relay starts nothing, and exits with an error when no agent is running. No
+token is involved — the endpoint admits only the OS user the agent runs as —
+so the room profile a token would pick is named in the host config instead:
+
+```toml
+[acp]
+stdio_room_profile = "zed"   # any [room_profile.<name>]; required for `acp`
+
+[room_profile.zed]
+profile = "default"
+rooms   = []
+```
+
+Then, in Zed's `settings.json`:
+
+```jsonc
+"agent_servers": {
+  "sapphire": { "type": "custom", "command": "sapphire-agent", "args": ["acp"] }
+}
+```
+
+`[acp].enabled` is not needed for this; it gates the WebSocket endpoint only.
+
+### From another machine: `/acp`
 
 **1. Enable the endpoint** in your config (host-local; the workspace config
 layer cannot turn this on):

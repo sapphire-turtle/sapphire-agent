@@ -6,11 +6,14 @@
 //!           GET  /.well-known/agent-card.json
 //!           GET  /acp  (Agent Client Protocol over WebSocket; gated by [acp].enabled)
 //!
+//! ACP also runs on stdio, tunnelled over IPC: see [`acp_tunnel`].
+//!
 //! Session management uses a `Session-Id` request/response header.
 
 pub mod a2a;
 pub mod acp;
 pub mod acp_permissions;
+pub mod acp_tunnel;
 
 use crate::acp_session::AcpSessionStore;
 use crate::channel::RoomInfo;
@@ -3799,6 +3802,7 @@ rooms    = []
         config.acp = Some(crate::config::AcpConfig {
             enabled: acp_enabled,
             keepalive_secs: acp_keepalive_secs,
+            stdio_room_profile: Some("developer".to_string()),
         });
         config.tools.tool_rounds = rounds;
         config.room_profiles.get_mut("developer").unwrap().devices =

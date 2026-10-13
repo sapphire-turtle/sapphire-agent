@@ -695,3 +695,11 @@ enabled = false
 # The client answers each ping with an automatic pong, so one timer keeps
 # traffic on the tunnel in both directions.
 #keepalive_secs = 30
+
+# The room profile ACP on stdio runs under: `sapphire-agent acp`, which an
+# editor starts as its agent command on the machine the agent runs on. It
+# relays to the running agent over its local IPC endpoint (the agent loop
+# runs there), so no token is involved and no profile is picked by one —
+# name it here. Unset, `sapphire-agent acp` exits with an error. Independent
+# of `enabled`, which gates the WebSocket endpoint alone.
+#stdio_room_profile = "editor"

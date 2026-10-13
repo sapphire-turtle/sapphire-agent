@@ -119,6 +119,9 @@ sapphire-framework = { git = "https://github.com/sapphire-turtle/sapphire-framew
 # Same git ref as `sapphire-framework`, so both resolve to one copy.
 sapphire-framework-bridge-api = { git = "https://github.com/sapphire-turtle/sapphire-framework", branch = "feat/workspace-sync-option", features = ["cli"] }
 sapphire-framework-bridge-client = { git = "https://github.com/sapphire-turtle/sapphire-framework", branch = "feat/workspace-sync-option" }
+# The app server's API version, which `sapphire-agent acp` names in its
+# IPC handshake. The facade does not re-export it either.
+sapphire-framework-server-api = { git = "https://github.com/sapphire-turtle/sapphire-framework", branch = "feat/workspace-sync-option" }
 
 # Human-readable ids: session ids, and external device ids. Must match the
 # version sapphire-framework uses — `keys::Authenticated::id` is a `GrainId`, and two semver-incompatible grain-id versions in one graph are
