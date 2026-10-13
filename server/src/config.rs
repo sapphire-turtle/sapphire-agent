@@ -147,8 +147,9 @@ pub struct Config {
     /// Ambient (always-on) audio capture ingest configuration.
     #[serde(default)]
     pub ambient: AmbientConfig,
-    /// Location of the `sapphire-framework` key file used to authenticate
-    /// ambient capture devices.
+    /// Removed when tokens moved to the workgroup's external devices; kept
+    /// only so a leftover `[keys]` block reaches `Config::migration_errors`
+    /// and fails loudly with instructions. Never read otherwise.
     #[serde(default)]
     pub keys: KeysConfig,
     /// Removed in the device-registry migration; kept only so a config that
@@ -216,8 +217,9 @@ pub struct RoomProfileConfig {
     /// `Config::migration_errors`.
     #[serde(default)]
     pub api_keys: Vec<String>,
-    /// Device ids (from the workspace `devices.toml`) that run under this room
-    /// profile. A device id appears in exactly one room profile; the binding is
+    /// External devices (by name or id, from `sapphire-agent external-device`)
+    /// that run under this room profile. A device appears in exactly one room
+    /// profile; the binding is
     /// what gives an authenticated device its LLM profile and memory namespace.
     /// Replaces `api_keys`, which held raw tokens in this file.
     #[serde(default)]
@@ -429,9 +431,7 @@ impl Default for AmbientConfig {
     }
 }
 
-/// Location of the `sapphire-framework` key file. Host-local: it names
-/// the only place tokens are stored, so it must never be settable from
-/// the workspace config layer.
+/// The removed `[keys]` block. See `Config::keys`.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct KeysConfig {
@@ -1671,18 +1671,29 @@ api_key = "test"
             );
         }
 
+        if self.keys.file.is_some() {
+            errors.push(
+                "[keys].file is gone: the agent no longer reads a key file. Tokens now belong \
+                 to the workgroup's external devices, which the sapphire bridge checks. Delete \
+                 the [keys] block, then re-create each device with `sapphire-agent \
+                 external-device add <name>` (the old tokens cannot be carried over), put the \
+                 printed token on the device, and keep its name or id in a \
+                 `[room_profile.<name>].devices` array."
+                    .to_string(),
+            );
+        }
+
         let mut names: Vec<&String> = self.devices.keys().collect();
         names.sort();
         for name in names {
             errors.push(format!(
                 "[device.{name}] no longer lives in this file. Delete this block from \
                  config.toml first — startup refuses to run any command, including \
-                 `sapphire-agent device add`, while it is still present. Devices moved to the \
-                 workspace table at <workspace>/.sapphire-agent/devices.toml. Once the block is \
-                 gone, run `sapphire-agent device add --name {name}`, put the printed token on \
-                 the device, and add the printed id to a `[room_profile.<name>].devices` array. \
-                 The old token cannot be carried over: it was hand-written plaintext with no \
-                 entry in the key file."
+                 `sapphire-agent external-device add`, while it is still present. Devices moved to the \
+                 workgroup's external devices. Once the block is gone, run `sapphire-agent \
+                 external-device add {name}`, put the printed token on the device, and add \
+                 {name:?} to a `[room_profile.<name>].devices` array. The old token cannot be \
+                 carried over."
             ));
         }
 
@@ -1697,9 +1708,9 @@ api_key = "test"
             errors.push(format!(
                 "[room_profile.{name}].api_keys was replaced by `devices`. Delete this \
                  `api_keys` line from config.toml first — startup refuses to run any command, \
-                 including `sapphire-agent device add`, while it is still present. Raw tokens \
-                 no longer live in this file; run `sapphire-agent device add --name <device>` \
-                 for each client and list the printed ids in `[room_profile.{name}].devices`."
+                 including `sapphire-agent external-device add`, while it is still present. Raw tokens \
+                 no longer live in this file; run `sapphire-agent external-device add <device>` \
+                 for each client and list the names in `[room_profile.{name}].devices`."
             ));
         }
 
@@ -1914,22 +1925,6 @@ pub fn resolve_workspace_dir(explicit: Option<&str>, config_path: &Path) -> Path
 /// resolves its workspace through the marker-free path.
 pub fn workspace_config_path(workspace_dir: &Path) -> PathBuf {
     workspace_dir.join(".sapphire-agent").join("config.toml")
-}
-
-/// Path to the workspace device table.
-///
-/// Mirrors `workspace_config_path`. The framework has `Workspace::devices_path`
-/// for the same convention, but the agent resolves its workspace as a plain
-/// `PathBuf` and never builds a framework `Workspace` for config purposes —
-/// that constructor canonicalizes and requires the marker directory to already
-/// exist, neither of which is true when `device add` runs on a fresh checkout.
-pub fn workspace_devices_path(workspace_dir: &Path) -> PathBuf {
-    workspace_dir.join(".sapphire-agent").join("devices.toml")
-}
-
-/// Path to the workspace user table. See `workspace_devices_path`.
-pub fn workspace_users_path(workspace_dir: &Path) -> PathBuf {
-    workspace_dir.join(".sapphire-agent").join("users.toml")
 }
 
 /// A `Config` plus what the layering did to produce it.
@@ -2589,6 +2584,25 @@ key_id = "550e8400-e29b-41d4-a716-446655440000"
         // The message has to say what to run, not just what is wrong: the
         // token cannot be carried over, so the operator must re-issue it.
         assert!(errors[0].contains("device add"), "{errors:?}");
+    }
+
+    #[test]
+    fn migration_errors_name_a_leftover_key_file() {
+        let cfg: Config = toml::from_str(
+            r#"
+[anthropic]
+api_key = "test"
+
+[keys]
+file = "/etc/sapphire/keys.toml"
+"#,
+        )
+        .unwrap();
+
+        let errors = cfg.migration_errors();
+
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("external-device add"), "{errors:?}");
     }
 
     #[test]

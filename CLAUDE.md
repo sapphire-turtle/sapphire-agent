@@ -41,7 +41,7 @@ This is not a Windows quirk, and it is the reason `sherpa-onnx` was briefly link
 
 The resolution is to keep `ort` out of the default graph, which restores static linking and single-file distribution everywhere:
 
-- **`server/`** — `fastembed-embed` is off by default (#225). The framework's `openai` and `ollama` embedders cover the same ground over HTTP, and llama.cpp's server speaks the OpenAI-compatible `/v1/embeddings` shape.
+- **`server/`** — the agent no longer embeds in-process at all: embedding moved to the sapphire bridge (framework 0.17), and the `fastembed-embed` feature (off by default since #225) is gone.
 - **`cli/`** — the openWakeWord detector is gone; detection moves server-side in #183.
 - **`desktop/`** — never pulled `ort`; it only followed the workspace's link mode.
 
@@ -51,8 +51,6 @@ So `cargo build --workspace` works on Linux and macOS. It still does **not** lin
 cargo build --package sapphire-agent-cli
 cargo build --package sapphire-agent-desktop
 ```
-
-If you enable `fastembed-embed`, drop `voice-sherpa`: `--no-default-features --features redb-store,fastembed-embed`.
 
 ### Historical note: agent false-positive release PRs (now fixed)
 

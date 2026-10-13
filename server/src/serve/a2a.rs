@@ -183,9 +183,16 @@ pub async fn handle_a2a_post(
             return (StatusCode::UNAUTHORIZED, "missing bearer token").into_response();
         }
     };
-    let profile_name = match state.device_auth.resolve(&bearer) {
-        Some(r) => r.room_profile.to_string(),
-        None => {
+    let profile_name = match state.device_auth.resolve(&bearer).await {
+        Ok(r) => r.room_profile,
+        Err(crate::device_auth::AuthError::Unavailable) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "cannot check the bearer token now",
+            )
+                .into_response();
+        }
+        Err(crate::device_auth::AuthError::Refused) => {
             return jsonrpc_error_response(
                 req_id,
                 codes::AUTH_REQUIRED,

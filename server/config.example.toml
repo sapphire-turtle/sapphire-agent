@@ -20,10 +20,10 @@
 # ([anthropic].api_key, [matrix], [discord], [tools]), bind addresses,
 # cache and workspace paths, and STT/TTS model paths are host-local: if
 # the workspace file sets one, it is ignored and named in a warning at
-# startup. `[room_profile.<n>].devices` is different: it names device
-# ids from the workspace device table, not a secret, so the workspace
-# layer may set it. The bearer token itself lives only in the
-# host-local key file — see "Device key file" below.
+# startup. `[room_profile.<n>].devices` is different: it names external
+# devices by name or id, not a secret, so the workspace layer may set it.
+# The bearer token itself is never stored here — see "External devices"
+# below.
 #
 # [providers.<n>].base_url is host-local too, and deliberately so even
 # though a private-network DNS name would work from every host: a
@@ -211,8 +211,8 @@ system_prompt = "You are a helpful personal assistant."
 #
 # API sessions pin a room profile via the bearer token sent in
 # `Authorization: Bearer <token>` on every `/rpc` request. The token
-# resolves to a device (`sapphire-agent-server device add`, see "Device key
-# file" below), and that device's id must appear in some
+# resolves to an external device (`sapphire-agent-server external-device
+# add`, see "External devices" below), whose name or id must appear in some
 # `[room_profile.<n>].devices` below — same mechanism `/a2a`, `/acp`,
 # `/mcp` and ambient ingest all use (sapphire-agent-cli: `[server].token` or
 # `--token <TOKEN>`).
@@ -236,24 +236,23 @@ system_prompt = "You are a helpful personal assistant."
 #
 # /rpc (sapphire-agent-cli), A2A (Agent2Agent Protocol), MCP clients, `/acp`
 # and ambient ingest all reach a room_profile through devices declared
-# here. Each device id must be unique across all room profiles —
-# startup fails if two profiles share one, and also if a live device is
-# in the workspace device table but bound to none — and an incoming
-# `Authorization: Bearer <token>` resolves implicitly (token -> device
-# -> room profile), so external clients never name room_profile
-# themselves. Leave `devices = []` (or omit) to deny external access to
+# here. Each device must be unique across all room profiles — startup
+# fails if two profiles share one — and an incoming
+# `Authorization: Bearer <token>` resolves implicitly (token -> external
+# device -> room profile), so external clients never name room_profile
+# themselves. A device bound to no room profile is refused (`verify`
+# lists them). Leave `devices = []` (or omit) to deny external access to
 # a profile.
 #
-# Every device id here comes from `sapphire-agent-server device add`, which
-# prints the id to mint — a 7-character grain-id — on stderr alongside
-# the token (printed alone to stdout, so `device add ... > token.txt`
-# captures just the secret). See "Device key file" below.
+# Each entry is an external device's name or its id, both printed by
+# `sapphire-agent-server external-device add <name>`. See "External
+# devices" below.
 #
 # [room_profile.sapphire_world]
 # profile          = "default"
 # memory_namespace = "sapphire_world"
 # rooms            = []             # A2A-only; no chat rooms map here
-# devices          = ["a3f9k2p"]    # id printed by `device add --name a2a-client`
+# devices          = ["a2a-client"] # `external-device add a2a-client`
 #
 # A typical MCP setup for an external coding assistant (Claude Code
 # and similar) sharing the user's default memory namespace. The
@@ -264,7 +263,7 @@ system_prompt = "You are a helpful personal assistant."
 # profile          = "default"
 # memory_namespace = "default"      # share the everyday namespace
 # rooms            = []             # MCP-only; no chat rooms map here
-# devices          = ["k7d2m9x"]    # id printed by `device add --name claude-code`
+# devices          = ["claude-code"] # `external-device add claude-code`
 #
 # Caveat: workspace retrieve (FTS / vector search) currently spans every
 # namespace because the agent's retrieve tools don't yet set the
@@ -277,8 +276,8 @@ system_prompt = "You are a helpful personal assistant."
 # ─────────────────────────────────────────────────────────────────────
 # Mounts `/a2a` (JSON-RPC) and `/.well-known/agent-card.json` on the
 # same HTTP server as `/rpc`. Disabled by default — flip `enabled` to
-# turn the routes on. Auth resolves through the same device table as
-# every other endpoint: token -> device -> `[room_profile.<n>].devices`;
+# turn the routes on. Auth resolves like every other endpoint:
+# token -> external device -> `[room_profile.<n>].devices`;
 # this section configures only the public face of the agent.
 #
 # [a2a]
@@ -569,7 +568,7 @@ system_prompt = "You are a helpful personal assistant."
 # framing (and no base64 inflation) around a multi-kilobyte payload.
 #
 #   POST /audio/ingest?segment=<id>&started_at=<unix_ms>&rate=16000&live=1
-#   Authorization: Bearer <token from `sapphire-agent-server device add`, see below>
+#   Authorization: Bearer <token from `sapphire-agent-server external-device add`, see below>
 #   Content-Type: audio/L16   (raw s16le)  — or: audio/wav
 #   <raw audio bytes>
 #
@@ -636,47 +635,31 @@ system_prompt = "You are a helpful personal assistant."
 # a promoted candidate's grain-id is written into the marker, that
 # directory gains an id and becomes rename-safe.
 
-# ── Device key file (host-local) ────────────────────────────────────
+# ── External devices (owned by the sapphire bridge, not this file) ──
 # Every authenticated entry point — ambient ingest, `/rpc`, `/a2a`,
-# `/acp`, `/mcp` — resolves the same way: bearer token -> key file entry
-# -> workspace device -> room profile. The token lives only in
-# `sapphire-framework`'s key file — never in this config — so a leaked
-# config reveals no credential. `DeviceAuth` holds a snapshot of the key
-# file and the device table taken at startup with no reload path, so a
-# revoke, rotate, retire, or `[room_profile.*].devices` edit takes effect
-# on this agent's next restart, not immediately. Defaults to
-# `dirs::config_dir()/sapphire-agent/keys.toml`.
+# `/acp`, `/mcp` — resolves the same way: bearer token -> external device
+# -> room profile. External devices are the workgroup's synced ledger,
+# owned by the sapphire bridge: only a token's SHA-256 is stored, and
+# every host of the workgroup accepts the same tokens. The agent asks the
+# running bridge about each token and trusts a success for 30 seconds, so
+# a retire or rotate reaches it within the sync delay plus 30 s, without a
+# restart. If the bridge is not running, every authenticated request
+# answers 503. There is no `[keys]` block anymore.
 #
-# [keys]
-# file = "/etc/sapphire/keys.toml"
+#   sapphire-agent external-device add pendant --description "the one on the lanyard"
+#   sapphire-agent external-device list
+#   sapphire-agent external-device rotate <name-or-id>
+#   sapphire-agent external-device retire <name-or-id>
+#   sapphire-agent external-device restore <name-or-id>
 #
-# `sapphire-agent` owns this file's rows; there is normally no reason to
-# hand-edit it. It is written only by:
+# `add` and `rotate` print the token once. `add` allows the device to use
+# this agent (`--app sapphire-agent`) unless `--app` names others.
 #
-#   sapphire-agent device add --name pendant --description "the one on the lanyard"
-#   sapphire-agent device rotate <name-or-id>
-#   sapphire-agent device retire <name-or-id> [--purge]
-#
-# `device add` prints the freshly minted token to stdout ONLY (safe to
-# pipe: `device add --name pendant > pendant.token`), and everything
-# else — the device id, timestamps, and the `[room_profile.<n>].devices`
-# line to paste — to stderr.
-
-# ── Devices (owned by `sapphire-agent device`, not this file) ────────
-# There is no `[device.*]` block here anymore: the device table lives at
-# `<workspace_dir>/.sapphire-agent/devices.toml`, next to
-# `.sapphire-agent/config.toml`, and is entirely owned by the `device`
-# subcommand above — this config only *routes* an existing device id to
-# a room profile, via `[room_profile.<n>].devices` (see the room_profile
-# examples earlier in this file).
-#
-# Every device that is not retired must appear in exactly one
-# room_profile's `devices` array — startup refuses to run otherwise.
-# This includes devices that only ever reach ambient ingest: the moment
-# a captured conversation is answered rather than merely recorded, the
-# room_profile a device is bound to is what decides which LLM profile
-# and which memory namespace that conversation uses, so an ambient-only
-# device is not exempt from being routed.
+# This config only *routes* a device to a room profile, via
+# `[room_profile.<n>].devices` (see the room_profile examples earlier in
+# this file). The room profile a device is bound to decides which LLM
+# profile and which memory namespace its conversations use — ambient-only
+# devices included.
 
 # ── Timer / Pomodoro presets ────────────────────────────────────────
 # Single-shot timers ("5分後に教えて") don't need configuration — the
@@ -709,8 +692,8 @@ steps  = [
 
 # Agent Client Protocol endpoint (GET /acp, WebSocket).
 # Lets an ACP client such as Zed drive this agent. Authentication resolves
-# through the same device table as every other endpoint (token -> device ->
-# room profile via [room_profile.<name>].devices), and the token that
+# like every other endpoint (token -> external device -> room profile via
+# [room_profile.<name>].devices), and the token that
 # connects selects the room profile the ACP session runs under.
 # Host-local: the workspace config layer cannot set this.
 #

@@ -601,9 +601,16 @@ async fn rpc_post(
             return (StatusCode::UNAUTHORIZED, "missing bearer token").into_response();
         }
     };
-    let (profile_name, authenticated_device_id) = match state.device_auth.resolve(&bearer) {
-        Some(r) => (r.room_profile.to_string(), r.device.id.to_string()),
-        None => {
+    let (profile_name, authenticated_device_id) = match state.device_auth.resolve(&bearer).await {
+        Ok(r) => (r.room_profile, r.device.id.to_string()),
+        Err(crate::device_auth::AuthError::Unavailable) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "cannot check the bearer token now",
+            )
+                .into_response();
+        }
+        Err(crate::device_auth::AuthError::Refused) => {
             let body = error_response(req_id, RPC_AUTH_REQUIRED, "unknown or revoked bearer token");
             return body.into_response();
         }
@@ -3854,29 +3861,12 @@ impl ServeState {
         let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
         let base = dir.path().to_path_buf();
         let workspace_dir = base.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
 
         // Device auth fixture: one device ("developer-device") routed to
         // room_profile "developer", with its bearer token fixed at
         // "sa-acp-token" so the many tests presenting that literal keep
-        // working. Written by hand rather than through
-        // `KeyStore::generate` (which always mints a random token) — the
-        // key file format documents `token` as its only required field,
-        // exactly like this. Mirrors the fixture shape in
-        // `device_auth::tests`, minus the random token.
-        let keys_file = base.join("keys.toml");
-        let devices_file = crate::config::workspace_devices_path(&workspace_dir);
-        std::fs::create_dir_all(devices_file.parent().unwrap()).unwrap();
-        let mut devices = sapphire_framework::registry::Devices::load(&devices_file).unwrap();
-        let device = devices.add("developer-device", None, None).unwrap();
-        std::fs::write(
-            &keys_file,
-            format!(
-                "[[key]]\ntoken = \"sa-acp-token\"\nlabel = \"developer-device\"\ndevice_id = \"{}\"\n",
-                device.id
-            ),
-        )
-        .unwrap();
-
+        // working. A static verifier stands in for the bridge.
         let mut config = Config::parse_for_test(
             r#"
 [anthropic]
@@ -3895,12 +3885,12 @@ rooms    = []
             keepalive_secs: acp_keepalive_secs,
         });
         config.tools.tool_rounds = rounds;
-        config.keys.file = Some(keys_file.clone());
-        config.room_profiles.get_mut("developer").unwrap().devices = vec![device.id.to_string()];
+        config.room_profiles.get_mut("developer").unwrap().devices =
+            vec!["developer-device".to_string()];
 
-        let device_auth = Arc::new(
-            crate::device_auth::DeviceAuth::open(&keys_file, &devices_file, &config.room_profiles)
-                .expect("test device_auth fixture should build"),
+        let device_auth = crate::device_auth::testing::device_auth(
+            &[("sa-acp-token", "developer-device")],
+            &config.room_profiles,
         );
 
         // Registered under both names: `provider_for_session` falls
@@ -5251,9 +5241,10 @@ mod tests {
         let resolved = state
             .device_auth
             .resolve("sa-acp-token")
+            .await
             .expect("fixture token should resolve");
         assert_eq!(resolved.room_profile, "developer");
-        assert!(state.device_auth.resolve("sa-wrong").is_none());
+        assert!(state.device_auth.resolve("sa-wrong").await.is_err());
     }
 
     /// Without this check, an authenticated client could pass someone else's
@@ -5266,6 +5257,7 @@ mod tests {
         let authenticated_device_id = state
             .device_auth
             .resolve("sa-acp-token")
+            .await
             .expect("fixture token should resolve")
             .device
             .id
