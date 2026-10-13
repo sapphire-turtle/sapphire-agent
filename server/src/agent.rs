@@ -184,7 +184,11 @@ impl Agent {
         Arc::clone(self).handle_message(incoming).await
     }
 
-    pub async fn run(self: Arc<Self>) -> anyhow::Result<()> {
+    /// Handle channel messages until `shutdown` is cancelled.
+    pub async fn run(
+        self: Arc<Self>,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) -> anyhow::Result<()> {
         let (tx, mut rx) = mpsc::channel(64);
 
         let channels = Arc::clone(&self.channels);
@@ -193,9 +197,6 @@ impl Agent {
                 error!("Channel listen error: {e:#}");
             }
         });
-
-        let shutdown = tokio::signal::ctrl_c();
-        tokio::pin!(shutdown);
 
         info!("Agent is running. Press Ctrl-C to stop.");
 
@@ -217,7 +218,7 @@ impl Agent {
                         }
                     }
                 }
-                _ = &mut shutdown => {
+                () = shutdown.cancelled() => {
                     info!("Shutting down...");
                     break;
                 }

@@ -913,7 +913,7 @@ impl Tool for DirWalkTool {
         let workspace_root = state.workspace.root.clone();
         let mut results: Vec<(PathBuf, bool)> = Vec::new();
         let truncated = walk_recurse(
-            &state,
+            state,
             &workspace_root,
             &path,
             0,

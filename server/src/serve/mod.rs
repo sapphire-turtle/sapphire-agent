@@ -342,6 +342,7 @@ pub async fn run(
     addr: String,
     state: Arc<ServeState>,
     extra: Option<axum::Router>,
+    shutdown: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<()> {
     // Routes are intentionally separated so protocol endpoints can be
     // mounted alongside `/rpc` without colliding with the methods (`chat`,
@@ -368,9 +369,7 @@ pub async fn run(
     spawn_session_residency_log(Arc::clone(&state));
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
-            if let Err(e) = tokio::signal::ctrl_c().await {
-                error!("Failed to install Ctrl-C handler: {e}");
-            }
+            shutdown.cancelled().await;
             info!("HTTP server shutting down...");
         })
         .await?;
