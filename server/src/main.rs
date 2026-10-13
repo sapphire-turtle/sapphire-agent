@@ -23,6 +23,7 @@ mod image_cache;
 mod mcp_client;
 mod memory_compaction;
 mod periodic_log;
+mod placement;
 mod provider;
 mod serve;
 mod session;
@@ -558,7 +559,7 @@ async fn main() -> Result<()> {
             // another workspace (which is a restart — see `app_server`).
             let shutdown = CancellationToken::new();
             let restart = Arc::new(AtomicBool::new(false));
-            let server = app_server::build();
+            let (server, sync_parts) = app_server::with_sync(app_server::build()).await?;
             let host = Arc::clone(server.host());
             let server_task = {
                 let shutdown = shutdown.clone();
@@ -590,10 +591,24 @@ async fn main() -> Result<()> {
             }
             let switch_watch = app_server::watch_for_switch(
                 Arc::clone(&host),
-                served_root,
+                served_root.clone(),
                 shutdown.clone(),
                 Arc::clone(&restart),
             );
+            // ── Placement: which host runs what, once synced ───────────────
+            let placement = match sync_parts {
+                Some((runtime, bridge)) => {
+                    let placement = placement::Placement::synced(runtime, bridge, served_root);
+                    placement::spawn_claim_keeper(
+                        Arc::clone(&placement),
+                        workspace_dir.clone(),
+                        placement::local_channels(&config),
+                        shutdown.clone(),
+                    );
+                    placement
+                }
+                None => placement::Placement::alone(),
+            };
             // `sync_interval_minutes` is the re-index cadence. The framework
             // removed local-workspace auto-sync, so a tick is an mtime-based
             // refresh of the retrieve cache and nothing else.
@@ -989,6 +1004,7 @@ async fn main() -> Result<()> {
                     Arc::clone(&serve_state),
                     Some(Arc::clone(&channel_session_store)),
                 )
+                .with_placement(Arc::clone(&placement))
                 .spawn();
             } else {
                 tracing::info!("Autonomous sessions disabled by config");
@@ -1047,6 +1063,7 @@ async fn main() -> Result<()> {
             let mut agent_handle: Option<tokio::task::JoinHandle<()>> = None;
 
             // ── Channel + Agent (Matrix and/or Discord, if configured) ──────
+            let mut channel_agent: Option<Arc<Agent>> = None;
             if config.matrix.is_some() || config.discord.is_some() {
                 let mut channel_list: Vec<(String, Arc<dyn channel::Channel>)> = Vec::new();
                 if let Some(m) = &config.matrix {
@@ -1067,6 +1084,81 @@ async fn main() -> Result<()> {
                 ));
                 tracing::info!("Channels active: {}", channels.names().join(", "));
 
+                // ── Agent ───────────────────────────────────────────────────
+                let agent = Arc::new(Agent::new(
+                    config.clone(),
+                    Arc::clone(&channels),
+                    Arc::clone(&registry),
+                    Arc::clone(&workspace),
+                    Some(Arc::clone(&tool_set)),
+                    Arc::clone(&channel_session_store),
+                    image_cache.clone(),
+                ));
+                // Wire the agent into the timer manager so chat-origin
+                // timers fire through `Agent::trigger`.
+                timer_manager.set_agent(Arc::downgrade(&agent));
+
+                // ── refresh_system_prompt ───────────────────────────────
+                // Registered here, right after the agent is built, and
+                // only in this channel-configured branch: an ACP-only
+                // configuration has no Agent and thus no snapshots, so
+                // the pinned file reads alone are enough there. Held as
+                // `Weak` to avoid a cycle — the tool set is itself owned
+                // (transitively) by the agent.
+                tool_set
+                    .register_tool(Box::new(
+                        tools::builtin_tools::RefreshSystemPromptTool::new(Arc::downgrade(&agent)),
+                    ))
+                    .await;
+
+                // ── Periodic workspace re-index ─────────────────────────
+                // `sync()` picks up session JSONLs and notes written
+                // outside the agent. It used to also rebuild a
+                // per-namespace "today's digest" block for the system
+                // prompt; that block is gone, and `session_list` /
+                // `session_read` answer the same question on demand.
+                if let Some(dur) = ws_sync_interval {
+                    tracing::info!(
+                        "Periodic workspace re-index enabled: every {}s",
+                        dur.as_secs()
+                    );
+                    let ws = Arc::clone(&ws_state);
+                    tokio::spawn(async move {
+                        let mut tick = tokio::time::interval(dur);
+                        tick.tick().await; // skip immediate fire
+                        loop {
+                            tick.tick().await;
+                            {
+                                let state = &ws;
+                                match state.sync_retrieve() {
+                                    Ok((u, r)) => tracing::info!(
+                                        "Periodic ws sync: {u} upserted, {r} removed"
+                                    ),
+                                    Err(e) => tracing::warn!("Periodic ws sync failed: {e:#}"),
+                                }
+                            }
+                        }
+                    });
+                }
+
+                channel_agent = Some(Arc::clone(&agent));
+
+                let agent_run = Arc::clone(&agent);
+                let agent_shutdown = shutdown.clone();
+                agent_handle = Some(tokio::spawn(async move {
+                    if let Err(e) = agent_run.run(agent_shutdown).await {
+                        tracing::error!("Agent error: {e:#}");
+                    }
+                }));
+            }
+
+            // ── Catch-up and heartbeat ──────────────────────────────────────
+            // Outside the channel block: the logs and the compaction run on
+            // the primary device of a synced workspace (`placement`), which
+            // need not have a chat channel. The startup catch-up runs only if
+            // this host already knows it is that device; the hourly
+            // catch-up loop picks up what this skips.
+            if placement.runs_background().await {
                 // ── Catch-up: iterate every configured memory namespace ────
                 // Each namespace's background tasks run on its own provider
                 // (resolved via `background_provider_for_namespace`), so an
@@ -1132,65 +1224,9 @@ async fn main() -> Result<()> {
                         .await;
                     }
                 }
+            }
 
-                // ── Agent ───────────────────────────────────────────────────
-                let agent = Arc::new(Agent::new(
-                    config.clone(),
-                    Arc::clone(&channels),
-                    Arc::clone(&registry),
-                    Arc::clone(&workspace),
-                    Some(Arc::clone(&tool_set)),
-                    Arc::clone(&channel_session_store),
-                    image_cache.clone(),
-                ));
-                // Wire the agent into the timer manager so chat-origin
-                // timers fire through `Agent::trigger`.
-                timer_manager.set_agent(Arc::downgrade(&agent));
-
-                // ── refresh_system_prompt ───────────────────────────────
-                // Registered here, right after the agent is built, and
-                // only in this channel-configured branch: an ACP-only
-                // configuration has no Agent and thus no snapshots, so
-                // the pinned file reads alone are enough there. Held as
-                // `Weak` to avoid a cycle — the tool set is itself owned
-                // (transitively) by the agent.
-                tool_set
-                    .register_tool(Box::new(
-                        tools::builtin_tools::RefreshSystemPromptTool::new(Arc::downgrade(&agent)),
-                    ))
-                    .await;
-
-                // ── Periodic workspace re-index ─────────────────────────
-                // `sync()` picks up session JSONLs and notes written
-                // outside the agent. It used to also rebuild a
-                // per-namespace "today's digest" block for the system
-                // prompt; that block is gone, and `session_list` /
-                // `session_read` answer the same question on demand.
-                if let Some(dur) = ws_sync_interval {
-                    tracing::info!(
-                        "Periodic workspace re-index enabled: every {}s",
-                        dur.as_secs()
-                    );
-                    let ws = Arc::clone(&ws_state);
-                    tokio::spawn(async move {
-                        let mut tick = tokio::time::interval(dur);
-                        tick.tick().await; // skip immediate fire
-                        loop {
-                            tick.tick().await;
-                            {
-                                let state = &ws;
-                                match state.sync_retrieve() {
-                                    Ok((u, r)) => tracing::info!(
-                                        "Periodic ws sync: {u} upserted, {r} removed"
-                                    ),
-                                    Err(e) => tracing::warn!("Periodic ws sync failed: {e:#}"),
-                                }
-                            }
-                        }
-                    });
-                }
-
-                // ── Heartbeat (day-boundary + cron loops) ───────────────────
+            if config.heartbeat_enabled {
                 let default_room_id = config
                     .matrix
                     .as_ref()
@@ -1201,7 +1237,7 @@ async fn main() -> Result<()> {
                             .as_ref()
                             .and_then(|d| d.channel_ids.first().cloned())
                     });
-                let heartbeat = Heartbeat {
+                Heartbeat {
                     workspace_dir: workspace_dir.clone(),
                     ws_state: Arc::clone(&ws_state),
                     day_boundary_hour: config.day_boundary_hour,
@@ -1210,24 +1246,24 @@ async fn main() -> Result<()> {
                     digest_cfg: config.digest.clone(),
                     session_store: Arc::clone(&channel_session_store),
                     registry: Arc::clone(&registry),
-                    agent: Arc::clone(&agent),
+                    agent: channel_agent.clone(),
                     default_room_id,
+                    placement: Arc::clone(&placement),
+                    local_rooms: channel::seed_routing_from_config(&config),
+                    local_catch_all: config
+                        .matrix
+                        .as_ref()
+                        .is_some_and(|m| m.room_ids.is_empty())
+                        || config
+                            .discord
+                            .as_ref()
+                            .is_some_and(|d| d.channel_ids.is_empty()),
                     config: config.clone(),
                     serve_state: Some(Arc::clone(&serve_state)),
-                };
-                if config.heartbeat_enabled {
-                    heartbeat.spawn();
-                } else {
-                    tracing::info!("Heartbeat disabled by config");
                 }
-
-                let agent_run = Arc::clone(&agent);
-                let agent_shutdown = shutdown.clone();
-                agent_handle = Some(tokio::spawn(async move {
-                    if let Err(e) = agent_run.run(agent_shutdown).await {
-                        tracing::error!("Agent error: {e:#}");
-                    }
-                }));
+                .spawn();
+            } else {
+                tracing::info!("Heartbeat disabled by config");
             }
 
             // ── HTTP API server ─────────────────────────────────────────────

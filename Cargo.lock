@@ -7461,6 +7461,7 @@ source = "git+https://github.com/sapphire-turtle/sapphire-framework?branch=feat%
 dependencies = [
  "sapphire-framework-backend",
  "sapphire-framework-frontmatter",
+ "sapphire-framework-ipc",
  "sapphire-framework-keys",
  "sapphire-framework-server",
  "sapphire-framework-workspace",
