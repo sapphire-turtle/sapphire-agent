@@ -19,12 +19,11 @@ A personal AI assistant agent that works on file-based, local-first [`sapphire-f
 - **Voice**: optional `sapphire-agent-cli voice` satellite with local STT/TTS (via `sherpa-onnx`) and Silero VAD. See [cli/](cli/). Wake-word gating is temporarily unavailable while detection moves to the server ([#183](https://github.com/fluo10/sapphire-agent/issues/183)); the satellite runs VAD-only.
 - **Ambient audio ingest**: optional always-on capture from a wearable/pendant device — `POST /audio/ingest` takes raw audio (metadata in query params, no JSON/base64 framing) from a bearer-authenticated device, re-gates it, transcribes it, attributes it to a speaker against reference audio curated in the workspace, and stores the transcript outside the workspace. Records without answering: nothing in this path starts an LLM turn. `transcript_read`, `speaker_candidates` and `speaker_promote` expose the result as agent tools. Disabled by default — enable via `[ambient].enabled = true`; see `config.example.toml`.
 - **Agent-to-agent**: `/a2a` endpoint speaks the v1 A2A protocol (JSON-RPC `SendMessage`, AgentCard) with per-device bearer-token auth — enable via `[a2a].enabled = true`.
-- **External AI integration**: `/mcp` endpoint publishes `write_report` and `recall_memory` tools so Claude Code (and other MCP clients) can share project context with the agent — see [docs/mcp-integration.md](docs/mcp-integration.md).
 - **Subagents**: `<workspace>/agents/<name>.md` definitions the main agent can delegate a task to via the `subagent` tool — its own system prompt, its own tool loop, only the final answer comes back, it can be resumed by handle for a later round, and a delegated agent can itself delegate up to `[tools.subagent] max_depth` deep. See [Subagents](#subagents) below.
 - **Skills**: written procedures (planning, TDD, debugging, code review, …) loaded on request from a checkout on the *editor's* machine, over ACP. Requires an ACP client that declared terminal support — off entirely for Matrix, Discord and voice. See [Skills](#skills) below.
 - **Editor integration**: `/acp` endpoint speaks the Agent Client Protocol over WebSocket, so Zed can drive the running agent — enable via `[acp].enabled = true`; see [Zed / ACP](#zed--acp) below.
 - **Commands**:
-  - `sapphire-agent` — start the channel listeners + JSON-RPC HTTP control API (`/rpc`, `/mcp`, `/a2a`, `/acp`)
+  - `sapphire-agent` — start the channel listeners + JSON-RPC HTTP control API (`/rpc`, `/a2a`, `/acp`)
   - `sapphire-agent-server init [PATH]` — seed a workspace with the files the agent reads (`AGENTS.md`, `SOUL.md`, …), then print the host-local config to paste; never overwrites an existing file
   - `sapphire-agent-server verify` — validate config and report loaded workspace files, including the device -> room_profile bindings
   - `sapphire-agent-server external-device add|list|rotate|retire|restore|apps` — manage the workgroup's external devices (clients that reach the agent with a bearer token) through the running sapphire bridge; `add` and `rotate` print the token once
@@ -348,7 +347,7 @@ layer cannot turn this on):
 enabled = true
 ```
 
-**2. Mint a token.** Authentication works as for `/a2a` and `/mcp`: add an
+**2. Mint a token.** Authentication works as for `/rpc` and `/a2a`: add an
 external device (the sapphire bridge must be running), bind its name under a
 `[room_profile.<name>]`'s `devices`, and that device's token both authenticates the connection and
 selects the room profile (and therefore the provider and memory namespace)

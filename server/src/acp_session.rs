@@ -796,7 +796,6 @@ impl AcpSessionStore {
             created_at: header.created_at,
             public_id: None,
             namespace: Some(header.namespace.clone()),
-            project: None,
             device_id: None,
             room_profile: None,
             title: summary.title.clone(),
@@ -858,7 +857,6 @@ impl AcpSessionStore {
                             parts: text,
                             input_kind: None,
                             user_id: None,
-                            report_meta: None,
                         })
                     }
                     _ => None,

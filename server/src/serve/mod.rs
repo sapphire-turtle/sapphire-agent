@@ -4,7 +4,6 @@
 //!           GET  /rpc  (Phase 2: server→client SSE push, currently 405)
 //!           POST /a2a  (Agent2Agent Protocol; gated by [a2a].enabled)
 //!           GET  /.well-known/agent-card.json
-//!           POST /mcp  (MCP server; write_report / recall_memory tools)
 //!           GET  /acp  (Agent Client Protocol over WebSocket; gated by [acp].enabled)
 //!
 //! Session management uses a `Session-Id` request/response header.
@@ -12,7 +11,6 @@
 pub mod a2a;
 pub mod acp;
 pub mod acp_permissions;
-pub mod mcp;
 
 use crate::acp_session::AcpSessionStore;
 use crate::channel::RoomInfo;
@@ -82,19 +80,6 @@ pub struct ServeState {
     /// the purpose of anything else. Its files are named by agent-day
     /// (`{date}-{uuid}.jsonl`) — see `SessionStore::with_dated_files`.
     pub(crate) autonomous_session_store: Arc<SessionStore>,
-    /// MCP session store (kind = `"mcp"`). Holds long-lived
-    /// per-project sessions written through `/mcp`'s `write_report`
-    /// tool — kept physically separate from `cross_device_session_store` so the
-    /// project index scan and any future MCP-specific retention only
-    /// see MCP traffic.
-    pub(crate) mcp_session_store: Arc<SessionStore>,
-    /// Reverse index `(namespace, project) → session_id` for the MCP
-    /// session store. Seeded at startup from `SessionMeta.project` and
-    /// maintained on `create_mcp_session`. The mapping isn't
-    /// persisted to its own file: each session file's first-line meta
-    /// IS the source of truth, so a restart rebuilds the index by
-    /// scanning `sessions/<ns>/mcp/*.jsonl` meta lines.
-    pub(crate) mcp_project_index: tokio::sync::Mutex<HashMap<(String, String), String>>,
     /// In-memory conversation history, keyed by session_id.
     /// Lazy-loaded from JSONL on first access.
     pub(crate) sessions: tokio::sync::Mutex<HashMap<String, Vec<ChatMessage>>>,
@@ -195,30 +180,12 @@ impl ServeState {
         device_default_session_store: Arc<SessionStore>,
         // Autonomous sessions, one per task. See the field's doc.
         autonomous_session_store: Arc<SessionStore>,
-        mcp_session_store: Arc<SessionStore>,
         voice: Option<Arc<VoiceProviders>>,
         image_cache: Option<Arc<crate::image_cache::ImageCache>>,
         device_auth: Arc<crate::device_auth::DeviceAuth>,
         acp_session_store: Arc<AcpSessionStore>,
         subagent_cache: Option<Arc<SubagentCache>>,
     ) -> Self {
-        // Scan once on startup: each MCP session's first-line meta
-        // carries `namespace` + `project`, so this reproduces the
-        // logical mapping without a side-channel index file. The same
-        // map is updated in-place when `write_report` creates a new
-        // project session.
-        let mut mcp_index: HashMap<(String, String), String> = HashMap::new();
-        for meta in mcp_session_store.list_sessions() {
-            let (Some(ns), Some(proj)) = (meta.namespace.clone(), meta.project.clone()) else {
-                continue;
-            };
-            // `list_sessions` is sorted by `created_at`, so overwriting
-            // here keeps the most recent session per (ns, project) —
-            // matters only if a project ever ended up with multiple
-            // session files (manual surgery, future reset semantics).
-            mcp_index.insert((ns, proj), meta.session_id);
-        }
-
         Self {
             config,
             registry,
@@ -234,8 +201,6 @@ impl ServeState {
             cross_device_session_store,
             device_default_session_store,
             autonomous_session_store,
-            mcp_session_store,
-            mcp_project_index: tokio::sync::Mutex::new(mcp_index),
             sessions: tokio::sync::Mutex::new(HashMap::new()),
             pending_sessions: tokio::sync::Mutex::new(HashMap::new()),
             session_room_profiles: tokio::sync::Mutex::new(HashMap::new()),
@@ -289,52 +254,6 @@ impl ServeState {
         } else {
             &self.cross_device_session_store
         }
-    }
-
-    /// Look up the MCP session id for `(namespace, project)`. Returns
-    /// `None` if the project has never received a report.
-    pub(crate) async fn mcp_session_for_project(
-        &self,
-        namespace: &str,
-        project: &str,
-    ) -> Option<String> {
-        self.mcp_project_index
-            .lock()
-            .await
-            .get(&(namespace.to_string(), project.to_string()))
-            .cloned()
-    }
-
-    /// Look up (or create) the MCP session for `(namespace, project)`.
-    /// First call for a project creates the underlying session file
-    /// and registers it in the index; subsequent calls hit the index.
-    /// Concurrent calls for the same new project are serialized
-    /// through the index mutex so only one session file is created.
-    pub(crate) async fn mcp_session_for_project_or_create(
-        &self,
-        namespace: &str,
-        project: &str,
-    ) -> anyhow::Result<String> {
-        let key = (namespace.to_string(), project.to_string());
-        {
-            let idx = self.mcp_project_index.lock().await;
-            if let Some(id) = idx.get(&key) {
-                return Ok(id.clone());
-            }
-        }
-        // Hold the lock across creation so two simultaneous
-        // first-time writers for the same project don't each spawn
-        // a session file. Double-check inside the lock in case
-        // another task won the race between our two acquisitions.
-        let mut idx = self.mcp_project_index.lock().await;
-        if let Some(id) = idx.get(&key) {
-            return Ok(id.clone());
-        }
-        let session_id = self
-            .mcp_session_store
-            .create_mcp_session(namespace, project)?;
-        idx.insert(key, session_id.clone());
-        Ok(session_id)
     }
 
     /// Provider that should serve the given session. Resolves the
@@ -424,9 +343,8 @@ pub async fn run(
     state: Arc<ServeState>,
     extra: Option<axum::Router>,
 ) -> anyhow::Result<()> {
-    // Routes are intentionally separated so future protocol endpoints
-    // (`/mcp` for the MCP server in #79/#80) can be mounted alongside
-    // `/rpc` without colliding with the methods (`chat`,
+    // Routes are intentionally separated so protocol endpoints can be
+    // mounted alongside `/rpc` without colliding with the methods (`chat`,
     // `initialize`, `voice/*`, …) that live here. The A2A protocol
     // endpoints below are mounted unconditionally — the handler refuses
     // requests when `[a2a].enabled = false` so we don't pay a route
@@ -434,7 +352,6 @@ pub async fn run(
     let mut app = Router::new()
         .route("/rpc", post(rpc_post).get(rpc_get))
         .route("/a2a", post(a2a::handle_a2a_post))
-        .route("/mcp", post(mcp::handle_mcp_post))
         .route("/acp", axum::routing::get(acp::handle_acp_ws))
         .route(
             "/.well-known/agent-card.json",
@@ -575,7 +492,7 @@ pub(crate) fn spawn_session_residency_log(state: Arc<ServeState>) {
 
 /// JSON-RPC error code returned when the Authorization header is present
 /// but the bearer token does not resolve through `DeviceAuth`. Mirrors
-/// `codes::AUTH_REQUIRED` used by `/a2a` and `/mcp` so the three protocol
+/// `codes::AUTH_REQUIRED` used by `/a2a` so the two protocol
 /// surfaces stay symmetrical.
 const RPC_AUTH_REQUIRED: i32 = -32001;
 
@@ -658,7 +575,7 @@ async fn rpc_post(
 /// carries an empty token — every one of which the endpoints treat as
 /// "unauthenticated" rather than "malformed".
 ///
-/// `pub(crate)` so `/rpc`, `/a2a`, `/mcp`, `/acp` and
+/// `pub(crate)` so `/rpc`, `/a2a`, `/acp` and
 /// `crate::ambient::ingest` share one set of parsing rules rather than
 /// each duplicating them.
 pub(crate) fn extract_bearer(headers: &HeaderMap) -> Option<String> {
@@ -3943,8 +3860,6 @@ rooms    = []
                 SessionStore::new(base.join("workspace").join("sessions"), "autonomous", None)
                     .with_dated_files(4),
             ),
-            mcp_session_store: Arc::new(SessionStore::new(base.join("mcp"), "mcp", None)),
-            mcp_project_index: Default::default(),
             sessions: Default::default(),
             pending_sessions: Default::default(),
             session_room_profiles: Default::default(),

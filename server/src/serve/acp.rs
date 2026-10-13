@@ -1,7 +1,7 @@
 //! Agent Client Protocol over WebSocket, at `GET /acp`.
 //!
 //! Auth: `Authorization: Bearer <token>` on the upgrade request, resolved
-//! through `DeviceAuth` — the same mechanism as `/a2a` and `/mcp`. The
+//! through `DeviceAuth` — the same mechanism as `/rpc` and `/a2a`. The
 //! match resolves the room profile the ACP session runs under, so a
 //! dedicated Zed token can pin the editor to its own profile, provider
 //! and memory namespace.

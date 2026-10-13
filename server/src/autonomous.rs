@@ -207,7 +207,6 @@ impl AutonomousLoop {
         }
         rows.extend(self.state.cross_device_session_store.session_rows());
         rows.extend(self.state.device_default_session_store.session_rows());
-        rows.extend(self.state.mcp_session_store.session_rows());
         rows.extend(self.state.acp_session_store.session_rows());
         rows
     }
@@ -384,7 +383,6 @@ mod tests {
                 created_at: Utc::now() - Duration::hours(5),
                 public_id: None,
                 namespace: Some("default".to_string()),
-                project: None,
                 device_id: None,
                 room_profile: None,
                 title: None,
