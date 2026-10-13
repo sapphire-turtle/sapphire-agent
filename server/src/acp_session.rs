@@ -6,27 +6,27 @@
 //! conversations. The directory-walking machinery is shared; the line
 //! format is not.
 //!
-//! Every event carries a UUIDv7 `id` and the `parent` it was appended
-//! after. That pair cannot be reconstructed later, which is why it is
-//! here now even though nothing reads it yet: it is what will make an
-//! offline divergence detectable if remote-workspace sync is ever
-//! implemented, and what makes splitting one file per event a
-//! mechanical move rather than a redesign.
+//! On disk it is `session_log`'s format, as for `SessionStore`: one
+//! directory per session, `session.md` for the header, one `<id>.md` per
+//! event. Every event carries a UUIDv7 `id` and the `parent` it was
+//! appended after, and **the chain is the authority on order**, not the
+//! id's timestamp.
 //!
-//! **The chain is the authority on order, not the id's timestamp.**
-//! UUIDv7 embeds the writer's clock, so two devices with skewed clocks
-//! produce ids that sort wrongly against each other.
+//! Sessions written before that format are single `.jsonl` files of
+//! `Line`s. They are read as they are and converted on the first write,
+//! keeping every event's id and parent. TODO(#284).
 
 use crate::provider::{ChatMessage, ContentPart, Role};
+use crate::session::Location;
 use crate::session::{SessionMeta, StoredMessage};
+use crate::session_log::{self, BodyOr, EntryFile, Linked};
 use crate::session_storage::{MISSING_RESULT, missing_input};
 use crate::tool_payload_cache::ToolPayloadCache;
 use anyhow::Result;
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tracing::warn;
 use uuid::Uuid;
@@ -167,6 +167,160 @@ enum Line {
     },
 }
 
+/// The front matter of one event file. The id is the file name; the body
+/// is the message's first text, or the summary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum AcpFront {
+    Message {
+        parent: Option<Uuid>,
+        at: DateTime<Utc>,
+        role: Role,
+        /// Absent when the body is the whole message.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parts: Option<Vec<BodyOr<StoredPart>>>,
+    },
+    Title {
+        parent: Option<Uuid>,
+        at: DateTime<Utc>,
+        title: String,
+    },
+    Closed {
+        parent: Option<Uuid>,
+        at: DateTime<Utc>,
+    },
+    Summary {
+        parent: Option<Uuid>,
+        at: DateTime<Utc>,
+        covers_through: Uuid,
+    },
+}
+
+impl Linked for AcpFront {
+    fn parent(&self) -> Option<Uuid> {
+        match self {
+            AcpFront::Message { parent, .. }
+            | AcpFront::Title { parent, .. }
+            | AcpFront::Closed { parent, .. }
+            | AcpFront::Summary { parent, .. } => *parent,
+        }
+    }
+    fn at(&self) -> DateTime<Utc> {
+        match self {
+            AcpFront::Message { at, .. }
+            | AcpFront::Title { at, .. }
+            | AcpFront::Closed { at, .. }
+            | AcpFront::Summary { at, .. } => *at,
+        }
+    }
+}
+
+fn stored_text(part: &StoredPart) -> Option<&str> {
+    match part {
+        StoredPart::Text(t) => Some(t.as_str()),
+        _ => None,
+    }
+}
+
+/// An event `Line` as an event file. `None` for the header, which is
+/// `session.md` instead.
+fn line_to_entry(line: Line) -> Option<(Uuid, AcpFront, String)> {
+    Some(match line {
+        Line::Header(_) => return None,
+        Line::Message {
+            id,
+            parent,
+            at,
+            role,
+            parts,
+        } => {
+            let (parts, body) = session_log::split_body(parts, stored_text);
+            (
+                id,
+                AcpFront::Message {
+                    parent,
+                    at,
+                    role,
+                    parts,
+                },
+                body,
+            )
+        }
+        Line::Title {
+            id,
+            parent,
+            at,
+            title,
+        } => (id, AcpFront::Title { parent, at, title }, String::new()),
+        Line::Closed { id, parent, at } => (id, AcpFront::Closed { parent, at }, String::new()),
+        Line::Summary {
+            id,
+            parent,
+            at,
+            summary,
+            covers_through,
+        } => (
+            id,
+            AcpFront::Summary {
+                parent,
+                at,
+                covers_through,
+            },
+            summary,
+        ),
+    })
+}
+
+fn entry_to_event(entry: EntryFile<AcpFront>) -> Event {
+    let EntryFile { id, front, body } = entry;
+    match front {
+        AcpFront::Message {
+            parent,
+            at,
+            role,
+            parts,
+        } => Event {
+            id,
+            parent,
+            at,
+            body: EventBody::Message {
+                role,
+                parts: session_log::join_body(parts, body, StoredPart::Text),
+            },
+        },
+        AcpFront::Title { parent, at, title } => Event {
+            id,
+            parent,
+            at,
+            body: EventBody::Title { title },
+        },
+        AcpFront::Closed { parent, at } => Event {
+            id,
+            parent,
+            at,
+            body: EventBody::Closed,
+        },
+        AcpFront::Summary {
+            parent,
+            at,
+            covers_through,
+        } => Event {
+            id,
+            parent,
+            at,
+            body: EventBody::Summary {
+                summary: body,
+                covers_through,
+            },
+        },
+    }
+}
+
+fn line_to_event(line: Line) -> Option<Event> {
+    let (id, front, body) = line_to_entry(line)?;
+    Some(entry_to_event(EntryFile { id, front, body }))
+}
+
 pub struct AcpSessionStore {
     base_dir: PathBuf,
     /// `None` when the tool-payload cache directory could not be opened
@@ -197,51 +351,51 @@ impl AcpSessionStore {
     }
 
     fn path(&self, session_id: &str, namespace: &str) -> PathBuf {
-        self.base_dir
-            .join(namespace)
-            .join(KIND)
-            .join(format!("{session_id}.jsonl"))
+        self.base_dir.join(namespace).join(KIND).join(session_id)
     }
 
-    /// Find an existing session's file by scanning namespaces.
-    fn find(&self, session_id: &str) -> Option<PathBuf> {
-        let target = format!("{session_id}.jsonl");
-        crate::session::collect_session_files(&self.base_dir, KIND)
+    /// Find an existing session by scanning namespaces.
+    fn find(&self, session_id: &str) -> Option<Location> {
+        crate::session::collect_sessions(&self.base_dir, KIND)
             .into_iter()
-            .find(|p| p.file_name().and_then(|s| s.to_str()) == Some(target.as_str()))
+            .find(|l| session_name(l) == Some(session_id))
     }
 
     #[cfg(test)]
     pub fn path_for_test(&self, session_id: &str) -> PathBuf {
-        self.find(session_id).expect("the session exists")
+        self.absolute_path_for(session_id)
+            .expect("the session exists")
     }
 
-    /// Absolute path of an existing session's file, for callers that
-    /// need to read raw bytes (e.g. `mtime` for `updated_at`) rather than
-    /// going through the store's own accessors. Mirrors the old
-    /// `SessionStore::absolute_path_for`, which `session/list` used the
-    /// same way.
+    /// Absolute path of an existing session — its directory, or its legacy
+    /// `.jsonl` until something is written to it — for callers that need
+    /// the filesystem (e.g. `mtime` for `updated_at`) rather than going
+    /// through the store's own accessors.
     pub fn absolute_path_for(&self, session_id: &str) -> Option<PathBuf> {
-        self.find(session_id)
+        self.find(session_id).map(|l| l.path().to_path_buf())
     }
 
     pub fn create(&self, session_id: &str, namespace: &str, cwd: &str) -> Result<()> {
-        let path = self.path(session_id, namespace);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let header = Line::Header(SessionHeader {
+        let header = SessionHeader {
             session_id: session_id.to_string(),
             namespace: namespace.to_string(),
             cwd: cwd.to_string(),
             created_at: Utc::now(),
-        });
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
-        writeln!(file, "{}", serde_json::to_string(&header)?)?;
+        };
+        session_log::write_meta(&self.path(session_id, namespace), &header)?;
         Ok(())
+    }
+
+    /// The directory to write `session_id`'s next event into, converting
+    /// a legacy `.jsonl` session first. TODO(#284).
+    fn writable_dir(&self, session_id: &str) -> Result<PathBuf> {
+        match self
+            .find(session_id)
+            .ok_or_else(|| anyhow::anyhow!("no ACP session '{session_id}'"))?
+        {
+            Location::Dir(dir) => Ok(dir),
+            Location::Jsonl(path) => convert_jsonl(&path),
+        }
     }
 
     /// Read the tip, write `body(parent)` as the next line, and record
@@ -265,17 +419,17 @@ impl AcpSessionStore {
         body: impl FnOnce(Option<Uuid>) -> Line,
     ) -> Result<()> {
         let mut tips = self.tips.lock().unwrap();
+        let dir = self.writable_dir(session_id)?;
         let parent = match tips.get(session_id) {
             Some(tip) => Some(*tip),
             None => self
                 .events(session_id)
-                .and_then(|evs| evs.last().map(|e| e.id)),
+                .and_then(|evs| self.chain(session_id, &evs).last().map(|e| e.id)),
         };
-        let path = self
-            .find(session_id)
-            .ok_or_else(|| anyhow::anyhow!("no ACP session '{session_id}'"))?;
-        let mut file = std::fs::OpenOptions::new().append(true).open(&path)?;
-        writeln!(file, "{}", serde_json::to_string(&body(parent))?)?;
+        let (entry_id, front, text) = line_to_entry(body(parent))
+            .ok_or_else(|| anyhow::anyhow!("a header is not an event"))?;
+        debug_assert_eq!(entry_id, id);
+        session_log::write_entry(&dir, entry_id, &front, &text)?;
         tips.insert(session_id.to_string(), id);
         Ok(())
     }
@@ -433,81 +587,36 @@ impl AcpSessionStore {
 }
 
 impl AcpSessionStore {
-    fn lines(&self, session_id: &str) -> Option<Vec<Line>> {
-        let path = self.find(session_id)?;
-        let text = std::fs::read_to_string(path).ok()?;
-        Some(
-            text.lines()
-                .filter(|l| !l.trim().is_empty())
-                .filter_map(|l| match serde_json::from_str::<Line>(l) {
-                    Ok(line) => Some(line),
-                    Err(e) => {
-                        warn!("ACP session {session_id}: skipping unreadable line: {e}");
-                        None
+    /// The header and every event, whichever format the session is in.
+    fn read(&self, session_id: &str) -> Option<(SessionHeader, Vec<Event>)> {
+        match self.find(session_id)? {
+            Location::Dir(dir) => {
+                let header = session_log::read_meta(&dir)?;
+                let entries: Vec<EntryFile<AcpFront>> = session_log::read_entries(&dir);
+                let mut events: Vec<Event> = entries.into_iter().map(entry_to_event).collect();
+                events.sort_by_key(|e| (e.at, e.id));
+                Some((header, events))
+            }
+            Location::Jsonl(path) => {
+                let lines = read_jsonl_lines(&path, session_id)?;
+                let mut header = None;
+                let mut events = Vec::new();
+                for line in lines {
+                    match line {
+                        Line::Header(h) => header = Some(h),
+                        other => events.extend(line_to_event(other)),
                     }
-                })
-                .collect(),
-        )
+                }
+                Some((header?, events))
+            }
+        }
     }
 
-    /// Every event in the order the file holds them.
-    ///
-    /// File order, not chain order — Task 3's reader is what walks the
-    /// chain. They agree for a session written by one process, which is
-    /// every session today.
+    /// Every event: in file order for a legacy `.jsonl`, by `(at, id)` for
+    /// a directory, which has no order of its own. Neither is the session's
+    /// order — `chain` is.
     pub fn events(&self, session_id: &str) -> Option<Vec<Event>> {
-        Some(
-            self.lines(session_id)?
-                .into_iter()
-                .filter_map(|l| match l {
-                    Line::Header(_) => None,
-                    Line::Message {
-                        id,
-                        parent,
-                        at,
-                        role,
-                        parts,
-                    } => Some(Event {
-                        id,
-                        parent,
-                        at,
-                        body: EventBody::Message { role, parts },
-                    }),
-                    Line::Title {
-                        id,
-                        parent,
-                        at,
-                        title,
-                    } => Some(Event {
-                        id,
-                        parent,
-                        at,
-                        body: EventBody::Title { title },
-                    }),
-                    Line::Closed { id, parent, at } => Some(Event {
-                        id,
-                        parent,
-                        at,
-                        body: EventBody::Closed,
-                    }),
-                    Line::Summary {
-                        id,
-                        parent,
-                        at,
-                        summary,
-                        covers_through,
-                    } => Some(Event {
-                        id,
-                        parent,
-                        at,
-                        body: EventBody::Summary {
-                            summary,
-                            covers_through,
-                        },
-                    }),
-                })
-                .collect(),
-        )
+        Some(self.read(session_id)?.1)
     }
 
     /// What the listing needs about one session, oldest first.
@@ -521,16 +630,16 @@ impl AcpSessionStore {
     /// requires, which is why `has_messages` and `title` are computed
     /// eagerly rather than left to per-session follow-up calls.
     pub fn list_summaries(&self, namespace: &str) -> Vec<SessionSummary> {
-        let dir = self.base_dir.join(namespace).join(KIND);
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            return Vec::new();
-        };
-        let mut out: Vec<SessionSummary> = entries
-            .flatten()
-            .filter_map(|e| {
-                let stem = e.path().file_stem()?.to_str()?.to_string();
-                self.summary(&stem)
+        let mut out: Vec<SessionSummary> = crate::session::collect_sessions(&self.base_dir, KIND)
+            .iter()
+            .filter(|l| {
+                l.path()
+                    .parent()
+                    .and_then(Path::parent)
+                    .and_then(Path::file_name)
+                    == Some(std::ffi::OsStr::new(namespace))
             })
+            .filter_map(|l| self.summary(session_name(l)?))
             .collect();
         out.sort_by_key(|s| s.header.created_at);
         out
@@ -540,23 +649,21 @@ impl AcpSessionStore {
     /// `session/resume` need `cwd`, `title` and `is_closed` for a single
     /// session without paying for the whole namespace's listing.
     pub fn summary(&self, session_id: &str) -> Option<SessionSummary> {
-        let lines = self.lines(session_id)?;
-        let mut header = None;
+        let (header, events) = self.read(session_id)?;
         let mut title = None;
         let mut has_messages = false;
         let mut is_closed = false;
-        for line in lines {
-            match line {
-                Line::Header(h) => header = Some(h),
-                Line::Message { .. } => has_messages = true,
+        for event in self.chain(session_id, &events) {
+            match &event.body {
+                EventBody::Message { .. } => has_messages = true,
                 // Last title wins: a session can be retitled.
-                Line::Title { title: t, .. } => title = Some(t),
-                Line::Closed { .. } => is_closed = true,
-                Line::Summary { .. } => {}
+                EventBody::Title { title: t } => title = Some(t.clone()),
+                EventBody::Closed => is_closed = true,
+                EventBody::Summary { .. } => {}
             }
         }
         Some(SessionSummary {
-            header: header?,
+            header,
             title,
             has_messages,
             is_closed,
@@ -573,6 +680,12 @@ impl AcpSessionStore {
         let mut children: HashMap<Option<Uuid>, Vec<&Event>> = HashMap::new();
         for event in events {
             children.entry(event.parent).or_default().push(event);
+        }
+        // A directory has no order, so "the first branch" is the earliest
+        // by `(at, id)` — which is file order for a legacy `.jsonl` that one
+        // process wrote.
+        for kids in children.values_mut() {
+            kids.sort_by_key(|e| (e.at, e.id));
         }
         let mut out = Vec::with_capacity(events.len());
         let mut cursor = None;
@@ -730,38 +843,31 @@ impl AcpSessionStore {
     /// Listing rows for every session this store holds, newest activity
     /// last — the ACP half of what `session_list` renders.
     ///
-    /// One pass per file, and no message bodies: a listing wants counts
-    /// and timestamps, and an ACP session's events carry whole tool
-    /// inputs. `SessionRow` is `session::`'s type on purpose — the tool
+    /// A listing wants counts and timestamps only. `SessionRow` is `session::`'s type on purpose — the tool
     /// merges rows from every store and should not be teaching itself a
     /// second shape per store.
     pub fn session_rows(&self) -> Vec<crate::session::SessionRow> {
         let mut rows = Vec::new();
         for session_id in self.all_session_ids() {
-            let Some(lines) = self.lines(&session_id) else {
+            let Some((header, events)) = self.read(&session_id) else {
                 continue;
             };
-            let mut header = None;
             let mut title = None;
             let mut is_closed = false;
             let mut message_count = 0usize;
             let mut last_at = None;
-            for line in lines {
-                match line {
-                    Line::Header(h) => header = Some(h),
-                    Line::Message { at, .. } => {
+            for event in self.chain(&session_id, &events) {
+                match &event.body {
+                    EventBody::Message { .. } => {
                         message_count += 1;
-                        last_at = Some(at);
+                        last_at = Some(event.at);
                     }
                     // Last title wins: a session can be retitled.
-                    Line::Title { title: t, .. } => title = Some(t),
-                    Line::Closed { .. } => is_closed = true,
-                    Line::Summary { .. } => {}
+                    EventBody::Title { title: t } => title = Some(t.clone()),
+                    EventBody::Closed => is_closed = true,
+                    EventBody::Summary { .. } => {}
                 }
             }
-            let Some(header) = header else {
-                continue;
-            };
             let summary = SessionSummary {
                 header,
                 title,
@@ -804,9 +910,9 @@ impl AcpSessionStore {
 
     /// Every session id this store holds, across namespaces.
     fn all_session_ids(&self) -> Vec<String> {
-        crate::session::collect_session_files(&self.base_dir, KIND)
-            .into_iter()
-            .filter_map(|p| Some(p.file_stem()?.to_str()?.to_string()))
+        crate::session::collect_sessions(&self.base_dir, KIND)
+            .iter()
+            .filter_map(|l| Some(session_name(l)?.to_string()))
             .collect()
     }
 }
@@ -911,6 +1017,88 @@ impl AcpSessionStore {
     }
 }
 
+/// The session id a location is named by.
+fn session_name(loc: &Location) -> Option<&str> {
+    match loc {
+        Location::Dir(p) => p.file_name()?.to_str(),
+        Location::Jsonl(p) => p.file_stem()?.to_str(),
+    }
+}
+
+/// Every line of a legacy `.jsonl` session. TODO(#284).
+fn read_jsonl_lines(path: &Path, session_id: &str) -> Option<Vec<Line>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    Some(
+        text.lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| match serde_json::from_str::<Line>(l) {
+                Ok(line) => Some(line),
+                Err(e) => {
+                    warn!("ACP session {session_id}: skipping unreadable line: {e}");
+                    None
+                }
+            })
+            .collect(),
+    )
+}
+
+/// Convert a legacy `.jsonl` session into a directory beside it, keeping
+/// every event's id and parent, and return the directory. The `.jsonl` is
+/// left in place. TODO(#284).
+fn convert_jsonl(path: &Path) -> Result<PathBuf> {
+    let dest = path.with_extension("");
+    if session_log::is_session_dir(&dest) {
+        return Ok(dest);
+    }
+    let session_id = session_name(&Location::Jsonl(path.to_path_buf()))
+        .unwrap_or_default()
+        .to_string();
+    let lines = read_jsonl_lines(path, &session_id)
+        .ok_or_else(|| anyhow::anyhow!("{} is not readable", path.display()))?;
+    let staging = session_log::staging_dir_for(&dest)?;
+    let mut header = None;
+    let mut entries = Vec::new();
+    for line in lines {
+        match line {
+            Line::Header(h) => header = Some(h),
+            other => entries.extend(line_to_entry(other)),
+        }
+    }
+    let header = header.ok_or_else(|| anyhow::anyhow!("{} has no header", path.display()))?;
+    session_log::write_meta(&staging, &header)?;
+    for (id, front, body) in entries {
+        session_log::write_entry(&staging, id, &front, &body)?;
+    }
+    session_log::publish_dir(&staging, &dest)?;
+    Ok(dest)
+}
+
+#[cfg(test)]
+impl AcpSessionStore {
+    /// Write one event given as a legacy JSON line — how the tests forge
+    /// forks, orphans and old part shapes.
+    pub fn write_line_for_test(&self, session_id: &str, line: &serde_json::Value) {
+        let line: Line = serde_json::from_value(line.clone()).expect("a valid line");
+        let (id, front, body) = line_to_entry(line).expect("an event line");
+        let dir = self.writable_dir(session_id).expect("the session exists");
+        session_log::write_entry(&dir, id, &front, &body).unwrap();
+    }
+
+    /// Every file of a session, concatenated — for asserting what reached
+    /// the disk.
+    pub fn raw_for_test(&self, session_id: &str) -> String {
+        let path = self.path_for_test(session_id);
+        if path.is_file() {
+            return std::fs::read_to_string(path).unwrap();
+        }
+        let mut out = String::new();
+        for entry in std::fs::read_dir(path).unwrap().flatten() {
+            out.push_str(&std::fs::read_to_string(entry.path()).unwrap_or_default());
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -966,6 +1154,59 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = AcpSessionStore::new(dir.path().join("sessions"), None);
         (dir, store)
+    }
+
+    /// A legacy `.jsonl` session reads as it is, and the first write
+    /// converts it into a directory that keeps every event's id and
+    /// parent. The `.jsonl` stays where it was.
+    #[test]
+    fn a_legacy_session_converts_on_its_first_write() {
+        let (dir, store) = store();
+        let kind_dir = dir.path().join("sessions").join("default").join(KIND);
+        std::fs::create_dir_all(&kind_dir).unwrap();
+        let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+        let lines = [
+            serde_json::json!({"kind": "header", "session_id": "old", "namespace": "default",
+                "cwd": "/p", "created_at": "2026-04-06T09:00:00Z"}),
+            serde_json::json!({"kind": "message", "id": a, "parent": null,
+                "at": "2026-04-06T10:00:00Z", "role": "user", "parts": [{"text": "hello"}]}),
+            serde_json::json!({"kind": "title", "id": b, "parent": a,
+                "at": "2026-04-06T10:00:01Z", "title": "greeting"}),
+        ];
+        let jsonl = kind_dir.join("old.jsonl");
+        let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
+        std::fs::write(&jsonl, text).unwrap();
+
+        assert_eq!(store.history("old").unwrap().len(), 1, "read as it is");
+        assert!(
+            store.path_for_test("old").is_file(),
+            "reading does not convert"
+        );
+
+        store
+            .append_message("old", &ChatMessage::user("again"))
+            .unwrap();
+
+        assert!(store.path_for_test("old").is_dir(), "a write converts");
+        assert!(jsonl.exists(), "the legacy file is never deleted");
+        let events = store.events("old").unwrap();
+        let chain = store.chain("old", &events);
+        let ids: Vec<Uuid> = chain.iter().map(|e| e.id).collect();
+        assert_eq!(&ids[..2], [a, b], "ids survive");
+        assert_eq!(
+            chain[2].parent,
+            Some(b),
+            "the new event chains onto the old tip"
+        );
+        assert_eq!(
+            store.summary("old").unwrap().title.as_deref(),
+            Some("greeting")
+        );
+        assert_eq!(
+            store.list_summaries("default").len(),
+            1,
+            "one session, not two"
+        );
     }
 
     #[test]
@@ -1052,7 +1293,7 @@ mod tests {
             )
             .unwrap();
 
-        let raw = std::fs::read_to_string(store.path_for_test("s1")).unwrap();
+        let raw = store.raw_for_test("s1");
         assert!(
             !raw.contains("a very long file listing"),
             "the content must live in the cache, not the log: {raw}"
@@ -1180,7 +1421,7 @@ mod tests {
             )
             .unwrap();
 
-        let raw = std::fs::read_to_string(store.path_for_test("s1")).unwrap();
+        let raw = store.raw_for_test("s1");
         assert!(
             !raw.contains(&"x".repeat(60_000)),
             "the oversized input must not reach the (indexed) JSONL verbatim"
@@ -1232,13 +1473,7 @@ mod tests {
                 "input": {"path": "a.rs"},
             }}],
         });
-        let mut f = std::fs::OpenOptions::new()
-            .append(true)
-            .open(store.path_for_test("s1"))
-            .unwrap();
-        use std::io::Write as _;
-        writeln!(f, "{legacy}").unwrap();
-        drop(f);
+        store.write_line_for_test("s1", &legacy);
 
         let history = store.history("s1").expect("the session loads");
         let call = history.iter().flat_map(|m| &m.parts).find_map(|p| match p {
@@ -1300,7 +1535,7 @@ mod tests {
             .append_message("s1", &tool_result_message("c1", "the real output"))
             .unwrap();
 
-        let raw = std::fs::read_to_string(store.path_for_test("s1")).unwrap();
+        let raw = store.raw_for_test("s1");
         assert!(!raw.contains("the real output"), "got {raw}");
         assert!(raw.contains("tool_result_ref"), "got {raw}");
         assert_eq!(
@@ -1575,7 +1810,6 @@ mod tests {
 
         // Hand-write a second child of the root to forge a divergence.
         let root = store.events("s1").unwrap()[0].id;
-        let path = store.path_for_test("s1");
         let forged = serde_json::json!({
             "kind": "message",
             "id": Uuid::now_v7(),
@@ -1584,13 +1818,7 @@ mod tests {
             "role": "user",
             "parts": [{"text": "the other branch"}],
         });
-        let mut f = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .unwrap();
-        use std::io::Write as _;
-        writeln!(f, "{forged}").unwrap();
-        drop(f);
+        store.write_line_for_test("s1", &forged);
 
         // The legitimate continuation, appended after the forgery, is
         // the file's *last* line but the root's *second* child.
@@ -1623,8 +1851,6 @@ mod tests {
         store
             .append_message("s1", &ChatMessage::user("root"))
             .unwrap();
-
-        let path = store.path_for_test("s1");
         let orphan = serde_json::json!({
             "kind": "message",
             "id": Uuid::now_v7(),
@@ -1633,13 +1859,7 @@ mod tests {
             "role": "user",
             "parts": [{"text": "unreachable"}],
         });
-        let mut f = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .unwrap();
-        use std::io::Write as _;
-        writeln!(f, "{orphan}").unwrap();
-        drop(f);
+        store.write_line_for_test("s1", &orphan);
 
         let history = store.history("s1").expect("the session still loads");
         assert_eq!(
@@ -1667,7 +1887,6 @@ mod tests {
         // it — standing in for a crash or a failed cache write between
         // the two appends `run_llm_turn` makes.
         let parent = store.events("s1").unwrap()[0].id;
-        let path = store.path_for_test("s1");
         let orphan_use = serde_json::json!({
             "kind": "message",
             "id": Uuid::now_v7(),
@@ -1676,13 +1895,7 @@ mod tests {
             "role": "assistant",
             "parts": [{"tool_use": {"id": "call-1", "name": "risky", "input": {}}}],
         });
-        let mut f = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .unwrap();
-        use std::io::Write as _;
-        writeln!(f, "{orphan_use}").unwrap();
-        drop(f);
+        store.write_line_for_test("s1", &orphan_use);
 
         let history = store.history("s1").expect("the session still loads");
         let last = history.last().expect("a synthesised message was appended");
@@ -1717,7 +1930,6 @@ mod tests {
         // falls back to reading the file for the tip, exactly as a
         // real writer resuming after a crash would, and correctly
         // chains onto this hand-written event.
-        let path = store.path_for_test("s1");
         let orphan_id = Uuid::now_v7();
         let orphan_use = serde_json::json!({
             "kind": "message",
@@ -1727,13 +1939,7 @@ mod tests {
             "role": "assistant",
             "parts": [{"tool_use": {"id": "call-1", "name": "risky", "input": {}}}],
         });
-        let mut f = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .unwrap();
-        use std::io::Write as _;
-        writeln!(f, "{orphan_use}").unwrap();
-        drop(f);
+        store.write_line_for_test("s1", &orphan_use);
 
         // A later turn carries the conversation on, on disk, without
         // the orphan ever having been repaired in place.
@@ -1780,7 +1986,6 @@ mod tests {
     fn two_far_apart_orphans_each_get_their_own_repair_in_position() {
         let (_d, store) = store();
         store.create("s1", "default", "/p").unwrap();
-        let path = store.path_for_test("s1");
 
         let write_line = |parent: Option<Uuid>, id: Uuid, role: &str, parts: serde_json::Value| {
             let line = serde_json::json!({
@@ -1791,12 +1996,7 @@ mod tests {
                 "role": role,
                 "parts": parts,
             });
-            let mut f = std::fs::OpenOptions::new()
-                .append(true)
-                .open(&path)
-                .unwrap();
-            use std::io::Write as _;
-            writeln!(f, "{line}").unwrap();
+            store.write_line_for_test("s1", &line);
         };
 
         let e1 = Uuid::now_v7();
@@ -1965,7 +2165,6 @@ mod tests {
     fn a_result_answering_a_non_adjacent_tool_use_is_dropped() {
         let (_d, store) = store();
         store.create("s1", "default", "/p").unwrap();
-        let path = store.path_for_test("s1");
 
         let write_line = |parent: Option<Uuid>, id: Uuid, role: &str, parts: serde_json::Value| {
             let line = serde_json::json!({
@@ -1976,12 +2175,7 @@ mod tests {
                 "role": role,
                 "parts": parts,
             });
-            let mut f = std::fs::OpenOptions::new()
-                .append(true)
-                .open(&path)
-                .unwrap();
-            use std::io::Write as _;
-            writeln!(f, "{line}").unwrap();
+            store.write_line_for_test("s1", &line);
         };
 
         // e1: an ordinary root message with no tool_use at all.

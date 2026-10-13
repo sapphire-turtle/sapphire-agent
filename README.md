@@ -585,13 +585,19 @@ recommended way to do it once it is on.
 
 ### Loading past sessions
 
-An ACP session lives at `<sessions_dir>/<namespace>/acp/<id>.jsonl`, its own
-tree with its own line format — separate from `/rpc`'s. It is routed by the
+An ACP session lives at `<sessions_dir>/<namespace>/acp/<id>/`, its own
+tree with its own event kinds — separate from `/rpc`'s. It is routed by the
 `namespace` recorded in the session's own header, not by a room id (an ACP
-session has none), and it is recorded with `channel: "acp"`. Every line is
-`kind`-tagged; the first is the header (`session_id`, `namespace`, `cwd`,
-`created_at`), and every event after it carries a UUIDv7 `id` and the
-`parent` it was appended after. **The `parent` chain is the authority on
+session has none), and it is recorded with `channel: "acp"`. Like every
+session it is a directory: `session.md` holds the header (`session_id`,
+`namespace`, `cwd`, `created_at`) as front matter, and each event is its own
+`<uuidv7>.md` — front matter for its `kind`, the `parent` it was appended
+after and its time, the message text as the Markdown body. One file per
+event is what lets two hosts append to a synced session without writing the
+same file. Sessions from before this layout are single `.jsonl` files; they
+are read as they are and converted the first time something is written to
+them ([#284](https://github.com/sapphire-turtle/sapphire-agent/issues/284)
+tracks removing that). **The `parent` chain is the authority on
 order, not the `id`'s embedded clock** — two writers with skewed clocks
 would otherwise sort against each other wrongly.
 

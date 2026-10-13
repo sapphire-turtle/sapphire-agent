@@ -270,10 +270,10 @@ async fn handle_send_message(
         .unwrap_or_else(a2a::new_context_id);
 
     // Internal session id: deterministic from (profile, contextId) so a
-    // crash-restart with the same contextId resumes the same JSONL
-    // session. Prefix `a2a-` makes the kind self-documenting in logs;
-    // hyphens (not colons) keep the resulting `<session_id>.jsonl`
-    // filename portable to Windows.
+    // crash-restart with the same contextId resumes the same session.
+    // Prefix `a2a-` makes the kind self-documenting in logs; hyphens (not
+    // colons) keep the resulting `<session_id>/` directory name portable
+    // to Windows.
     let session_id = format!("a2a-{profile_name}-{context_id}");
 
     // Pin the profile so `run_llm_turn`'s provider/namespace resolution
