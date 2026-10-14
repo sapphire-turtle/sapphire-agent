@@ -4,7 +4,6 @@
 //! `sapphire-agent-gui` crate when mobile lands.
 
 pub mod chat;
-pub mod settings;
 
 use bevy_egui::egui;
 

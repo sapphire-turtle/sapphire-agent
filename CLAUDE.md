@@ -4,13 +4,13 @@ Loaded by Claude Code at session start. Keep it short and operational; deep desi
 
 ## Conventional commit scopes
 
-This workspace ships four crates and uses **conventional-commit scopes** to route changelog entries (and only changelog entries — see "Misattribution" below).
+This workspace ships three crates and uses **conventional-commit scopes** to route changelog entries (and only changelog entries — see "Misattribution" below).
 
 | Scope | Targets |
 |---|---|
 | `(desktop)` | `desktop/` (bevy GUI client) |
-| `(rpc)` | `crates/sapphire-agent-core/` (RPC client library) |
-| `(core)` | `crates/sapphire-agent-client/` (shared config + device_id) |
+| `(rpc)` | `crates/sapphire-agent-core/` (local IPC chat protocol + client, shared by `chat` and the desktop) |
+| `(core)` | retired with `crates/sapphire-agent-client/` (#278); still skipped by `cliff.toml` |
 | unscoped, or `(agent)` / `(messages)` / `(voice)` / `(serve)` / `(channel)` / `(matrix)` / `(discord)` / `(sessions)` / `(chat)` / `(timer)` / `(heartbeat)` / `(memory)` / `(image-cache)` / `(api)` / `(tools)` / `(search)` / `(fts)` / `(mcp)` / `(features)` / `(workspace)` / `(deps)` | the agent binary (`cli/`); `(cli)` / `(call)` too |
 | `(release)`, `(release-plz)`, `(fmt)`, `(ci)`, `(test)` | infrastructure — workspace-wide, no semver impact intended |
 
@@ -25,13 +25,12 @@ The repo root is a **virtual workspace manifest** (`[workspace]` only, no `[pack
 | `cli/` | `sapphire-agent` | bin (`sapphire-agent`) — the server and its CLI |
 | `desktop/` | `sapphire-agent-desktop` | bin (`sapphire-agent-desktop`) |
 | `crates/sapphire-agent-core/` | `sapphire-agent-core` | lib |
-| `crates/sapphire-agent-client/` | `sapphire-agent-client` | lib |
 
-**One app, one binary** (#278): the server and its CLI are the single `sapphire-agent` binary in `cli/`, the way `sapphire-ledger` and the other sapphire-framework apps are. The directory is `cli/` because the CLI is what people face; serving is one of its modes. A bare invocation (or `serve`) runs the server; the client commands (`chat`, `acp`, and the framework's `status`, `workspace`, …) talk to the server already running on the host over the app server's IPC endpoint — never over HTTP, and they start none. The agent's own IPC methods are versioned by `APP_API` in `cli/src/serve/acp_tunnel.rs`; bump it when adding or changing one.
+**One app, one binary** (#278): the server and its CLI are the single `sapphire-agent` binary in `cli/`, the way `sapphire-ledger` and the other sapphire-framework apps are. The directory is `cli/` because the CLI is what people face; serving is one of its modes. `sapphire-agent-desktop` is a local IPC client the same way, sharing `sapphire-agent-core` with `chat`. A bare invocation (or `serve`) runs the server; the client commands (`chat`, `acp`, and the framework's `status`, `workspace`, …) talk to the server already running on the host over the app server's IPC endpoint — never over HTTP, and they start none. The agent's own IPC methods are versioned by `APP_API` in `cli/src/serve/acp_tunnel.rs`; bump it when adding or changing one.
 
 `cli/` carries the agent's `templates/`, `config.example.toml`, and `CHANGELOG.md` (the binary embeds the templates via `include_str!` and reads `config.example.toml` via `CARGO_MANIFEST_DIR`). `default-members = ["cli"]` keeps a bare `cargo build` / `cargo test` at the root scoped to the agent.
 
-Note the crates.io packages for the libraries retain their pre-rename names until republished: the RPC lib as `sapphire-agent-rpc`, the client-core lib as `sapphire-call-core` (see the crates.io publish-plan in the tracking issue). The agent binary publishes as `sapphire-agent`, which is its package name again. A future ESP32-S3 client firmware would live in a separate nested workspace (its own `Cargo.lock` / `rust-toolchain.toml` / `.cargo/config.toml`), added to `[workspace] exclude`, not as a member.
+Note the crates.io packages for the libraries retain their pre-rename names until republished: the core lib as `sapphire-agent-rpc` (see the crates.io publish-plan in the tracking issue). The agent binary publishes as `sapphire-agent`, which is its package name again. A future ESP32-S3 client firmware would live in a separate nested workspace (its own `Cargo.lock` / `rust-toolchain.toml` / `.cargo/config.toml`), added to `[workspace] exclude`, not as a member.
 
 ### Two ONNX Runtimes cannot share a binary — keep `ort` out of the default build
 
@@ -45,11 +44,7 @@ The resolution is to keep `ort` out of the default graph, which restores static 
 - The old voice-satellite CLI's openWakeWord detector is gone, and so is the satellite (#278).
 - **`desktop/`** — never pulled `ort`; it only followed the workspace's link mode.
 
-So `cargo build --workspace` works on Linux and macOS. It still does **not** link on Windows for `cli/`, which is fine — the agent is a headless server app with no Windows build (#182). Build the desktop client by name there:
-
-```sh
-cargo build --package sapphire-agent-desktop
-```
+So `cargo build --workspace` works on Linux and macOS. It still does **not** link on Windows for `cli/`, which is fine — the agent is a headless server app with no Windows build (#182). The desktop has none either: it talks to the agent on its own host over IPC.
 
 ### Historical note: agent false-positive release PRs (now fixed)
 

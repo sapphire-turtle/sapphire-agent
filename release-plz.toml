@@ -27,10 +27,6 @@ changelog_path = "./cli/CHANGELOG.md"
 name = "sapphire-agent-core"
 changelog_path = "./crates/sapphire-agent-core/CHANGELOG.md"
 
-[[package]]
-name = "sapphire-agent-client"
-changelog_path = "./crates/sapphire-agent-client/CHANGELOG.md"
-
 # sapphire-agent-desktop ships as a GitHub-release-only binary (bevy +
 # bundled font + ICE-licensed Lucide SVGs — not intended for crates.io,
 # hence `publish = false` in its Cargo.toml). release-plz still creates

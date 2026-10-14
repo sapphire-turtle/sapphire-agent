@@ -1,4 +1,4 @@
-Lucide icons (settings.svg, mic.svg, square.svg, send.svg) are sourced
+Lucide icons (send.svg) are sourced
 from the Lucide project (https://lucide.dev) and distributed under the
 ISC License — reproduced below for the bundled files only:
 

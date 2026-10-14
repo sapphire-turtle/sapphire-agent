@@ -1,563 +1,195 @@
-//! Client library for `sapphire-agent`.
+//! Client library for `sapphire-agent`'s local chat.
 //!
-//! Provides an HTTP client for the sapphire-agent RPC surface
-//! (`/rpc`, JSON-RPC 2.0) and an interactive REPL that can be embedded
-//! in any binary (`sapphire-agent call` or the standalone
-//! `sapphire-agent-cli`).
+//! The agent's clients on its own host — `sapphire-agent chat` and
+//! `sapphire-agent-desktop` — reach the running agent over the
+//! sapphire-framework app server's IPC endpoint, the way every
+//! sapphire-framework app's CLI and GUI reach their server. This crate holds
+//! the method names both ends agree on and a client for them; the server
+//! side lives in the agent's `serve::chat_ipc`.
+//!
+//! - [`OPEN`] `{session?}` resumes the session with that public id, or
+//!   reserves a new one: `{session_id, public_id?, is_new, room_profile}`.
+//! - [`SEND`] `{session_id, content}` runs one turn and answers
+//!   `{content}` once it is done. While it runs, [`PROGRESS`]
+//!   `{session_id, kind, id, name}` notifies each tool call starting
+//!   (`kind: "tool_start"`) and ending (`"tool_end"`).
+//! - [`HISTORY`] `{session_id}` answers `{messages}`.
+//! - [`SESSIONS`] answers `{sessions}`.
+//!
+//! There is no token: the IPC endpoint admits only the OS user that runs
+//! the server, and the agent's `[cli].room_profile` names the room profile.
 
-pub mod chat;
-pub mod voice;
-
-use anyhow::{Context, Result};
-use futures_util::StreamExt;
-use reedline::{
-    Prompt, PromptEditMode, PromptHistorySearch, PromptHistorySearchStatus, Reedline, Signal,
-};
+use anyhow::{Context as _, Result, anyhow, bail};
+use sapphire_framework::ipc::{Client, ClientInfo, Notification};
 use serde_json::{Value, json};
-use std::borrow::Cow;
-use std::io::{Write, stderr, stdout};
-use std::sync::atomic::{AtomicU64, Ordering};
 
-pub use chat::{ChatEvent, ChatModality, chat_stream};
-pub use voice::{
-    VoiceEvent, VoicePushEvent, WakeWordConfig, WakeWordModel, voice_config, voice_pipeline_run,
-    voice_subscribe,
-};
+/// The app name the agent's IPC endpoint is registered under.
+pub const APP: &str = "sapphire-agent";
 
-/// Client-side description of the device running this satellite. Sent
-/// to the agent via the `device` block on `initialize` and
-/// `voice/pipeline_run` so the agent's system prompt can mention
-/// "you are speaking through the living-room speakerphone" without
-/// duplicating that knowledge in AGENTS.md.
+/// The version of the agent's own IPC methods — these and its
+/// `sapphire-agent.acp.*` — apart from the framework's. The handshake
+/// refuses a server that speaks another, so a client never talks to an
+/// agent that would read its calls differently, or lacks them.
 ///
-/// `name` is the only required field — the agent server-side renders
-/// the full room name as `"voice channel with <name>"`. `description`
-/// is free-form: a good place to flag "STT may produce typos," the
-/// physical location, who typically uses it, etc.
-#[derive(Debug, Clone, Default)]
-pub struct DeviceMetadata {
-    pub name: Option<String>,
-    pub description: Option<String>,
+/// 2: added `sapphire-agent.chat.*`.
+pub const APP_API: u32 = 2;
+
+/// Open (resume or reserve) a session.
+pub const OPEN: &str = "sapphire-agent.chat.open";
+/// Run one turn; answers with the reply.
+pub const SEND: &str = "sapphire-agent.chat.send";
+/// A session's stored messages.
+pub const HISTORY: &str = "sapphire-agent.chat.history";
+/// The client sessions.
+pub const SESSIONS: &str = "sapphire-agent.chat.sessions";
+/// Notification: a tool call in a [`SEND`] turn started or ended.
+pub const PROGRESS: &str = "sapphire-agent.chat.progress";
+
+/// The running agent, reached over its IPC endpoint.
+pub struct ChatClient {
+    client: Client,
 }
 
-impl DeviceMetadata {
-    /// Render into the JSON shape the agent's `/rpc` methods expect, or
-    /// `None` when both fields are absent (so we don't send empty blocks).
-    pub(crate) fn to_params(&self) -> Option<Value> {
-        let name = self.name.as_ref().filter(|s| !s.trim().is_empty())?;
-        let mut obj = serde_json::Map::new();
-        obj.insert("name".to_string(), Value::String(name.clone()));
-        if let Some(desc) = self.description.as_ref().filter(|s| !s.trim().is_empty()) {
-            obj.insert("description".to_string(), Value::String(desc.clone()));
-        }
-        Some(Value::Object(obj))
-    }
+/// A session [`ChatClient::open`] opened.
+#[derive(Debug, Clone)]
+pub struct Opened {
+    /// The internal id later calls name it by.
+    pub session_id: String,
+    /// The id shown to people.
+    pub display_id: String,
+    pub is_new: bool,
 }
 
-/// Initialize an RPC session against `base`. Returns the internal
-/// session id (UUID, sent back on subsequent requests via the
-/// `Session-Id` header), the human-readable display id, and whether
-/// the session is brand-new. Exposed so out-of-tree clients (e.g. the
-/// voice satellite) can reuse the same session-setup flow as the REPL.
-///
-/// `token` is sent as `Authorization: Bearer <token>` and selects the
-/// room_profile server-side (the token must be one minted by
-/// `sapphire-agent device add` for a device listed in some
-/// `[room_profile.<n>].devices`). The RPC surface requires this on
-/// every `/rpc` call — there is no anonymous mode.
-pub async fn initialize(
-    client: &reqwest::Client,
-    base: &str,
-    session: Option<String>,
-    token: &str,
-    device: Option<&DeviceMetadata>,
-) -> Result<(String, String, bool)> {
-    initialize_session(client, base, session, token, device).await
+/// One tool call starting or ending, from [`PROGRESS`].
+#[derive(Debug, Clone)]
+pub struct ToolEvent {
+    pub started: bool,
+    pub id: String,
+    pub name: String,
 }
 
-static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+impl ChatClient {
+    /// Dial the agent running on this host. Starts none.
+    ///
+    /// `kind` names the client in the server's logs (`"chat"`,
+    /// `"desktop"`); `version` is the client's own.
+    pub async fn connect(kind: &str, version: &str) -> Result<Self> {
+        let endpoint = sapphire_framework::ipc::Endpoint::for_app(APP)?;
+        let info = ClientInfo {
+            kind: kind.to_owned(),
+            version: version.to_owned(),
+            api: sapphire_framework_server_api::API_VERSION,
+            app_api: Some(APP_API),
+            pid: std::process::id(),
+        };
+        let Some((client, _)) = sapphire_framework::ipc::connect_or_absent(&endpoint, APP, info)
+            .await
+            .context("connecting to the running agent")?
+        else {
+            bail!(
+                "{APP} is not running on this host; its clients talk to a running agent and \
+                 start none. Start it with `{APP} serve`, or install it as a service with \
+                 `{APP} service install`"
+            );
+        };
+        Ok(Self { client })
+    }
 
-/// Minimal prompt for reedline: just "> ".
-struct SimplePrompt;
+    /// Wrap a connection that has already been handshaken.
+    pub fn from_client(client: Client) -> Self {
+        Self { client }
+    }
 
-impl Prompt for SimplePrompt {
-    fn render_prompt_left(&self) -> Cow<'_, str> {
-        Cow::Borrowed("> ")
+    /// Resume the session with public id `session`, or reserve a new one.
+    pub async fn open(&self, session: Option<&str>) -> Result<Opened> {
+        let result: Value = self
+            .client
+            .call(OPEN, json!({ "session": session }))
+            .await
+            .map_err(|e| anyhow!(e))?;
+        let session_id = result["session_id"]
+            .as_str()
+            .ok_or_else(|| anyhow!("{OPEN} answered no session id"))?
+            .to_owned();
+        let display_id = result["public_id"]
+            .as_str()
+            .unwrap_or(&session_id)
+            .to_owned();
+        Ok(Opened {
+            session_id,
+            display_id,
+            is_new: result["is_new"].as_bool().unwrap_or(true),
+        })
     }
-    fn render_prompt_right(&self) -> Cow<'_, str> {
-        Cow::Borrowed("")
-    }
-    fn render_prompt_indicator(&self, _mode: PromptEditMode) -> Cow<'_, str> {
-        Cow::Borrowed("")
-    }
-    fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
-        Cow::Borrowed("::: ")
-    }
-    fn render_prompt_history_search_indicator(
+
+    /// Run one turn in `session_id`, handing each tool event to `on_tool`
+    /// as it arrives, and return the reply.
+    pub async fn send(
         &self,
-        history_search: PromptHistorySearch,
-    ) -> Cow<'_, str> {
-        let prefix = match history_search.status {
-            PromptHistorySearchStatus::Passing => "",
-            PromptHistorySearchStatus::Failing => "failing ",
+        session_id: &str,
+        content: &str,
+        mut on_tool: impl FnMut(ToolEvent),
+    ) -> Result<String> {
+        // Subscribed before the call, so no notification can be missed.
+        let mut events = self.client.notifications();
+        let call = self.client.call::<_, Value>(
+            SEND,
+            json!({ "session_id": session_id, "content": content }),
+        );
+        tokio::pin!(call);
+        let mut handle = |event: Notification| {
+            if event.method != PROGRESS || event.params["session_id"].as_str() != Some(session_id) {
+                return;
+            }
+            let started = match event.params["kind"].as_str() {
+                Some("tool_start") => true,
+                Some("tool_end") => false,
+                _ => return,
+            };
+            on_tool(ToolEvent {
+                started,
+                id: event.params["id"].as_str().unwrap_or_default().to_owned(),
+                name: event.params["name"].as_str().unwrap_or("?").to_owned(),
+            });
         };
-        Cow::Owned(format!(
-            "({}reverse-search: {}) ",
-            prefix, history_search.term
-        ))
-    }
-}
-
-fn next_id() -> u64 {
-    REQUEST_ID.fetch_add(1, Ordering::Relaxed)
-}
-
-/// Run the interactive call client.
-///
-/// This is the shared entry point used by both `sapphire-agent call` and
-/// the standalone `sapphire-agent-cli` binary. `token` is forwarded as
-/// `Authorization: Bearer <token>` on every `/rpc` call — resolving it to
-/// the device it was minted for, and that device's
-/// `[room_profile.<n>].devices` binding server-side, is what pins the
-/// session to a profile (no more `--room-profile`).
-#[allow(clippy::too_many_arguments)]
-pub async fn run(
-    server: String,
-    session: Option<String>,
-    list: bool,
-    message: Option<String>,
-    history: bool,
-    json: bool,
-    token: String,
-    device: Option<DeviceMetadata>,
-) -> Result<()> {
-    let base = server.trim_end_matches('/').to_string();
-    let client = reqwest::Client::new();
-
-    // -- --list mode ----------------------------------------------------------
-    if list {
-        let (session_id, _, _) =
-            initialize_session(&client, &base, session, &token, device.as_ref()).await?;
-        list_sessions(&client, &base, &token, &session_id, json).await?;
-        return Ok(());
-    }
-
-    // -- Initialize session ---------------------------------------------------
-    let (mut session_id, display_id, is_new) =
-        initialize_session(&client, &base, session, &token, device.as_ref()).await?;
-
-    // -- --history dump-only mode ---------------------------------------------
-    if history {
-        dump_history(&client, &base, &token, &session_id, json, true).await?;
-        return Ok(());
-    }
-
-    // -- --message one-shot mode ----------------------------------------------
-    if let Some(text) = message {
-        let trimmed = text.trim();
-        if trimmed.is_empty() {
-            anyhow::bail!("--message requires non-empty text");
-        }
-        send_chat(&client, &base, &token, &session_id, trimmed, json).await?;
-        if !json {
-            println!();
-        }
-        return Ok(());
-    }
-
-    // -- REPL -----------------------------------------------------------------
-    // --json is a no-op in REPL mode (text output is always human-readable).
-    let _ = json;
-    println!("sapphire-agent call  (session: {display_id})");
-    if !is_new {
-        println!("[resumed existing session]\n");
-        if let Err(e) = dump_history(&client, &base, &token, &session_id, false, false).await {
-            eprintln!("[warning: failed to load history: {e:#}]");
-        }
-    }
-    println!("Commands: /clear  /help  /quit\n");
-
-    let mut line_editor = Reedline::create();
-    let prompt = SimplePrompt;
-
-    loop {
-        let line = match line_editor.read_line(&prompt) {
-            Ok(Signal::Success(buf)) => buf,
-            Ok(Signal::CtrlC) | Ok(Signal::CtrlD) => break,
-            Ok(_) => continue,
-            Err(e) => {
-                eprintln!("Error reading input: {e}");
-                break;
+        let answered = loop {
+            tokio::select! {
+                // Notifications first: the server sends each before its
+                // answer, so one already here belongs before the reply.
+                biased;
+                event = events.recv() => {
+                    if let Ok(event) = event {
+                        handle(event);
+                    }
+                }
+                answered = &mut call => break answered,
             }
         };
-
-        let trimmed = line.trim();
-        match trimmed {
-            "/quit" | "/exit" => break,
-            "/help" => {
-                println!("  /clear   Start a new session");
-                println!("  /quit    Exit");
-                continue;
-            }
-            "/clear" => {
-                match initialize_session(&client, &base, None, &token, device.as_ref()).await {
-                    Ok((new_sid, new_display_id, _)) => {
-                        session_id = new_sid;
-                        println!("[new session: {new_display_id}]");
-                    }
-                    Err(e) => eprintln!("[error starting new session: {e:#}]"),
-                }
-                continue;
-            }
-            "" => continue,
-            _ => {}
+        // Whatever arrived with the answer.
+        while let Ok(event) = events.try_recv() {
+            handle(event);
         }
-
-        if let Err(e) = send_chat(&client, &base, &token, &session_id, trimmed, false).await {
-            eprintln!("[error: {e:#}]");
-        }
-        println!();
+        let result = answered.map_err(|e| anyhow!(e))?;
+        Ok(result["content"].as_str().unwrap_or_default().to_owned())
     }
 
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Session initialization
-// ---------------------------------------------------------------------------
-
-async fn initialize_session(
-    client: &reqwest::Client,
-    base: &str,
-    session: Option<String>,
-    token: &str,
-    device: Option<&DeviceMetadata>,
-) -> Result<(String, String, bool)> {
-    let session_id_req = session.as_deref().unwrap_or("new");
-    let mut params = json!({ "session_id": session_id_req });
-    if let Some(d) = device.and_then(DeviceMetadata::to_params) {
-        params["device"] = d;
-    }
-    let body = json!({
-        "jsonrpc": "2.0",
-        "id": next_id(),
-        "method": "initialize",
-        "params": params,
-    });
-
-    let resp = client
-        .post(format!("{base}/rpc"))
-        .bearer_auth(token)
-        .json(&body)
-        .send()
-        .await
-        .context("Failed to connect to server. Is `sapphire-agent serve` running?")?
-        .error_for_status()?;
-
-    let session_id = resp
-        .headers()
-        .get("session-id")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| session_id_req.to_string());
-
-    let val: Value = resp.json().await?;
-    if let Some(err) = val.get("error") {
-        let msg = err["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("{msg}");
-    }
-    let result = &val["result"];
-    // Prefer human-readable grain-id for display; fall back to UUID
-    let display_id = result["public_id"]
-        .as_str()
-        .or_else(|| result["session_id"].as_str())
-        .unwrap_or(&session_id)
-        .to_string();
-    let is_new = result["is_new"].as_bool().unwrap_or(true);
-
-    Ok((session_id, display_id, is_new))
-}
-
-// ---------------------------------------------------------------------------
-// History dump (on session resume)
-// ---------------------------------------------------------------------------
-
-async fn dump_history(
-    client: &reqwest::Client,
-    base: &str,
-    token: &str,
-    session_id: &str,
-    json_mode: bool,
-    standalone: bool,
-) -> Result<()> {
-    let body = json!({
-        "jsonrpc": "2.0",
-        "id": next_id(),
-        "method": "get_session",
-        "params": null,
-    });
-
-    let val: Value = client
-        .post(format!("{base}/rpc"))
-        .bearer_auth(token)
-        .header("session-id", session_id)
-        .json(&body)
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-
-    if let Some(err) = val.get("error") {
-        let msg = err["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("{msg}");
+    /// `session_id`'s stored messages.
+    pub async fn history(&self, session_id: &str) -> Result<Vec<Value>> {
+        let result: Value = self
+            .client
+            .call(HISTORY, json!({ "session_id": session_id }))
+            .await
+            .map_err(|e| anyhow!(e))?;
+        Ok(result["messages"].as_array().cloned().unwrap_or_default())
     }
 
-    let messages = val["result"]["messages"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-
-    if json_mode {
-        let out = json!({ "messages": messages });
-        println!("{}", serde_json::to_string(&out)?);
-        return Ok(());
-    }
-
-    if messages.is_empty() {
-        return Ok(());
-    }
-
-    if !standalone {
-        println!("──── history ────");
-    }
-    for msg in &messages {
-        let role = msg["role"].as_str().unwrap_or("?");
-        let parts = msg["parts"].as_array().cloned().unwrap_or_default();
-        for part in parts {
-            match part["type"].as_str() {
-                Some("text") => {
-                    let text = part["text"].as_str().unwrap_or("");
-                    if text.is_empty() {
-                        continue;
-                    }
-                    match role {
-                        "user" => println!("> {text}"),
-                        "assistant" => println!("{text}\n"),
-                        _ => println!("{text}"),
-                    }
-                }
-                Some("tool_use") => {
-                    let name = part["name"].as_str().unwrap_or("?");
-                    println!("[tool: {name}]");
-                }
-                Some("tool_result") => {
-                    // Skip tool results in the dump to keep it readable
-                }
-                _ => {}
-            }
-        }
-    }
-    if !standalone {
-        println!("──── end of history ────\n");
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Session listing
-// ---------------------------------------------------------------------------
-
-async fn list_sessions(
-    client: &reqwest::Client,
-    base: &str,
-    token: &str,
-    session_id: &str,
-    json_mode: bool,
-) -> Result<()> {
-    let body = json!({
-        "jsonrpc": "2.0",
-        "id": next_id(),
-        "method": "list_sessions",
-        "params": null,
-    });
-
-    let val: Value = client
-        .post(format!("{base}/rpc"))
-        .bearer_auth(token)
-        .header("session-id", session_id)
-        .json(&body)
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-
-    let sessions = val["result"]["sessions"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-
-    if json_mode {
-        let out = json!({ "sessions": sessions });
-        println!("{}", serde_json::to_string(&out)?);
-        return Ok(());
-    }
-
-    if sessions.is_empty() {
-        println!("No sessions found.");
-    } else {
-        println!("{:<10}  {:<30}  Created at", "ID", "Title");
-        println!("{}", "-".repeat(64));
-        for s in &sessions {
-            let pub_id = s["public_id"].as_str().unwrap_or("-");
-            let title = s["title"].as_str().unwrap_or("(untitled)");
-            let created = s["created_at"].as_str().unwrap_or("?");
-            println!("{pub_id:<10}  {title:<30}  {created}");
-        }
-    }
-
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Send a chat message and stream back the SSE response
-// ---------------------------------------------------------------------------
-
-async fn send_chat(
-    client: &reqwest::Client,
-    base: &str,
-    token: &str,
-    session_id: &str,
-    content: &str,
-    json_mode: bool,
-) -> Result<()> {
-    let id = next_id();
-    let body = json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "method": "chat",
-        "params": { "content": content },
-    });
-
-    let resp = client
-        .post(format!("{base}/rpc"))
-        .bearer_auth(token)
-        .header("session-id", session_id)
-        .header("accept", "text/event-stream")
-        .json(&body)
-        .send()
-        .await?
-        .error_for_status()?;
-
-    let mut stream = resp.bytes_stream();
-    let mut buf = String::new();
-
-    // For JSON mode, accumulate events until the final result and emit one
-    // structured object at the end.
-    let mut json_tools: Vec<Value> = Vec::new();
-    let mut json_content: Option<String> = None;
-    let mut json_error: Option<String> = None;
-
-    'outer: while let Some(chunk) = stream.next().await {
-        buf.push_str(&String::from_utf8_lossy(&chunk?));
-        while let Some(pos) = buf.find("\n\n") {
-            let raw = buf[..pos].to_string();
-            buf.drain(..pos + 2);
-            if let Some(data) = parse_sse_data(&raw) {
-                if json_mode {
-                    if collect_event(&data, &mut json_tools, &mut json_content, &mut json_error) {
-                        break 'outer;
-                    }
-                } else if handle_event(&data) {
-                    return Ok(());
-                }
-            }
-        }
-    }
-
-    if json_mode {
-        let mut out = json!({
-            "content": json_content.unwrap_or_default(),
-            "tools": json_tools,
-        });
-        if let Some(err) = json_error {
-            out["error"] = Value::String(err);
-        }
-        println!("{}", serde_json::to_string(&out)?);
-    }
-
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// SSE parsing helpers
-// ---------------------------------------------------------------------------
-
-/// Extract the `data:` field from a raw SSE message block, parse as JSON.
-fn parse_sse_data(raw: &str) -> Option<Value> {
-    let data_line = raw.lines().find(|l| l.starts_with("data:"))?;
-    let data = data_line.strip_prefix("data:").unwrap_or("").trim();
-    serde_json::from_str(data).ok()
-}
-
-/// Collect SSE events into JSON output buffers. Returns true when done.
-fn collect_event(
-    val: &Value,
-    tools: &mut Vec<Value>,
-    content: &mut Option<String>,
-    error: &mut Option<String>,
-) -> bool {
-    if let Some(method) = val["method"].as_str() {
-        if method == "tool_start" {
-            let name = val["params"]["name"].as_str().unwrap_or("?").to_string();
-            let id = val["params"]["id"].as_str().unwrap_or("").to_string();
-            tools.push(json!({ "id": id, "name": name }));
-        }
-        false
-    } else if val.get("result").is_some() {
-        *content = val["result"]["content"].as_str().map(|s| s.to_string());
-        true
-    } else if let Some(err) = val.get("error") {
-        *error = err["message"].as_str().map(|s| s.to_string());
-        true
-    } else {
-        false
-    }
-}
-
-/// Handle a JSON-RPC 2.0 SSE event. Returns true when the final result arrives.
-fn handle_event(val: &Value) -> bool {
-    if let Some(method) = val["method"].as_str() {
-        // Notification
-        match method {
-            "tool_start" => {
-                let name = val["params"]["name"].as_str().unwrap_or("?");
-                eprint!("[{name}] ");
-                let _ = stderr().flush();
-            }
-            "tool_end" => {
-                eprint!("done ");
-                let _ = stderr().flush();
-            }
-            _ => {}
-        }
-        false
-    } else if val.get("result").is_some() {
-        // Final chat response
-        if let Some(content) = val["result"]["content"].as_str()
-            && !content.is_empty()
-        {
-            eprintln!();
-            print!("{content}");
-            let _ = stdout().flush();
-        }
-        true // done
-    } else if val.get("error").is_some() {
-        let msg = val["error"]["message"].as_str().unwrap_or("unknown error");
-        eprintln!("\n[error: {msg}]");
-        true // treat as done
-    } else {
-        false
+    /// The client sessions.
+    pub async fn sessions(&self) -> Result<Vec<Value>> {
+        let result: Value = self
+            .client
+            .call(SESSIONS, json!({}))
+            .await
+            .map_err(|e| anyhow!(e))?;
+        Ok(result["sessions"].as_array().cloned().unwrap_or_default())
     }
 }

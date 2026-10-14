@@ -10,7 +10,7 @@ use reedline::{
 };
 use serde_json::{Value, json};
 
-use crate::serve::chat_ipc::{ChatClient, ToolEvent};
+use sapphire_agent_core::{ChatClient, ToolEvent};
 
 /// What `sapphire-agent chat` was asked to do.
 pub struct ChatOptions {
@@ -58,7 +58,7 @@ impl Prompt for SimplePrompt {
 }
 
 pub async fn run(options: ChatOptions) -> Result<()> {
-    let client = ChatClient::connect().await?;
+    let client = ChatClient::connect("chat", crate::app_server::VERSION).await?;
 
     if options.list {
         return print_sessions(&client.sessions().await?, options.json);

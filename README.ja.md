@@ -46,9 +46,9 @@ cargo build --release
 
 リリースバイナリは**Linux**（x86_64、aarch64）と**macOS**（aarch64）向けに公開されています。それぞれ単一の自己完結ファイル — `sherpa-onnx`とそのONNX Runtimeは静的リンクされているため、一緒にインストールするものは何もありません。
 
-エージェントはヘッドレスなサーバーアプリケーションで、Windows向けにはビルドされていません。`sapphire-agent-desktop` はWindows向けにもビルドされます。
+エージェントはヘッドレスなサーバーアプリケーションで、Windows向けにはビルドされていません。同じホストのエージェントと話す `sapphire-agent-desktop` も同様です。
 
-サーバーとその CLI は 1 つのバイナリです（[#278](https://github.com/fluo10/sapphire-agent/issues/278)）。`sapphire-ledger` など他の sapphire-framework アプリと同じく、クライアント系のコマンド（`chat`、`acp`、`status` など）は同じホストで動いているサーバーにローカル IPC で問い合わせます。[#182](https://github.com/fluo10/sapphire-agent/issues/182)参照。
+サーバーとその CLI は 1 つのバイナリです（[#278](https://github.com/fluo10/sapphire-agent/issues/278)）。`sapphire-ledger` など他の sapphire-framework アプリと同じく、クライアント系のコマンド（`chat`、`acp`、`status` など）は同じホストで動いているサーバーにローカル IPC で問い合わせます。GUI チャットクライアントの `sapphire-agent-desktop` も同じで、`chat` と同じく `[cli].room_profile` のルームプロファイルで動きます。[#182](https://github.com/fluo10/sapphire-agent/issues/182)参照。
 
 ## 設定
 
