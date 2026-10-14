@@ -103,6 +103,7 @@ use workspace::Workspace;
 #[derive(Parser)]
 #[command(
     name = "sapphire-agent",
+    arg_required_else_help = true,
     about = "Personal AI assistant — Anthropic + Matrix/Discord",
     // Without this, `--help` shows the flattened `FrameworkCommand`'s doc
     // comment as the long description instead of `about`.
@@ -118,7 +119,7 @@ struct Cli {
     bind: Option<String>,
 
     #[command(subcommand)]
-    command: Option<Command>,
+    command: Command,
 }
 
 #[derive(Subcommand)]
@@ -316,22 +317,22 @@ async fn main() -> Result<()> {
     // Before the config load below: `init` is what an operator runs when there
     // is no host config yet, so requiring one to reach it would make the
     // command unusable exactly when it is needed.
-    if let Some(Command::Init { path }) = &cli.command {
+    if let Command::Init { path } = &cli.command {
         return cli_init::run(path.clone());
     }
     // A relay to the running agent, which holds the config: nothing to load
     // here, and stdout belongs to ACP.
-    if let Some(Command::Acp) = &cli.command {
+    if let Command::Acp = &cli.command {
         return serve::acp_tunnel::run_stdio().await;
     }
     // Likewise a client of the running agent.
-    if let Some(Command::Chat {
+    if let Command::Chat {
         session,
         list,
         message,
         history,
         json,
-    }) = &cli.command
+    } = &cli.command
     {
         return chat::run(chat::ChatOptions {
             session: session.clone(),
@@ -346,7 +347,7 @@ async fn main() -> Result<()> {
     // The framework's verbs other than `serve` talk to the running server
     // or the bridge, and need no agent config either.
     let cli = match cli.command {
-        Some(Command::Framework(command))
+        Command::Framework(command)
             if !matches!(command, sapphire_framework::server::FrameworkCommand::Serve) =>
         {
             let code = command
@@ -357,10 +358,6 @@ async fn main() -> Result<()> {
             }
             return Ok(());
         }
-        Some(Command::Framework(_)) => Cli {
-            command: None,
-            ..cli
-        },
         command => Cli { command, ..cli },
     };
 
@@ -445,137 +442,12 @@ async fn main() -> Result<()> {
 
     match cli.command {
         // Returned above, before the config was loaded.
-        Some(Command::Init { .. }) => unreachable!("`init` is dispatched ahead of the config load"),
-        Some(Command::Acp) => unreachable!("`acp` is dispatched ahead of the config load"),
-        Some(Command::Chat { .. }) => {
+        Command::Init { .. } => unreachable!("`init` is dispatched ahead of the config load"),
+        Command::Acp => unreachable!("`acp` is dispatched ahead of the config load"),
+        Command::Chat { .. } => {
             unreachable!("`chat` is dispatched ahead of the config load")
         }
-        Some(Command::Framework(_)) => {
-            unreachable!("the framework's verbs are dispatched ahead of the config load")
-        }
-        Some(Command::Verify) => {
-            let profile_errors = config.validate_profiles();
-            if profile_errors.is_empty() {
-                println!("Config OK");
-            } else {
-                println!("Config INVALID:");
-                for err in &profile_errors {
-                    println!("  - {err}");
-                }
-            }
-            for (file, keys) in group_unknown_keys(
-                &unknown,
-                &provenance,
-                &config_path,
-                workspace_path.as_deref(),
-            ) {
-                println!("  Unknown keys      : {file}");
-                for key in keys {
-                    println!("    {key} (ignored)");
-                }
-            }
-            // The device -> room_profile binding is written by hand, so it
-            // needs somewhere to be checked.
-            match device_auth::DeviceAuth::bridge(&config.room_profiles) {
-                Ok(auth) => verify_external_devices(&auth).await,
-                Err(e) => println!("  Devices           : INVALID: {e:#}"),
-            }
-            match &workspace_path {
-                Some(p) => println!("  Workspace config  : {}", p.display()),
-                None => {
-                    let ws_config = config::workspace_config_path(&workspace_dir);
-                    println!(
-                        "  Workspace config  : none ({} absent)",
-                        ws_config.display()
-                    );
-                }
-            }
-            if let Some(m) = &config.matrix {
-                println!("  Channel           : matrix");
-                println!("  Matrix homeserver : {}", m.homeserver);
-                println!("  Matrix user_id    : {}", m.user_id);
-                println!("  Matrix rooms      : {:?}", m.room_ids);
-            } else if let Some(d) = &config.discord {
-                println!("  Channel           : discord");
-                println!("  Discord channels  : {:?}", d.channel_ids);
-                println!("  Allowed users     : {:?}", d.allowed_users);
-            } else {
-                println!("  Channel           : NONE (add [discord] or [matrix] to config)");
-            }
-            println!(
-                "  ACP endpoint      : {}",
-                if config.acp.as_ref().is_some_and(|c| c.enabled) {
-                    "enabled (GET /acp)"
-                } else {
-                    "disabled"
-                }
-            );
-            println!(
-                "  Anthropic model   : {} [{}]",
-                config.anthropic.model,
-                layer_tag(&provenance, "anthropic.model")
-            );
-            println!(
-                "  Anthropic max_tok : {} [{}]",
-                config.anthropic.max_tokens,
-                layer_tag(&provenance, "anthropic.max_tokens")
-            );
-            match &selection {
-                Some(_) => println!(
-                    "  Workspace dir     : {} (selected)",
-                    workspace_dir.display()
-                ),
-                None => println!(
-                    "  Workspace dir     : {} (from `workspace_dir`; selected on the next start)",
-                    workspace_dir.display()
-                ),
-            }
-            println!(
-                "  Day boundary hour : {}:00 local [{}]",
-                config.day_boundary_hour,
-                layer_tag(&provenance, "day_boundary_hour")
-            );
-            println!(
-                "  Heartbeat enabled : {} [{}]",
-                config.heartbeat_enabled,
-                layer_tag(&provenance, "heartbeat_enabled")
-            );
-            println!();
-            println!("Workspace-supplied settings:");
-            let ws_settings: Vec<&String> = provenance
-                .iter()
-                .filter(|(_, layer)| **layer == config_layer::Layer::Workspace)
-                .map(|(path, _)| path)
-                .collect();
-            if ws_settings.is_empty() {
-                println!("  (none)");
-            } else {
-                for path in ws_settings {
-                    println!("  {path}");
-                }
-            }
-            println!();
-            let workspace_files = [
-                ("AGENTS.md / AGENT.md", vec!["AGENTS.md", "AGENT.md"]),
-                ("SOUL.md", vec!["SOUL.md"]),
-                ("IDENTITY.md", vec!["IDENTITY.md"]),
-                ("USER.md", vec!["USER.md"]),
-                ("TOOLS.md", vec!["TOOLS.md"]),
-                ("BOOTSTRAP.md", vec!["BOOTSTRAP.md"]),
-                ("MEMORY.md", vec!["MEMORY.md", "memory.md"]),
-            ];
-            for (label, candidates) in &workspace_files {
-                let found = candidates.iter().find_map(|f| {
-                    let p = workspace_dir.join(f);
-                    if p.exists() { Some(*f) } else { None }
-                });
-                match found {
-                    Some(f) => println!("  {label:<28} found ({f})"),
-                    None => println!("  {label:<28} -"),
-                }
-            }
-        }
-        None => {
+        Command::Framework(sapphire_framework::server::FrameworkCommand::Serve) => {
             let bind = cli.bind;
             let workspace_dir = match &selection {
                 Some(selected) => selected.root.clone(),
@@ -1384,6 +1256,131 @@ async fn main() -> Result<()> {
             }
             server_task.await.context("the app server panicked")??;
         }
+        Command::Verify => {
+            let profile_errors = config.validate_profiles();
+            if profile_errors.is_empty() {
+                println!("Config OK");
+            } else {
+                println!("Config INVALID:");
+                for err in &profile_errors {
+                    println!("  - {err}");
+                }
+            }
+            for (file, keys) in group_unknown_keys(
+                &unknown,
+                &provenance,
+                &config_path,
+                workspace_path.as_deref(),
+            ) {
+                println!("  Unknown keys      : {file}");
+                for key in keys {
+                    println!("    {key} (ignored)");
+                }
+            }
+            // The device -> room_profile binding is written by hand, so it
+            // needs somewhere to be checked.
+            match device_auth::DeviceAuth::bridge(&config.room_profiles) {
+                Ok(auth) => verify_external_devices(&auth).await,
+                Err(e) => println!("  Devices           : INVALID: {e:#}"),
+            }
+            match &workspace_path {
+                Some(p) => println!("  Workspace config  : {}", p.display()),
+                None => {
+                    let ws_config = config::workspace_config_path(&workspace_dir);
+                    println!(
+                        "  Workspace config  : none ({} absent)",
+                        ws_config.display()
+                    );
+                }
+            }
+            if let Some(m) = &config.matrix {
+                println!("  Channel           : matrix");
+                println!("  Matrix homeserver : {}", m.homeserver);
+                println!("  Matrix user_id    : {}", m.user_id);
+                println!("  Matrix rooms      : {:?}", m.room_ids);
+            } else if let Some(d) = &config.discord {
+                println!("  Channel           : discord");
+                println!("  Discord channels  : {:?}", d.channel_ids);
+                println!("  Allowed users     : {:?}", d.allowed_users);
+            } else {
+                println!("  Channel           : NONE (add [discord] or [matrix] to config)");
+            }
+            println!(
+                "  ACP endpoint      : {}",
+                if config.acp.as_ref().is_some_and(|c| c.enabled) {
+                    "enabled (GET /acp)"
+                } else {
+                    "disabled"
+                }
+            );
+            println!(
+                "  Anthropic model   : {} [{}]",
+                config.anthropic.model,
+                layer_tag(&provenance, "anthropic.model")
+            );
+            println!(
+                "  Anthropic max_tok : {} [{}]",
+                config.anthropic.max_tokens,
+                layer_tag(&provenance, "anthropic.max_tokens")
+            );
+            match &selection {
+                Some(_) => println!(
+                    "  Workspace dir     : {} (selected)",
+                    workspace_dir.display()
+                ),
+                None => println!(
+                    "  Workspace dir     : {} (from `workspace_dir`; selected on the next start)",
+                    workspace_dir.display()
+                ),
+            }
+            println!(
+                "  Day boundary hour : {}:00 local [{}]",
+                config.day_boundary_hour,
+                layer_tag(&provenance, "day_boundary_hour")
+            );
+            println!(
+                "  Heartbeat enabled : {} [{}]",
+                config.heartbeat_enabled,
+                layer_tag(&provenance, "heartbeat_enabled")
+            );
+            println!();
+            println!("Workspace-supplied settings:");
+            let ws_settings: Vec<&String> = provenance
+                .iter()
+                .filter(|(_, layer)| **layer == config_layer::Layer::Workspace)
+                .map(|(path, _)| path)
+                .collect();
+            if ws_settings.is_empty() {
+                println!("  (none)");
+            } else {
+                for path in ws_settings {
+                    println!("  {path}");
+                }
+            }
+            println!();
+            let workspace_files = [
+                ("AGENTS.md / AGENT.md", vec!["AGENTS.md", "AGENT.md"]),
+                ("SOUL.md", vec!["SOUL.md"]),
+                ("IDENTITY.md", vec!["IDENTITY.md"]),
+                ("USER.md", vec!["USER.md"]),
+                ("TOOLS.md", vec!["TOOLS.md"]),
+                ("BOOTSTRAP.md", vec!["BOOTSTRAP.md"]),
+                ("MEMORY.md", vec!["MEMORY.md", "memory.md"]),
+            ];
+            for (label, candidates) in &workspace_files {
+                let found = candidates.iter().find_map(|f| {
+                    let p = workspace_dir.join(f);
+                    if p.exists() { Some(*f) } else { None }
+                });
+                match found {
+                    Some(f) => println!("  {label:<28} found ({f})"),
+                    None => println!("  {label:<28} -"),
+                }
+            }
+        }
+        Command::Framework(_) => {
+            unreachable!("the framework's verbs are dispatched ahead of the config load")
+        }
     }
 
     Ok(())
@@ -1885,59 +1882,60 @@ mod tests {
         .unwrap();
         assert!(matches!(
             cli.command,
-            Some(Command::Framework(FrameworkCommand::ExternalDevice(
+            Command::Framework(FrameworkCommand::ExternalDevice(
                 ExternalDeviceCommand::Add {
                     ref name,
                     description: Some(_),
                     ..
                 }
-            ))) if name == "pendant"
+            )) if name == "pendant"
         ));
     }
 
     /// The framework's verbs sit beside the agent's own at the top level,
-    /// and a bare invocation is still the server.
+    /// and a bare invocation prints the help.
     #[test]
     fn the_framework_verbs_parse_beside_the_agents() {
         use sapphire_framework::server::{FrameworkCommand, WorkspaceCommand};
         let parse = |args: &[&str]| Cli::try_parse_from(args).unwrap().command;
 
-        assert!(parse(&["sapphire-agent"]).is_none());
+        let err = Cli::try_parse_from(["sapphire-agent"])
+            .err()
+            .expect("a bare invocation does not parse");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        );
         assert!(matches!(
             parse(&["sapphire-agent", "serve"]),
-            Some(Command::Framework(FrameworkCommand::Serve))
+            Command::Framework(FrameworkCommand::Serve)
         ));
         assert!(matches!(
             parse(&["sapphire-agent", "status"]),
-            Some(Command::Framework(FrameworkCommand::Status))
+            Command::Framework(FrameworkCommand::Status)
         ));
         assert!(matches!(
             parse(&["sapphire-agent", "workspace", "show"]),
-            Some(Command::Framework(FrameworkCommand::Workspace(
-                WorkspaceCommand::Show
-            )))
+            Command::Framework(FrameworkCommand::Workspace(WorkspaceCommand::Show))
         ));
         assert!(matches!(
             parse(&["sapphire-agent", "verify"]),
-            Some(Command::Verify)
+            Command::Verify
         ));
         assert!(matches!(
             parse(&["sapphire-agent", "init"]),
-            Some(Command::Init { .. })
+            Command::Init { .. }
         ));
-        assert!(matches!(
-            parse(&["sapphire-agent", "acp"]),
-            Some(Command::Acp)
-        ));
+        assert!(matches!(parse(&["sapphire-agent", "acp"]), Command::Acp));
         assert!(matches!(
             parse(&["sapphire-agent", "chat", "--session", "a3b7k9p", "-m", "hi", "--json"]),
-            Some(Command::Chat {
+            Command::Chat {
                 session: Some(ref s),
                 message: Some(ref m),
                 json: true,
                 list: false,
                 history: false,
-            }) if s == "a3b7k9p" && m == "hi"
+            } if s == "a3b7k9p" && m == "hi"
         ));
     }
 

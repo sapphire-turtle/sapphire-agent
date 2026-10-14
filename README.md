@@ -86,7 +86,7 @@ Then:
 
 ```sh
 sapphire-agent verify   # sanity-check config and workspace
-sapphire-agent          # start the channel listeners + HTTP control API
+sapphire-agent serve    # start the channel listeners + HTTP control API
 sapphire-agent chat     # interactive session with it (needs [cli].room_profile)
 ```
 
