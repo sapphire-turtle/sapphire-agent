@@ -1202,19 +1202,19 @@ mod tests {
         );
     }
 
-    /// Task 6's ruling that the plan itself does not state: a one-shot
-    /// `shell` call that outruns its timeout must be tracked too
-    /// — not just handed back in the result text. Otherwise the handle
-    /// escapes both the cap and the "what is holding this session"
-    /// listing, and the model is told to clean up while the very thing
-    /// it needs to clean up stays invisible.
-    /// Review round 1, Finding 1: the one-shot path must respect the
-    /// same cap `shell_start` does. `shell`'s timeout
-    /// branch tracks a handle (previous test), so without a cap check
-    /// on this path too, a model looping `shell` with a short
-    /// `timeout_secs` could accumulate live processes past the cap the
-    /// same way looping `shell_start` would — exactly what
-    /// `MAX_TERMINALS_PER_SESSION` exists to prevent.
+    // Task 6's ruling that the plan itself does not state: a one-shot
+    // `shell` call that outruns its timeout must be tracked too
+    // — not just handed back in the result text. Otherwise the handle
+    // escapes both the cap and the "what is holding this session"
+    // listing, and the model is told to clean up while the very thing
+    // it needs to clean up stays invisible.
+    // Review round 1, Finding 1: the one-shot path must respect the
+    // same cap `shell_start` does. `shell`'s timeout
+    // branch tracks a handle (previous test), so without a cap check
+    // on this path too, a model looping `shell` with a short
+    // `timeout_secs` could accumulate live processes past the cap the
+    // same way looping `shell_start` would — exactly what
+    // `MAX_TERMINALS_PER_SESSION` exists to prevent.
     // -----------------------------------------------------------------
     // Final review, Fix 1 & Fix 2
     // -----------------------------------------------------------------

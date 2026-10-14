@@ -457,12 +457,9 @@ mod tests {
     use std::process::Command;
 
     fn sh() -> Option<&'static str> {
-        for c in ["sh", "bash"] {
-            if Command::new(c).arg("-c").arg("exit 0").status().is_ok() {
-                return Some(c);
-            }
-        }
-        None
+        ["sh", "bash"]
+            .into_iter()
+            .find(|c| Command::new(c).arg("-c").arg("exit 0").status().is_ok())
     }
 
     #[test]

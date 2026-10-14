@@ -2312,7 +2312,7 @@ mod tests {
         let (_s, _c, store, sid) = cached_store();
         for i in 0..5 {
             store
-                .append(&sid, &ChatMessage::user(&format!("m{i}")))
+                .append(&sid, &ChatMessage::user(format!("m{i}")))
                 .unwrap();
         }
         store.append_summary(&sid, "the first three", 2).unwrap();
@@ -2459,7 +2459,7 @@ mod tests {
         let (_s, _c, store, sid) = cached_store();
         for i in 0..3 {
             store
-                .append(&sid, &ChatMessage::user(&format!("m{i}")))
+                .append(&sid, &ChatMessage::user(format!("m{i}")))
                 .unwrap();
         }
         store.append_summary(&sid, "yesterday", 0).unwrap();

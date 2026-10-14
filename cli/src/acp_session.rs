@@ -1676,7 +1676,7 @@ mod tests {
         store.create("s1", "default", "/tmp").unwrap();
         for i in 0..5 {
             store
-                .append_message("s1", &ChatMessage::user(&format!("m{i}")))
+                .append_message("s1", &ChatMessage::user(format!("m{i}")))
                 .unwrap();
         }
         store.append_summary("s1", "the first three", 2).unwrap();
