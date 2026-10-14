@@ -16,7 +16,7 @@ pub fn ui(mut contexts: EguiContexts, mut state: ResMut<AppState>, bridge: NonSe
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
     };
-    egui::CentralPanel::default().show(ctx, |ui| {
+    egui::CentralPanel::default().show(&mut super::root_ui(ctx), |ui| {
         ui.heading("sapphire-agent-desktop · Connection");
         ui.add_space(8.0);
 

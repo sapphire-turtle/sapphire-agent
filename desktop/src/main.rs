@@ -159,11 +159,11 @@ fn main() {
         .add_plugins(EguiPlugin::default())
         .insert_resource(state)
         .insert_resource(BridgeEventQueue(Mutex::new(event_rx)))
-        .insert_non_send_resource(ActiveMic::default())
+        .insert_non_send(ActiveMic::default())
         .insert_resource(AudioState {
             player: audio_player,
         })
-        .insert_non_send_resource(bridge)
+        .insert_non_send(bridge)
         .add_systems(Startup, spawn_camera)
         .add_systems(Update, (drain_bridge_events, poll_mic_recorder))
         .add_systems(

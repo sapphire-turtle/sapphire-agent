@@ -34,7 +34,8 @@ pub fn ui(
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
     };
-    egui::TopBottomPanel::top("chat_topbar").show(ctx, |ui| {
+    let root = &mut super::root_ui(ctx);
+    egui::Panel::top("chat_topbar").show(root, |ui| {
         ui.horizontal(|ui| {
             ui.heading("sapphire-agent-cli");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -56,9 +57,9 @@ pub fn ui(
         });
     });
 
-    egui::TopBottomPanel::bottom("chat_input")
-        .min_height(60.0)
-        .show(ctx, |ui| {
+    egui::Panel::bottom("chat_input")
+        .min_size(60.0)
+        .show(root, |ui| {
             let session_ready = matches!(state.session, Session::Ready { .. });
             let can_send = session_ready && state.turn == TurnState::Idle;
             let recording = matches!(state.mic, MicUiState::Recording { .. });
@@ -154,7 +155,7 @@ pub fn ui(
             }
         });
 
-    egui::CentralPanel::default().show(ctx, |ui| {
+    egui::CentralPanel::default().show(root, |ui| {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .stick_to_bottom(true)
