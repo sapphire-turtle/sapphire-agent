@@ -589,7 +589,7 @@ async fn main() -> Result<()> {
                 let tunnel = acp_tunnel.clone();
                 move |router| tunnel.router(router)
             });
-            let (server, sync_parts) = app_server::with_sync(server).await?;
+            let (server, sync_runtime) = app_server::with_sync(server)?;
             let host = Arc::clone(server.host());
             let server_task = {
                 let shutdown = shutdown.clone();
@@ -626,19 +626,13 @@ async fn main() -> Result<()> {
                 Arc::clone(&restart),
             );
             // ── Placement: which host runs what, once synced ───────────────
-            let placement = match sync_parts {
-                Some((runtime, bridge)) => {
-                    let placement = placement::Placement::synced(runtime, bridge, served_root);
-                    placement::spawn_claim_keeper(
-                        Arc::clone(&placement),
-                        workspace_dir.clone(),
-                        placement::local_channels(&config),
-                        shutdown.clone(),
-                    );
-                    placement
-                }
-                None => placement::Placement::alone(),
-            };
+            let placement = placement::Placement::synced(sync_runtime, served_root);
+            placement::spawn_claim_keeper(
+                Arc::clone(&placement),
+                workspace_dir.clone(),
+                placement::local_channels(&config),
+                shutdown.clone(),
+            );
             // `sync_interval_minutes` is the re-index cadence. The framework
             // removed local-workspace auto-sync, so a tick is an mtime-based
             // refresh of the retrieve cache and nothing else.

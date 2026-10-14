@@ -74,8 +74,27 @@ pub struct Placement {
 
 struct Synced {
     runtime: Arc<SyncRuntime>,
-    bridge: Arc<BridgeClient>,
+    /// This host's own connection to the bridge, for who is who. Opened on
+    /// first use and again after the bridge restarts.
+    bridge: tokio::sync::Mutex<Option<Arc<BridgeClient>>>,
     root: PathBuf,
+}
+
+impl Synced {
+    /// The bridge, connecting to it when there is no live connection.
+    async fn bridge(&self) -> Option<Arc<BridgeClient>> {
+        let mut bridge = self.bridge.lock().await;
+        if let Some(live) = bridge.as_ref().filter(|b| !b.is_closed()) {
+            return Some(Arc::clone(live));
+        }
+        let connected =
+            BridgeClient::connect_running(crate::APP_CTX.app_name, crate::app_server::VERSION)
+                .await
+                .ok()
+                .map(Arc::new);
+        bridge.clone_from(&connected);
+        connected
+    }
 }
 
 impl Placement {
@@ -85,15 +104,11 @@ impl Placement {
     }
 
     /// A host whose workspace `root` may be synced through `runtime`.
-    pub fn synced(
-        runtime: Arc<SyncRuntime>,
-        bridge: Arc<BridgeClient>,
-        root: PathBuf,
-    ) -> Arc<Placement> {
+    pub fn synced(runtime: Arc<SyncRuntime>, root: PathBuf) -> Arc<Placement> {
         Arc::new(Placement {
             synced: Some(Synced {
                 runtime,
-                bridge,
+                bridge: tokio::sync::Mutex::new(None),
                 root,
             }),
         })
@@ -111,8 +126,13 @@ impl Placement {
             return Role::Alone;
         };
         let primary = s.runtime.is_primary(workspace_id).await;
-        let (me, peers) = match (s.bridge.status().await, s.bridge.peers().await) {
-            (Ok(st), Ok(p)) => {
+        let bridge = s.bridge().await;
+        let answers = match &bridge {
+            Some(bridge) => Some((bridge.status().await, bridge.peers().await)),
+            None => None,
+        };
+        let (me, peers) = match answers {
+            Some((Ok(st), Ok(p))) => {
                 let peers: Vec<Device> = p
                     .peers
                     .iter()
