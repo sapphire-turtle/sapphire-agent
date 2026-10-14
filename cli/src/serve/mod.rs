@@ -6,7 +6,9 @@
 //!           GET  /.well-known/agent-card.json
 //!           GET  /acp  (Agent Client Protocol over WebSocket; gated by [acp].enabled)
 //!
-//! ACP also runs on stdio, tunnelled over IPC: see [`acp_tunnel`].
+//! ACP also runs on stdio, tunnelled over IPC: see [`acp_tunnel`]. The
+//! `sapphire-agent chat` REPL reaches the agent over IPC too: see
+//! [`chat_ipc`].
 //!
 //! Session management uses a `Session-Id` request/response header.
 
@@ -14,6 +16,7 @@ pub mod a2a;
 pub mod acp;
 pub mod acp_permissions;
 pub mod acp_tunnel;
+pub mod chat_ipc;
 
 use crate::acp_session::AcpSessionStore;
 use crate::channel::RoomInfo;
@@ -97,7 +100,7 @@ pub struct ServeState {
     /// on resume.
     pub(crate) session_room_profiles: tokio::sync::Mutex<HashMap<String, String>>,
     /// Per-session room metadata supplied by the client at `initialize`
-    /// (sapphire-agent-cli's `[device]` block, principally). Mirrors the
+    /// (a voice client's `[device]` block, principally). Mirrors the
     /// channel-side `Channel::room_info()` lookup so the agent can tell
     /// the model "you are speaking through the living-room speaker; STT
     /// may have introduced typos" without baking that into AGENTS.md.
@@ -621,7 +624,85 @@ async fn handle_initialize(
     // (mirrors A2A / MCP). `DeviceAuth::resolve` only returns profile
     // names that exist in the config, so no extra validation is needed
     // here.
+    let opened = match open_session(
+        &state,
+        existing_header_session,
+        params.as_ref().and_then(|p| p["session_id"].as_str()),
+        profile_name,
+        params.as_ref().and_then(|p| p.get("device")),
+    )
+    .await
+    {
+        Ok(opened) => opened,
+        Err((code, message)) => return error_response(req_id, code, message).into_response(),
+    };
+    let session_id = opened.session_id.clone();
 
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "result": opened.to_json(),
+    });
+
+    let mut response = axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .header(
+            "session-id",
+            HeaderValue::from_str(&session_id).unwrap_or_else(|_| HeaderValue::from_static("")),
+        )
+        .body(axum::body::Body::from(body.to_string()))
+        .unwrap();
+
+    // Also set Session-Id in the response headers (accessible via response)
+    response.headers_mut().insert(
+        "session-id",
+        HeaderValue::from_str(&session_id).unwrap_or_else(|_| HeaderValue::from_static("")),
+    );
+
+    response
+}
+
+/// A session [`open_session`] resolved or reserved.
+pub(crate) struct OpenedSession {
+    /// The internal UUID every later call names the session by.
+    pub session_id: String,
+    /// The 7-char grain-id shown to people. Reserved now for a new session.
+    pub public_id: Option<String>,
+    pub is_new: bool,
+    pub room_profile: String,
+}
+
+impl OpenedSession {
+    /// The `initialize` result's shape, which the IPC `open` shares.
+    pub(crate) fn to_json(&self) -> Value {
+        let mut result = json!({
+            "session_id": self.session_id,
+            "is_new": self.is_new,
+            "room_profile": self.room_profile,
+        });
+        if let Some(pub_id) = &self.public_id {
+            result["public_id"] = json!(pub_id);
+        }
+        result
+    }
+}
+
+/// Open a client session for `/rpc`'s `initialize` and the IPC chat's
+/// `open`: resume the one named, or reserve a new one, and pin it to
+/// `profile_name`.
+///
+/// `existing_header_session` is an internal UUID this server issued
+/// earlier, trusted as is; `param_id` is a public 7-char grain-id, `"new"`,
+/// or absent. `device` is the optional `{name, description}` block a voice
+/// client sends. On failure, the JSON-RPC error code and message.
+pub(crate) async fn open_session(
+    state: &Arc<ServeState>,
+    existing_header_session: Option<String>,
+    param_id: Option<&str>,
+    profile_name: String,
+    device: Option<&Value>,
+) -> Result<OpenedSession, (i32, &'static str)> {
     // Resolve to an internal UUID session_id.
     // - Session-Id header: already a UUID (internal), use directly.
     // - params.session_id: must be a 7-char grain-id (public) or "new"/absent.
@@ -629,31 +710,17 @@ async fn handle_initialize(
         // Header carries the internal UUID we issued — trust it directly.
         Some(uuid)
     } else {
-        let param_id = params
-            .as_ref()
-            .and_then(|p| p["session_id"].as_str())
-            .filter(|s| *s != "new")
-            .map(|s| s.to_string());
+        let param_id = param_id.filter(|s| *s != "new").map(|s| s.to_string());
 
         match param_id {
             None => None,
             Some(ref id) if id.len() == 7 => {
                 match state.cross_device_session_store.find_by_public_id(id) {
                     Some(uuid) => Some(uuid),
-                    None => {
-                        let body = error_response(req_id, -32602, "Session not found");
-                        return body.into_response();
-                    }
+                    None => return Err((-32602, "Session not found")),
                 }
             }
-            Some(_) => {
-                let body = error_response(
-                    req_id,
-                    -32602,
-                    "Invalid session id (expected 7-char grain-id)",
-                );
-                return body.into_response();
-            }
+            Some(_) => return Err((-32602, "Invalid session id (expected 7-char grain-id)")),
         }
     };
 
@@ -710,12 +777,12 @@ async fn handle_initialize(
         .await
         .insert(session_id.clone(), profile_name.clone());
 
-    // Optional `params.device = { name, description }` from sapphire-agent-cli /
-    // other voice clients. We treat `name` as the device handle (e.g.
+    // Optional `params.device = { name, description }` from voice
+    // clients. We treat `name` as the device handle (e.g.
     // "living-room-speaker") and render the full room name server-side
     // — that way every voice client doesn't have to agree on a template
     // and the agent stays in control of how the metadata is presented.
-    if let Some(device) = params.as_ref().and_then(|p| p.get("device")) {
+    if let Some(device) = device {
         let device_name = device
             .get("name")
             .and_then(|v| v.as_str())
@@ -738,40 +805,12 @@ async fn handle_initialize(
         }
     }
 
-    let mut result = json!({
-        "session_id": session_id,
-        "is_new": is_new,
-    });
-    if let Some(ref pub_id) = public_id {
-        result["public_id"] = json!(pub_id);
-    }
-    if let Some(name) = state.session_room_profiles.lock().await.get(&session_id) {
-        result["room_profile"] = json!(name);
-    }
-
-    let body = json!({
-        "jsonrpc": "2.0",
-        "id": req_id,
-        "result": result,
-    });
-
-    let mut response = axum::response::Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "application/json")
-        .header(
-            "session-id",
-            HeaderValue::from_str(&session_id).unwrap_or_else(|_| HeaderValue::from_static("")),
-        )
-        .body(axum::body::Body::from(body.to_string()))
-        .unwrap();
-
-    // Also set Session-Id in the response headers (accessible via response)
-    response.headers_mut().insert(
-        "session-id",
-        HeaderValue::from_str(&session_id).unwrap_or_else(|_| HeaderValue::from_static("")),
-    );
-
-    response
+    Ok(OpenedSession {
+        session_id,
+        public_id,
+        is_new,
+        room_profile: profile_name,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -831,8 +870,18 @@ async fn handle_chat(
 // ---------------------------------------------------------------------------
 
 async fn handle_list_sessions(state: Arc<ServeState>, req_id: Value) -> axum::response::Response {
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "result": { "sessions": session_list(&state) },
+    });
+    (StatusCode::OK, axum::Json(body)).into_response()
+}
+
+/// The client sessions `list_sessions` and the IPC chat's `sessions` show.
+pub(crate) fn session_list(state: &ServeState) -> Vec<Value> {
     let metas = state.cross_device_session_store.list_sessions();
-    let items: Vec<Value> = metas
+    metas
         .into_iter()
         .map(|m| {
             let mut v = json!({
@@ -847,14 +896,7 @@ async fn handle_list_sessions(state: Arc<ServeState>, req_id: Value) -> axum::re
             }
             v
         })
-        .collect();
-
-    let body = json!({
-        "jsonrpc": "2.0",
-        "id": req_id,
-        "result": { "sessions": items },
-    });
-    (StatusCode::OK, axum::Json(body)).into_response()
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -874,17 +916,28 @@ async fn handle_get_session(
         }
     };
 
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "result": { "messages": session_history(&state, &session_id) },
+    });
+    (StatusCode::OK, axum::Json(body)).into_response()
+}
+
+/// A session's stored messages, as `get_session` and the IPC chat's
+/// `history` hand them back.
+pub(crate) fn session_history(state: &ServeState, session_id: &str) -> Vec<Value> {
     // `load_session` is the model's view — a compaction checkpoint trims
     // covered messages and prefixes a synthetic summary stub the client
     // never sent. This endpoint hands the record back to the client that
     // wrote it, so it must read the untrimmed, unsummarised record instead.
     let messages = state
-        .store_for_session(&session_id)
-        .load_session_full(&session_id)
+        .store_for_session(session_id)
+        .load_session_full(session_id)
         .map(|(messages, _summary)| messages)
         .unwrap_or_default();
 
-    let items: Vec<Value> = messages
+    messages
         .iter()
         .map(|m| {
             let role = match m.role {
@@ -927,14 +980,7 @@ async fn handle_get_session(
                 .collect();
             json!({ "role": role, "parts": parts })
         })
-        .collect();
-
-    let body = json!({
-        "jsonrpc": "2.0",
-        "id": req_id,
-        "result": { "messages": items },
-    });
-    (StatusCode::OK, axum::Json(body)).into_response()
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -3119,23 +3165,30 @@ async fn run_turn(
     if outcome.was_first_turn
         && let Some(text) = outcome.text
     {
-        let state2 = Arc::clone(&state);
-        let sid = session_id.clone();
-        let user_msg = user_message.clone();
-        tokio::spawn(async move {
-            let p = state2.provider_for_session(&sid).await;
-            if let Some(title) = generate_session_title(&*p, &user_msg, &text).await {
-                let result = if state2.is_acp(&sid).await {
-                    state2.acp_session_store.append_title(&sid, &title)
-                } else {
-                    state2.store_for_session(&sid).set_title(&sid, &title)
-                };
-                if let Err(e) = result {
-                    warn!("Failed to store session title: {e}");
-                }
-            }
-        });
+        spawn_session_title(state, session_id, user_message, text);
     }
+}
+
+/// Title a session from its first exchange, in the background.
+pub(crate) fn spawn_session_title(
+    state: Arc<ServeState>,
+    sid: String,
+    user_msg: String,
+    reply: String,
+) {
+    tokio::spawn(async move {
+        let p = state.provider_for_session(&sid).await;
+        if let Some(title) = generate_session_title(&*p, &user_msg, &reply).await {
+            let result = if state.is_acp(&sid).await {
+                state.acp_session_store.append_title(&sid, &title)
+            } else {
+                state.store_for_session(&sid).set_title(&sid, &title)
+            };
+            if let Err(e) = result {
+                warn!("Failed to store session title: {e}");
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -3805,6 +3858,9 @@ rooms    = []
             enabled: acp_enabled,
             keepalive_secs: acp_keepalive_secs,
             stdio_room_profile: Some("developer".to_string()),
+        });
+        config.cli = Some(crate::config::CliConfig {
+            room_profile: Some("developer".to_string()),
         });
         config.tools.tool_rounds = rounds;
         config.room_profiles.get_mut("developer").unwrap().devices =

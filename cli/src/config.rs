@@ -35,6 +35,10 @@ pub struct Config {
     /// `GET /acp` route off. Host-local — see [`AcpConfig`].
     #[serde(default)]
     pub acp: Option<AcpConfig>,
+    /// `[cli]` — `sapphire-agent chat`, the REPL that reaches the running
+    /// agent over its local IPC endpoint. Host-local — see [`CliConfig`].
+    #[serde(default)]
+    pub cli: Option<CliConfig>,
     /// Workspace-external image cache. Holds raw bytes for vision
     /// inputs by SHA-256 so in-memory `ChatMessage` history and JSONL
     /// session files only carry compact references. When unset, the
@@ -305,6 +309,23 @@ impl Default for AcpConfig {
 
 fn default_acp_keepalive_secs() -> u64 {
     30
+}
+
+/// `[cli]` — `sapphire-agent chat`, carried to the running agent over the
+/// app server's IPC endpoint.
+///
+/// Host-local by construction, like [`AcpConfig`]: `src/config_layer.rs` is
+/// default-deny.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct CliConfig {
+    /// The room profile `sapphire-agent chat` runs under. Unset, `chat`
+    /// refuses to start and says so.
+    ///
+    /// A bearer token picks the room profile on `/rpc`; the IPC endpoint has
+    /// none — it only lets this OS user in — so the profile is named here,
+    /// the way `[acp].stdio_room_profile` names stdio ACP's.
+    #[serde(default)]
+    pub room_profile: Option<String>,
 }
 
 /// Image cache settings. See [`Config::image_cache`] for an overview
@@ -1574,6 +1595,14 @@ api_key = "test"
                 "[acp].stdio_room_profile references unknown room_profile '{name}'"
             ));
         }
+        if let Some(name) = self.cli.as_ref().and_then(|c| c.room_profile.as_ref())
+            && name != DEFAULT_PROFILE_NAME
+            && !self.room_profiles.contains_key(name)
+        {
+            errors.push(format!(
+                "[cli].room_profile references unknown room_profile '{name}'"
+            ));
+        }
         // The admin allow list names room profiles. A typo there would grant
         // nothing and say nothing — the same hour-costing shape
         // `validate_subagent_profiles` exists to close.
@@ -2295,6 +2324,22 @@ mod tests {
         );
         let unset = parse("[anthropic]\napi_key = \"test\"\n\n[acp]\nenabled = true\n");
         assert_eq!(unset.acp.unwrap().stdio_room_profile, None);
+    }
+
+    /// Likewise `[cli].room_profile`, rather than every `sapphire-agent chat`.
+    #[test]
+    fn an_unknown_cli_room_profile_is_reported() {
+        let cfg = parse("[anthropic]\napi_key = \"test\"\n\n[cli]\nroom_profile = \"typo\"\n");
+        let errors = cfg.validate_profiles();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("[cli].room_profile") && e.contains("typo")),
+            "{errors:?}"
+        );
+        let default =
+            parse("[anthropic]\napi_key = \"test\"\n\n[cli]\nroom_profile = \"default\"\n");
+        assert!(default.validate_profiles().is_empty());
     }
 
     /// The default is off. An agent that starts working on its own

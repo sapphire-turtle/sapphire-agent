@@ -54,7 +54,7 @@ sort_commits = "oldest"
 # `(voice)`, ...) need no change here — they fall through to the
 # conventional-type parsers and appear in agent's changelog.
 [[git.commit_parsers]]
-message = '^[a-z]+\((desktop|cli|call|rpc|core|release|release-plz|fmt|ci|test|deps)\):'
+message = '^[a-z]+\((desktop|rpc|core|release|release-plz|fmt|ci|test|deps)\):'
 skip = true
 
 # Conventional commit type → changelog group mapping. Mirrors
