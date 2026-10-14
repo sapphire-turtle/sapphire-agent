@@ -665,9 +665,10 @@ tracks removing that). **The `parent` chain is the authority on
 order, not the `id`'s embedded clock** — two writers with skewed clocks
 would otherwise sort against each other wrongly.
 
-Zed's session picker lists this token's own conversations: `session/list`
-returns every open session under the connecting device's room profile's
-memory namespace — that is the isolation boundary, not the room profile
+Zed's session picker lists the connection's own conversations: `session/list`
+returns every open session under the memory namespace of the connection's
+room profile — the one its token picked on `/acp`, or
+`[acp].stdio_room_profile` for `sapphire-agent acp` — that is the isolation boundary, not the room profile
 itself, so two profiles that leave `memory_namespace` unset both land on
 `default` and see each other's sessions. Zed can further narrow the list to
 the project directory it has open (`cwd`), which every ACP session records
@@ -690,15 +691,22 @@ from the digest.
 
 A second, similarly workspace-external location,
 `<cache_dir>/sapphire-agent/tool-results/<sha256>`, is a content-addressed
-cache holding a tool call's result by hash — the JSONL itself stores only
-the tool name, the result's hash, not the result body, and the input as
+cache holding a tool call's result by hash — the session's event file stores
+only the tool name, the result's hash, not the result body, and the input as
 given. The input has nowhere to be hashed out to the way a result does, so
-it goes into the JSONL directly; one that serialises past the same 50,000
-byte cap is elided to a small marker object on the way to disk rather than
-stored, so a single oversized call cannot put its raw content into the
+it goes into the event file directly; one that serialises past the same
+50,000 byte cap is elided to a small marker object on the way to disk rather
+than stored, so a single oversized call cannot put its raw content into the
 (indexed) workspace. An ACP session's `tool_use` and `tool_result` messages
 are persisted (see "Tool calls are persisted for ACP sessions" below);
 every other transport still is not.
+
+**Both caches belong to the host, and are not synced.** The session files
+are in the workspace and travel to every synced host; the caches stay on the
+host that wrote them. A session continued on another host therefore sees the
+results of tool calls made elsewhere as placeholders (see the next
+paragraph). Whether to sync them is an open question in the
+[design note](docs/superpowers/specs/2026-10-13-app-server-sync-acp-stdio-design.md).
 
 **Losing the cache degrades a session rather than breaking it.** Delete
 the directory, or lose an entry to a write failure, and the session still
@@ -723,20 +731,20 @@ cannot be pruned out of the session log itself: events are chained by
 **ACP sessions appear in both the cross-session "today" digest and the
 daily log.** The digest is kept current by a sweep on a rolling 30-minute
 cadence from process start, which regenerates only the sessions whose
-newest message postdates their cached digest. `/rpc`, device-default and
-MCP sessions still do not reach the daily log —
+newest message postdates their cached digest. `/rpc` and device-default
+sessions still do not reach the daily log —
 [#189](https://github.com/fluo10/sapphire-agent/issues/189).
 
 **Tool calls are persisted for ACP sessions.** `run_llm_turn` writes
-`tool_use` and `tool_result` messages to the ACP session's JSONL (see
-"A second, similarly workspace-external location" above for what the
-JSONL stores versus the result cache). `/rpc`, device-default and MCP
-sessions do not — their line format has no reference form for a result,
+`tool_use` and `tool_result` events to the ACP session's directory (see
+"A second, similarly workspace-external location" above for what an
+event file stores versus the result cache). `/rpc` and device-default
+sessions do not — their event format has no reference form for a result,
 so writing one raw would put the content in the workspace and the
 retrieve index, which is exactly what the ACP store's external cache
 exists to avoid for results ([#194](https://github.com/fluo10/sapphire-agent/issues/194)).
 That protection is only for results, though — a tool *input* has no
-hash-and-cache indirection, so it lands in the JSONL directly, bounded
+hash-and-cache indirection, so it lands in the event file directly, bounded
 rather than eliminated: capped at the same 50,000-byte limit, and
 elided to a marker object above it. Reloading an ACP session therefore
 restores what the agent did as well as what was said — but the editor
@@ -789,9 +797,9 @@ whole turn.
   the API returns, so neither `session/update: usage_update` nor
   `PromptResponse.usage` is sent, and the editor cannot show what a turn
   cost or how full the context is.
-- **`/rpc`, device-default and MCP sessions still do not persist tool
-  calls.** Only ACP sessions write `tool_use` / `tool_result` to their
-  JSONL; the other transports' line format has no reference form for a
+- **`/rpc` and device-default sessions still do not persist tool
+  calls.** Only ACP sessions write `tool_use` / `tool_result` events;
+  the other transports' event format has no reference form for a
   result, so a reload of one of those restores what was said but not what
   was done. Tracked as [#194](https://github.com/fluo10/sapphire-agent/issues/194).
 - **A loaded session's tool calls are not shown in the editor.** Even for
