@@ -21,7 +21,7 @@ sapphire-agent-client = { path = "../crates/sapphire-agent-client", version = "0
 # rewriting the runtime later. Default features are deliberately
 # avoided: bevy ships ~70 of them, including audio and asset loaders we
 # don't need yet, and pulling them all in slows the cold build by minutes.
-bevy = { version = "0.18", default-features = false, features = [
+bevy = { version = "0.20", default-features = false, features = [
     "bevy_winit",
     "bevy_window",
     "bevy_render",
@@ -29,7 +29,7 @@ bevy = { version = "0.18", default-features = false, features = [
     "bevy_text",
     "bevy_ui",
     "bevy_sprite",
-    # bevy_egui 0.39 enables its `picking` feature by default and emits
+    # bevy_egui enables its `picking` feature by default and emits
     # a warning at startup if bevy's matching `bevy_picking` isn't on;
     # without it, the picking plugin isn't installed and bevy_egui's
     # input + render path doesn't wire up correctly (window paints
@@ -43,14 +43,14 @@ bevy = { version = "0.18", default-features = false, features = [
 
 # Immediate-mode UI inside the bevy app — drives every panel until /
 # unless we eventually replace specific panels with native bevy_ui.
-bevy_egui = "0.39"
+bevy_egui = "0.43"
 
 # egui_extras supplies the image loader plumbing we use to render the
 # bundled Lucide SVG icons (settings / mic / send / stop). The `svg`
 # feature pulls in resvg, which turns each SVG into a texture at the
-# requested DPI on first use. Pinned to 0.33 so it matches the egui
-# 0.33.x re-export from bevy_egui 0.39.
-egui_extras = { version = "0.33", features = ["svg"] }
+# requested DPI on first use. Pinned to 0.36 so it matches the egui
+# 0.36.x re-export from bevy_egui 0.43.
+egui_extras = { version = "0.36", features = ["svg"] }
 
 # Async RPC needs its own runtime because bevy's scheduler is sync.
 # Multi-threaded so streaming chat + audio playback don't block the

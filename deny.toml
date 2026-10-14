@@ -24,8 +24,8 @@ ignore = [
     # The bincode (RUSTSEC-2025-0141) and encoding (RUSTSEC-2021-0153) entries
     # are gone: both reached us through lance, which left the graph when
     # sapphire-framework dropped its LanceDB backend. `cargo tree -i` finds
-    # neither package now, even under --all-features.
-    { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained but pulled in via many proc-macro consumers; no drop-in replacement." },
+    # neither package now, even under --all-features. paste (RUSTSEC-2024-0436)
+    # went the same way when the desktop moved to bevy 0.20.
 
     # --- unmaintained, reached only through the bevy/egui text stack ---
     # ttf-parser is unmaintained upstream (author-declared). It reaches us via
@@ -59,13 +59,13 @@ ignore = [
     # itself; RustSec lists no safe upgrade. Re-check on the next bump.
     { id = "RUSTSEC-2026-0319", reason = "anymap2 is unmaintained; a direct dependency of matrix-sdk 0.19. No safe upgrade." },
 
-    # --- ruzstd 0.8 pinned by bevy 0.18 (desktop only) ---
-    # Fixed in ruzstd 0.9.1, but bevy_image 0.18 requires ^0.8 and bevy_egui
-    # 0.39 turns on its `zstd_rust` feature whenever rendering is on, so it
-    # cannot be dropped. It decodes zstd-compressed KTX2 textures, and the
-    # desktop client loads no such assets, let alone untrusted ones. Drop
-    # this when the desktop moves to a bevy whose bevy_image takes 0.9.
-    { id = "RUSTSEC-2026-0344", reason = "ruzstd decompression bomb; reached only via the desktop's bevy_image 0.18 (KTX2 textures, none loaded). Needs a bevy upgrade." },
+    # --- ruzstd 0.8 pinned by bevy (desktop only) ---
+    # Fixed in ruzstd 0.9.1, but bevy_image requires ^0.8 — still so in bevy
+    # 0.20 — and bevy_egui turns on its `zstd_rust` feature whenever
+    # rendering is on, so it cannot be dropped. It decodes zstd-compressed
+    # KTX2 textures, and the desktop client loads no such assets, let alone
+    # untrusted ones. Drop this when bevy_image takes ruzstd 0.9.
+    { id = "RUSTSEC-2026-0344", reason = "ruzstd decompression bomb; reached only via the desktop's bevy_image, which pins ^0.8 through bevy 0.20 (KTX2 textures, none loaded)." },
 ]
 
 [licenses]
