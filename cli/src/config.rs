@@ -35,8 +35,9 @@ pub struct Config {
     /// `GET /acp` route off. Host-local — see [`AcpConfig`].
     #[serde(default)]
     pub acp: Option<AcpConfig>,
-    /// `[cli]` — `sapphire-agent chat`, the REPL that reaches the running
-    /// agent over its local IPC endpoint. Host-local — see [`CliConfig`].
+    /// `[cli]` — the local chat clients (`sapphire-agent chat`, the desktop)
+    /// that reach the running agent over its IPC endpoint. Host-local — see
+    /// [`CliConfig`].
     #[serde(default)]
     pub cli: Option<CliConfig>,
     /// Workspace-external image cache. Holds raw bytes for vision
@@ -311,15 +312,16 @@ fn default_acp_keepalive_secs() -> u64 {
     30
 }
 
-/// `[cli]` — `sapphire-agent chat`, carried to the running agent over the
-/// app server's IPC endpoint.
+/// `[cli]` — the local chat clients, `sapphire-agent chat` and
+/// `sapphire-agent-desktop`, carried to the running agent over the app
+/// server's IPC endpoint.
 ///
 /// Host-local by construction, like [`AcpConfig`]: `src/config_layer.rs` is
 /// default-deny.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct CliConfig {
-    /// The room profile `sapphire-agent chat` runs under. Unset, `chat`
-    /// refuses to start and says so.
+    /// The room profile the local chat clients run under. Unset, they
+    /// cannot open a session, and are told so.
     ///
     /// A bearer token picks the room profile on `/rpc`; the IPC endpoint has
     /// none — it only lets this OS user in — so the profile is named here,

@@ -12,8 +12,9 @@ name = "sapphire-agent-desktop"
 path = "src/main.rs"
 
 [dependencies]
+# The local chat protocol and its client: the desktop talks to the agent
+# running on this host over its IPC endpoint, like `sapphire-agent chat`.
 sapphire-agent-core = { path = "../crates/sapphire-agent-core", version = "0.8.0" }
-sapphire-agent-client = { path = "../crates/sapphire-agent-client", version = "0.8.0" }
 
 # Game engine — needed up front for the eventual 3D character work
 # (desktop-mate-style avatar). For the chat-only first cut we use only
@@ -46,21 +47,16 @@ bevy = { version = "0.20", default-features = false, features = [
 bevy_egui = "0.43"
 
 # egui_extras supplies the image loader plumbing we use to render the
-# bundled Lucide SVG icons (settings / mic / send / stop). The `svg`
+# bundled Lucide SVG icons (send). The `svg`
 # feature pulls in resvg, which turns each SVG into a texture at the
 # requested DPI on first use. Pinned to 0.36 so it matches the egui
 # 0.36.x re-export from bevy_egui 0.43.
 egui_extras = { version = "0.36", features = ["svg"] }
 
-# Async RPC needs its own runtime because bevy's scheduler is sync.
-# Multi-threaded so streaming chat + audio playback don't block the
-# UI tokio task on the same thread.
+# The agent client is async but bevy's scheduler is sync, so it gets its
+# own runtime. Multi-threaded so an in-flight turn doesn't hold up a
+# reconnect.
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
-
-# Shared HTTP client. Blocking variant is used by the one-shot
-# Silero VAD model download on first mic press (off the tokio runtime
-# via spawn_blocking).
-reqwest = { workspace = true, features = ["blocking"] }
 
 # Error handling
 anyhow.workspace = true
@@ -68,20 +64,3 @@ anyhow.workspace = true
 # Logging
 tracing = "0.1"
 tracing-subscriber.workspace = true
-
-# Desktop-specific config (extends the shared core ServerConfig with
-# TTS opt-in + window-state knobs).
-serde = { version = "1", features = ["derive"] }
-toml = "1"
-directories = "6"
-
-# Audio I/O: TTS playback (server-streamed s16le mono 16 kHz PCM)
-# and mic capture for the voice button. Same crate the call CLI
-# satellite uses, so the cpal sample-format handling matches.
-cpal = "0.18"
-
-# Silero VAD for mic auto-stop on silence — matches the CLI's
-# detection logic instead of rolling a separate energy-based path.
-# sherpa-onnx statically links its C++ + ONNX runtime, so first
-# build of this crate is slow.
-sherpa-onnx = "1.13"

@@ -1,25 +1,17 @@
-//! Chat over IPC: `sapphire-agent chat`, carried to the running agent over
-//! the app server's IPC endpoint.
+//! Chat over IPC: `sapphire-agent chat` and `sapphire-agent-desktop`,
+//! carried to the running agent over the app server's IPC endpoint.
 //!
-//! The REPL is a client of the agent already running on this host, the way
-//! `sapphire-agent acp` is — and the way every sapphire-framework app's CLI
-//! reaches its own server — rather than an HTTP client of `/rpc`:
+//! The local clients reach the agent already running on this host, the way
+//! `sapphire-agent acp` does — and the way every sapphire-framework app's
+//! clients reach their own server — rather than over HTTP `/rpc`:
 //!
 //! ```text
-//! terminal ──▶ sapphire-agent chat ──IPC──▶ sapphire-agent serve
+//! sapphire-agent chat / sapphire-agent-desktop ──IPC──▶ sapphire-agent serve
 //! ```
 //!
-//! The methods mirror `/rpc`'s client surface, and share its handlers'
-//! bodies (see [`open_session`]):
-//!
-//! - [`OPEN`] `{session?}` resumes the session with that public id, or
-//!   reserves a new one, and answers like `initialize`.
-//! - [`SEND`] `{session_id, content}` runs one turn and answers
-//!   `{content}` once it is done. While it runs, [`PROGRESS`]
-//!   `{session_id, kind, id, name}` notifies each tool call starting
-//!   (`kind: "tool_start"`) and ending (`"tool_end"`).
-//! - [`HISTORY`] `{session_id}` answers `{messages}`, like `get_session`.
-//! - [`SESSIONS`] answers `{sessions}`, like `list_sessions`.
+//! The method names and the client live in `sapphire-agent-core`, which
+//! documents the protocol. They mirror `/rpc`'s client surface, and this
+//! side shares its handlers' bodies (see [`open_session`]).
 //!
 //! There is no token on this path. The IPC endpoint admits only the OS user
 //! that runs the server, and the room profile a token would have picked is
@@ -27,10 +19,8 @@
 
 use std::sync::{Arc, Mutex, OnceLock};
 
-use anyhow::{Context as _, Result, anyhow, bail};
-use sapphire_framework::ipc::{
-    Client, ClientInfo, PeerHandle, RequestCtx, Router, RpcError, codes,
-};
+use sapphire_agent_core::{HISTORY, OPEN, PROGRESS, SEND, SESSIONS};
+use sapphire_framework::ipc::{PeerHandle, RequestCtx, Router, RpcError, codes};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::{info, warn};
@@ -40,17 +30,6 @@ use super::{
     spawn_session_title,
 };
 use crate::provider::ChatMessage;
-
-/// Open (resume or reserve) a session.
-pub const OPEN: &str = "sapphire-agent.chat.open";
-/// Run one turn; answers with the reply.
-pub const SEND: &str = "sapphire-agent.chat.send";
-/// A session's stored messages.
-pub const HISTORY: &str = "sapphire-agent.chat.history";
-/// The client sessions.
-pub const SESSIONS: &str = "sapphire-agent.chat.sessions";
-/// Notification: a tool call in a [`SEND`] turn started or ended.
-pub const PROGRESS: &str = "sapphire-agent.chat.progress";
 
 /// The server's side: the methods above, registered on the app server's
 /// router.
@@ -149,8 +128,8 @@ impl ChatTunnel {
             .and_then(|c| c.room_profile.clone())
         else {
             return Err(failed(
-                "`sapphire-agent chat` needs a room profile: set [cli].room_profile in this \
-                 host's config.toml",
+                "local chat clients (`sapphire-agent chat`, sapphire-agent-desktop) need a room \
+                 profile: set [cli].room_profile in this host's config.toml",
             ));
         };
         let opened = open_session(&state, None, params.session.as_deref(), profile, None)
@@ -270,152 +249,12 @@ impl TurnHost for IpcProgress {
     }
 }
 
-/// The client's side: the running agent, reached over its IPC endpoint.
-pub struct ChatClient {
-    client: Client,
-}
-
-/// A session [`ChatClient::open`] opened.
-#[derive(Debug)]
-pub struct Opened {
-    /// The internal id later calls name it by.
-    pub session_id: String,
-    /// The id shown to people.
-    pub display_id: String,
-    pub is_new: bool,
-}
-
-/// One tool call starting or ending, from [`PROGRESS`].
-pub struct ToolEvent {
-    pub started: bool,
-    pub id: String,
-    pub name: String,
-}
-
-impl ChatClient {
-    /// Dial the agent running on this host. Starts none.
-    pub async fn connect() -> Result<Self> {
-        let app = crate::APP_CTX.app_name;
-        let endpoint = sapphire_framework::ipc::Endpoint::for_app(app)?;
-        let info = ClientInfo {
-            kind: "chat".to_owned(),
-            version: crate::app_server::VERSION.to_owned(),
-            api: sapphire_framework_server_api::API_VERSION,
-            app_api: Some(super::acp_tunnel::APP_API),
-            pid: std::process::id(),
-        };
-        let Some((client, _)) = sapphire_framework::ipc::connect_or_absent(&endpoint, app, info)
-            .await
-            .context("connecting to the running agent")?
-        else {
-            bail!(
-                "{app} is not running on this host; `{app} chat` talks to a running agent and \
-                 starts none. Start it with `{app} serve`, or install it as a service with \
-                 `{app} service install`"
-            );
-        };
-        Ok(Self { client })
-    }
-
-    /// Resume the session with public id `session`, or reserve a new one.
-    pub async fn open(&self, session: Option<&str>) -> Result<Opened> {
-        let result: Value = self
-            .client
-            .call(OPEN, json!({ "session": session }))
-            .await
-            .map_err(|e| anyhow!(e))?;
-        let session_id = result["session_id"]
-            .as_str()
-            .ok_or_else(|| anyhow!("{OPEN} answered no session id"))?
-            .to_owned();
-        let display_id = result["public_id"]
-            .as_str()
-            .unwrap_or(&session_id)
-            .to_owned();
-        Ok(Opened {
-            session_id,
-            display_id,
-            is_new: result["is_new"].as_bool().unwrap_or(true),
-        })
-    }
-
-    /// Run one turn in `session_id`, handing each tool event to `on_tool`
-    /// as it arrives, and return the reply.
-    pub async fn send(
-        &self,
-        session_id: &str,
-        content: &str,
-        mut on_tool: impl FnMut(ToolEvent),
-    ) -> Result<String> {
-        // Subscribed before the call, so no notification can be missed.
-        let mut events = self.client.notifications();
-        let call = self.client.call::<_, Value>(
-            SEND,
-            json!({ "session_id": session_id, "content": content }),
-        );
-        tokio::pin!(call);
-        let mut handle = |event: sapphire_framework::ipc::Notification| {
-            if event.method != PROGRESS || event.params["session_id"].as_str() != Some(session_id) {
-                return;
-            }
-            let started = match event.params["kind"].as_str() {
-                Some("tool_start") => true,
-                Some("tool_end") => false,
-                _ => return,
-            };
-            on_tool(ToolEvent {
-                started,
-                id: event.params["id"].as_str().unwrap_or_default().to_owned(),
-                name: event.params["name"].as_str().unwrap_or("?").to_owned(),
-            });
-        };
-        let answered = loop {
-            tokio::select! {
-                // Notifications first: the server sends each before its
-                // answer, so one already here belongs before the reply.
-                biased;
-                event = events.recv() => {
-                    if let Ok(event) = event {
-                        handle(event);
-                    }
-                }
-                answered = &mut call => break answered,
-            }
-        };
-        // Whatever arrived with the answer.
-        while let Ok(event) = events.try_recv() {
-            handle(event);
-        }
-        let result = answered.map_err(|e| anyhow!(e))?;
-        Ok(result["content"].as_str().unwrap_or_default().to_owned())
-    }
-
-    /// `session_id`'s stored messages.
-    pub async fn history(&self, session_id: &str) -> Result<Vec<Value>> {
-        let result: Value = self
-            .client
-            .call(HISTORY, json!({ "session_id": session_id }))
-            .await
-            .map_err(|e| anyhow!(e))?;
-        Ok(result["messages"].as_array().cloned().unwrap_or_default())
-    }
-
-    /// The client sessions.
-    pub async fn sessions(&self) -> Result<Vec<Value>> {
-        let result: Value = self
-            .client
-            .call(SESSIONS, json!({}))
-            .await
-            .map_err(|e| anyhow!(e))?;
-        Ok(result["sessions"].as_array().cloned().unwrap_or_default())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::provider::{ChatResponse, ToolCall};
-    use sapphire_framework::ipc::{Connection, ManagedBy, ServerInfo, serve};
+    use sapphire_agent_core::{APP_API, ChatClient};
+    use sapphire_framework::ipc::{Client, ClientInfo, Connection, ManagedBy, ServerInfo, serve};
 
     const APP: &str = "sapphire-agent";
 
@@ -427,7 +266,7 @@ mod tests {
         let server_info = ServerInfo {
             version: "test".into(),
             api: 1,
-            app_api: Some(super::super::acp_tunnel::APP_API),
+            app_api: Some(APP_API),
             pid: std::process::id(),
             managed_by: ManagedBy::Service,
         };
@@ -436,13 +275,13 @@ mod tests {
             kind: "chat".into(),
             version: "test".into(),
             api: 1,
-            app_api: Some(super::super::acp_tunnel::APP_API),
+            app_api: Some(APP_API),
             pid: std::process::id(),
         };
         let (client, _) = Client::handshake(client_end, APP, client_info)
             .await
             .unwrap();
-        ChatClient { client }
+        ChatClient::from_client(client)
     }
 
     fn reply_text(text: &str) -> ChatResponse {

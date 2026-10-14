@@ -3,8 +3,8 @@
 > **Note (#278):** the `sapphire-agent-cli voice` satellite this guide drives
 > was removed when the CLI merged into the single `sapphire-agent` binary; its
 > role moves to wearable device firmware. The server side described here
-> (`voice/*` on `/rpc`, the STT/TTS providers) is unchanged and is still what
-> `sapphire-agent-desktop` uses. To follow the satellite steps as written, use
+> (`voice/*` on `/rpc`, the STT/TTS providers) is unchanged, for networked
+> voice clients; `sapphire-agent-desktop` no longer uses it. To follow the satellite steps as written, use
 > the `sapphire-agent-cli-v0.8.0` tag; read `sapphire-agent-server` there as
 > `sapphire-agent serve` against a current server.
 

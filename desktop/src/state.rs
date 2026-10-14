@@ -3,37 +3,22 @@
 //! Kept independent of bevy types so future mobile / cross-platform GUI
 //! crates (`sapphire-agent-mobile`, `sapphire-agent-gui`) can reuse it.
 
-/// Which screen is currently rendered.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Screen {
-    /// First-run setup or "Settings" entered from the chat screen.
-    Settings,
-    /// Live chat against the configured endpoint.
-    Chat,
-}
-
 /// Connection lifecycle for the agent session.
 #[derive(Debug, Clone)]
 pub enum Session {
-    /// Either no config yet, or the user backed out of a previous
-    /// connection attempt.
-    Disconnected,
-    /// Background task is running `initialize` against the configured
-    /// endpoint.
-    Initializing,
+    /// Background task is connecting to the local agent and opening a
+    /// session.
+    Connecting,
     /// Session is ready; chat input is enabled.
-    Ready {
-        session_id: String,
-        display_id: String,
-    },
-    /// `initialize` failed. The message is surfaced in the chat panel
-    /// and the user can retry from Settings.
+    Ready { display_id: String },
+    /// Connecting failed — typically the agent isn't running on this
+    /// host. The message is surfaced in the top bar with a retry button.
     Failed { message: String },
 }
 
-/// A single message in the on-screen chat history. Tool calls and
-/// audio chunks aren't persisted here — they're transient UI affordances
-/// (spinner / playback) rendered separately while a turn is in flight.
+/// A single message in the on-screen chat history. Tool calls aren't
+/// persisted here — they're transient UI affordances rendered separately
+/// while a turn is in flight.
 #[derive(Debug, Clone)]
 pub struct ChatEntry {
     pub role: ChatRole,
@@ -44,28 +29,14 @@ pub struct ChatEntry {
 pub enum ChatRole {
     User,
     Assistant,
-    /// System-level notice (e.g. TTS unavailable, connection error).
-    /// Rendered in a muted style.
+    /// System-level notice (e.g. a connection or turn error). Rendered in
+    /// a muted style.
     System,
 }
 
-/// In-flight turn state. Disabled input until the server emits its
-/// final `result`.
+/// In-flight turn state. Disabled input until the server answers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnState {
     Idle,
     Sending,
-}
-
-/// Whether the mic capture path is active. `Recording` carries a flag
-/// for whether Silero VAD has seen the start of speech yet — the UI
-/// uses it for the "listening…" affordance vs. the idle mic icon.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MicUiState {
-    Idle,
-    Recording {
-        speech_detected: bool,
-    },
-    /// Audio captured; waiting for `voice/pipeline_run` to return.
-    Uploading,
 }

@@ -46,10 +46,9 @@ jobs:
             binary: sapphire-agent-desktop
             asset_name: sapphire-agent-desktop-macos-aarch64
             continue-on-error: true
-          - os: windows-latest
-            binary: sapphire-agent-desktop.exe
-            asset_name: sapphire-agent-desktop-windows-x86_64.exe
-            continue-on-error: true
+          # No Windows entry: the desktop talks to the agent running on the
+          # same host over its local IPC endpoint (#278), and the agent has
+          # no Windows build (#182).
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write
@@ -62,15 +61,14 @@ jobs:
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      # bevy needs X11 + Wayland + libxkbcommon; cpal needs ALSA; bevy_winit
-      # talks to udev for device hot-plug events. Only required on Linux —
-      # macOS and Windows ship the equivalents in the base SDK.
+      # bevy needs X11 + Wayland + libxkbcommon; bevy_winit talks to udev
+      # for device hot-plug events. Only required on Linux — macOS ships the
+      # equivalents in the base SDK.
       - name: Install Linux build deps
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libasound2-dev \
             libudev-dev \
             libwayland-dev \
             libxkbcommon-dev \
@@ -81,30 +79,7 @@ jobs:
             pkg-config
 
       - uses: Swatinem/rust-cache@v2
-      - uses: ./.github/actions/refresh-sherpa-onnx-libs
       - run: cargo build --release --package sapphire-agent-desktop
-
-      # This crate never pulled `ort` — it only followed the workspace onto
-      # shared sherpa linking, because Cargo unifies features additively and
-      # sherpa-onnx-sys refuses `static` and `shared` at once. With `ort`
-      # behind an off-by-default feature in the CLI, it links static again.
-      - name: Assert the binary is self-contained
-        shell: bash
-        run: |
-          bin="target/release/${{ matrix.binary }}"
-          case "$RUNNER_OS" in
-            Linux) deps=$(ldd "$bin") ;;
-            macOS) deps=$(otool -L "$bin") ;;
-            # No dumpbin without the VS dev shell, so use a proxy:
-            # sherpa-onnx-sys drops its DLLs next to the exe only when
-            # built shared, so finding one is the failure this guards.
-            Windows) deps=$(ls target/release/*.dll 2>/dev/null || true) ;;
-          esac
-          if grep -i sherpa <<<"$deps"; then
-            echo "::error::$bin depends on a sherpa-onnx library; this asset would not start"
-            exit 1
-          fi
-          echo "$bin links no sherpa-onnx library — self-contained."
 
       - name: Package binary
         shell: bash

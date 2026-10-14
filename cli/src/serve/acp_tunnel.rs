@@ -52,12 +52,9 @@ use super::ServeState;
 use super::acp::serve_connection;
 
 /// The version of the agent's own IPC methods — the ones below and
-/// [`super::chat_ipc`]'s — apart from the framework's. The handshake refuses
-/// a server that speaks another, so a client never talks to an agent that
-/// would read its calls differently, or lacks them.
-///
-/// 2: added `sapphire-agent.chat.*`.
-pub const APP_API: u32 = 2;
+/// [`super::chat_ipc`]'s. Kept in `sapphire-agent-core`, beside the chat
+/// methods its clients share.
+pub use sapphire_agent_core::APP_API;
 
 /// Run one ACP connection; answers once it has ended.
 pub const OPEN: &str = "sapphire-agent.acp.open";

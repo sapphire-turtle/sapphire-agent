@@ -7,7 +7,6 @@ members = [
     "cli",
     "desktop",
     "crates/sapphire-agent-core",
-    "crates/sapphire-agent-client",
 ]
 # Keep the bare `cargo build` / `cargo test` at the repo root scoped to the
 # `sapphire-agent` binary, as it was when it was the root package. Without

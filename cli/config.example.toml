@@ -719,10 +719,10 @@ enabled = false
 # ---------------------------------------------------------------------------
 # [cli] — `sapphire-agent chat`
 # ---------------------------------------------------------------------------
-# `sapphire-agent chat` is the REPL (and `-m` one-shot) client. It runs on the
-# machine the agent runs on and reaches it over the local IPC endpoint, the
-# same way `sapphire-agent acp` does, so no token picks its room profile —
-# name it here. Unset, `sapphire-agent chat` exits with an error. Host-local:
-# the workspace layer cannot set it.
+# `sapphire-agent chat` (the REPL and `-m` one-shot client) and
+# `sapphire-agent-desktop` (the GUI) run on the machine the agent runs on and
+# reach it over the local IPC endpoint, the same way `sapphire-agent acp`
+# does, so no token picks their room profile — name it here. Unset, they
+# cannot open a session. Host-local: the workspace layer cannot set it.
 #[cli]
 #room_profile = "default"
