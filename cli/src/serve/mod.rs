@@ -3556,12 +3556,16 @@ impl crate::tools::Tool for Arc<AdminProfileProbe> {
 /// moved into a `ProviderRegistry` can still be read afterwards.
 #[cfg(test)]
 #[derive(Clone, Default)]
-pub(crate) struct ChatLog(Arc<std::sync::Mutex<Vec<(Option<String>, Vec<String>)>>>);
+pub(crate) struct ChatLog(Arc<std::sync::Mutex<Vec<ChatCall>>>);
+
+/// One recorded call: its system prompt and the names of the tools it offered.
+#[cfg(test)]
+pub(crate) type ChatCall = (Option<String>, Vec<String>);
 
 #[cfg(test)]
 impl ChatLog {
     /// A snapshot of every call recorded so far, in order.
-    pub(crate) fn calls(&self) -> Vec<(Option<String>, Vec<String>)> {
+    pub(crate) fn calls(&self) -> Vec<ChatCall> {
         self.0.lock().unwrap().clone()
     }
 }

@@ -1,0 +1,52 @@
+name: Release binaries
+
+# Builds a binary for the release platforms and attaches it to an existing
+# release. release-plz.yml calls it after a release; run it by hand to
+# (re)upload the files for an existing tag.
+on:
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+      target:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to attach binaries to (e.g. v0.9.0 or desktop-v0.9.0).'
+        required: true
+        type: string
+      target:
+        required: true
+        type: choice
+        options: [cli, desktop]
+
+jobs:
+  cli:
+    if: inputs.target == 'cli'
+    permissions:
+      contents: write
+    uses: sapphire-turtle/sapphire-framework/.github/workflows/shared-release-binary.yml@main
+    with:
+      tag: ${{ inputs.tag }}
+      package: sapphire-agent
+      binary: sapphire-agent
+      pre-build: .github/scripts/refresh-sherpa-onnx-libs.sh
+      # sherpa-onnx must be linked in, or the file would not start once copied
+      # away from target/.
+      post-build: .github/scripts/assert-self-contained.sh "$BIN"
+
+  desktop:
+    if: inputs.target == 'desktop'
+    permissions:
+      contents: write
+    uses: sapphire-turtle/sapphire-framework/.github/workflows/shared-release-binary.yml@main
+    with:
+      tag: ${{ inputs.tag }}
+      package: sapphire-agent-desktop
+      binary: sapphire-agent-desktop
+      linux-packages: >-
+        pkg-config libudev-dev libwayland-dev libxkbcommon-dev libx11-dev
+        libxi-dev libxcursor-dev libxrandr-dev

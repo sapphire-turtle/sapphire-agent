@@ -44,7 +44,7 @@ The resolution is to keep `ort` out of the default graph, which restores static 
 - The old voice-satellite CLI's openWakeWord detector is gone, and so is the satellite (#278).
 - **`desktop/`** — never pulled `ort`; it only followed the workspace's link mode.
 
-So `cargo build --workspace` works on Linux and macOS. It still does **not** link on Windows for `cli/`, which is fine — the agent is a headless server app with no Windows build (#182). The desktop has none either: it talks to the agent on its own host over IPC.
+So `cargo build --workspace` works on Linux and macOS. It still does **not** link on Windows for `cli/`. Since the CLI and the server became one binary (#278) that is no longer fine — the CLI has to run on Windows — and making it link there is #299 (reversing #182).
 
 ### Historical note: agent false-positive release PRs (now fixed)
 
@@ -65,7 +65,7 @@ Rust's `regex` crate has no negative lookahead, so the filter is an allowlist of
 
 ## Release flow recap
 
-- `release-plz` creates per-package tags (`sapphire-agent-v*`, `sapphire-agent-desktop-v*`, ...) and GitHub releases on push to main.
-- `.github/workflows/release-plz.yml` parses the `releases` output with `jq` and chains into reusable build workflows (`release.yml`, `release-desktop.yml`) which attach platform binaries to each release.
-- Tags pushed by `GITHUB_TOKEN` don't fire downstream workflows on their own — the `workflow_call` chain inside `release-plz.yml` is the path; `workflow_dispatch` with `-f tag=…` is the retroactive escape hatch.
-- `sapphire-agent-desktop` carries `publish = false`; release-plz still tags + releases it because `release-plz.toml` sets `release = true` explicitly (the default for `publish = false` crates is to skip them).
+- `release-plz` creates the tags and GitHub releases on push to main: `v{version}` for `sapphire-agent`, `desktop-v{version}` for `sapphire-agent-desktop`, none for `sapphire-agent-core` (the sapphire-turtle convention; per-package `sapphire-agent-*-v*` tags are history).
+- `.github/workflows/release-plz.yml` calls sapphire-framework's shared `shared-release-plz.yml` and, for each released package, `release-binaries.yml`, which builds through the shared `shared-release-binary.yml` and attaches platform binaries to the release (`v{version}` for `sapphire-agent`, `desktop-v{version}` for the desktop). CI is the shared `shared-rust-ci.yml`; the sherpa-onnx cache refresh and the self-contained check live in `.github/scripts/`.
+- Tags a workflow pushes don't fire downstream workflows on their own — the `workflow_call` chain inside `release-plz.yml` is the path; running `release-binaries.yml` by hand (`-f tag=… -f target=cli|desktop`) is the retroactive escape hatch.
+- `sapphire-agent-desktop` carries `publish = false`; release-plz still tags + releases it because `release-plz.toml` sets `git_only = true` (it skips a `publish = false` crate without it; `release = true` alone no longer does it).

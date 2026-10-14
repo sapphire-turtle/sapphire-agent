@@ -1678,10 +1678,13 @@ mod tests {
     /// entire call — claim, run, persist, release — complete within a
     /// single poll, never giving a concurrently-started second resume a
     /// chance to observe the busy guard still held.
+    /// One call the provider saw: system prompt, messages, tools.
+    type ProviderCall = (Option<String>, Vec<ChatMessage>, Vec<ToolSpec>);
+
     #[derive(Default)]
     struct ScriptedProvider {
         script: std::sync::Mutex<std::collections::VecDeque<crate::provider::ChatResponse>>,
-        calls: std::sync::Mutex<Vec<(Option<String>, Vec<ChatMessage>, Vec<ToolSpec>)>>,
+        calls: std::sync::Mutex<Vec<ProviderCall>>,
     }
 
     impl ScriptedProvider {

@@ -3,7 +3,7 @@
 
 [graph]
 # Restrict the dep graph to the platforms we actually publish binaries for
-# (see release.yml). Drops UEFI/WASM-only transitive deps like `r-efi`
+# (see release-binaries.yml). Drops UEFI/WASM-only transitive deps like `r-efi`
 # (LGPL-2.1-or-later) so we don't need to allow their licenses.
 targets = [
     "x86_64-unknown-linux-gnu",
@@ -103,6 +103,10 @@ confidence-threshold = 0.93
 # the sole graph root otherwise, so `sapphire-agent-desktop`'s tree had never
 # been checked before.
 exceptions = [
+    # Our own desktop app is GPL-3.0-or-later with an app store exception
+    # (desktop/LICENSE.App-Store-Exception). Scoped to it, so a GPL dependency
+    # cannot slip in unnoticed.
+    { name = "sapphire-agent-desktop", allow = ["GPL-3.0-or-later"] },
     { name = "epaint_default_fonts", allow = ["OFL-1.1", "Ubuntu-font-1.0"] },
 ]
 
@@ -111,6 +115,9 @@ exceptions = [
 # transitively-pulled `syn`/`bitflags`/`hashbrown` version trips it).
 multiple-versions = "allow"
 wildcards = "deny"
+# A `path` dependency without a version (a workspace crate's dev-dependency, or a
+# crate that is not published) is not a wildcard on the registry.
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"
