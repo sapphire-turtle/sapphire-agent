@@ -4,18 +4,17 @@
 # (→ resolver "3"), so pin "3" to preserve the prior feature-resolution behavior.
 resolver = "3"
 members = [
-    "server",
     "cli",
     "desktop",
     "crates/sapphire-agent-core",
     "crates/sapphire-agent-client",
 ]
 # Keep the bare `cargo build` / `cargo test` at the repo root scoped to the
-# agent binary, as it was when `sapphire-agent` was the root package. Without
+# `sapphire-agent` binary, as it was when it was the root package. Without
 # this a virtual workspace defaults to all members, dragging in the desktop
-# (bevy) and cli (sherpa) builds. CI targets the full set explicitly via
+# (bevy) build. CI targets the full set explicitly via
 # `--workspace` / `--package`, so it is unaffected.
-default-members = ["server"]
+default-members = ["cli"]
 
 [workspace.dependencies]
 anyhow = "1.0"

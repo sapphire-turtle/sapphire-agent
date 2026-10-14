@@ -13,14 +13,15 @@ pr_name = "chore(release): version bump"
 # Custom git-cliff config to drop sibling-crate-scoped commits from the
 # generated changelog entries. Doesn't suppress the version bump itself
 # (release-plz decides "did this package change?" purely from file
-# paths, and `sapphire-agent-server` lives at the workspace root so any
-# Cargo.lock touch still counts) — but it keeps the changelog
-# readable. See cliff.toml for details.
+# paths) — but it keeps the changelog readable. See cliff.toml for
+# details.
 changelog_config = "./cliff.toml"
 
+# The one `sapphire-agent` binary: the server and its CLI (#278). Lives in
+# `cli/`, and continues the server's changelog and version line.
 [[package]]
-name = "sapphire-agent-server"
-changelog_path = "./server/CHANGELOG.md"
+name = "sapphire-agent"
+changelog_path = "./cli/CHANGELOG.md"
 
 [[package]]
 name = "sapphire-agent-core"
@@ -29,10 +30,6 @@ changelog_path = "./crates/sapphire-agent-core/CHANGELOG.md"
 [[package]]
 name = "sapphire-agent-client"
 changelog_path = "./crates/sapphire-agent-client/CHANGELOG.md"
-
-[[package]]
-name = "sapphire-agent-cli"
-changelog_path = "./cli/CHANGELOG.md"
 
 # sapphire-agent-desktop ships as a GitHub-release-only binary (bevy +
 # bundled font + ICE-licensed Lucide SVGs — not intended for crates.io,

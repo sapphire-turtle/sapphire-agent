@@ -16,7 +16,7 @@
 - **シェル・ファイルツール**： `file_read`、`file_write`、`file_append`、`file_delete`、`dir_list`、`dir_walk`、`shell`、それに長時間実行用の `shell_start` / `shell_output` / `shell_kill`。これらの**届くマシンは名前ではなくセッションで決まります**。ACPセッション内では、接続したエディタが動いているマシンに、`/acp`の`fs/*`と`terminal/*`リクエストを介して作用します。ただし接続したエディタが`initialize`で宣言した機能に対してのみで、欠けた機能はエージェント自身のディスクへのフォールバックなしに非表示になります。それ以外（Matrix、Discord、`/rpc`、音声、`/a2a`、ハートビート、autonomous、サブエージェント）ではエージェント自身のマシンに作用し、オプトインです： `[tools.host_access] enabled = false`がデフォルトで、すべてのオージンに適用されます。有効化は意図的な行為で、有効化したうえでエージェントをコンテナで動かすのが推奨されます。下記「シェル・ファイルツール：誰のマシンか」参照。
 - **セッション**： 人間が読める[`grain-id`](https://crates.io/crates/grain-id)エイリアス、自動生成タイトル、再開時の履歴ダンプ。
 - **バックグラウンド**： ハートビートcronタスク、定期的なメモリー圧縮、定期的なワークスペース再インデックス、キャッチアップ付きの日次／週次／月次／年次ログ。
-- **音声**： オプションの`sapphire-call voice`サテライト。ローカルSTT/TTS（`sherpa-onnx`経由）とSilero VADを備える。[cli/](cli/)参照。ウェイクワードゲーティングは検出がサーバーへ移行中のため一時的に利用不可（[#183](https://github.com/fluo10/sapphire-agent/issues/183)）。サテライトはVADのみ稼働。
+- **音声**： サーバー側の STT → ターン → TTS パイプライン（`/rpc` の `voice/*`）。ローカル STT/TTS は `sherpa-onnx` 経由。`sapphire-agent-desktop` などの音声クライアント向け。`sapphire-agent-cli voice` サテライトは CLI の本バイナリへの統合時に削除された（[#278](https://github.com/fluo10/sapphire-agent/issues/278)）。この役割はウェアラブルデバイスのファームウェアへ移行予定。
 - **アンビエント音声インジェスト**： オプションの常時キャプチャ（ウェアラブル／ペンダントデバイスから）。`POST /audio/ingest`がベアラー認証済みデバイスから生の音声（メタデータはクエリパラメータ。JSON/base64フレーミングなし）を受け取り、再ゲーティングし、文字起こしし、ワークスペースで精選された参照音声Against話者を特定し、文字起こしをワークスペース外に保存します。「答えずに記録する」：このパスでは何もLLMターンを開始しません。`transcript_read`、`speaker_candidates`、`speaker_promote`が結果をエージェントツールとして公開します。デフォルトは無効 — `[ambient].enabled = true`で有効化。`config.example.toml`参照。
 - **エージェント間**： `/a2a`エンドポイントはデバイス別のベアラートークン認証付きでv1 A2Aプロトコル（JSON-RPC `SendMessage`、AgentCard）を話します — `[a2a].enabled = true`で有効化。
 - **サブエージェント**： メインエージェントが`subagent`ツールでタスクを委譲できる`<workspace>/agents/<name>.md`定義 — 独自のシステムプロンプト、独自のツールループ、最終回答のみが返り、ハンドルで後のラウンドに再開可能。定義のフロントマターの`profile:`は省略可能。書くとその`[profiles.<name>]`のプロバイダ（`fallback_provider`込み）で親の代わりに走り、省略時は委譲元のターンと同じモデルで走る — 後者が仕様変更前の既定動作そのままの、どちらも正当な書き方。configの`[profiles]`が定義していない名前なら起動時に即失敗する。プロバイダは親から引き継がれないことがある唯一の要素であり、権限ゲート・ツール一覧・隔離はプロファイルの有無で一切変わらない。下記「サブエージェント」参照。
@@ -28,7 +28,7 @@
   - `sapphire-agent init [PATH]` — エージェントが読むファイル（`AGENTS.md`、`SOUL.md`など）でワークスペースをシードし、貼り付けるホストローカル設定を出力。既存ファイルを決して上書きしない
   - `sapphire-agent verify` — 設定を検証し、device -> room_profileのバインディングを含む読み込まれたワークスペースファイルを報告
   - sapphire-framework の動詞（稼働中のサーバーまたは bridge と話す）: `status`、`service install|uninstall|status`、`workspace init|select|show|…`（エージェントは選択されたワークスペースを扱う。`config.toml` の `workspace_dir` は初回起動時にだけ取り込まれ、切り替えるとエージェントは新しいワークスペースで再起動する）、`workgroup`、`device`、`embedding`、`external-device add|list|rotate|retire|restore|apps`（ベアラートークンでエージェントにアクセスするクライアント。`add` と `rotate` はトークンを一度だけ表示）
-  - `sapphire-call` — 対話型REPL／音声サテライトクライアント（別クレート。[cli/](cli/)参照）
+  - `sapphire-agent chat` — 同じホストで動いているエージェントとローカル IPC 経由で対話する REPL（`-m TEXT` で単発、`--list`、`--history`、`--session ID`、`--json`）。`[cli].room_profile` のルームプロファイルで動く
 
 ## インストール
 
@@ -46,7 +46,9 @@ cargo build --release
 
 リリースバイナリは**Linux**（x86_64、aarch64）と**macOS**（aarch64）向けに公開されています。それぞれ単一の自己完結ファイル — `sherpa-onnx`とそのONNX Runtimeは静的リンクされているため、一緒にインストールするものは何もありません。
 
-エージェントはヘッドレスなサーバーアプリケーションで、Windows向けにはビルドされていません。クライアントバイナリ（`sapphire-call`、`sapphire-call-desktop`）はWindows向けにもビルドされます。[#182](https://github.com/fluo10/sapphire-agent/issues/182)参照。
+エージェントはヘッドレスなサーバーアプリケーションで、Windows向けにはビルドされていません。`sapphire-agent-desktop` はWindows向けにもビルドされます。
+
+サーバーとその CLI は 1 つのバイナリです（[#278](https://github.com/fluo10/sapphire-agent/issues/278)）。`sapphire-ledger` など他の sapphire-framework アプリと同じく、クライアント系のコマンド（`chat`、`acp`、`status` など）は同じホストで動いているサーバーにローカル IPC で問い合わせます。[#182](https://github.com/fluo10/sapphire-agent/issues/182)参照。
 
 ## 設定
 
@@ -67,7 +69,7 @@ sapphire-agent init ~/sapphire-workspace
 ```sh
 sapphire-agent verify   # 設定とワークスペースのサニティチェック
 sapphire-agent          # チャネルリスナー＋HTTP制御APIを開始
-sapphire-call           # 単発の対話セッション（別クレート）
+sapphire-agent chat     # そのエージェントとの対話セッション（[cli].room_profile が必要）
 ```
 
 ### 誰にも読まれないキー

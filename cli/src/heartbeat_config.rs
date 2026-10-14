@@ -8,7 +8,7 @@
 //! room_id: "..."          # optional chat target, defaults to channel default
 //! device: "laptop"         # optional: the host that runs it, when synced
 //! voice:                   # optional voice satellite target
-//!   device_id: "01J..."   # the satellite's device id (see sapphire-agent-cli)
+//!   device_id: "01J..."   # the voice client's device id
 //! enabled: true            # optional, default true
 //! ---
 //!

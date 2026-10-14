@@ -16,23 +16,24 @@ A personal AI assistant agent that works on file-based, local-first [`sapphire-f
 - **Built-in tools**: `file_read`, `file_write`, `file_append`, `file_delete`, `dir_list`, `dir_walk`, `shell`, `timer_set` / `timer_preset` / `timer_cancel` / `timer_status` (incl. Pomodoro presets), plus workspace memory / search / sync tools. The seven that touch a filesystem or a shell (`file_read`, `file_write`, `file_append`, `file_delete`, `dir_list`, `dir_walk`, `shell`) plus `shell_start` / `shell_output` / `shell_kill` for long-running commands are **session-routed: which machine they reach is decided by the session, not by the name**. Inside an ACP session they act on the machine the connected editor is running on, over `/acp`'s `fs/*` and `terminal/*` requests, and only for the capabilities that editor declared at `initialize` — with no fallback to the agent's own disk when one is missing. Everywhere else (Matrix, Discord, `/rpc`, voice, `/a2a`, heartbeat, autonomous, subagents) they act on this agent's own machine, and are opt-in: `[tools.host_access] enabled = false` by default, for every origin. Turning that on is a deliberate act; running the agent in a container is the recommended way to do it once it is. See [Shell and file tools: whose machine](#shell-and-file-tools-whose-machine) below.
 - **Sessions**: human-readable [`grain-id`](https://crates.io/crates/grain-id) aliases, auto-generated titles, history dump on resume.
 - **Background**: heartbeat cron tasks, periodic memory compaction, periodic workspace re-index, daily / weekly / monthly / yearly logs with catch-up.
-- **Voice**: optional `sapphire-agent-cli voice` satellite with local STT/TTS (via `sherpa-onnx`) and Silero VAD. See [cli/](cli/). Wake-word gating is temporarily unavailable while detection moves to the server ([#183](https://github.com/fluo10/sapphire-agent/issues/183)); the satellite runs VAD-only.
+- **Voice**: a server-side STT → turn → TTS pipeline (`voice/*` on `/rpc`) with local STT/TTS via `sherpa-onnx`, for voice clients such as `sapphire-agent-desktop`. The `sapphire-agent-cli voice` satellite was removed when the CLI merged into this binary ([#278](https://github.com/fluo10/sapphire-agent/issues/278)); that role moves to wearable device firmware.
 - **Ambient audio ingest**: optional always-on capture from a wearable/pendant device — `POST /audio/ingest` takes raw audio (metadata in query params, no JSON/base64 framing) from a bearer-authenticated device, re-gates it, transcribes it, attributes it to a speaker against reference audio curated in the workspace, and stores the transcript outside the workspace. Records without answering: nothing in this path starts an LLM turn. `transcript_read`, `speaker_candidates` and `speaker_promote` expose the result as agent tools. Disabled by default — enable via `[ambient].enabled = true`; see `config.example.toml`.
 - **Agent-to-agent**: `/a2a` endpoint speaks the v1 A2A protocol (JSON-RPC `SendMessage`, AgentCard) with per-device bearer-token auth — enable via `[a2a].enabled = true`.
 - **Subagents**: `<workspace>/agents/<name>.md` definitions the main agent can delegate a task to via the `subagent` tool — its own system prompt, its own tool loop, only the final answer comes back, it can be resumed by handle for a later round, and a delegated agent can itself delegate up to `[tools.subagent] max_depth` deep. See [Subagents](#subagents) below.
 - **Skills**: written procedures (planning, TDD, debugging, code review, …) loaded on request from a checkout on the *editor's* machine, over ACP. Requires an ACP client that declared terminal support — off entirely for Matrix, Discord and voice. See [Skills](#skills) below.
 - **Editor integration**: Zed (or any ACP client) drives the running agent over the Agent Client Protocol — on the agent's own machine by starting `sapphire-agent acp` (stdio, relayed to the running agent over its local IPC endpoint), from elsewhere over the `/acp` WebSocket endpoint (`[acp].enabled = true`); see [Zed / ACP](#zed--acp) below.
 - **Commands**:
-  - `sapphire-agent` — start the channel listeners + JSON-RPC HTTP control API (`/rpc`, `/a2a`, `/acp`)
-  - `sapphire-agent-server init [PATH]` — seed a workspace with the files the agent reads (`AGENTS.md`, `SOUL.md`, …), then print the host-local config to paste; never overwrites an existing file
-  - `sapphire-agent-server verify` — validate config and report loaded workspace files, including the device -> room_profile bindings
+  - `sapphire-agent` (or `sapphire-agent serve`) — start the channel listeners + JSON-RPC HTTP control API (`/rpc`, `/a2a`, `/acp`)
+  - `sapphire-agent chat` — interactive REPL with the agent running on this host, over its local IPC endpoint (`-m TEXT` for one message, `--list`, `--history`, `--session ID`, `--json`); runs under `[cli].room_profile`
+  - `sapphire-agent acp` — ACP on stdio for an editor, relayed to the running agent over IPC
+  - `sapphire-agent init [PATH]` — seed a workspace with the files the agent reads (`AGENTS.md`, `SOUL.md`, …), then print the host-local config to paste; never overwrites an existing file
+  - `sapphire-agent verify` — validate config and report loaded workspace files, including the device -> room_profile bindings
   - The sapphire-framework verbs, which talk to the running server or the bridge: `status`; `service install|uninstall|status`; `workspace init|select|show|…` (the agent serves the selected workspace — `workspace_dir` in `config.toml` is only adopted on the first start, and switching restarts the agent around the new one); `workgroup`; `device`; `embedding`; `external-device add|list|rotate|retire|restore|apps` (clients that reach the agent with a bearer token — `add` and `rotate` print the token once)
-  - `sapphire-agent-cli` — interactive REPL / voice satellite client (separate crate; see [cli/](cli/))
 
 ## Install
 
 ```sh
-cargo install sapphire-agent-server
+cargo install sapphire-agent
 ```
 
 Or from source:
@@ -45,7 +46,9 @@ cargo build --release
 
 Release binaries are published for **Linux** (x86_64, aarch64) and **macOS** (aarch64). Each is a single self-contained file — `sherpa-onnx` and its ONNX Runtime are linked statically, so there is nothing to install alongside it.
 
-The agent is a headless server application and is not built for Windows; the client binaries (`sapphire-agent-cli`, `sapphire-agent-desktop`) still are. See [#182](https://github.com/fluo10/sapphire-agent/issues/182).
+The agent is a headless server application and is not built for Windows; `sapphire-agent-desktop` still is. See [#182](https://github.com/fluo10/sapphire-agent/issues/182).
+
+The server and its CLI are one binary ([#278](https://github.com/fluo10/sapphire-agent/issues/278)), the way `sapphire-ledger` and the other sapphire-framework apps are: the client commands (`chat`, `acp`, `status`, …) talk to the server already running on the same host over its local IPC endpoint.
 
 ## Configure
 
@@ -76,7 +79,7 @@ Then:
 ```sh
 sapphire-agent verify   # sanity-check config and workspace
 sapphire-agent          # start the channel listeners + HTTP control API
-sapphire-agent-cli           # one-off interactive session (separate crate)
+sapphire-agent chat     # interactive session with it (needs [cli].room_profile)
 ```
 
 ### Keys nothing reads

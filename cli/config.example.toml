@@ -1,75 +1,728 @@
-# Example sapphire-agent-cli configuration.
+# Directory containing AGENT.md and MEMORY.md.
+# Defaults to the same directory as this config file.
 #
-# Place at `~/.config/sapphire-agent-cli/config.toml` (XDG) for the
-# satellite to pick up automatically, or pass `--config <path>`.
+# Only read on the first start under the app server: the agent then
+# selects this directory as its workspace (the framework's
+# `workspace.toml`, beside this file) and serves the selected workspace
+# from then on. Change it with `sapphire-agent workspace select <dir>`;
+# this key is ignored, with a warning, once a workspace is selected.
 #
-# Wake-word configuration intentionally lives server-side under the
-# room_profile — see `[room_profile.<n>].wake_word` on the agent.
-# Every satellite for that room_profile fetches the same phrase via
-# `voice/config` at startup.
+# `workspace_dir` is a top-level key: it must appear before the first
+# `[table]` header (such as [matrix] below). Written after one, it
+# silently becomes a key of that table instead, and the loader never
+# sees it.
+# workspace_dir = "~/.config/sapphire-agent"
+
+# ── Layered configuration ────────────────────────────────────────────
+# Settings that describe the agent — its system prompt, profiles, memory
+# namespaces, providers, digest and heartbeat behaviour — can live in a
+# shared file inside the workspace instead of here:
 #
-# The room_profile binding is selected server-side by the bearer
-# `token` below: the token is minted by `sapphire-agent device add` for a
-# device listed in some `[room_profile.<n>].devices` on the agent, and
-# that profile becomes the session's binding (same mechanism MCP and A2A
-# use).
-
-[server]
-url   = "https://agent.example.com"
-token = "sa-call-REPLACE_ME"   # bearer minted by `sapphire-agent device add`; the device must be listed in [room_profile.<n>].devices on the agent
-# session = "abc1234"          # 7-char grain id to resume an existing session
-
-[audio]
-# Discover names via `sapphire-agent-cli voice --list-devices`. Either or
-# both may be omitted to fall back to the host's defaults.
-# input_device  = "Jabra SPEAK 510 USB"
-# output_device = "Jabra SPEAK 510 USB"
-
-[language]
-# Sent as an STT hint with each utterance. Server's voice_pipeline
-# default applies when omitted.
-# stt = "ja"
-
-[device]
-# Identity sent to the agent on every session. The agent renders the
-# system prompt's "# Current Room" block as "voice channel with <name>"
-# using the description as the topic — so the model knows where it's
-# speaking without that fact being baked into AGENTS.md. Both fields
-# are optional; the block is only emitted when `name` is set.
-# name        = "living-room-speaker"
-# description = "Speakerphone in the living room; STT may produce typos due to ambient noise"
-
-[behavior]
-# Confirmation beeps and listen-window timeout. Defaults shown.
-# beep_on_wake          = true   # rising tone — fires on wake word AND when the mic
-#                                  re-opens after the AI's TTS reply (the listen-start
-#                                  cue is the same event in both cases)
-# beep_on_capture_end   = true   # falling tone — fires when the VAD ships an utterance
-#                                  to STT. A distinct double-beep at a lower pitch
-#                                  fires when a listen window times out without speech,
-#                                  so the user can tell success from cancellation.
-# listen_timeout_seconds = 8     # silence-cancel timeout used in both wake-word states:
-#                                  after a wake match (drop back to wake-listening if
-#                                  the user doesn't speak) and after the AI's TTS reply
-#                                  (the follow-up window). An in-progress utterance is
-#                                  never cut off — VAD's speech-detected state extends
-#                                  the deadline so long replies still ship to STT.
-#                                  Set to 0 for no timeout (legacy: mic stays open
-#                                  until VAD ships). Wake-word mode only; VAD-only
-#                                  mode is always continuously listening.
-
-[sensitivity]
-# Mic gain + wake/VAD thresholds. Everything is optional; built-in
-# defaults (shown commented out) preserve the original hard-coded
-# behaviour. Tune when a speakerphone is too quiet for STT or the
-# wake / VAD models misfire on your room acoustics.
+#   {workspace_dir}/.sapphire-agent/config.toml
 #
-# Hardware/OS-mixer gain (PulseAudio, pavucontrol, etc.) is the
-# better adjustment when available — cpal exposes no hardware-gain
-# API so this is a software fallback for headless / locked-down hosts.
-# mic_gain           = 1.0   # linear multiplier on raw mic samples (clamped to ±i16)
-# wake_threshold     = 0.5   # openWakeWord confidence; lower = more sensitive
-# wake_cooldown_ms   = 2000  # suppress re-fires for this long after a wake
-# vad_threshold      = 0.5   # Silero speech-probability threshold
-# vad_min_silence_ms = 250   # silence required before VAD closes a segment
-# vad_min_speech_ms  = 250   # minimum speech before a segment is considered valid
+# That file is optional. When present its values are used unless this
+# host-local file also sets them, in which case this file wins.
+#
+# It may only set settings that belong to the agent. Credentials
+# ([anthropic].api_key, [matrix], [discord], [tools]), bind addresses,
+# cache and workspace paths, and STT/TTS model paths are host-local: if
+# the workspace file sets one, it is ignored and named in a warning at
+# startup. `[room_profile.<n>].devices` is different: it names external
+# devices by name or id, not a secret, so the workspace layer may set it.
+# The bearer token itself is never stored here — see "External devices"
+# below.
+#
+# [providers.<n>].base_url is host-local too, and deliberately so even
+# though a private-network DNS name would work from every host: a
+# workspace that could redirect a provider could point it at a hostile
+# server, and that server's replies drive tool calls. Declare each
+# provider completely here — the shared file may refine `model`,
+# `provider_name` and `max_tokens`, not say where the provider lives.
+#
+# Keep each host-local table complete for the same reason the fallback
+# exists: if the shared file is missing or invalid, the agent runs on
+# this file alone, so this file has to be valid on its own.
+#
+# `sapphire-agent verify` prints where each setting's effective value came
+# from.
+
+# Disable heartbeat (day-boundary + cron) tasks. Useful for test
+# environments that share the same workspace to avoid duplicate tasks.
+# heartbeat_enabled = false
+
+# Autonomous sessions: when no other session has been active for
+# `idle_minutes`, the agent picks the highest-priority due task from
+# `<workspace>/autonomous/*.md` and works on it for up to that task's
+# `max_turns`, as a normal session you can read back with `session_list`
+# and `session_read`.
+#
+# Off by default. Two switches have to agree before an autonomous turn
+# can do outward work like filing a GitHub issue:
+#
+#   - `origin = "trusted"` lets the permission table allow `shell` and
+#     `file_write`. With `origin = "channel"` they are refused and the
+#     feature can only read and edit workspace files.
+#   - `[tools] host_access.enabled = true` — without it the host tools
+#     are refused before the permission table is consulted at all, for
+#     every origin.
+#
+# [autonomous]
+# enabled = true
+# idle_minutes = 30
+# poll_seconds = 60
+# origin = "trusted"
+
+# Day-boundary session policy. One of:
+#   "reset"   — close the session; next message starts a new one (legacy default)
+#   "compact" — keep the session; force-summarize prior-day history into a stub
+#   "none"    — no day-boundary action
+# session_policy = "compact"
+
+[matrix]
+homeserver = "https://matrix.example.com"
+access_token = "syt_..."
+user_id = "@bot:example.com"
+device_id = "DEVICEID"
+# Rooms to listen in. Accepts either an array (preferred) or a single string
+# via the legacy `room_id` key.
+room_ids = ["!roomid:example.com"]
+# Messages from users not in this list are silently ignored.
+# Leave empty ([]) to allow all users.
+allowed_users = ["@you:example.com"]
+# E2EE recovery key — obtain from Element → Settings → Security → Secure Backup
+recovery_key = "EsT... "
+# Where to store matrix-sdk state / crypto DB (default: ~/.local/share/sapphire-agent/matrix)
+# state_dir = "~/.local/share/sapphire-agent/matrix"
+
+# Per-room behaviour is configured via [room_profile.<n>] further down,
+# not via per-room blocks. A room profile bundles `(profile, namespace,
+# session_policy)` and applies to a list of rooms — perfect when several
+# rooms share the same setup, and trivial to add API access controls to
+# later (see issue #73).
+
+# Periodic log digests. The agent summarises weekly/monthly/yearly activity
+# into short importance-ordered bullet lists, stored as YAML frontmatter in
+# memory/{weekly,monthly,yearly}/. The top-N items per kind are injected
+# into the system prompt so the agent retains long-horizon context.
+# [digest]
+# daily_items     = 3   # top-N per daily (injected as "This Week's Digests")
+# weekly_items    = 3   # top-N per weekly (injected as "This Month's Digests")
+# monthly_items   = 5   # top-N per monthly (injected as "This Year's Digests")
+# yearly_items    = 5   # top-N per yearly (injected as "Past Years' Digests")
+# weekly_enabled  = true
+# monthly_enabled = true
+# yearly_enabled  = true
+
+[anthropic]
+api_key = "sk-ant-..."
+# Model to use. Defaults to claude-opus-4-6.
+model = "claude-opus-4-6"
+# Maximum tokens in the response. Defaults to 8192.
+max_tokens = 8192
+# System prompt sent at the beginning of every conversation.
+system_prompt = "You are a helpful personal assistant."
+# Seconds connecting to the API may take. Defaults to 15; 0 disables.
+# connect_timeout_secs = 15
+# Seconds the API may send nothing at all — before its response headers
+# or between two chunks of the stream — before the request fails. This is
+# an idle deadline, not a total one: a long answer that keeps streaming is
+# never cut off, only a stream that has gone silent. Defaults to 300; 0
+# disables. Without it a stalled upstream hangs the turn forever.
+# stream_idle_timeout_secs = 300
+# How many times a response that came back unusable is retried with the
+# same request before the turn fails with an error: one cut off at
+# max_tokens (e.g. a model stuck reasoning in a loop), one with no text
+# and no tool call, or a stream that closed before it finished (the
+# server died mid-answer). Defaults to 2 (three attempts); 0 disables.
+# incomplete_retries = 2
+
+# ── Additional providers ────────────────────────────────────────────────
+# Beyond the built-in Anthropic provider above, you can declare any number
+# of OpenAI-compatible endpoints — llama.cpp's `llama-server`, Ollama,
+# vLLM, or the OpenAI API itself. Each entry is keyed by a name you choose
+# and must specify `type = "openai_compatible"`. The reserved name
+# `anthropic` cannot be reused here.
+#
+# [providers.local]
+# type     = "openai_compatible"
+# base_url = "http://127.0.0.1:8080/v1"  # llama-server, no trailing /chat/completions
+# model    = "gemma-4-31b-it"
+# api_key  = ""                          # optional; llama.cpp does not need one
+# max_tokens = 4096
+# connect_timeout_secs     = 15          # see [anthropic]; 0 disables
+# stream_idle_timeout_secs = 300         # see [anthropic]; 0 disables. A local
+#                                        # server can stay silent while it
+#                                        # processes a very large prompt —
+#                                        # raise this if that trips it.
+#                                        # A server that runs one request
+#                                        # at a time sends nothing to a
+#                                        # queued request until the one
+#                                        # ahead finishes, so this also
+#                                        # bounds how long a request may
+#                                        # wait in its queue.
+# incomplete_retries = 2                 # see [anthropic]; 0 disables
+
+# ── Profiles (LLM presets) ──────────────────────────────────────────────
+# A profile is a *pure* LLM preset: a provider plus an optional
+# refusal-fallback provider. Profiles know nothing about rooms or memory
+# namespaces; pairings happen via [room_profile.<n>] (for chat) and
+# memory_namespace.<n>.background_profile (for daily-log / digests /
+# compaction). Profiles that name an unknown provider cause startup to
+# fail.
+#
+# `fallback_provider` is consulted at runtime: when the primary refuses
+# (Anthropic `stop_reason = "refusal"`, OpenAI `finish_reason =
+# "content_filter"`, or a recognised apology pattern) or errors out, the
+# call is replayed against the named fallback provider.
+#
+# The conventional `background` profile is the workspace-wide fallback
+# for background tasks (daily-log generator, memory compaction, periodic
+# digests) when a memory namespace doesn't pin its own.
+#
+# [profiles.default]
+# provider = "anthropic"
+#
+# [profiles.opus]
+# provider = "anthropic"            # use claude-opus-4-7 in [anthropic.model]
+#
+# [profiles.local]
+# provider = "local"
+#
+# [profiles.background]
+# provider          = "anthropic"
+# fallback_provider = "local"
+
+# ── Memory namespaces ────────────────────────────────────────────────────
+# A memory namespace owns one subtree of `memory/`: its own MEMORY.md
+# plus the daily/weekly/monthly/yearly logs and digests. Room profiles
+# pin their writes to one namespace; rooms reading the system prompt
+# also pull in parent namespaces declared via `include`. Reads chain
+# through the include DAG; writes go only to the leaf namespace.
+#
+# The `default` namespace is implicit (no need to declare it explicitly)
+# and is what every config without `[memory_namespace.*]` resolves to.
+# `default` is also the migration target — on first startup, an existing
+# pre-namespace `memory/{daily,weekly,...}/` tree is auto-moved to
+# `memory/default/{...}` so existing workspaces keep working unchanged.
+#
+# The hierarchy below stacks: a `user_nsfw` room reads `user_nsfw` +
+# `user` + `default`, but a bare `default` room sees nothing private.
+#
+# [memory_namespace.user]
+# include = ["default"]
+#
+# [memory_namespace.user_nsfw]
+# include = ["user"]
+# # background_profile pins which profile drives this namespace's
+# # daily-log generation, periodic digests, and MEMORY.md compaction.
+# # Routes an NSFW namespace directly to a permissive local model
+# # instead of bouncing through Anthropic refusal-fallback every day.
+# # Resolution: this field > global [profiles.background] > plain
+# # Anthropic.
+# background_profile = "local"
+
+# ── Room profiles ───────────────────────────────────────────────────────
+# A room profile bundles a chat profile + memory namespace + session
+# policy and applies to a list of rooms (Matrix room_ids, Discord
+# channel ids, etc). Each room_id may appear in at most one room
+# profile. Rooms not listed anywhere fall back to [room_profile.default]
+# if defined, otherwise the built-in defaults (Anthropic provider,
+# `default` namespace, global session_policy).
+#
+# API sessions pin a room profile via the bearer token sent in
+# `Authorization: Bearer <token>` on every `/rpc` request. The token
+# resolves to an external device (`sapphire-agent external-device
+# add`, see "External devices" below), whose name or id must appear in some
+# `[room_profile.<n>].devices` below — same mechanism `/a2a`, `/acp`
+# and ambient ingest all use (sapphire-agent-desktop: `[server].token`).
+#
+# [room_profile.everyday]
+# profile          = "default"
+# memory_namespace = "default"     # optional; defaults to "default"
+# session_policy   = "reset"       # optional; defaults to global setting
+# rooms            = ["!chat:example.com"]
+#
+# [room_profile.development]
+# profile = "opus"                 # higher-quality model for coding work
+# rooms   = ["!dev:example.com", "!code:example.com"]
+# # memory_namespace omitted → writes to "default" alongside everyday chat
+#
+# [room_profile.private_nsfw]
+# profile          = "local"
+# memory_namespace = "user_nsfw"
+# session_policy   = "compact"
+# rooms            = ["!nsfw:example.com"]
+#
+# /rpc (sapphire-agent-desktop), A2A (Agent2Agent Protocol), `/acp`
+# and ambient ingest all reach a room_profile through devices declared
+# here. Each device must be unique across all room profiles — startup
+# fails if two profiles share one — and an incoming
+# `Authorization: Bearer <token>` resolves implicitly (token -> external
+# device -> room profile), so external clients never name room_profile
+# themselves. A device bound to no room profile is refused (`verify`
+# lists them). Leave `devices = []` (or omit) to deny external access to
+# a profile.
+#
+# Each entry is an external device's name or its id, both printed by
+# `sapphire-agent external-device add <name>`. See "External
+# devices" below.
+#
+# [room_profile.sapphire_world]
+# profile          = "default"
+# memory_namespace = "sapphire_world"
+# rooms            = []             # A2A-only; no chat rooms map here
+# devices          = ["a2a-client"] # `external-device add a2a-client`
+#
+# Caveat: workspace retrieve (FTS / vector search) currently spans every
+# namespace because the agent's retrieve tools don't yet set the
+# framework's path_prefix filter.
+# Contamination prevention is digest- and MEMORY.md-only in this
+# release; retrieve hits may still leak across namespaces.
+
+# ─────────────────────────────────────────────────────────────────────
+# A2A (Agent2Agent Protocol) server (optional)
+# ─────────────────────────────────────────────────────────────────────
+# Mounts `/a2a` (JSON-RPC) and `/.well-known/agent-card.json` on the
+# same HTTP server as `/rpc`. Disabled by default — flip `enabled` to
+# turn the routes on. Auth resolves like every other endpoint:
+# token -> external device -> `[room_profile.<n>].devices`;
+# this section configures only the public face of the agent.
+#
+# [a2a]
+# enabled           = true
+# public_url        = "https://agent.example.com/a2a"
+# agent_name        = "Sapphire"
+# agent_description = "Personal partner AI with persistent character and memory."
+
+# ─────────────────────────────────────────────────────────────────────
+# Built-in tools and MCP client (optional)
+# ─────────────────────────────────────────────────────────────────────
+# The `[tools]` table configures the agent's own tool belt. Three
+# concerns live here:
+#
+#   - `[tools.host_access]` — the switch that lets the agent touch its
+#     own filesystem and shell: `file_read`, `file_write`, `file_append`,
+#     `file_delete`, `dir_list`, `dir_walk`, `shell`. `enabled = false`
+#     by default, for every origin — `/rpc`, voice, `/a2a`, Matrix/Discord
+#     and ACP alike.
+#
+#     Inside an ACP session these same seven names reach the *editor's*
+#     machine instead, and this switch does not speak for it: what that
+#     session may call is decided by the capabilities the connected editor
+#     declared at `initialize` (`fs.read_text_file`, `fs.write_text_file`,
+#     `terminal/*`), and a missing capability hides the tool rather than
+#     falling back to the agent's own disk. Turning this on is therefore
+#     only about the agent's own machine; running the agent in a container
+#     is the recommended way to do it once it is on.
+#   - `tavily_api_key` — enables the `web_search` tool. Omit to leave
+#     the tool unregistered.
+#   - `[tools.tool_rounds]` — how many tool rounds one turn may spend,
+#     split by whether the route can cancel a turn in flight. `interactive`
+#     covers ACP, which has `session/cancel` (the editor's Escape), and
+#     defaults to `0` — unbounded — so a long piece of delegated work runs
+#     to its end instead of stopping every ten rounds. `unattended` covers
+#     Matrix, Discord, `/rpc`, `/a2a` and the heartbeat, none of which can
+#     be interrupted, and defaults to 25. `0` means unbounded on either
+#     side; subagents are always judged `unattended`, whatever their
+#     parent is. These bound spend, not context — `[compression]` is what
+#     keeps the history in the window.
+#   - `[tools.subagent]` — `turn_timeout_secs` bounds how long one
+#     delegated subagent turn may run in total, default 3600, `0` for no
+#     limit. A turn past it is stopped and reported to the parent as a
+#     tool error, with its conversation so far saved under a handle the
+#     parent can `resume`. It is a backstop for hangs a round cap cannot
+#     see — a tool call that never returns — not a budget, so keep it well
+#     above how long real delegated work takes. `max_depth` is the
+#     nesting cap, default 2: main(0) delegating to a planning agent(1)
+#     that delegates to an explorer(2) fits, nothing deeper does. `0`
+#     forbids delegation outright — the `subagent` tool is not offered to
+#     any turn, the main agent's included — and `1` is the old
+#     "never nest" behaviour.
+#   - `[[tools.mcp_servers]]` — outbound MCP client. Connects to
+#     external MCP servers and exposes their tools to the agent as
+#     `mcp__<name>__<tool_name>`. Distinct from the inbound MCP
+#     server block above: that lets external AIs call sapphire-agent;
+#     this lets sapphire-agent call external MCP servers.
+#   - `[tools.admin].room_profiles` — the room profiles whose sessions may
+#     use the config-file management tools (`heartbeat`, `autonomous`,
+#     `agents`), which add and edit the definitions under the workspace
+#     that the unattended loops later run. Values are `[room_profile.<name>]`
+#     keys, not room ids: a channel turn is judged by the profile its room
+#     resolves to, an ACP session by the profile its bearer token pinned, and
+#     voice / `/rpc` / A2A / the unattended loops by nothing (refused). Empty
+#     (the default) leaves all of them unregistered, the same shape as
+#     `[tools.host_access]`. Host-layer only: `[tools]` is outside the
+#     workspace-layer allowlist, so a synced workspace config cannot grant
+#     itself this.
+#
+#     `room_profiles = ["default"]` is the broad one: it names the implicit
+#     profile that every room no other profile claims falls through to, so
+#     list the profiles you actually mean. Anyone who can reach a session of
+#     a listed profile can rewrite, through the agent, what runs unattended
+#     — pair this with the profile's `devices` or the room's `allowed_users`.
+
+# Each `[[tools.mcp_servers]]` entry has a `name` (used as the tool
+# prefix) and a `type` selecting one of two transports:
+#
+#   - `type = "http"`  — Streamable HTTP. Fields: `url`, optional
+#     `api_key` (sent as Bearer).
+#   - `type = "stdio"` — spawn a local child process. Fields:
+#     `command`, optional `args`, optional `env` table.
+#
+# If a server fails to connect at startup the agent logs a warning
+# and continues without its tools — startup is not aborted.
+#
+# `trust` — how far this server's tools are trusted:
+#
+#   - `"none"` (default) — the tools are unclassified, which the
+#     permission policy treats as its strictest bucket. Chat channels
+#     (Matrix, Discord) refuse them, and so does the heartbeat's chat
+#     leg; `/acp` asks before each call. Leave it here unless you mean
+#     to change that.
+#   - `"read"` — the tools are reads: allowed on every origin, never
+#     asked. For a server that only looks things up.
+#   - `"edit"` — the tools are edits: allowed unasked on chat channels
+#     and on `/rpc`, `/a2a` and voice, still asked in `/acp`'s default
+#     mode. The same treatment `file_write` gets. This is what lets a
+#     Matrix message or a heartbeat task record something.
+#
+# It is the *operator's* declaration, not the server's. MCP servers can
+# annotate their own tools (`readOnlyHint`, `destructiveHint`) more
+# finely, but those are self-reported — and the channel restriction
+# exists precisely because a channel turn carries untrusted input that
+# nobody can be asked about, so letting the far side declare itself safe
+# would invert what is being defended. You are the one who decided to
+# connect to that server; this is where you say how much that means.
+#
+# It is per server rather than per tool for the same kind of reason: a
+# list of tool names would go stale the moment the server adds a tool,
+# and it would go stale silently — the new tool would fall back to
+# `none` and be refused, which looks like the server being broken.
+#
+# [tools]
+# tavily_api_key = "tvly-..."
+#
+# [tools.host_access]
+# enabled = false
+#
+# [tools.tool_rounds]
+# interactive = 0                           # ACP; 0 = unbounded
+# unattended  = 25                          # everything else
+#
+# [tools.subagent]
+# turn_timeout_secs = 3600                  # 0 = no limit
+# max_depth = 2                             # nesting cap; 0 = no
+#                                           # delegation, 1 = never nest
+#
+# # Example: let the `ops` and `developer` room profiles manage the
+# # heartbeat/autonomous/agents definitions. Empty by default (all four
+# # tools unregistered).
+# [tools.admin]
+# room_profiles = ["ops", "developer"]
+#
+# # Example: HTTP transport to a remote MCP server.
+# [[tools.mcp_servers]]
+# name    = "github"
+# type    = "http"
+# url     = "https://mcp.example.com/mcp"
+# api_key = "ghp_..."                       # optional; sent as Bearer
+#                                           # trust omitted -> "none"
+#
+# # Example: stdio transport, launching a local server via npx.
+# [[tools.mcp_servers]]
+# name    = "filesystem"
+# type    = "stdio"
+# command = "npx"
+# args    = ["-y", "@modelcontextprotocol/server-filesystem", "/home/me/work"]
+# env     = { NODE_ENV = "production" }     # optional; merged into child env
+#
+# # Example: a server you host yourself and mean to drive from chat and
+# # from heartbeat tasks — so its tools must not be refused there.
+# [[tools.mcp_servers]]
+# name    = "ledger"
+# type    = "http"
+# url     = "http://127.0.0.1:3173/mcp"
+# trust   = "edit"                          # "none" (default) | "read" | "edit"
+
+# ─────────────────────────────────────────────────────────────────────
+# Voice pipeline (optional)
+# ─────────────────────────────────────────────────────────────────────
+# Enables the `voice/pipeline_run` method used by voice clients on `/rpc`
+# (sapphire-agent-desktop). Each room_profile can opt in via `voice_pipeline = "<name>"`.
+# Without these blocks the method returns -32601 "Method not found".
+#
+# Local STT and TTS require the `voice-sherpa` cargo feature:
+#     cargo build --release --features voice-sherpa
+# OpenAI TTS works without it — pure HTTP, no native build. The
+# `openai_tts` provider talks to OpenAI's `/v1/audio/speech` endpoint
+# and to any self-hosted server that speaks the same shape (e.g. an
+# Irodori-TTS fork with an OpenAI-compatible shim).
+#
+# [voice_pipeline.default]
+# stt_provider   = "sense_voice"
+# tts_provider   = "openai_remote"
+# language       = "ja"             # BCP-47 hint; client param overrides
+# capture_max_ms = 30000            # server-side hard cap, default 30s
+#
+# [stt_provider.sense_voice]        # requires --features voice-sherpa
+# type   = "sherpa_onnx"
+# kind   = "sense_voice"            # multi-lingual zh/en/ja/ko/yue
+# model  = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
+# # If `model_dir` is set it takes precedence over the bundle name.
+# # model_dir = "~/.local/share/sapphire-agent/voice-models/..."
+#
+# [stt_provider.mock_stt]           # testing only
+# type       = "mock"
+# transcript = "test transcript"
+#
+# [tts_provider.openai_remote]      # OpenAI public endpoint
+# type        = "openai_tts"
+# api_key_env = "OPENAI_API_KEY"    # required for the public endpoint
+# # base_url defaults to https://api.openai.com
+# # model    = "tts-1"              # or "tts-1-hd"
+# # voice    = "alloy"              # alloy / echo / fable / onyx / nova / shimmer
+#
+# [tts_provider.openai_selfhosted]  # any OpenAI-compatible self-hosted shim
+# type     = "openai_tts"
+# base_url = "https://irodori-tts-api.example.net"
+# # api_key_env omitted → no Authorization header sent
+# # model / voice: pass through whatever the fork's catalogue defines
+#
+# [tts_provider.vits_ja]            # local TTS, requires --features voice-sherpa
+# type   = "sherpa_onnx"
+# kind   = "vits"
+# model  = "vits-melo-tts-zh_en"    # placeholder — pick a ja-capable VITS bundle
+# speaker_id = 0
+# speed      = 1.0
+#
+# [tts_provider.mock_tts]           # synthetic sine wave; testing only
+# type         = "mock"
+# duration_ms  = 200
+# frequency_hz = 440
+#
+# [room_profile.home_voice]
+# profile          = "casual"
+# voice_pipeline   = "default"
+# rooms            = []             # MCP-only; not bound to chat rooms
+#
+# # ── Voice-mode global settings ───────────────────────────────────────
+# # AI-name wake words can't be served by pre-trained KWS bundles
+# # (their vocabulary is finite), so custom openWakeWord ONNXes are
+# # the only path. Train externally with
+# # https://github.com/dscripka/openWakeWord, drop the .onnx on the
+# # server, point `wake_word_model` at it, restart. Every connected
+# # satellite fetches the bytes via voice/config and caches by SHA-256.
+# #
+# # NOTE: no client can act on this today. The satellite's openWakeWord
+# # runtime was removed because it forced the whole workspace onto shared
+# # sherpa linking, which left every published binary unable to start
+# # (#182). A satellite that receives a model warns and runs VAD-only.
+# # #183 moves detection to the server, which restores the feature and
+# # is also what the ESP32 satellites need. The setting is kept so the
+# # model keeps its home in config until then.
+# [voice]
+# wake_word_model = "/srv/sapphire/wake-models/saphina-v1.onnx"
+
+# ─────────────────────────────────────────────────────────────────────
+# Ambient audio ingest (optional)
+# ─────────────────────────────────────────────────────────────────────
+# A wearable/pendant device POSTs short audio segments to
+# `POST /audio/ingest`, mounted on the same HTTP server as `/rpc` only
+# once this subsystem actually starts. Disabled by default: with
+# `[ambient].enabled = false` the route is not mounted at all, so it
+# answers 404 like any other unmatched path — a device probing for the
+# feature isn't told its key is wrong (401), the same distinction `/a2a`
+# preserves, just reached by router omission here rather than
+# by a handler that refuses while still being mounted.
+#
+# This is a **recording** pipeline, not a conversational one: segments
+# are re-gated, transcribed, attributed to a speaker, and stored — no
+# LLM turn runs over them. `transcript_read`, `speaker_candidates` and
+# `speaker_promote` (registered as agent tools once this starts) are
+# how a normal chat turn reads back what was overheard.
+#
+# Requires the `voice-sherpa` cargo feature (on by default) for the
+# Silero VAD re-gate and the speaker-embedding model — same feature
+# the local STT/TTS providers above need.
+#
+# ── Wire format ──
+# `curl` or a microcontroller can speak this directly: raw audio in
+# the body, everything else in the query string, so there is no JSON
+# framing (and no base64 inflation) around a multi-kilobyte payload.
+#
+#   POST /audio/ingest?segment=<id>&started_at=<unix_ms>&rate=16000&live=1
+#   Authorization: Bearer <token from `sapphire-agent external-device add`, see below>
+#   Content-Type: audio/L16   (raw s16le)  — or: audio/wav
+#   <raw audio bytes>
+#
+#   - `segment`    — device-chosen idempotency key; a replay is
+#                    accepted and silently discarded, not an error.
+#   - `started_at` — when the audio was *recorded*, Unix ms. Replayed
+#                    spool (after a device reconnects) keeps its
+#                    original timestamp here.
+#   - `rate`       — must be 16000; the server never resamples.
+#   - `live`       — 1 for realtime audio, 0 for replayed spool. Only
+#                    `live=1` can ever reach a future conversational
+#                    path (S4) — replayed audio is recorded, never
+#                    answered, no matter how it is marked otherwise.
+#   - `audio/wav`  — must already be 16 kHz mono 16-bit PCM; other
+#                    bit depths are rejected outright rather than
+#                    silently reinterpreted.
+#
+# `POST /audio/hello` (same bearer auth, no body) answers with the
+# resolved device name and accepted parameters — a device can probe
+# this once at boot to confirm its credentials and the expected format
+# before it starts spooling audio.
+#
+# [ambient]
+# enabled              = true
+# # Root of the workspace-external cache for raw audio + speaker data
+# # (transcripts, unlike audio, are kept forever — only the audio blobs
+# # get swept). Defaults to `dirs::cache_dir()/sapphire-agent/ambient`.
+# cache_dir            = "/var/cache/sapphire-agent/ambient"
+# audio_retention_days = 7          # raw audio swept after this many days
+# stt_provider         = "sense_voice"   # names a [stt_provider.<n>] block above
+# min_embed_ms         = 1500       # below this, a segment gets a transcript but no speaker
+# match_threshold      = 0.55       # cosine-similarity floor for a speaker match
+# promote_after_seconds = 60        # both thresholds must clear before an
+# promote_after_days    = 2         # auto-enrolled voice is promoted into voices/
+# max_queue            = 1000       # admission queue depth; full queue answers 429
+#
+# # Silero VAD re-gate and the speaker-embedding model: sherpa-onnx
+# # publishes both only as bare `.onnx` files, never as a downloadable
+# # bundle name, so — unlike the STT/TTS providers above — there is no
+# # auto-download for these two. Fetch them yourself from the
+# # sherpa-onnx GitHub releases page and point these at the directory
+# # you saved them in:
+# #   - vad_model_dir:       the `asr-models` release tag (silero_vad.onnx)
+# #   - embedding_model_dir: the `speaker-recongition-models` release tag
+# #     (upstream's own spelling) — pick a 3D-Speaker or CAM++ bundle
+# vad_model_dir         = "/srv/sapphire/ambient-models/silero-vad"
+# embedding_model_dir   = "/srv/sapphire/ambient-models/3dspeaker"
+# vad_threshold         = 0.5
+# embedding_num_threads = 2
+#
+# Reference audio for a *named* speaker lives inside the workspace at
+# `voices/<name>/*.wav` — drop a clean sample there and restart (or
+# just wait for auto-enrolment + `speaker_promote`, see below).
+# Auto-enrolled voices that have not been named live outside the
+# workspace, alongside the audio cache.
+#
+# The directory name is the speaker's *display* name, not their id.
+# A promoted voice gets a one-line `voices/<name>/id` file holding
+# the id transcripts actually record, so the directory can be renamed
+# ("blithe-otter-42" -> "tanaka-san") and everything already recorded
+# reads back under the new name with no rewrite pass. A directory you
+# create by hand has no `id` file and simply uses its own name as the
+# id — safe to rename only before any transcript records from it. Once
+# a promoted candidate's grain-id is written into the marker, that
+# directory gains an id and becomes rename-safe.
+
+# ── External devices (owned by the sapphire bridge, not this file) ──
+# Every authenticated entry point — ambient ingest, `/rpc`, `/a2a`,
+# `/acp` — resolves the same way: bearer token -> external device
+# -> room profile. External devices are the workgroup's synced ledger,
+# owned by the sapphire bridge: only a token's SHA-256 is stored, and
+# every host of the workgroup accepts the same tokens. The agent asks the
+# running bridge about each token and trusts a success for 30 seconds, so
+# a retire or rotate reaches it within the sync delay plus 30 s, without a
+# restart. If the bridge is not running, every authenticated request
+# answers 503. There is no `[keys]` block anymore.
+#
+#   sapphire-agent external-device add pendant --description "the one on the lanyard"
+#   sapphire-agent external-device list
+#   sapphire-agent external-device rotate <name-or-id>
+#   sapphire-agent external-device retire <name-or-id>
+#   sapphire-agent external-device restore <name-or-id>
+#
+# `add` and `rotate` print the token once. `add` allows the device to use
+# this agent (`--app sapphire-agent`) unless `--app` names others.
+#
+# This config only *routes* a device to a room profile, via
+# `[room_profile.<n>].devices` (see the room_profile examples earlier in
+# this file). The room profile a device is bound to decides which LLM
+# profile and which memory namespace its conversations use — ambient-only
+# devices included.
+
+# ── Timer / Pomodoro presets ────────────────────────────────────────
+# Single-shot timers ("5分後に教えて") don't need configuration — the
+# `timer_set` tool takes minutes + label directly. Presets are for
+# multi-step routines like Pomodoro so the user can say "ポモドーロ開始"
+# instead of redictating "25分集中 + 5分休憩を3回" every time.
+#
+# Only ONE timer (single-shot or preset) can be active per process;
+# starting a new one cancels the previous. Timers are in-memory and
+# reset on restart. When a timer fires the agent is re-invoked to send
+# a notification on the same channel it was set from — voice → voice,
+# chat → chat, no cross-fallback.
+
+[[timer.preset]]
+name   = "pomodoro"
+cycles = 4
+steps  = [
+  { label = "Focus", minutes = 25 },
+  { label = "Break", minutes = 5 },
+]
+
+# Example: a long-form variant for deep work.
+# [[timer.preset]]
+# name   = "deep_work"
+# cycles = 2
+# steps  = [
+#   { label = "Focus",      minutes = 50 },
+#   { label = "Break",      minutes = 10 },
+# ]
+
+# Agent Client Protocol endpoint (GET /acp, WebSocket).
+# Lets an ACP client such as Zed drive this agent. Authentication resolves
+# like every other endpoint (token -> external device -> room profile via
+# [room_profile.<name>].devices), and the token that
+# connects selects the room profile the ACP session runs under.
+# Host-local: the workspace config layer cannot set this.
+#
+# Tool permission is NOT configured here. Which tools need approval is
+# decided by what each tool does, and by the session mode the editor picks
+# (default / accept_edits / bypass). Standing "always allow" and "never
+# allow" answers are recorded in the host-local
+# ~/.config/sapphire-agent/acp-permissions.json — delete it to be asked
+# everything again. Chat channels (Matrix, Discord) are never asked: they
+# cannot call shell at all, and can reach an MCP server's tools only when
+# that server carries a `trust` of "read" or "edit" (see
+# `[[tools.mcp_servers]]` above).
+[acp]
+enabled = false
+
+# Seconds between server-initiated WebSocket pings. 0 sends none.
+#
+# ACP has no idle traffic of its own — an editor with its panel open but
+# nothing being asked sends nothing for as long as the person is away — and
+# a reverse proxy in front of this endpoint closes a connection that stays
+# silent. Measured against one HAProxy: 1800.005s, arriving here as
+# "Connection reset by peer" and arriving at the editor as a `websocat`
+# stuck in CLOSE-WAIT that never exits, so the editor keeps writing into a
+# dead socket instead of reconnecting.
+#
+# The default is half of the tightest common proxy default (nginx's 60s
+# proxy_read_timeout). Lower it if something in front is stricter still.
+# The client answers each ping with an automatic pong, so one timer keeps
+# traffic on the tunnel in both directions.
+#keepalive_secs = 30
+
+# The room profile ACP on stdio runs under: `sapphire-agent acp`, which an
+# editor starts as its agent command on the machine the agent runs on. It
+# relays to the running agent over its local IPC endpoint (the agent loop
+# runs there), so no token is involved and no profile is picked by one —
+# name it here. Unset, `sapphire-agent acp` exits with an error. Independent
+# of `enabled`, which gates the WebSocket endpoint alone.
+#stdio_room_profile = "editor"
+
+# ---------------------------------------------------------------------------
+# [cli] — `sapphire-agent chat`
+# ---------------------------------------------------------------------------
+# `sapphire-agent chat` is the REPL (and `-m` one-shot) client. It runs on the
+# machine the agent runs on and reaches it over the local IPC endpoint, the
+# same way `sapphire-agent acp` does, so no token picks its room profile —
+# name it here. Unset, `sapphire-agent chat` exits with an error. Host-local:
+# the workspace layer cannot set it.
+#[cli]
+#room_profile = "default"
