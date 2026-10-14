@@ -4139,7 +4139,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.58.0",
+ "windows-core 0.61.2",
 ]
 
 [[package]]
@@ -6382,7 +6382,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "343d3bd7056eda839b03204e68deff7d1b13aba7af2b2fd16890697274262ee7"
 dependencies = [
  "heck",
- "itertools 0.10.5",
+ "itertools 0.13.0",
  "log",
  "multimap",
  "petgraph",
@@ -6401,7 +6401,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.10.5",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -6414,7 +6414,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools 0.10.5",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -7457,8 +7457,9 @@ dependencies = [
 
 [[package]]
 name = "sapphire-framework"
-version = "0.17.0"
-source = "git+https://github.com/sapphire-turtle/sapphire-framework?branch=feat%2Fworkspace-sync-option#2e369dd93f7ef56bec97ba444095e036e2b7d3bd"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3963b43f004cd0f14c6f05cb28686a9dffc26fe2e8db1777a56bff797b369786"
 dependencies = [
  "sapphire-framework-backend",
  "sapphire-framework-frontmatter",
@@ -7470,8 +7471,9 @@ dependencies = [
 
 [[package]]
 name = "sapphire-framework-backend"
-version = "0.17.0"
-source = "git+https://github.com/sapphire-turtle/sapphire-framework?branch=feat%2Fworkspace-sync-option#2e369dd93f7ef56bec97ba444095e036e2b7d3bd"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c22b8ee66a8de0fa1ab1b5ef537002592b2824001ccecf44303639c60424402"
 dependencies = [
  "async-trait",
  "chrono",
@@ -7490,7 +7492,8 @@ dependencies = [
 [[package]]
 name = "sapphire-framework-bridge-api"
 version = "2.3.0"
-source = "git+https://github.com/sapphire-turtle/sapphire-framework?branch=feat%2Fworkspace-sync-option#2e369dd93f7ef56bec97ba444095e036e2b7d3bd"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "609a7098a9959db900727f3b674865031c4aa4c0196948c5cbf0564b0a0b1eac"
 dependencies = [
  "clap",
  "grain-id",
@@ -7500,8 +7503,9 @@ dependencies = [
 
 [[package]]
 name = "sapphire-framework-bridge-client"
-version = "0.17.0"
-source = "git+https://github.com/sapphire-turtle/sapphire-framework?branch=feat%2Fworkspace-sync-option#2e369dd93f7ef56bec97ba444095e036e2b7d3bd"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6f770f9f36e09587d82deb5bacb2457d50a3ee4c08daa4d0afe745ef3cc8a91"
 dependencies = [
  "sapphire-framework-bridge-api",
  "sapphire-framework-ipc",
@@ -7512,8 +7516,9 @@ dependencies = [
 
 [[package]]
 name = "sapphire-framework-frontmatter"
-version = "0.17.0"
-source = "git+https://github.com/sapphire-turtle/sapphire-framework?branch=feat%2Fworkspace-sync-option#2e369dd93f7ef56bec97ba444095e036e2b7d3bd"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5be1d60d3f8f4033787ed9ca3500e9bb6cb9035e1dc7c4db24d4636ad6bc6521"
 dependencies = [
  "serde",
  "serde-saphyr",
@@ -7523,8 +7528,9 @@ dependencies = [
 
 [[package]]
 name = "sapphire-framework-ipc"
-version = "0.17.0"
-source = "git+https://github.com/sapphire-turtle/sapphire-framework?branch=feat%2Fworkspace-sync-option#2e369dd93f7ef56bec97ba444095e036e2b7d3bd"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9a46d818b1bd7a2495179a93a88212e16d8992c1200820ad496ac8d528d20f1a"
 dependencies = [
  "dirs 7.0.0",
  "libc",
@@ -7539,8 +7545,9 @@ dependencies = [
 
 [[package]]
 name = "sapphire-framework-keys"
-version = "0.17.0"
-source = "git+https://github.com/sapphire-turtle/sapphire-framework?branch=feat%2Fworkspace-sync-option#2e369dd93f7ef56bec97ba444095e036e2b7d3bd"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "00d966a1a80d093e5293d42c2c530deb5a49dd8c60c02f917497313d00bf7ce9"
 dependencies = [
  "async-trait",
  "axum",
@@ -7555,8 +7562,9 @@ dependencies = [
 
 [[package]]
 name = "sapphire-framework-retrieve"
-version = "0.17.0"
-source = "git+https://github.com/sapphire-turtle/sapphire-framework?branch=feat%2Fworkspace-sync-option#2e369dd93f7ef56bec97ba444095e036e2b7d3bd"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c37ae83dddcebb90c63f41cb002fd345a2f9e11afe7b6d676d5fbed399b48836"
 dependencies = [
  "redb",
  "serde",
@@ -7568,8 +7576,9 @@ dependencies = [
 
 [[package]]
 name = "sapphire-framework-server"
-version = "0.17.0"
-source = "git+https://github.com/sapphire-turtle/sapphire-framework?branch=feat%2Fworkspace-sync-option#2e369dd93f7ef56bec97ba444095e036e2b7d3bd"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dff3daeb82e0b0ec8fad479c527092c19f6dd705320fc3acb50a59468d515daf"
 dependencies = [
  "clap",
  "grain-id",
@@ -7594,7 +7603,8 @@ dependencies = [
 [[package]]
 name = "sapphire-framework-server-api"
 version = "4.1.0"
-source = "git+https://github.com/sapphire-turtle/sapphire-framework?branch=feat%2Fworkspace-sync-option#2e369dd93f7ef56bec97ba444095e036e2b7d3bd"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a76503762b4af57ab5d846a9f8e053652abaeecdfaaebae689406c8dc752f49"
 dependencies = [
  "grain-id",
  "serde",
@@ -7602,8 +7612,9 @@ dependencies = [
 
 [[package]]
 name = "sapphire-framework-service"
-version = "0.17.0"
-source = "git+https://github.com/sapphire-turtle/sapphire-framework?branch=feat%2Fworkspace-sync-option#2e369dd93f7ef56bec97ba444095e036e2b7d3bd"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e7bc9e628a4ce55ae90cb6f53f630b5f8b72753c5d3fb4c1fc34e8ab755f9fa"
 dependencies = [
  "clap",
  "libc",
@@ -7614,8 +7625,9 @@ dependencies = [
 
 [[package]]
 name = "sapphire-framework-session"
-version = "0.17.0"
-source = "git+https://github.com/sapphire-turtle/sapphire-framework?branch=feat%2Fworkspace-sync-option#2e369dd93f7ef56bec97ba444095e036e2b7d3bd"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34fbdc26ce6ea4d22b8ecadc08741a91a274affb6ae72f533b8d0a98114ccea2"
 dependencies = [
  "grain-id",
  "sapphire-framework-sync",
@@ -7628,8 +7640,9 @@ dependencies = [
 
 [[package]]
 name = "sapphire-framework-sync"
-version = "0.17.0"
-source = "git+https://github.com/sapphire-turtle/sapphire-framework?branch=feat%2Fworkspace-sync-option#2e369dd93f7ef56bec97ba444095e036e2b7d3bd"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "17285efae0e3c73d78f63386da590be06c4cdb50fc373c31bafa318853a7dd82"
 dependencies = [
  "grain-id",
  "ignore",
@@ -7645,8 +7658,9 @@ dependencies = [
 
 [[package]]
 name = "sapphire-framework-track"
-version = "0.17.0"
-source = "git+https://github.com/sapphire-turtle/sapphire-framework?branch=feat%2Fworkspace-sync-option#2e369dd93f7ef56bec97ba444095e036e2b7d3bd"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4e7b12a881ebdd58859070d8653479b59e7b03888fe93fde7930640f0300d84"
 dependencies = [
  "redb",
  "thiserror 2.0.18",
@@ -7655,8 +7669,9 @@ dependencies = [
 
 [[package]]
 name = "sapphire-framework-workspace"
-version = "0.17.0"
-source = "git+https://github.com/sapphire-turtle/sapphire-framework?branch=feat%2Fworkspace-sync-option#2e369dd93f7ef56bec97ba444095e036e2b7d3bd"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "16ee49eddc0bddbc81118decbff4bb74daaa9ac239fc6294900e231e4b45c375"
 dependencies = [
  "chrono",
  "clap",
@@ -7800,7 +7815,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8050abb251097357e24aff63ba2c52a6309ecb7d23a5474023df960a02694d8"
 dependencies = [
  "annotate-snippets",
- "base64 0.22.1",
+ "base64 0.23.1",
  "encoding_rs_io",
  "granit-parser",
  "nohash-hasher",
