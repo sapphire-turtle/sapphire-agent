@@ -1,7 +1,7 @@
 //! Device authentication: bearer token -> external device -> room profile.
 //!
 //! One mechanism for every authenticated entry point: ambient ingest, `/rpc`,
-//! `/a2a`, `/acp` and `/mcp`. Tokens belong to the workgroup's external
+//! `/a2a` and `/acp`. Tokens belong to the workgroup's external
 //! devices, a ledger the sapphire bridge owns and syncs to every host; the
 //! agent never sees a stored token. A presented token goes to the bridge
 //! (`external_device.authenticate`, for [`APP_NAME`]) through the framework's

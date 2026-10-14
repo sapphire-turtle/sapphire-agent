@@ -698,18 +698,6 @@ async fn main() -> Result<()> {
                 .with_dated_files(config.day_boundary_hour),
             );
 
-            // ── MCP session store (sessions/<namespace>/mcp/) ──────────────
-            // External AI clients (Claude Code, etc.) reach this through
-            // the `/mcp` `write_report` / `recall_memory` tools. Kept in
-            // its own `kind` directory so the project-name reverse index
-            // and any future MCP-specific retention only scan MCP files.
-            let mcp_session_store = Arc::new(SessionStore::with_workspace(
-                sessions_base.clone(),
-                "mcp",
-                Arc::clone(&ws_state),
-                tool_payload_cache.clone(),
-            ));
-
             // ── Voice providers + ServeState (built early) ──────────────────
             // ServeState owns the voice_subscribers registry that heartbeat
             // pushes through, so it has to exist before heartbeat is spawned.
@@ -732,7 +720,7 @@ async fn main() -> Result<()> {
 
             // ── Device auth (bearer token -> device -> room profile) ────────
             // Built once, here, and shared as one `Arc` between ambient
-            // ingest and `ServeState` (`/rpc`, `/a2a`, `/acp`, `/mcp`) so
+            // ingest and `ServeState` (`/rpc`, `/a2a`, `/acp`) so
             // there is exactly one answer to "who is this token" in the
             // process. Tokens are checked by the sapphire bridge; one that
             // is not running is not fatal here (it may come up later), but
@@ -877,7 +865,6 @@ async fn main() -> Result<()> {
                 Arc::clone(&cross_device_session_store),
                 Arc::clone(&device_default_session_store),
                 Arc::clone(&autonomous_session_store),
-                Arc::clone(&mcp_session_store),
                 voice_providers,
                 image_cache.clone(),
                 Arc::clone(&device_auth),
@@ -1555,7 +1542,6 @@ mod tests {
             created_at: chrono::Utc::now(),
             public_id: None,
             namespace: Some(namespace.to_string()),
-            project: None,
             device_id: None,
             room_profile: None,
             title: None,

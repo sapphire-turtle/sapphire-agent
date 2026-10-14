@@ -19,17 +19,15 @@
 - **音声**： オプションの`sapphire-call voice`サテライト。ローカルSTT/TTS（`sherpa-onnx`経由）とSilero VADを備える。[cli/](cli/)参照。ウェイクワードゲーティングは検出がサーバーへ移行中のため一時的に利用不可（[#183](https://github.com/fluo10/sapphire-agent/issues/183)）。サテライトはVADのみ稼働。
 - **アンビエント音声インジェスト**： オプションの常時キャプチャ（ウェアラブル／ペンダントデバイスから）。`POST /audio/ingest`がベアラー認証済みデバイスから生の音声（メタデータはクエリパラメータ。JSON/base64フレーミングなし）を受け取り、再ゲーティングし、文字起こしし、ワークスペースで精選された参照音声Against話者を特定し、文字起こしをワークスペース外に保存します。「答えずに記録する」：このパスでは何もLLMターンを開始しません。`transcript_read`、`speaker_candidates`、`speaker_promote`が結果をエージェントツールとして公開します。デフォルトは無効 — `[ambient].enabled = true`で有効化。`config.example.toml`参照。
 - **エージェント間**： `/a2a`エンドポイントはデバイス別のベアラートークン認証付きでv1 A2Aプロトコル（JSON-RPC `SendMessage`、AgentCard）を話します — `[a2a].enabled = true`で有効化。
-- **外部AI統合**： `/mcp`エンドポイントが`write_report`と`recall_memory`ツールを公開し、Claude Code（や他のMCPクライアント）がエージェントとプロジェクトコンテキストを共有できます — [docs/mcp-integration.md](docs/mcp-integration.md)参照。
 - **サブエージェント**： メインエージェントが`subagent`ツールでタスクを委譲できる`<workspace>/agents/<name>.md`定義 — 独自のシステムプロンプト、独自のツールループ、最終回答のみが返り、ハンドルで後のラウンドに再開可能。定義のフロントマターの`profile:`は省略可能。書くとその`[profiles.<name>]`のプロバイダ（`fallback_provider`込み）で親の代わりに走り、省略時は委譲元のターンと同じモデルで走る — 後者が仕様変更前の既定動作そのままの、どちらも正当な書き方。configの`[profiles]`が定義していない名前なら起動時に即失敗する。プロバイダは親から引き継がれないことがある唯一の要素であり、権限ゲート・ツール一覧・隔離はプロファイルの有無で一切変わらない。下記「サブエージェント」参照。
 - **サブエージェントのネスト**： 委譲は再帰でき、段数の上限はconfigの`[tools.subagent] max_depth`で決まる（既定2。メインエージェントが段数0 → 委譲先が1 → その先が2）。`1`は従来の「常に1段のみ」動作、`0`は委譲そのものを禁止し、メインエージェントのターンからも`subagent`ツールが見えない。定義のフロントマターの`subagents:`は`tools:`と同型の許可リストで、省略時は委譲元ターンに見えているエージェント集合をそのまま継承、`[]`は段数と無関係にそれ以上委譲しない、リストはその名前に限定する。ネストしたサブエージェントもこの段数上限と、各段の許可リストの連鎖の両方に従い、各ネスト段は個別に`[tools.subagent] turn_timeout_secs`の締切対象になる。
 - **スキル**： エディタの*マシン*上にあるチェックアウトからACP経由でリクエスト時に読み込まれる、手順の書き下げ（プランニング、TDD、デバッグ、コードレビューなど）。ターミナルサポートを宣言したACPクライアントが必要 — Matrix、Discord、音声では完全に無効。下記「スキル」参照。
 - **エディタ統合**： `/acp`エンドポイントがWebSocket経由でAgent Client Protocolを話すことで、Zedが稼働中のエージェントを操作できる — `[acp].enabled = true`で有効化。下記「Zed / ACP」参照。
 - **コマンド**：
-  - `sapphire-agent` — チャネルリスナー＋JSON-RPC HTTP制御API（`/rpc`、`/mcp`、`/a2a`、`/acp`）を開始
+  - `sapphire-agent` — チャネルリスナー＋JSON-RPC HTTP制御API（`/rpc`、`/a2a`、`/acp`）を開始
   - `sapphire-agent init [PATH]` — エージェントが読むファイル（`AGENTS.md`、`SOUL.md`など）でワークスペースをシードし、貼り付けるホストローカル設定を出力。既存ファイルを決して上書きしない
   - `sapphire-agent verify` — 設定を検証し、device -> room_profileのバインディングを含む読み込まれたワークスペースファイルを報告
-  - `sapphire-agent device add|list|rotate|retire` — デバイスの登録、ベアラートークンの発行・交換・停止。`device add`はトークンをstdoutへ、貼り付ける`[room_profile.<n>].devices`行をstderrへ出力
-  - `sapphire-agent user add|list` — デバイスが属する人物またはエージェントを登録
+  - `sapphire-agent external-device add|list|rotate|retire|restore|apps` — 稼働中のsapphire bridgeを通じて、ワークグループの外部デバイス（ベアラートークンでエージェントにアクセスするクライアント）を管理。`add`と`rotate`はトークンを一度だけ表示
   - `sapphire-call` — 対話型REPL／音声サテライトクライアント（別クレート。[cli/](cli/)参照）
 
 ## インストール

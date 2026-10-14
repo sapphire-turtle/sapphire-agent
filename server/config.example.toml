@@ -226,8 +226,8 @@ system_prompt = "You are a helpful personal assistant."
 # `Authorization: Bearer <token>` on every `/rpc` request. The token
 # resolves to an external device (`sapphire-agent-server external-device
 # add`, see "External devices" below), whose name or id must appear in some
-# `[room_profile.<n>].devices` below — same mechanism `/a2a`, `/acp`,
-# `/mcp` and ambient ingest all use (sapphire-agent-cli: `[server].token` or
+# `[room_profile.<n>].devices` below — same mechanism `/a2a`, `/acp`
+# and ambient ingest all use (sapphire-agent-cli: `[server].token` or
 # `--token <TOKEN>`).
 #
 # [room_profile.everyday]
@@ -247,7 +247,7 @@ system_prompt = "You are a helpful personal assistant."
 # session_policy   = "compact"
 # rooms            = ["!nsfw:example.com"]
 #
-# /rpc (sapphire-agent-cli), A2A (Agent2Agent Protocol), MCP clients, `/acp`
+# /rpc (sapphire-agent-cli), A2A (Agent2Agent Protocol), `/acp`
 # and ambient ingest all reach a room_profile through devices declared
 # here. Each device must be unique across all room profiles — startup
 # fails if two profiles share one — and an incoming
@@ -266,17 +266,6 @@ system_prompt = "You are a helpful personal assistant."
 # memory_namespace = "sapphire_world"
 # rooms            = []             # A2A-only; no chat rooms map here
 # devices          = ["a2a-client"] # `external-device add a2a-client`
-#
-# A typical MCP setup for an external coding assistant (Claude Code
-# and similar) sharing the user's default memory namespace. The
-# profile pin is what the ねぎらい reply for `write_report` uses; pick
-# whichever model you want responding to project reports.
-#
-# [room_profile.claude_code]
-# profile          = "default"
-# memory_namespace = "default"      # share the everyday namespace
-# rooms            = []             # MCP-only; no chat rooms map here
-# devices          = ["claude-code"] # `external-device add claude-code`
 #
 # Caveat: workspace retrieve (FTS / vector search) currently spans every
 # namespace because the agent's retrieve tools don't yet set the
@@ -298,31 +287,6 @@ system_prompt = "You are a helpful personal assistant."
 # public_url        = "https://agent.example.com/a2a"
 # agent_name        = "Sapphire"
 # agent_description = "Personal partner AI with persistent character and memory."
-
-# ─────────────────────────────────────────────────────────────────────
-# MCP (Model Context Protocol) server
-# ─────────────────────────────────────────────────────────────────────
-# Mounts `/mcp` (JSON-RPC) on the same HTTP server as `/rpc`. Always
-# enabled — there's no `[mcp]` block — but gated entirely by the device
-# table: without a device bound to a room profile's `devices`, every
-# request returns 401. See the `[room_profile.claude_code]` example
-# above for the typical wiring.
-#
-# Two tools are exposed:
-#
-#   - `write_report` — external AI clients (Claude Code, etc.) report
-#     a unit of work back. Stored per-project under
-#     `sessions/<namespace>/mcp/<ULID>.jsonl`; the response is a
-#     ねぎらい (acknowledgement) generated through the room_profile's
-#     `profile`.
-#   - `recall_memory` — fetch a project's compact summary + recent
-#     reports at session start, so the external AI can pick up where
-#     the user left off (possibly across hosts).
-#
-# Trust boundary is asymmetric: writes flow into the namespace's
-# daily-digest pipeline normally, but `recall_memory` is scoped
-# strictly to the named project's session — namespace-wide memory
-# never leaks back to the external AI.
 
 # ─────────────────────────────────────────────────────────────────────
 # Built-in tools and MCP client (optional)
@@ -562,7 +526,7 @@ system_prompt = "You are a helpful personal assistant."
 # `[ambient].enabled = false` the route is not mounted at all, so it
 # answers 404 like any other unmatched path — a device probing for the
 # feature isn't told its key is wrong (401), the same distinction `/a2a`
-# and `/mcp` preserve, just reached by router omission here rather than
+# preserves, just reached by router omission here rather than
 # by a handler that refuses while still being mounted.
 #
 # This is a **recording** pipeline, not a conversational one: segments
@@ -650,7 +614,7 @@ system_prompt = "You are a helpful personal assistant."
 
 # ── External devices (owned by the sapphire bridge, not this file) ──
 # Every authenticated entry point — ambient ingest, `/rpc`, `/a2a`,
-# `/acp`, `/mcp` — resolves the same way: bearer token -> external device
+# `/acp` — resolves the same way: bearer token -> external device
 # -> room profile. External devices are the workgroup's synced ledger,
 # owned by the sapphire bridge: only a token's SHA-256 is stored, and
 # every host of the workgroup accepts the same tokens. The agent asks the
