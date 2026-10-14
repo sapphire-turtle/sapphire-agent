@@ -20,24 +20,6 @@ default = ["redb-store", "voice-sherpa"]
 # brute-force vector index alongside it. Without it the workspace falls back to
 # an ephemeral in-memory store.
 redb-store = ["sapphire-framework/redb-store"]
-# In-process local embeddings. MUTUALLY EXCLUSIVE WITH `voice-sherpa`, and off
-# by default for that reason — see #225.
-#
-# fastembed pulls `ort`, which vendors its own ONNX Runtime; sherpa-onnx-sys
-# vendors another. Both statically link a copy of re2, so linking them into one
-# binary gives duplicate symbols (`re2::Regexp::Concat` and friends) on Linux,
-# and LNK2038 on Windows where the CRTs also disagree. Whether it actually
-# fails depends on which objects the linker happens to pull: the agent's
-# release binary linked, its *test* binary did not.
-#
-# Dropping it costs nothing operationally — the framework's `openai` and
-# `ollama` embedders cover the same ground over HTTP, and llama.cpp's server
-# speaks the OpenAI-compatible `/v1/embeddings` shape. What it buys back is
-# single-file distribution: with sherpa linked shared to dodge the conflict,
-# the published binary could not start at all (#182).
-#
-# Usable on its own: `--no-default-features --features redb-store,fastembed-embed`.
-fastembed-embed = ["sapphire-framework/fastembed-embed"]
 # Compile in the local sherpa-onnx STT + TTS providers. Enabled by
 # default, but note that sherpa-onnx-sys pulls in a large C++ build
 # (sherpa-onnx + ONNX runtime, ~5–10 minutes on a cold cache). Users
@@ -126,15 +108,18 @@ uuid = { version = "1", features = ["v7", "serde"] }
 # crates; each feature re-exports one as a module. `default-features = false`
 # plus an explicit `workspace` keeps the facade's own default (workspace +
 # redb-store) from bypassing the feature flags below.
-# `remote-server` is enabled for one type: `remote_server::KeyStore`, which
-# authenticates ambient capture devices. It drags in the whole JSON-RPC sync
-# server (axum, redb, blob, retrieve, track) for that one struct; splitting it
-# out is fluo10/sapphire-framework#103, after which this becomes `keys`.
-sapphire-framework = { version = "0.13.0", default-features = false, features = ["workspace", "remote-server", "registry"] }
+# `keys` provides `keys::BridgeVerifier`, which checks a bearer token against
+# the workgroup's external devices through the running bridge.
+sapphire-framework = { version = "0.18.0", default-features = false, features = ["workspace", "keys"] }
+# The bridge's control-plane API and client, which the facade does not
+# re-export: `external-device` reuses the framework's own subcommand
+# (`cli` feature) and sends it to the running bridge, which owns the ledger.
+# Same release as `sapphire-framework`, so both resolve to one copy.
+sapphire-framework-bridge-api = { version = "2.3.0", features = ["cli"] }
+sapphire-framework-bridge-client = "0.18.0"
 
-# Human-readable ids: session ids, and the device/user ids in the workspace
-# registry. Must match the version sapphire-framework uses — `KeyEntry.device_id`
-# is a `GrainId`, and two semver-incompatible grain-id versions in one graph are
+# Human-readable ids: session ids, and external device ids. Must match the
+# version sapphire-framework uses — `keys::Authenticated::id` is a `GrainId`, and two semver-incompatible grain-id versions in one graph are
 # two different types.
 grain-id = { version = "0.16", features = ["serde"] }
 

@@ -807,18 +807,25 @@ pub async fn handle_acp_ws(
         return (StatusCode::NOT_FOUND, "ACP disabled").into_response();
     }
 
-    // 1. Bearer auth → room profile. Both failure modes are 401 at the HTTP
-    //    layer; ACP never sees an unauthenticated peer.
+    // 1. Bearer auth → room profile. A missing or refused token is 401 at
+    //    the HTTP layer, an unreachable bridge 503; ACP never sees an
+    //    unauthenticated peer.
     let Some(bearer) = extract_bearer(&headers) else {
         return (StatusCode::UNAUTHORIZED, "missing bearer token").into_response();
     };
-    let Some(profile_name) = state
-        .device_auth
-        .resolve(&bearer)
-        .map(|r| r.room_profile.to_string())
-    else {
-        warn!("ACP: rejected an unknown or revoked bearer token");
-        return (StatusCode::UNAUTHORIZED, "unknown or revoked bearer token").into_response();
+    let profile_name = match state.device_auth.resolve(&bearer).await {
+        Ok(r) => r.room_profile,
+        Err(crate::device_auth::AuthError::Unavailable) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "cannot check the bearer token now",
+            )
+                .into_response();
+        }
+        Err(crate::device_auth::AuthError::Refused) => {
+            warn!("ACP: rejected an unknown or revoked bearer token");
+            return (StatusCode::UNAUTHORIZED, "unknown or revoked bearer token").into_response();
+        }
     };
 
     info!("ACP: connection accepted for room profile '{profile_name}'");

@@ -10,7 +10,7 @@ mod ambient;
 mod autonomous;
 mod autonomous_config;
 mod channel;
-mod cli_device;
+mod cli_external_device;
 mod cli_init;
 mod config;
 mod config_layer;
@@ -103,15 +103,11 @@ enum Command {
     },
     /// Validate the config file and exit
     Verify,
-    /// Manage the devices that authenticate to this agent.
-    Device {
+    /// Manage the external devices that authenticate to this agent with a
+    /// key: the workgroup's ledger, through the running sapphire bridge.
+    ExternalDevice {
         #[command(subcommand)]
-        command: cli_device::DeviceCommand,
-    },
-    /// Manage the users devices belong to.
-    User {
-        #[command(subcommand)]
-        command: cli_device::UserCommand,
+        command: sapphire_framework_bridge_api::ExternalDeviceCommand,
     },
 }
 
@@ -182,20 +178,78 @@ fn group_unknown_keys<'a>(
     by_file.into_iter().collect()
 }
 
+/// `verify`'s device section: the bindings in config, and — when the bridge
+/// is running — the external devices allowed to use this agent, so a device
+/// with no room profile, or a selector naming no device, shows up before a
+/// request is refused for it.
+async fn verify_external_devices(auth: &device_auth::DeviceAuth) {
+    use sapphire_framework_bridge_api::{ExternalDeviceOutcome, ExternalDeviceRequest};
+
+    println!("  Device bindings   :");
+    for (selector, rp) in auth.bindings() {
+        println!("    {selector:<20} -> room_profile '{rp}'");
+    }
+    let listed = match sapphire_framework_bridge_client::BridgeClient::connect_running(
+        "cli",
+        env!("CARGO_PKG_VERSION"),
+    )
+    .await
+    {
+        Ok(client) => client
+            .external_device_request(ExternalDeviceRequest::List)
+            .await
+            .map_err(anyhow::Error::from),
+        Err(e) => Err(e.into()),
+    };
+    let devices = match listed {
+        Ok(ExternalDeviceOutcome::List(devices)) => devices,
+        Ok(_) => return,
+        Err(e) => {
+            println!("  External devices  : not checked, the sapphire bridge is unreachable ({e})");
+            return;
+        }
+    };
+    let live: Vec<_> = devices
+        .iter()
+        .filter(|d| d.retired_at.is_none() && d.apps.iter().any(|a| a == device_auth::APP_NAME))
+        .collect();
+    println!(
+        "  External devices  : {} allowed to use {}",
+        live.len(),
+        device_auth::APP_NAME
+    );
+    for d in &live {
+        match auth.room_profile_for_device(d.id, &d.name) {
+            Some(rp) => println!("    {:<20} {} -> room_profile '{rp}'", d.name, d.id),
+            None => println!(
+                "    {:<20} {} -> UNBOUND: its token is refused",
+                d.name, d.id
+            ),
+        }
+    }
+    for (selector, _) in auth.bindings() {
+        let known = devices.iter().any(|d| {
+            d.name == selector
+                || selector
+                    .parse::<grain_id::GrainId>()
+                    .is_ok_and(|id| id == d.id)
+        });
+        if !known {
+            println!("    {selector:<20} names no external device");
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
-        // `tracing_subscriber::fmt` defaults to stdout. `device add` prints
-        // the minted token alone to stdout so it can be piped straight into
-        // a file or a device's provisioning step; a stray log line ahead of
-        // it (e.g. the framework's own "key file permissions are not
-        // restricted on this platform" warning on non-Unix hosts) would
-        // corrupt that. Every other command's output is also `println!`, so
-        // sending logs to stderr instead keeps the split intact everywhere,
-        // not just here.
+        // `tracing_subscriber::fmt` defaults to stdout. Every command's
+        // output is `println!` (`external-device add` prints the minted
+        // token there), so sending logs to stderr keeps a stray log line
+        // out of anything piped from a command's output.
         .with_writer(std::io::stderr)
         .init();
 
@@ -300,29 +354,9 @@ async fn main() -> Result<()> {
             }
             // The device -> room_profile binding is written by hand, so it
             // needs somewhere to be checked.
-            let keys_file = config
-                .keys
-                .file
-                .clone()
-                .or_else(device_auth::DeviceAuth::default_key_file);
-            match keys_file {
-                Some(keys_file) => {
-                    let devices_file = config::workspace_devices_path(&workspace_dir);
-                    match device_auth::DeviceAuth::open(
-                        &keys_file,
-                        &devices_file,
-                        &config.room_profiles,
-                    ) {
-                        Ok(auth) => {
-                            println!("  Device table      : {}", devices_file.display());
-                            for (device, rp) in auth.bindings() {
-                                println!("    {device:<20} -> room_profile '{rp}'");
-                            }
-                        }
-                        Err(e) => println!("  Devices           : INVALID: {e:#}"),
-                    }
-                }
-                None => println!("  Devices           : [keys].file unset"),
+            match device_auth::DeviceAuth::bridge(&config.room_profiles) {
+                Ok(auth) => verify_external_devices(&auth).await,
+                Err(e) => println!("  Devices           : INVALID: {e:#}"),
             }
             match &workspace_path {
                 Some(p) => println!("  Workspace config  : {}", p.display()),
@@ -410,29 +444,8 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Some(Command::Device { command }) => {
-            let workspace_dir = config.resolved_workspace_dir(&config_path);
-            let keys_file = config
-                .keys
-                .file
-                .clone()
-                .or_else(device_auth::DeviceAuth::default_key_file)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "[keys].file is unset and no platform config directory is \
-                         resolvable; set [keys].file explicitly"
-                    )
-                })?;
-            return cli_device::run_device(
-                command,
-                &config::workspace_devices_path(&workspace_dir),
-                &config::workspace_users_path(&workspace_dir),
-                &keys_file,
-            );
-        }
-        Some(Command::User { command }) => {
-            let workspace_dir = config.resolved_workspace_dir(&config_path);
-            return cli_device::run_user(command, &config::workspace_users_path(&workspace_dir));
+        Some(Command::ExternalDevice { command }) => {
+            return cli_external_device::run(command).await;
         }
         None => {
             let bind = cli.bind;
@@ -721,25 +734,21 @@ async fn main() -> Result<()> {
             // Built once, here, and shared as one `Arc` between ambient
             // ingest and `ServeState` (`/rpc`, `/a2a`, `/acp`, `/mcp`) so
             // there is exactly one answer to "who is this token" in the
-            // process. A missing or unusable key file is fatal — see
-            // `DeviceAuth::open`'s own doc.
-            let keys_file = config
-                .keys
-                .file
-                .clone()
-                .or_else(device_auth::DeviceAuth::default_key_file)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "[keys].file is unset and no platform config directory is resolvable; \
-                         set [keys].file explicitly"
-                    )
-                })?;
-            let devices_file = config::workspace_devices_path(&workspace_dir);
-            let device_auth = Arc::new(device_auth::DeviceAuth::open(
-                &keys_file,
-                &devices_file,
-                &config.room_profiles,
-            )?);
+            // process. Tokens are checked by the sapphire bridge; one that
+            // is not running is not fatal here (it may come up later), but
+            // every authenticated request answers 503 until it does.
+            let device_auth = Arc::new(device_auth::DeviceAuth::bridge(&config.room_profiles)?);
+            if let Err(e) = sapphire_framework_bridge_client::BridgeClient::connect_running(
+                "agent",
+                env!("CARGO_PKG_VERSION"),
+            )
+            .await
+            {
+                tracing::warn!(
+                    "device auth: cannot reach the sapphire bridge ({e}); every authenticated \
+                     endpoint answers 503 until it is running"
+                );
+            }
 
             // ── Ambient audio ingest (optional) ─────────────────────────────
             // Built here — after `voice_providers` exists, before it is
@@ -1637,12 +1646,11 @@ mod tests {
     }
 
     #[test]
-    fn device_add_takes_a_name_and_a_description() {
+    fn external_device_add_takes_a_name_and_a_description() {
         let cli = Cli::try_parse_from([
             "sapphire-agent",
-            "device",
+            "external-device",
             "add",
-            "--name",
             "pendant",
             "--description",
             "the one on the lanyard",
@@ -1650,20 +1658,13 @@ mod tests {
         .unwrap();
         assert!(matches!(
             cli.command,
-            Some(Command::Device {
-                command: cli_device::DeviceCommand::Add { ref name, description: Some(_), .. }
+            Some(Command::ExternalDevice {
+                command: sapphire_framework_bridge_api::ExternalDeviceCommand::Add {
+                    ref name,
+                    description: Some(_),
+                    ..
+                }
             }) if name == "pendant"
-        ));
-    }
-
-    #[test]
-    fn device_retire_defaults_to_keeping_the_row() {
-        let cli = Cli::try_parse_from(["sapphire-agent", "device", "retire", "pendant"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Some(Command::Device {
-                command: cli_device::DeviceCommand::Retire { purge: false, .. }
-            })
         ));
     }
 

@@ -56,9 +56,8 @@ pub const WORKSPACE_ALLOWLIST: &[&[&str]] = &[
     &["room_profile", "*", "memory_namespace"],
     &["room_profile", "*", "rooms"],
     // Routing, like `rooms` above — which device runs under which profile. Not
-    // a credential: the tokens live in the host-local key file and a key names
-    // its own device, so a poisoned workspace layer can re-route a device but
-    // cannot admit one.
+    // a credential: the tokens belong to the bridge's external devices, so a
+    // poisoned workspace layer can re-route a device but cannot admit one.
     &["room_profile", "*", "devices"],
     &["room_profile", "*", "session_policy"],
     &["room_profile", "*", "voice_pipeline"],

@@ -27,8 +27,7 @@ A personal AI assistant agent that works on file-based, local-first [`sapphire-f
   - `sapphire-agent` — start the channel listeners + JSON-RPC HTTP control API (`/rpc`, `/mcp`, `/a2a`, `/acp`)
   - `sapphire-agent-server init [PATH]` — seed a workspace with the files the agent reads (`AGENTS.md`, `SOUL.md`, …), then print the host-local config to paste; never overwrites an existing file
   - `sapphire-agent-server verify` — validate config and report loaded workspace files, including the device -> room_profile bindings
-  - `sapphire-agent-server device add|list|rotate|retire` — register a device, mint or replace its bearer token, or stop it; `device add` prints the token to stdout and the `[room_profile.<n>].devices` line to paste to stderr
-  - `sapphire-agent-server user add|list` — register the person or agent a device belongs to
+  - `sapphire-agent-server external-device add|list|rotate|retire|restore|apps` — manage the workgroup's external devices (clients that reach the agent with a bearer token) through the running sapphire bridge; `add` and `rotate` print the token once
   - `sapphire-agent-cli` — interactive REPL / voice satellite client (separate crate; see [cli/](cli/))
 
 ## Install
@@ -349,23 +348,23 @@ layer cannot turn this on):
 enabled = true
 ```
 
-**2. Mint a token.** Authentication reuses the same device table as `/a2a`
-and `/mcp`: register a device, bind its id under a `[room_profile.<name>]`'s
-`devices`, and that device's token both authenticates the connection and
+**2. Mint a token.** Authentication works as for `/a2a` and `/mcp`: add an
+external device (the sapphire bridge must be running), bind its name under a
+`[room_profile.<name>]`'s `devices`, and that device's token both authenticates the connection and
 selects the room profile (and therefore the provider and memory namespace)
 the ACP session runs under. A dedicated profile keeps the editor on its own
 model or namespace:
 
 ```sh
-sapphire-agent device add --name zed-editor
-# token on stdout, device id + a devices=[...] line to paste on stderr
+sapphire-agent external-device add zed-editor
+# prints the device's id and its token, once
 ```
 
 ```toml
 [room_profile.zed]
 profile = "default"
 rooms   = []              # ACP-only; no chat rooms map here
-devices = ["a3f9k2p"]     # id printed by `device add --name zed-editor`
+devices = ["zed-editor"]  # its name, or the id `external-device add` printed
 ```
 
 Note that `[acp].enabled = true` opens `/acp` to **every** device bound to

@@ -131,10 +131,11 @@ pub fn routes(state: Arc<AmbientState>) -> Router {
 
 /// Resolve the bearer to a device name, or the error response to return.
 ///
-/// Every auth failure mode `DeviceAuth::resolve` distinguishes (unknown
-/// token, expired token, token bound to no device, device retired, device
-/// unrouted) collapses to the same 401 — the distinction is logged, not
-/// returned.
+/// Every refusal `DeviceAuth::resolve` can give (unknown token, retired
+/// device, device not allowed to use the agent, device unrouted) collapses
+/// to the same 401 — the distinction is logged, not returned. A bridge that
+/// cannot be asked is 503, so the device retries rather than concluding its
+/// key is wrong.
 ///
 /// The `enabled` check here is **defence in depth, not the mechanism**:
 /// `ambient::startup::build` returns `None` when `[ambient].enabled` is
@@ -144,15 +145,18 @@ pub fn routes(state: Arc<AmbientState>) -> Router {
 /// 404 rather than 401 so that case stays indistinguishable from the
 /// unmounted one — a device probing for the feature must never be told its
 /// key is wrong.
-fn authenticate(state: &AmbientState, headers: &HeaderMap) -> Result<String, StatusCode> {
+async fn authenticate(state: &AmbientState, headers: &HeaderMap) -> Result<String, StatusCode> {
     if !state.config.enabled {
         return Err(StatusCode::NOT_FOUND);
     }
     let token = crate::serve::extract_bearer(headers).ok_or(StatusCode::UNAUTHORIZED)?;
-    match state.devices.resolve(&token) {
-        Some(r) => Ok(r.device.name.clone()),
-        None => {
-            debug!("ambient: rejected bearer (unknown, expired, retired, or bound to no device)");
+    match state.devices.resolve(&token).await {
+        Ok(r) => Ok(r.device.name),
+        Err(crate::device_auth::AuthError::Unavailable) => Err(StatusCode::SERVICE_UNAVAILABLE),
+        Err(crate::device_auth::AuthError::Refused) => {
+            debug!(
+                "ambient: rejected bearer (unknown, retired, not allowed, or bound to no room profile)"
+            );
             Err(StatusCode::UNAUTHORIZED)
         }
     }
@@ -164,7 +168,7 @@ async fn handle_ingest(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
-    let device = match authenticate(&state, &headers) {
+    let device = match authenticate(&state, &headers).await {
         Ok(d) => d,
         Err(status) => return status.into_response(),
     };
@@ -248,7 +252,7 @@ async fn handle_hello(
     State(state): State<Arc<AmbientState>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let device = match authenticate(&state, &headers) {
+    let device = match authenticate(&state, &headers).await {
         Ok(d) => d,
         Err(status) => return status.into_response(),
     };
@@ -324,44 +328,24 @@ mod tests {
     }
 
     /// Build a `DeviceAuth` binding one device ("pendant") to a token
-    /// ("sa-dev-good"), routed to room_profile "home". Written by hand
-    /// (not `KeyStore::generate`, which always mints a random token) so
-    /// the fixed bearer literal used throughout these tests keeps
-    /// resolving — `[[key]]` requires only `token`; `device_id` links it
-    /// to the device table entry.
-    fn device_auth_fixture(dir: &std::path::Path) -> Arc<crate::device_auth::DeviceAuth> {
-        let keys_file = dir.join("keys.toml");
-        let devices_file = dir.join("devices.toml");
-        let mut devices = sapphire_framework::registry::Devices::load(&devices_file).unwrap();
-        let device = devices.add("pendant", None, None).unwrap();
-        std::fs::write(
-            &keys_file,
-            format!(
-                "[[key]]\ntoken = \"sa-dev-good\"\nlabel = \"pendant-key\"\ndevice_id = \"{}\"\n",
-                device.id
-            ),
-        )
-        .unwrap();
-
+    /// ("sa-dev-good"), routed to room_profile "home". A static verifier
+    /// stands in for the bridge, so the fixed bearer literal used
+    /// throughout these tests keeps resolving.
+    fn device_auth_fixture() -> Arc<crate::device_auth::DeviceAuth> {
         let mut room_profiles = std::collections::HashMap::new();
         room_profiles.insert(
             "home".to_string(),
             crate::config::RoomProfileConfig {
                 profile: "sonnet".into(),
-                devices: vec![device.id.to_string()],
+                devices: vec!["pendant".to_string()],
                 ..Default::default()
             },
         );
-
-        Arc::new(
-            crate::device_auth::DeviceAuth::open(&keys_file, &devices_file, &room_profiles)
-                .unwrap(),
-        )
+        crate::device_auth::testing::device_auth(&[("sa-dev-good", "pendant")], &room_profiles)
     }
 
     fn harness_with(depth: usize, enabled: bool) -> (Router, mpsc::Receiver<Segment>) {
-        let tmp = tempfile::tempdir().unwrap();
-        let device_auth = device_auth_fixture(tmp.path());
+        let device_auth = device_auth_fixture();
         let (tx, rx) = mpsc::channel(depth);
         let cfg = AmbientConfig {
             enabled,

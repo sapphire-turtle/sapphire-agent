@@ -45,8 +45,7 @@ pub struct AmbientRuntime {
 ///
 /// `device_auth` is built once by the caller and shared with `ServeState` —
 /// there is exactly one answer to "who is this token" in the process, so
-/// this function never resolves `[keys].file` or opens a device store
-/// itself.
+/// this function does no authentication of its own.
 ///
 /// Assembles, in order, failing loudly at each step:
 /// 1. the cache root (`[ambient].cache_dir`, else a platform default);
@@ -226,22 +225,11 @@ mod tests {
         assert!(result.is_none(), "ambient is opt-in");
     }
 
-    /// A minimal, valid `DeviceAuth`: one usable key, bound to no device.
-    /// `build` no longer resolves `[keys].file` or opens a device store
-    /// itself — that now happens once, before `build` is called, and is
-    /// covered by `device_auth::tests` (see in particular
-    /// `open_fails_when_the_key_file_has_no_usable_key`, which is what
-    /// `build_errors_on_a_missing_key_file_and_names_it` used to test here
-    /// before the key file resolution moved out of this module).
-    fn test_device_auth(dir: &std::path::Path) -> Arc<DeviceAuth> {
-        let keys_file = dir.join("keys.toml");
-        let devices_file = dir.join("devices.toml");
-        let mut keys = sapphire_framework::remote_server::KeyStore::load(&keys_file).unwrap();
-        keys.generate("sat", None, None, Some("test".into()), None)
-            .unwrap();
-        Arc::new(
-            DeviceAuth::open(&keys_file, &devices_file, &std::collections::HashMap::new()).unwrap(),
-        )
+    /// A minimal, valid `DeviceAuth` with no devices. `build` does no auth
+    /// of its own — `device_auth` is built once, before `build` is called,
+    /// and is covered by `device_auth::tests`.
+    fn test_device_auth(_dir: &std::path::Path) -> Arc<DeviceAuth> {
+        crate::device_auth::testing::device_auth(&[], &std::collections::HashMap::new())
     }
 
     #[test]

@@ -530,7 +530,7 @@ impl Tool for WorkspaceSearchTool {
         if mode == "semantic"
             && let Some(embedder) = state.embedder()
         {
-            let vq = VectorQuery::new(query, embedder).limit(limit);
+            let vq = VectorQuery::new(query, &*embedder).limit(limit);
             let results = state
                 .retrieve_db()
                 .search_similar(&vq)
