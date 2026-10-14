@@ -306,7 +306,9 @@ pub fn encode_embedding(v: &[f32]) -> Vec<u8> {
 
 /// Inverse of [`encode_embedding`]. `pub` for the same reason.
 pub fn decode_embedding(raw: &[u8]) -> Vec<f32> {
-    raw.chunks_exact(4)
+    raw.as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
 }

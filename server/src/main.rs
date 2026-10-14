@@ -56,6 +56,18 @@ static APP_CTX: AppContext = AppContext::new("sapphire-agent").allow_external_pa
 /// Inject host-platform paths into [`APP_CTX`] before any code touches a
 /// [`SwWorkspace`]. The framework deliberately does not depend on `dirs`, so
 /// each host app resolves its own cache / data directories at startup.
+/// Make ring rustls's process-wide crypto provider.
+///
+/// rustls picks a default on its own only when exactly one backend is
+/// compiled in, and matrix-sdk 0.19 adds aws-lc-rs beside the ring that
+/// reqwest and the rest already use. reqwest names its provider and does not
+/// care, but anything building a `ClientConfig::builder()` would panic with
+/// both present. ring keeps every connection on the provider it used before.
+fn install_crypto_provider() {
+    // Err only when one is already installed, which is what we want anyway.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 fn init_app_ctx() {
     let base = directories::BaseDirs::new();
     let cache_dir = base
@@ -267,6 +279,7 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
+    install_crypto_provider();
     init_app_ctx();
 
     let cli = Cli::parse();
@@ -1868,6 +1881,16 @@ mod tests {
             parse(&["sapphire-agent", "acp"]),
             Some(Command::Acp)
         ));
+    }
+
+    /// With ring and aws-lc-rs both compiled in, building a rustls config
+    /// without naming a provider panics unless one has been installed.
+    #[test]
+    fn a_default_crypto_provider_is_installed() {
+        install_crypto_provider();
+        let _ = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
     }
 
     fn write_stub(path: &std::path::Path, body: &str) {

@@ -150,7 +150,7 @@ pub fn load_heartbeat_dir(dir: &Path) -> Vec<HeartbeatTask> {
 
 fn parse_task(name: String, raw: &str) -> Option<HeartbeatTask> {
     let (fm, body) = crate::frontmatter::split(raw)?;
-    let meta: HeartbeatTaskMeta = match serde_yaml::from_str(fm) {
+    let meta: HeartbeatTaskMeta = match serde_norway::from_str(fm) {
         Ok(m) => m,
         Err(e) => {
             warn!("heartbeat task {name}: yaml parse error: {e}");

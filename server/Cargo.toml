@@ -39,11 +39,15 @@ tokio = { workspace = true, features = [
 
 # HTTP client (Anthropic API + tool HTTP calls)
 reqwest = { workspace = true, features = ["blocking"] }
+# Only to install the process-wide crypto provider (see `main`): matrix-sdk
+# 0.19 brings rustls's aws-lc-rs backend beside the ring one everything else
+# uses, and with two compiled in rustls has no default of its own.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 # Matrix client + E2EE
-matrix-sdk = { version = "0.16", default-features = false, features = [
+matrix-sdk = { version = "0.19", default-features = false, features = [
     "e2e-encryption",
-    "rustls-tls",
+    "rustls-aws-lc-rs",
     "sqlite",
     "bundled-sqlite",
     "markdown",
@@ -62,8 +66,11 @@ toml = "1.0"
 # for a newer build unloadable by an older one.
 serde_ignored = "0.1"
 
-# YAML (heartbeat task frontmatter)
-serde_yaml = "0.9"
+# YAML front matter (heartbeat, autonomous and agent definitions, memory
+# files, periodic logs). A maintained fork of serde_yaml with the same API:
+# serde_yaml is deprecated, and its unsafe-libyaml is unmaintained
+# (RUSTSEC-2024-0449).
+serde_norway = "0.9"
 
 # Cron expression parsing (heartbeat schedules)
 cron = "0.16"

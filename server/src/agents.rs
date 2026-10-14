@@ -85,7 +85,7 @@ pub fn load_agents_dir(dir: &Path) -> Vec<AgentDef> {
 
 fn parse_agent(name: String, raw: &str) -> Option<AgentDef> {
     let (fm, body) = crate::frontmatter::split(raw)?;
-    let meta: AgentMeta = match serde_yaml::from_str(fm) {
+    let meta: AgentMeta = match serde_norway::from_str(fm) {
         Ok(m) => m,
         Err(e) => {
             warn!("agent {name}: yaml parse error: {e}");

@@ -40,7 +40,7 @@ pub struct SkillIndex {
 /// macOS path simply does not exist on Linux.
 ///
 /// Frontmatter is emitted raw, one `FM` line per line of it, and parsed
-/// by `serde_yaml` in `parse_index`. Parsing YAML in `sed` would break
+/// by `serde_norway` in `parse_index`. Parsing YAML in `sed` would break
 /// on the quoted descriptions superpowers actually ships.
 pub const RESOLVE_AND_INDEX_SH: &str = r#"
 set -u

@@ -76,17 +76,17 @@ pub fn set_enabled(raw: &str, enabled: bool) -> Option<String> {
     Some(out)
 }
 
-/// Parse YAML frontmatter into a `serde_yaml::Mapping`. Empty or unparseable
+/// Parse YAML frontmatter into a `serde_norway::Mapping`. Empty or unparseable
 /// input yields an empty mapping — convenient when merging catchup updates.
-pub fn parse_mapping(fm: &str) -> serde_yaml::Mapping {
-    serde_yaml::from_str(fm).unwrap_or_default()
+pub fn parse_mapping(fm: &str) -> serde_norway::Mapping {
+    serde_norway::from_str(fm).unwrap_or_default()
 }
 
 /// Serialize a mapping + body back into a Markdown file with YAML frontmatter.
 /// Emits `---\n{yaml}---\n\n{body}`; the body's leading newlines are stripped
 /// to guarantee exactly one blank line after the closing `---`.
-pub fn serialize(meta: &serde_yaml::Mapping, body: &str) -> Result<String> {
-    let fm = serde_yaml::to_string(meta).context("failed to serialize frontmatter")?;
+pub fn serialize(meta: &serde_norway::Mapping, body: &str) -> Result<String> {
+    let fm = serde_norway::to_string(meta).context("failed to serialize frontmatter")?;
     let body_trimmed = body.trim_start_matches(['\n', '\r']);
     Ok(format!("---\n{fm}---\n\n{body_trimmed}"))
 }

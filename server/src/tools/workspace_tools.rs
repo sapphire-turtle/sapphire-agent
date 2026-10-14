@@ -117,7 +117,7 @@ struct MemoryMeta {
 fn parse_memory_file(raw: &str) -> (MemoryMeta, String) {
     match crate::frontmatter::split(raw) {
         Some((fm, body)) => {
-            let meta: MemoryMeta = serde_yaml::from_str(fm).unwrap_or_default();
+            let meta: MemoryMeta = serde_norway::from_str(fm).unwrap_or_default();
             let body = body.trim_start_matches(['\n', '\r']).to_string();
             (meta, body)
         }
@@ -127,7 +127,7 @@ fn parse_memory_file(raw: &str) -> (MemoryMeta, String) {
 
 /// Serialize `(meta, body)` back into a Markdown file with YAML frontmatter.
 fn serialize_memory_file(meta: &MemoryMeta, body: &str) -> Result<String> {
-    let fm = serde_yaml::to_string(meta).context("failed to serialize memory frontmatter")?;
+    let fm = serde_norway::to_string(meta).context("failed to serialize memory frontmatter")?;
     let body_trimmed = body.trim_start_matches(['\n', '\r']);
     Ok(format!("---\n{fm}---\n\n{body_trimmed}"))
 }
