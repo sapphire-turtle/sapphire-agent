@@ -76,7 +76,7 @@ fn adopt_into(file: &SelectionFile, dir: &Path) -> Result<PathBuf> {
 /// the service spec from it and talk to the running server or the bridge
 /// themselves.
 pub fn build() -> AppServer {
-    AppServer::new(&APP_CTX, VERSION)
+    AppServer::new(&APP_CTX, VERSION).app_api(crate::serve::acp_tunnel::APP_API)
 }
 
 /// Attach sync, through the host's `sapphire-bridge` when one is running.

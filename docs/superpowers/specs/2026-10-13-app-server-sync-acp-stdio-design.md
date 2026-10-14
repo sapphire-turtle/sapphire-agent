@@ -156,11 +156,20 @@ autonomous セッション、日誌・週報などの periodic log、memory comp
 変わるたびに中継側も直すことになるので、中継は JSON-RPC の 1 メッセージ（1 行）を中身に
 触れずに運ぶだけにする。
 
-- `sapphire-agent.acp.open` → `{ conn }`: サーバー側で ACP 接続を 1 本作る。
-- `sapphire-agent.acp.send { conn, line }`: エディタ → エージェントの 1 行。
+- `sapphire-agent.acp.open`: サーバー側で ACP 接続を 1 本作り、**その接続が終わるまで応答しない**。
+  始めに通知 `sapphire-agent.acp.opened { conn }` で接続の id を知らせ、終わったら通知
+  `sapphire-agent.acp.closed { conn }` を送ってから応答する。
+- `sapphire-agent.acp.send { conn, line }`: エディタ → エージェントの 1 行。中継は応答を待ってから
+  次を送る（framework はリクエストごとに別タスクで処理するので、同時に送ると順序が入れ替わりうる）。
 - 通知 `sapphire-agent.acp.recv { conn, line }`: エージェント → エディタの 1 行
   （`PeerHandle::notify`）。
 - `sapphire-agent.acp.close { conn }`、または IPC 接続が切れたら、その ACP 接続を閉じる。
+
+（実装時の変更）`open` が `{ conn }` を返してすぐ終わる形だと、IPC 接続が切れたことをサーバー側で
+知る手段がない（framework のルーターはハンドラに切断を知らせない）。`open` を接続の寿命だけ
+保留しておけば、切断時に framework がそのハンドラを落とすので、それを合図に ACP 接続を閉じられる。
+ACP 接続自体は別タスクで動かし、ハンドラはガードだけを持つ。ハンドラごと接続を落とすと、
+保持していたセッションの解放（`open_acp_sessions`）が飛ばされるため。
 
 サーバー側では、今 WebSocket に結び付いている `serve_connection` を「1 行ずつ読み書きできる
 トランスポート」に一般化し、WebSocket と IPC トンネルの両方から使う。ACP の処理は 1 つのまま。
@@ -168,6 +177,12 @@ autonomous セッション、日誌・週報などの periodic log、memory comp
 **認証とルーム プロファイル**: IPC は同じ OS ユーザーにしか開かない（framework の peer uid 確認）
 ので、Bearer トークンは使わない。トークンがないためルーム プロファイルが決まらないので、
 `[acp].stdio_room_profile` で指定する（未設定なら stdio ACP は起動時にエラーで、その旨を言う）。
+
+**App API の版**: エージェント独自の IPC メソッドの版（`APP_API`、今は 1）はハンドシェイクで
+確認する。当初は `crates/sapphire-agent-core` に置く案だったが、中継（`acp` サブコマンド）は
+サーバーと同じバイナリにあり、core をサーバーに入れると reedline なども付いてくるので、
+`server/src/serve/acp_tunnel.rs` に置いた。別のクライアント（desktop など）が呼ぶようになったら
+core に移す。
 
 **却下した案**: エージェントが ACP 専用の生ソケット（`connect_raw`）を別に開く案。
 バイトを素通しできて簡単だが、エンドポイントが 2 つになり、framework のハンドシェイク

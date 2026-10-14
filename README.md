@@ -21,7 +21,7 @@ A personal AI assistant agent that works on file-based, local-first [`sapphire-f
 - **Agent-to-agent**: `/a2a` endpoint speaks the v1 A2A protocol (JSON-RPC `SendMessage`, AgentCard) with per-device bearer-token auth — enable via `[a2a].enabled = true`.
 - **Subagents**: `<workspace>/agents/<name>.md` definitions the main agent can delegate a task to via the `subagent` tool — its own system prompt, its own tool loop, only the final answer comes back, it can be resumed by handle for a later round, and a delegated agent can itself delegate up to `[tools.subagent] max_depth` deep. See [Subagents](#subagents) below.
 - **Skills**: written procedures (planning, TDD, debugging, code review, …) loaded on request from a checkout on the *editor's* machine, over ACP. Requires an ACP client that declared terminal support — off entirely for Matrix, Discord and voice. See [Skills](#skills) below.
-- **Editor integration**: `/acp` endpoint speaks the Agent Client Protocol over WebSocket, so Zed can drive the running agent — enable via `[acp].enabled = true`; see [Zed / ACP](#zed--acp) below.
+- **Editor integration**: Zed (or any ACP client) drives the running agent over the Agent Client Protocol — on the agent's own machine by starting `sapphire-agent acp` (stdio, relayed to the running agent over its local IPC endpoint), from elsewhere over the `/acp` WebSocket endpoint (`[acp].enabled = true`); see [Zed / ACP](#zed--acp) below.
 - **Commands**:
   - `sapphire-agent` — start the channel listeners + JSON-RPC HTTP control API (`/rpc`, `/a2a`, `/acp`)
   - `sapphire-agent-server init [PATH]` — seed a workspace with the files the agent reads (`AGENTS.md`, `SOUL.md`, …), then print the host-local config to paste; never overwrites an existing file
@@ -369,6 +369,40 @@ tree and line format from `/rpc`, Matrix and Discord, not a `cwd`-tagged row
 folded into one of theirs. See
 [Loading past sessions](#loading-past-sessions) below for the layout.
 
+There are two ways in. On a machine where the agent runs — every synced host
+runs one — the editor starts `sapphire-agent acp` itself. From a machine that
+does not, it connects to `/acp` over the network.
+
+### On the agent's machine: `sapphire-agent acp`
+
+`sapphire-agent acp` speaks ACP on stdio, which is the transport editors
+expect, and relays every line to the agent already running on this host over
+its local IPC endpoint. The conversation runs in that agent, on this host; the
+relay starts nothing, and exits with an error when no agent is running. No
+token is involved — the endpoint admits only the OS user the agent runs as —
+so the room profile a token would pick is named in the host config instead:
+
+```toml
+[acp]
+stdio_room_profile = "zed"   # any [room_profile.<name>]; required for `acp`
+
+[room_profile.zed]
+profile = "default"
+rooms   = []
+```
+
+Then, in Zed's `settings.json`:
+
+```jsonc
+"agent_servers": {
+  "sapphire": { "type": "custom", "command": "sapphire-agent", "args": ["acp"] }
+}
+```
+
+`[acp].enabled` is not needed for this; it gates the WebSocket endpoint only.
+
+### From another machine: `/acp`
+
 **1. Enable the endpoint** in your config (host-local; the workspace config
 layer cannot turn this on):
 
@@ -631,9 +665,10 @@ tracks removing that). **The `parent` chain is the authority on
 order, not the `id`'s embedded clock** — two writers with skewed clocks
 would otherwise sort against each other wrongly.
 
-Zed's session picker lists this token's own conversations: `session/list`
-returns every open session under the connecting device's room profile's
-memory namespace — that is the isolation boundary, not the room profile
+Zed's session picker lists the connection's own conversations: `session/list`
+returns every open session under the memory namespace of the connection's
+room profile — the one its token picked on `/acp`, or
+`[acp].stdio_room_profile` for `sapphire-agent acp` — that is the isolation boundary, not the room profile
 itself, so two profiles that leave `memory_namespace` unset both land on
 `default` and see each other's sessions. Zed can further narrow the list to
 the project directory it has open (`cwd`), which every ACP session records
@@ -656,15 +691,22 @@ from the digest.
 
 A second, similarly workspace-external location,
 `<cache_dir>/sapphire-agent/tool-results/<sha256>`, is a content-addressed
-cache holding a tool call's result by hash — the JSONL itself stores only
-the tool name, the result's hash, not the result body, and the input as
+cache holding a tool call's result by hash — the session's event file stores
+only the tool name, the result's hash, not the result body, and the input as
 given. The input has nowhere to be hashed out to the way a result does, so
-it goes into the JSONL directly; one that serialises past the same 50,000
-byte cap is elided to a small marker object on the way to disk rather than
-stored, so a single oversized call cannot put its raw content into the
+it goes into the event file directly; one that serialises past the same
+50,000 byte cap is elided to a small marker object on the way to disk rather
+than stored, so a single oversized call cannot put its raw content into the
 (indexed) workspace. An ACP session's `tool_use` and `tool_result` messages
 are persisted (see "Tool calls are persisted for ACP sessions" below);
 every other transport still is not.
+
+**Both caches belong to the host, and are not synced.** The session files
+are in the workspace and travel to every synced host; the caches stay on the
+host that wrote them. A session continued on another host therefore sees the
+results of tool calls made elsewhere as placeholders (see the next
+paragraph). Whether to sync them is an open question in the
+[design note](docs/superpowers/specs/2026-10-13-app-server-sync-acp-stdio-design.md).
 
 **Losing the cache degrades a session rather than breaking it.** Delete
 the directory, or lose an entry to a write failure, and the session still
@@ -689,20 +731,20 @@ cannot be pruned out of the session log itself: events are chained by
 **ACP sessions appear in both the cross-session "today" digest and the
 daily log.** The digest is kept current by a sweep on a rolling 30-minute
 cadence from process start, which regenerates only the sessions whose
-newest message postdates their cached digest. `/rpc`, device-default and
-MCP sessions still do not reach the daily log —
+newest message postdates their cached digest. `/rpc` and device-default
+sessions still do not reach the daily log —
 [#189](https://github.com/fluo10/sapphire-agent/issues/189).
 
 **Tool calls are persisted for ACP sessions.** `run_llm_turn` writes
-`tool_use` and `tool_result` messages to the ACP session's JSONL (see
-"A second, similarly workspace-external location" above for what the
-JSONL stores versus the result cache). `/rpc`, device-default and MCP
-sessions do not — their line format has no reference form for a result,
+`tool_use` and `tool_result` events to the ACP session's directory (see
+"A second, similarly workspace-external location" above for what an
+event file stores versus the result cache). `/rpc` and device-default
+sessions do not — their event format has no reference form for a result,
 so writing one raw would put the content in the workspace and the
 retrieve index, which is exactly what the ACP store's external cache
 exists to avoid for results ([#194](https://github.com/fluo10/sapphire-agent/issues/194)).
 That protection is only for results, though — a tool *input* has no
-hash-and-cache indirection, so it lands in the JSONL directly, bounded
+hash-and-cache indirection, so it lands in the event file directly, bounded
 rather than eliminated: capped at the same 50,000-byte limit, and
 elided to a marker object above it. Reloading an ACP session therefore
 restores what the agent did as well as what was said — but the editor
@@ -755,9 +797,9 @@ whole turn.
   the API returns, so neither `session/update: usage_update` nor
   `PromptResponse.usage` is sent, and the editor cannot show what a turn
   cost or how full the context is.
-- **`/rpc`, device-default and MCP sessions still do not persist tool
-  calls.** Only ACP sessions write `tool_use` / `tool_result` to their
-  JSONL; the other transports' line format has no reference form for a
+- **`/rpc` and device-default sessions still do not persist tool
+  calls.** Only ACP sessions write `tool_use` / `tool_result` events;
+  the other transports' event format has no reference form for a
   result, so a reload of one of those restores what was said but not what
   was done. Tracked as [#194](https://github.com/fluo10/sapphire-agent/issues/194).
 - **A loaded session's tool calls are not shown in the editor.** Even for

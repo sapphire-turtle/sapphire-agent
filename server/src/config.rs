@@ -282,6 +282,15 @@ pub struct AcpConfig {
     /// direction the proxy actually watches.
     #[serde(default = "default_acp_keepalive_secs")]
     pub keepalive_secs: u64,
+    /// The room profile `sapphire-agent acp` (ACP on stdio, tunnelled to
+    /// the running agent over IPC) runs under. Unset, stdio ACP refuses to
+    /// start and says so.
+    ///
+    /// A token picks the room profile on `/acp`; the stdio path has none —
+    /// the IPC endpoint only lets this OS user in — so the profile is named
+    /// here instead. Independent of `enabled`, which gates `/acp` alone.
+    #[serde(default)]
+    pub stdio_room_profile: Option<String>,
 }
 
 impl Default for AcpConfig {
@@ -289,6 +298,7 @@ impl Default for AcpConfig {
         Self {
             enabled: false,
             keepalive_secs: default_acp_keepalive_secs(),
+            stdio_room_profile: None,
         }
     }
 }
@@ -1553,6 +1563,17 @@ api_key = "test"
                 }
             }
         }
+        if let Some(name) = self
+            .acp
+            .as_ref()
+            .and_then(|a| a.stdio_room_profile.as_ref())
+            && name != DEFAULT_PROFILE_NAME
+            && !self.room_profiles.contains_key(name)
+        {
+            errors.push(format!(
+                "[acp].stdio_room_profile references unknown room_profile '{name}'"
+            ));
+        }
         // The admin allow list names room profiles. A typo there would grant
         // nothing and say nothing — the same hour-costing shape
         // `validate_subagent_profiles` exists to close.
@@ -2257,6 +2278,23 @@ mod tests {
             "{:?}",
             ok.validate_profiles()
         );
+    }
+
+    /// A typo in `[acp].stdio_room_profile` fails `verify` and startup,
+    /// rather than every `sapphire-agent acp` later.
+    #[test]
+    fn an_unknown_stdio_room_profile_is_reported() {
+        let cfg =
+            parse("[anthropic]\napi_key = \"test\"\n\n[acp]\nstdio_room_profile = \"typo\"\n");
+        let errors = cfg.validate_profiles();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("[acp].stdio_room_profile") && e.contains("typo")),
+            "{errors:?}"
+        );
+        let unset = parse("[anthropic]\napi_key = \"test\"\n\n[acp]\nenabled = true\n");
+        assert_eq!(unset.acp.unwrap().stdio_room_profile, None);
     }
 
     /// The default is off. An agent that starts working on its own
