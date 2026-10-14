@@ -1177,9 +1177,12 @@ checkout is deliberately outside it.
 
 ## License
 
-Licensed under either of:
+This repository contains components under different licenses:
 
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
-- MIT License ([LICENSE-MIT](LICENSE-MIT))
+| Component | License |
+|-----------|---------|
+| `sapphire-agent` (`cli/`) | MIT OR Apache-2.0 |
+| `sapphire-agent-core` | MIT OR Apache-2.0 |
+| `sapphire-agent-desktop` | GPL-3.0-or-later, with [App Store marketplace exception](desktop/LICENSE.App-Store-Exception) |
 
-at your option.
+See the `LICENSE` (or `LICENSE-MIT` / `LICENSE-APACHE`) file in each component's directory for the full license text. The desktop app also bundles a font under the SIL Open Font License ([desktop/assets/LICENSE-OFL.txt](desktop/assets/LICENSE-OFL.txt)) and Lucide icons under the ISC License ([desktop/assets/icons/LICENSE-LUCIDE.txt](desktop/assets/icons/LICENSE-LUCIDE.txt)).

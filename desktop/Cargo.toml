@@ -3,7 +3,7 @@ name = "sapphire-agent-desktop"
 version = "0.8.0"
 edition.workspace = true
 description = "Desktop GUI client for sapphire-agent (bevy + egui)"
-license.workspace = true
+license-file = "LICENSE"
 repository.workspace = true
 publish = false
 

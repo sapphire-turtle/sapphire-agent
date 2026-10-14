@@ -103,6 +103,10 @@ confidence-threshold = 0.93
 # the sole graph root otherwise, so `sapphire-agent-desktop`'s tree had never
 # been checked before.
 exceptions = [
+    # Our own desktop app is GPL-3.0-or-later with an app store exception
+    # (desktop/LICENSE.App-Store-Exception). Scoped to it, so a GPL dependency
+    # cannot slip in unnoticed.
+    { name = "sapphire-agent-desktop", allow = ["GPL-3.0-or-later"] },
     { name = "epaint_default_fonts", allow = ["OFL-1.1", "Ubuntu-font-1.0"] },
 ]
 
