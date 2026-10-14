@@ -1,45 +1,52 @@
 [workspace]
-# Per-package tags / GitHub releases. Existing single-version tags like
-# `v0.6.1` stay as historical anchors; new tags use the per-package form.
-git_tag_name = "{{ package }}-v{{ version }}"
-git_release_name = "{{ package }}-v{{ version }}"
+# Tags and GitHub releases follow the sapphire-turtle convention
+# (sapphire-framework's ci/README.md): `v{version}` for sapphire-agent, the
+# CLI and server binary; `desktop-v{version}` for the desktop app; none for
+# the library crate. Before the CLI and the server became one binary, tags
+# were per package (`sapphire-agent-server-v…`, `sapphire-agent-cli-v…`).
+git_tag_enable = false
+git_release_enable = false
+pr_labels = ["release"]
 
 # Static PR title. release-plz's `pr_name` context doesn't expose a per-package
 # list (the `releases` variable is only available in `pr_body`), so dynamic
-# titles for multi-package bumps aren't possible. The PR body lists the bumps,
-# and per-package tags / GH releases use `{{ package }}-v{{ version }}` above.
+# titles for multi-package bumps aren't possible. The PR body lists the bumps.
 pr_name = "chore(release): version bump"
 
 # Custom git-cliff config to drop sibling-crate-scoped commits from the
 # generated changelog entries. Doesn't suppress the version bump itself
-# (release-plz decides "did this package change?" purely from file
-# paths) — but it keeps the changelog readable. See cliff.toml for
-# details.
+# (release-plz decides "did this package change?" purely from file paths) —
+# but it keeps the changelog readable. See cliff.toml for details.
 changelog_config = "./cliff.toml"
 
-# The one `sapphire-agent` binary: the server and its CLI (#278). Lives in
-# `cli/`, and continues the server's changelog and version line.
 [[package]]
 name = "sapphire-agent"
 changelog_path = "./cli/CHANGELOG.md"
+git_tag_enable = true
+git_release_enable = true
+git_tag_name = "v{{ version }}"
+git_release_name = "v{{ version }}"
 
 [[package]]
 name = "sapphire-agent-core"
 changelog_path = "./crates/sapphire-agent-core/CHANGELOG.md"
 
-# sapphire-agent-desktop ships as a GitHub-release-only binary (bevy +
-# bundled font + ICE-licensed Lucide SVGs — not intended for crates.io,
-# hence `publish = false` in its Cargo.toml). release-plz still creates
-# the `sapphire-agent-desktop-v*` tag + GH release; the
-# `.github/workflows/release-desktop.yml` workflow builds the binaries
-# for that tag and attaches them as release assets.
+# sapphire-agent-desktop ships as a GitHub-release-only binary (bevy + bundled
+# font + ISC-licensed Lucide SVGs — not intended for crates.io, hence
+# `publish = false` in its Cargo.toml); release-binaries.yml builds the
+# binaries for its tag.
 #
-# `release = true` is load-bearing: release-plz's default behaviour is
-# to skip any crate whose Cargo.toml has `publish = false`, even if it
-# appears in release-plz.toml. Without this line release-plz silently
-# excludes the package from its scan and never tags new versions.
+# It is versioned from its `desktop-v{version}` tags. `git_only = true` is
+# load-bearing: release-plz silently skips a crate whose Cargo.toml has
+# `publish = false` unless it is set — `release = true` alone, which this file
+# used before, no longer does it, and no desktop tag was made after the
+# package was renamed from sapphire-call-desktop.
 [[package]]
 name = "sapphire-agent-desktop"
 changelog_path = "./desktop/CHANGELOG.md"
+git_only = true
 publish = false
-release = true
+git_tag_enable = true
+git_release_enable = true
+git_tag_name = "desktop-v{{ version }}"
+git_release_name = "desktop-v{{ version }}"

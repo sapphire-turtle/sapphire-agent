@@ -2,7 +2,7 @@
 
 > Language: **English** | [日本語](README.ja.md)
 
-A personal AI assistant agent that works on file-based, local-first [`sapphire-framework`](https://github.com/fluo10/sapphire-framework) workspaces together with you — talking through Matrix and Discord.
+A personal AI assistant agent that works on file-based, local-first [`sapphire-framework`](https://github.com/sapphire-turtle/sapphire-framework) workspaces together with you — talking through Matrix and Discord.
 
 > **Status: personal project.** This is something I built for my own use. It only has to work in my environment, and that is the only environment I test it in. You are welcome to use it, fork it, or send pull requests, but I am not going to maintain providers, channels, or features I do not personally use. If your use case overlaps with mine, great; if not, fork freely.
 >
@@ -12,11 +12,11 @@ A personal AI assistant agent that works on file-based, local-first [`sapphire-f
 
 - **Channels**: Matrix (E2EE via `matrix-sdk`) and Discord (`serenity`), running concurrently.
 - **Providers**: Anthropic Messages API with SSE streaming and a multi-round tool-use loop, plus OpenAI-compatible backends (local LLMs, OpenRouter, …) selectable per room/session via the `[providers]` / `[profiles]` / `[room_profile]` schema.
-- **Workspace**: backed by [`sapphire-framework`](https://github.com/fluo10/sapphire-framework) — file index, full-text + vector search (redb + tantivy, plus LanceDB vectors by default).
+- **Workspace**: backed by [`sapphire-framework`](https://github.com/sapphire-turtle/sapphire-framework) — file index, full-text + vector search (redb + tantivy, plus LanceDB vectors by default).
 - **Built-in tools**: `file_read`, `file_write`, `file_append`, `file_delete`, `dir_list`, `dir_walk`, `shell`, `timer_set` / `timer_preset` / `timer_cancel` / `timer_status` (incl. Pomodoro presets), plus workspace memory / search / sync tools. The seven that touch a filesystem or a shell (`file_read`, `file_write`, `file_append`, `file_delete`, `dir_list`, `dir_walk`, `shell`) plus `shell_start` / `shell_output` / `shell_kill` for long-running commands are **session-routed: which machine they reach is decided by the session, not by the name**. Inside an ACP session they act on the machine the connected editor is running on, over `/acp`'s `fs/*` and `terminal/*` requests, and only for the capabilities that editor declared at `initialize` — with no fallback to the agent's own disk when one is missing. Everywhere else (Matrix, Discord, `/rpc`, voice, `/a2a`, heartbeat, autonomous, subagents) they act on this agent's own machine, and are opt-in: `[tools.host_access] enabled = false` by default, for every origin. Turning that on is a deliberate act; running the agent in a container is the recommended way to do it once it is. See [Shell and file tools: whose machine](#shell-and-file-tools-whose-machine) below.
 - **Sessions**: human-readable [`grain-id`](https://crates.io/crates/grain-id) aliases, auto-generated titles, history dump on resume.
 - **Background**: heartbeat cron tasks, periodic memory compaction, periodic workspace re-index, daily / weekly / monthly / yearly logs with catch-up.
-- **Voice**: a server-side STT → turn → TTS pipeline (`voice/*` on `/rpc`) with local STT/TTS via `sherpa-onnx`, for networked voice clients. The `sapphire-agent-cli voice` satellite and the desktop's voice input / spoken replies were dropped when the local clients moved to IPC ([#278](https://github.com/fluo10/sapphire-agent/issues/278)); the satellite role moves to wearable device firmware.
+- **Voice**: a server-side STT → turn → TTS pipeline (`voice/*` on `/rpc`) with local STT/TTS via `sherpa-onnx`, for networked voice clients. The `sapphire-agent-cli voice` satellite and the desktop's voice input / spoken replies were dropped when the local clients moved to IPC ([#278](https://github.com/sapphire-turtle/sapphire-agent/issues/278)); the satellite role moves to wearable device firmware.
 - **Ambient audio ingest**: optional always-on capture from a wearable/pendant device — `POST /audio/ingest` takes raw audio (metadata in query params, no JSON/base64 framing) from a bearer-authenticated device, re-gates it, transcribes it, attributes it to a speaker against reference audio curated in the workspace, and stores the transcript outside the workspace. Records without answering: nothing in this path starts an LLM turn. `transcript_read`, `speaker_candidates` and `speaker_promote` expose the result as agent tools. Disabled by default — enable via `[ambient].enabled = true`; see `config.example.toml`.
 - **Agent-to-agent**: `/a2a` endpoint speaks the v1 A2A protocol (JSON-RPC `SendMessage`, AgentCard) with per-device bearer-token auth — enable via `[a2a].enabled = true`.
 - **Subagents**: `<workspace>/agents/<name>.md` definitions the main agent can delegate a task to via the `subagent` tool — its own system prompt, its own tool loop, only the final answer comes back, it can be resumed by handle for a later round, and a delegated agent can itself delegate up to `[tools.subagent] max_depth` deep. See [Subagents](#subagents) below.
@@ -33,22 +33,30 @@ A personal AI assistant agent that works on file-based, local-first [`sapphire-f
 ## Install
 
 ```sh
+curl -fsSL https://raw.githubusercontent.com/sapphire-turtle/sapphire-framework/main/install/install.sh | sh -s -- agent
+```
+
+This installs `sapphire-agent` into `~/.local/bin` together with `sapphire-bridge`, which it syncs through. Add `agent-desktop` for the desktop client. See the [install script's README](https://github.com/sapphire-turtle/sapphire-framework/tree/main/install) for the options.
+
+Or with cargo:
+
+```sh
 cargo install sapphire-agent
 ```
 
 Or from source:
 
 ```sh
-git clone https://github.com/fluo10/sapphire-agent
+git clone https://github.com/sapphire-turtle/sapphire-agent
 cd sapphire-agent
 cargo build --release
 ```
 
 Release binaries are published for **Linux** (x86_64, aarch64) and **macOS** (aarch64). Each is a single self-contained file — `sherpa-onnx` and its ONNX Runtime are linked statically, so there is nothing to install alongside it.
 
-The agent is a headless server application and is not built for Windows ([#182](https://github.com/fluo10/sapphire-agent/issues/182)), and neither is `sapphire-agent-desktop`, which talks to the agent on its own host.
+The agent is a headless server application and is not built for Windows ([#182](https://github.com/sapphire-turtle/sapphire-agent/issues/182)), and neither is `sapphire-agent-desktop`, which talks to the agent on its own host.
 
-The server and its CLI are one binary ([#278](https://github.com/fluo10/sapphire-agent/issues/278)), the way `sapphire-ledger` and the other sapphire-framework apps are: the client commands (`chat`, `acp`, `status`, …) talk to the server already running on the same host over its local IPC endpoint. So does `sapphire-agent-desktop`, the GUI chat client; like `chat` it runs under `[cli].room_profile`.
+The server and its CLI are one binary ([#278](https://github.com/sapphire-turtle/sapphire-agent/issues/278)), the way `sapphire-ledger` and the other sapphire-framework apps are: the client commands (`chat`, `acp`, `status`, …) talk to the server already running on the same host over its local IPC endpoint. So does `sapphire-agent-desktop`, the GUI chat client; like `chat` it runs under `[cli].room_profile`.
 
 ## Configure
 
@@ -288,7 +296,7 @@ Matrix and Discord — cannot call `subagent` at all. See the
 **Project conventions are not shared yet.** A client-side project's
 `CLAUDE.md` isn't threaded into a subagent's prompt — but the main agent
 doesn't read it either, currently. Both are tracked together in
-[#199](https://github.com/fluo10/sapphire-agent/issues/199); when that
+[#199](https://github.com/sapphire-turtle/sapphire-agent/issues/199); when that
 lands, subagents get it too.
 
 ### Resuming a subagent
@@ -736,7 +744,7 @@ daily log.** The digest is kept current by a sweep on a rolling 30-minute
 cadence from process start, which regenerates only the sessions whose
 newest message postdates their cached digest. `/rpc` and device-default
 sessions still do not reach the daily log —
-[#189](https://github.com/fluo10/sapphire-agent/issues/189).
+[#189](https://github.com/sapphire-turtle/sapphire-agent/issues/189).
 
 **Tool calls are persisted for ACP sessions.** `run_llm_turn` writes
 `tool_use` and `tool_result` events to the ACP session's directory (see
@@ -745,7 +753,7 @@ event file stores versus the result cache). `/rpc` and device-default
 sessions do not — their event format has no reference form for a result,
 so writing one raw would put the content in the workspace and the
 retrieve index, which is exactly what the ACP store's external cache
-exists to avoid for results ([#194](https://github.com/fluo10/sapphire-agent/issues/194)).
+exists to avoid for results ([#194](https://github.com/sapphire-turtle/sapphire-agent/issues/194)).
 That protection is only for results, though — a tool *input* has no
 hash-and-cache indirection, so it lands in the event file directly, bounded
 rather than eliminated: capped at the same 50,000-byte limit, and
@@ -804,14 +812,14 @@ whole turn.
   calls.** Only ACP sessions write `tool_use` / `tool_result` events;
   the other transports' event format has no reference form for a
   result, so a reload of one of those restores what was said but not what
-  was done. Tracked as [#194](https://github.com/fluo10/sapphire-agent/issues/194).
+  was done. Tracked as [#194](https://github.com/sapphire-turtle/sapphire-agent/issues/194).
 - **A loaded session's tool calls are not shown in the editor.** Even for
   an ACP session, whose `tool_use` / `tool_result` pairs are on disk and
   do reach the model on the next turn, `session/load`'s replay only
   projects text parts to `session/update` notifications — tool calls in
   the stored history are silently skipped rather than rendered. The
   model sees them; the editor's thread view does not. Tracked as
-  [#192](https://github.com/fluo10/sapphire-agent/issues/192).
+  [#192](https://github.com/sapphire-turtle/sapphire-agent/issues/192).
 - **Tool output is capped at 50,000 bytes** (roughly 20,000 from the
   head, 30,000 from the tail, with a marker spliced in between) — this
   applies to every tool, on every transport, not only the shell tool over

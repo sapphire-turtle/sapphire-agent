@@ -3,7 +3,7 @@
 
 [graph]
 # Restrict the dep graph to the platforms we actually publish binaries for
-# (see release.yml). Drops UEFI/WASM-only transitive deps like `r-efi`
+# (see release-binaries.yml). Drops UEFI/WASM-only transitive deps like `r-efi`
 # (LGPL-2.1-or-later) so we don't need to allow their licenses.
 targets = [
     "x86_64-unknown-linux-gnu",
@@ -111,6 +111,9 @@ exceptions = [
 # transitively-pulled `syn`/`bitflags`/`hashbrown` version trips it).
 multiple-versions = "allow"
 wildcards = "deny"
+# A `path` dependency without a version (a workspace crate's dev-dependency, or a
+# crate that is not published) is not a wildcard on the registry.
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"

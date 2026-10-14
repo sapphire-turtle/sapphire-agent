@@ -12,11 +12,11 @@
 
 - **チャネル**： Matrix（`matrix-sdk`によるE2EE）とDiscord（`serenity`）を並行稼働。
 - **プロバイダ**： SSEストリーミングとマルチラウンドのツール使用ループを備えたAnthropic Messages APIに加え、OpenAI互換バックエンド（ローカルLLM、OpenRouterなど）を `[providers]` / `[profiles]` / `[room_profile]` スキーマでルーム／セッションごとに選択可能。
-- **ワークスペース**： [`sapphire-framework`](https://github.com/fluo10/sapphire-framework) をバックエンドに使用 — ファイルインデックス、全文＋ベクトル検索（redb＋tantivy、デフォルトでLanceDBベクトル付き）。
+- **ワークスペース**： [`sapphire-framework`](https://github.com/sapphire-turtle/sapphire-framework) をバックエンドに使用 — ファイルインデックス、全文＋ベクトル検索（redb＋tantivy、デフォルトでLanceDBベクトル付き）。
 - **シェル・ファイルツール**： `file_read`、`file_write`、`file_append`、`file_delete`、`dir_list`、`dir_walk`、`shell`、それに長時間実行用の `shell_start` / `shell_output` / `shell_kill`。これらの**届くマシンは名前ではなくセッションで決まります**。ACPセッション内では、接続したエディタが動いているマシンに、`/acp`の`fs/*`と`terminal/*`リクエストを介して作用します。ただし接続したエディタが`initialize`で宣言した機能に対してのみで、欠けた機能はエージェント自身のディスクへのフォールバックなしに非表示になります。それ以外（Matrix、Discord、`/rpc`、音声、`/a2a`、ハートビート、autonomous、サブエージェント）ではエージェント自身のマシンに作用し、オプトインです： `[tools.host_access] enabled = false`がデフォルトで、すべてのオージンに適用されます。有効化は意図的な行為で、有効化したうえでエージェントをコンテナで動かすのが推奨されます。下記「シェル・ファイルツール：誰のマシンか」参照。
 - **セッション**： 人間が読める[`grain-id`](https://crates.io/crates/grain-id)エイリアス、自動生成タイトル、再開時の履歴ダンプ。
 - **バックグラウンド**： ハートビートcronタスク、定期的なメモリー圧縮、定期的なワークスペース再インデックス、キャッチアップ付きの日次／週次／月次／年次ログ。
-- **音声**： サーバー側の STT → ターン → TTS パイプライン（`/rpc` の `voice/*`）。ローカル STT/TTS は `sherpa-onnx` 経由。`sapphire-agent-desktop` などの音声クライアント向け。`sapphire-agent-cli voice` サテライトは CLI の本バイナリへの統合時に削除された（[#278](https://github.com/fluo10/sapphire-agent/issues/278)）。この役割はウェアラブルデバイスのファームウェアへ移行予定。
+- **音声**： サーバー側の STT → ターン → TTS パイプライン（`/rpc` の `voice/*`）。ローカル STT/TTS は `sherpa-onnx` 経由。`sapphire-agent-desktop` などの音声クライアント向け。`sapphire-agent-cli voice` サテライトは CLI の本バイナリへの統合時に削除された（[#278](https://github.com/sapphire-turtle/sapphire-agent/issues/278)）。この役割はウェアラブルデバイスのファームウェアへ移行予定。
 - **アンビエント音声インジェスト**： オプションの常時キャプチャ（ウェアラブル／ペンダントデバイスから）。`POST /audio/ingest`がベアラー認証済みデバイスから生の音声（メタデータはクエリパラメータ。JSON/base64フレーミングなし）を受け取り、再ゲーティングし、文字起こしし、ワークスペースで精選された参照音声Against話者を特定し、文字起こしをワークスペース外に保存します。「答えずに記録する」：このパスでは何もLLMターンを開始しません。`transcript_read`、`speaker_candidates`、`speaker_promote`が結果をエージェントツールとして公開します。デフォルトは無効 — `[ambient].enabled = true`で有効化。`config.example.toml`参照。
 - **エージェント間**： `/a2a`エンドポイントはデバイス別のベアラートークン認証付きでv1 A2Aプロトコル（JSON-RPC `SendMessage`、AgentCard）を話します — `[a2a].enabled = true`で有効化。
 - **サブエージェント**： メインエージェントが`subagent`ツールでタスクを委譲できる`<workspace>/agents/<name>.md`定義 — 独自のシステムプロンプト、独自のツールループ、最終回答のみが返り、ハンドルで後のラウンドに再開可能。定義のフロントマターの`profile:`は省略可能。書くとその`[profiles.<name>]`のプロバイダ（`fallback_provider`込み）で親の代わりに走り、省略時は委譲元のターンと同じモデルで走る — 後者が仕様変更前の既定動作そのままの、どちらも正当な書き方。configの`[profiles]`が定義していない名前なら起動時に即失敗する。プロバイダは親から引き継がれないことがある唯一の要素であり、権限ゲート・ツール一覧・隔離はプロファイルの有無で一切変わらない。下記「サブエージェント」参照。
@@ -33,13 +33,21 @@
 ## インストール
 
 ```sh
+curl -fsSL https://raw.githubusercontent.com/sapphire-turtle/sapphire-framework/main/install/install.sh | sh -s -- agent
+```
+
+`sapphire-agent` と、同期に使う `sapphire-bridge` が一緒に `~/.local/bin` へ入ります。デスクトップクライアントも入れるには `agent-desktop` を足してください。オプションは[インストールスクリプトの README](https://github.com/sapphire-turtle/sapphire-framework/tree/main/install)を参照してください。
+
+cargo で入れる場合：
+
+```sh
 cargo install sapphire-agent
 ```
 
 またはソースから：
 
 ```sh
-git clone https://github.com/fluo10/sapphire-agent
+git clone https://github.com/sapphire-turtle/sapphire-agent
 cd sapphire-agent
 cargo build --release
 ```
@@ -48,7 +56,7 @@ cargo build --release
 
 エージェントはヘッドレスなサーバーアプリケーションで、Windows向けにはビルドされていません。同じホストのエージェントと話す `sapphire-agent-desktop` も同様です。
 
-サーバーとその CLI は 1 つのバイナリです（[#278](https://github.com/fluo10/sapphire-agent/issues/278)）。`sapphire-ledger` など他の sapphire-framework アプリと同じく、クライアント系のコマンド（`chat`、`acp`、`status` など）は同じホストで動いているサーバーにローカル IPC で問い合わせます。GUI チャットクライアントの `sapphire-agent-desktop` も同じで、`chat` と同じく `[cli].room_profile` のルームプロファイルで動きます。[#182](https://github.com/fluo10/sapphire-agent/issues/182)参照。
+サーバーとその CLI は 1 つのバイナリです（[#278](https://github.com/sapphire-turtle/sapphire-agent/issues/278)）。`sapphire-ledger` など他の sapphire-framework アプリと同じく、クライアント系のコマンド（`chat`、`acp`、`status` など）は同じホストで動いているサーバーにローカル IPC で問い合わせます。GUI チャットクライアントの `sapphire-agent-desktop` も同じで、`chat` と同じく `[cli].room_profile` のルームプロファイルで動きます。[#182](https://github.com/sapphire-turtle/sapphire-agent/issues/182)参照。
 
 ## 設定
 

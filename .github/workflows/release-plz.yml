@@ -1,109 +1,43 @@
-name: release-plz
+name: Release-plz
 
+# sapphire-agent (the CLI and the server) is tagged `v{version}`, the desktop
+# app `desktop-v{version}` (release-plz.toml). Each gets its binaries built once
+# release-plz has made its release.
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+  workflow_dispatch:
 
-# Avoid two release-plz jobs racing for the same branch.
+# Keep the release command and the release PR from racing on the same branch.
 concurrency:
   group: release-plz-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  release-plz-release:
-    name: Release-plz release
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    outputs:
-      releases: ${{ steps.release.outputs.releases }}
-      releases_created: ${{ steps.release.outputs.releases_created }}
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: Swatinem/rust-cache@v2
-      - uses: ./.github/actions/refresh-sherpa-onnx-libs
-      - name: Run release-plz
-        id: release
-        uses: release-plz/action@v0.5
-        with:
-          command: release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-
-  # Fan out to per-package binary build workflows. Each one runs only
-  # when release-plz reported a release for that package on this push.
-  #
-  # Why this isn't done via `on: push: tags` in the build workflows:
-  # release-plz uses GITHUB_TOKEN to push the per-package tags, and
-  # GitHub Actions does not fire downstream workflows on tags pushed
-  # by GITHUB_TOKEN. workflow_call (this fan-out) is the cleanest way
-  # to chain the builds without provisioning a PAT.
-  parse-releases:
-    name: Parse release-plz output
-    needs: release-plz-release
-    if: needs.release-plz-release.outputs.releases_created == 'true'
-    runs-on: ubuntu-latest
-    outputs:
-      agent_tag: ${{ steps.parse.outputs.agent_tag }}
-      desktop_tag: ${{ steps.parse.outputs.desktop_tag }}
-    steps:
-      - id: parse
-        env:
-          RELEASES: ${{ needs.release-plz-release.outputs.releases }}
-        run: |
-          agent_tag=$(jq -r '.[] | select(.package_name == "sapphire-agent") | .tag // empty' <<<"$RELEASES")
-          desktop_tag=$(jq -r '.[] | select(.package_name == "sapphire-agent-desktop") | .tag // empty' <<<"$RELEASES")
-          {
-            echo "agent_tag=$agent_tag"
-            echo "desktop_tag=$desktop_tag"
-          } >> "$GITHUB_OUTPUT"
-
-  build-agent:
-    name: Build sapphire-agent binaries
-    needs: parse-releases
-    if: needs.parse-releases.outputs.agent_tag != ''
-    permissions:
-      contents: write
-    uses: ./.github/workflows/release.yml
-    with:
-      tag: ${{ needs.parse-releases.outputs.agent_tag }}
-
-  build-desktop:
-    name: Build sapphire-agent-desktop binaries
-    needs: parse-releases
-    if: needs.parse-releases.outputs.desktop_tag != ''
-    permissions:
-      contents: write
-    uses: ./.github/workflows/release-desktop.yml
-    with:
-      tag: ${{ needs.parse-releases.outputs.desktop_tag }}
-
-  release-plz-pr:
-    name: Release-plz PR
-    runs-on: ubuntu-latest
+  release-plz:
     permissions:
       contents: write
       pull-requests: write
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: Swatinem/rust-cache@v2
-      - uses: ./.github/actions/refresh-sherpa-onnx-libs
-      - name: Run release-plz
-        uses: release-plz/action@v0.5
-        with:
-          command: release-pr
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    uses: sapphire-turtle/sapphire-framework/.github/workflows/shared-release-plz.yml@main
+    secrets: inherit
+
+  build-cli:
+    needs: release-plz
+    if: contains(fromJSON(needs.release-plz.outputs.packages), 'sapphire-agent')
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release-binaries.yml
+    with:
+      tag: ${{ fromJSON(needs.release-plz.outputs.tags)['sapphire-agent'] }}
+      target: cli
+
+  build-desktop:
+    needs: release-plz
+    if: contains(fromJSON(needs.release-plz.outputs.packages), 'sapphire-agent-desktop')
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release-binaries.yml
+    with:
+      tag: ${{ fromJSON(needs.release-plz.outputs.tags)['sapphire-agent-desktop'] }}
+      target: desktop

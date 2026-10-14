@@ -4,61 +4,12 @@ on:
   pull_request:
 
 jobs:
-  format:
-    name: Format
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - name: Install nightly rustfmt
-        run: rustup component add --toolchain nightly rustfmt
-      - name: Run rustfmt
-        run: cargo +nightly fmt --check --all
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Install Linux build deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libudev-dev \
-            libwayland-dev \
-            libxkbcommon-dev \
-            libx11-dev \
-            libxi-dev \
-            libxcursor-dev \
-            libxrandr-dev \
-            pkg-config
-      - uses: Swatinem/rust-cache@v2
-      - uses: ./.github/actions/refresh-sherpa-onnx-libs
-      - name: Run clippy
-        run: cargo clippy --workspace -- -D warnings
-  test:
-    strategy:
-      matrix:
-        os: [ubuntu-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Install Linux build deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libudev-dev \
-            libwayland-dev \
-            libxkbcommon-dev \
-            libx11-dev \
-            libxi-dev \
-            libxcursor-dev \
-            libxrandr-dev \
-            pkg-config
-      - uses: Swatinem/rust-cache@v2
-      - uses: ./.github/actions/refresh-sherpa-onnx-libs
-      - run: cargo test --workspace
-
+  ci:
+    uses: sapphire-turtle/sapphire-framework/.github/workflows/shared-rust-ci.yml@main
+    with:
+      # bevy (the desktop) needs X11, Wayland and xkbcommon; bevy_winit talks
+      # to udev for device hot-plug events.
+      linux-packages: >-
+        pkg-config libudev-dev libwayland-dev libxkbcommon-dev libx11-dev
+        libxi-dev libxcursor-dev libxrandr-dev
+      pre-build: .github/scripts/refresh-sherpa-onnx-libs.sh
