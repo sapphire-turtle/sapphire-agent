@@ -1,30 +1,33 @@
-//! JSONL-based session persistence.
+//! Session persistence: one directory per session, one Markdown file per
+//! event.
 //!
-//! Each session is stored as a single `.jsonl` file in `<workspace>/sessions/`,
-//! named by a ULID (time-ordered, lexicographically sortable).
-//!
-//! File layout:
 //! ```text
-//! {"meta": {"session_id":"01JX...","room_id":"!abc:m.org","thread_id":null,"channel":"matrix","created_at":"2026-04-06T10:00:00Z"}}
-//! {"timestamp":"2026-04-06T10:00:01Z","role":"user","parts":[{"Text":"hello"}]}
-//! {"timestamp":"2026-04-06T10:00:05Z","role":"assistant","parts":[{"Text":"hi"}]}
-//! {"digest_at":"2026-04-06T10:30:00Z","since":"2026-04-06T04:00:00Z","digest":"..."}  ← intra-day flush
-//! {"closed_at":"2026-04-06T11:00:00Z"}   ← optional, appended on reset/close
+//! <workspace>/sessions/<namespace>/<kind>/<session_id>/
+//!   session.md       metadata (room, channel, created_at, …), written once
+//!   <uuidv7>.md      one event — a message, a compaction summary, a title, a close
 //! ```
 //!
-//! Timestamps are ISO 8601 / RFC 3339 (chrono) for human readability and
-//! AI retrieval. `closed_at` acts as an append-only archive marker; presence
-//! of this line means the session is no longer active.
+//! The format itself — front matter, the body, the parent chain that
+//! orders events — is `session_log`'s, shared with the ACP store. What is
+//! here is what this store's events are and how its callers query them.
+//!
+//! Sessions written before this format are single `.jsonl` files. They are
+//! read as they are, and converted the first time something is written to
+//! them, so only sessions that are actually continued get converted. Once
+//! the directory exists it is authoritative and the `.jsonl` beside it is
+//! ignored; it is never deleted. TODO(#284): remove the `.jsonl` reader and
+//! the conversion once a bulk conversion has shipped.
 
 use crate::provider::{ChatMessage, ContentPart, Role, UserInputKind};
+use crate::session_log::{self, BodyOr, EntryFile, Linked};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::{DateTime, Duration, Local, NaiveDate, TimeZone, Timelike, Utc};
 use sapphire_framework::workspace::WorkspaceState;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tracing::warn;
@@ -85,16 +88,13 @@ pub struct StoredMessage {
     /// appends, and an NTP step backwards makes timestamps non-monotonic,
     /// either of which silently drops messages from a replay.
     ///
-    /// `None` on lines written before this field existed; readers fall
-    /// back to file order there. File order is what orders a session —
-    /// this is an identity, not a sort key, and no reader compares two
-    /// of them.
+    /// In the directory format this is the event file's name, and order
+    /// comes from the `parent` each event records (see `session_log`). It
+    /// is an identity, not a sort key.
     ///
-    /// Deliberately no `parent`. Unlike the ACP store, this format keeps
-    /// one file per session, so file order survives as a reconstruction
-    /// hint — a file written before `parent` existed cannot contain a
-    /// fork, because a fork needs two writers that both record one. See
-    /// decision 3.1 of the design doc.
+    /// `None` only on lines of a legacy `.jsonl` written before this field
+    /// existed; readers fall back to file order there, and the conversion
+    /// gives each one an id (decision 3.1 of the design doc).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub id: Option<Uuid>,
     pub timestamp: DateTime<Utc>,
@@ -114,6 +114,7 @@ pub struct StoredMessage {
 }
 
 impl StoredMessage {
+    #[cfg(test)]
     pub fn from_chat(msg: &ChatMessage) -> Self {
         Self {
             id: Some(Uuid::now_v7()),
@@ -135,21 +136,139 @@ impl StoredMessage {
     }
 }
 
-// Line wrappers used for JSON discrimination --------------------------------
+// Legacy `.jsonl` line wrappers, read-only (TODO(#284)) ---------------------
 
 #[derive(Serialize, Deserialize)]
 struct MetaLine {
     meta: SessionMeta,
 }
 
-#[derive(Serialize, Deserialize)]
-struct ClosedLine {
-    closed_at: DateTime<Utc>,
+// Event files --------------------------------------------------------------
+
+/// The front matter of one event file. The id is the file name; the body is
+/// the message text, the summary, or nothing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum Front {
+    Message {
+        parent: Option<Uuid>,
+        at: DateTime<Utc>,
+        role: Role,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_kind: Option<UserInputKind>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_id: Option<String>,
+        /// Absent when the body is the whole message.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parts: Option<Vec<BodyOr<ContentPart>>>,
+    },
+    Summary {
+        parent: Option<Uuid>,
+        at: DateTime<Utc>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        covers_through: Option<Uuid>,
+    },
+    Title {
+        parent: Option<Uuid>,
+        at: DateTime<Utc>,
+        title: String,
+    },
+    Closed {
+        parent: Option<Uuid>,
+        at: DateTime<Utc>,
+    },
 }
 
-#[derive(Serialize, Deserialize)]
-struct TitleLine {
-    session_title: String,
+impl Linked for Front {
+    fn parent(&self) -> Option<Uuid> {
+        match self {
+            Front::Message { parent, .. }
+            | Front::Summary { parent, .. }
+            | Front::Title { parent, .. }
+            | Front::Closed { parent, .. } => *parent,
+        }
+    }
+    fn at(&self) -> DateTime<Utc> {
+        match self {
+            Front::Message { at, .. }
+            | Front::Summary { at, .. }
+            | Front::Title { at, .. }
+            | Front::Closed { at, .. } => *at,
+        }
+    }
+}
+
+fn text_of(part: &ContentPart) -> Option<&str> {
+    match part {
+        ContentPart::Text(t) => Some(t.as_str()),
+        _ => None,
+    }
+}
+
+/// One event, whichever format it was read from, in session order.
+enum Event {
+    Message(StoredMessage),
+    Summary(SummaryLine),
+    Title(String),
+    Closed,
+}
+
+impl Event {
+    fn from_entry(entry: &EntryFile<Front>) -> Event {
+        match &entry.front {
+            Front::Message {
+                at,
+                role,
+                input_kind,
+                user_id,
+                parts,
+                ..
+            } => Event::Message(StoredMessage {
+                id: Some(entry.id),
+                timestamp: *at,
+                role: role.clone(),
+                parts: session_log::join_body(parts.clone(), entry.body.clone(), ContentPart::Text),
+                input_kind: input_kind.clone(),
+                user_id: user_id.clone(),
+            }),
+            Front::Summary {
+                at, covers_through, ..
+            } => Event::Summary(SummaryLine {
+                summary_at: *at,
+                summary: entry.body.clone(),
+                up_to_timestamp: None,
+                covers_through: *covers_through,
+            }),
+            Front::Title { title, .. } => Event::Title(title.clone()),
+            Front::Closed { .. } => Event::Closed,
+        }
+    }
+}
+
+/// Where a session lives on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Location {
+    /// A session directory.
+    Dir(PathBuf),
+    /// A legacy single-file session. TODO(#284).
+    Jsonl(PathBuf),
+}
+
+impl Location {
+    pub(crate) fn path(&self) -> &Path {
+        match self {
+            Location::Dir(p) | Location::Jsonl(p) => p,
+        }
+    }
+
+    /// The name a session is looked up by: the directory's name, or the
+    /// `.jsonl` file's stem.
+    fn name(&self) -> Option<&str> {
+        match self {
+            Location::Dir(p) => p.file_name()?.to_str(),
+            Location::Jsonl(p) => p.file_stem()?.to_str(),
+        }
+    }
 }
 
 /// Compacted recap of a session, appended whenever a compaction fires.
@@ -184,24 +303,19 @@ pub struct SummaryLine {
 // SessionStore
 // ---------------------------------------------------------------------------
 
-/// How a [`SessionStore`] names the files it writes.
+/// How a [`SessionStore`] names its session directories.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileNaming {
-    /// `{session_id}.jsonl`. Every store but the autonomous one.
+    /// `{session_id}`. Every store but the autonomous one.
     Plain,
-    /// `{date}-{session_id}.jsonl`, `date` being the agent-day (per
-    /// `boundary_hour`) the file was created in.
-    ///
-    /// Not supported by [`SessionStore::load_all`], which derives its
-    /// session id from the file stem and would read back
-    /// `2026-09-12-<uuid>` — a date prefix the resolver here does not
-    /// accept. Dated stores use `session_rows` / `resolve_path` instead.
+    /// `{date}-{session_id}`, `date` being the agent-day (per
+    /// `boundary_hour`) the session was created in.
     Dated { boundary_hour: u8 },
 }
 
 pub struct SessionStore {
-    /// Base sessions directory (e.g. `<workspace>/sessions`). Per-session
-    /// files live under `<base_dir>/<namespace>/<kind>/<session_id>.jsonl`
+    /// Base sessions directory (e.g. `<workspace>/sessions`). Session
+    /// directories live under `<base_dir>/<namespace>/<kind>/<session_id>/`
     /// — the namespace split is mechanical (matches `memory/<namespace>/`)
     /// so retrieve indexing can scope itself by directory and never
     /// accidentally mix NSFW sessions with default-namespace ones.
@@ -224,10 +338,16 @@ pub struct SessionStore {
     /// modifications notify the workspace so the index/cache stay in
     /// sync.
     ws_state: Option<Arc<Mutex<WorkspaceState>>>,
-    /// `session_id → absolute path` cache. Populated lazily by
+    /// `session_id → location` cache. Populated lazily by
     /// `resolve_path` (filesystem scan) and eagerly by `create_session` /
     /// `ensure_session`. Avoids re-scanning per `append` call.
-    path_cache: Mutex<HashMap<String, PathBuf>>,
+    path_cache: Mutex<HashMap<String, Location>>,
+    /// `session_id` → the id of the last event written, so an append
+    /// knows its parent without re-reading the session. Held across the
+    /// whole read-parent / write / record-tip step, so two appends to one
+    /// session in this process never fabricate a fork — the same reason
+    /// as `AcpSessionStore::append_line`.
+    tips: Mutex<HashMap<String, Uuid>>,
     /// Workspace-external, content-addressed store for both halves of a
     /// tool call — the `input` and the result.
     ///
@@ -252,6 +372,7 @@ impl SessionStore {
             naming: FileNaming::Plain,
             ws_state: None,
             path_cache: Mutex::new(HashMap::new()),
+            tips: Mutex::new(HashMap::new()),
             tool_payloads,
         }
     }
@@ -268,6 +389,7 @@ impl SessionStore {
             naming: FileNaming::Plain,
             ws_state: Some(ws_state),
             path_cache: Mutex::new(HashMap::new()),
+            tips: Mutex::new(HashMap::new()),
             tool_payloads,
         }
     }
@@ -283,65 +405,65 @@ impl SessionStore {
         self
     }
 
-    /// Compute (without filesystem checks) the path a new session file
+    /// Compute (without filesystem checks) the directory a new session
     /// should live at. Used by `create_session` / `ensure_session`. Also
     /// seeds the path cache so subsequent `append` calls hit it directly.
     fn path_for_new(&self, session_id: &str, namespace: &str) -> PathBuf {
-        let file_name = match self.naming {
-            FileNaming::Plain => format!("{session_id}.jsonl"),
+        let dir_name = match self.naming {
+            FileNaming::Plain => session_id.to_string(),
             FileNaming::Dated { boundary_hour } => {
                 let date = local_date_for_timestamp(Local::now(), boundary_hour);
-                format!("{date}-{session_id}.jsonl")
+                format!("{date}-{session_id}")
             }
         };
-        let p = self
-            .base_dir
-            .join(namespace)
-            .join(self.kind)
-            .join(file_name);
+        let p = self.base_dir.join(namespace).join(self.kind).join(dir_name);
         if let Ok(mut cache) = self.path_cache.lock() {
-            cache.insert(session_id.to_string(), p.clone());
+            cache.insert(session_id.to_string(), Location::Dir(p.clone()));
         }
         p
     }
 
-    /// Public accessor exposing the cached path of an existing session.
-    /// Used by callers that need to read raw bytes (e.g. parsing the meta
-    /// line for `read_session_date`) rather than going through the
-    /// `SessionStore` write methods.
+    /// Where an existing session lives — its directory, or its legacy
+    /// `.jsonl` until something is written to it. For callers that show
+    /// or test for the location rather than going through the store's
+    /// own accessors.
     pub fn absolute_path_for(&self, session_id: &str) -> Option<PathBuf> {
         self.resolve_path(session_id)
+            .map(|l| l.path().to_path_buf())
     }
 
-    /// Locate an existing session file by id, scanning every namespace
-    /// subdirectory under `<base_dir>/<*>/<kind>/`. Returns `None` if the
-    /// file isn't found. Hot path for `append`-style methods, so cached.
-    fn resolve_path(&self, session_id: &str) -> Option<PathBuf> {
+    /// When a session was created, from its metadata alone.
+    pub fn created_at(&self, session_id: &str) -> Option<DateTime<Utc>> {
+        meta_at(&self.resolve_path(session_id)?).map(|m| m.created_at)
+    }
+
+    /// Locate an existing session by id, scanning every namespace
+    /// subdirectory under `<base_dir>/<*>/<kind>/`. Returns `None` if it
+    /// isn't found. Hot path for `append`-style methods, so cached.
+    fn resolve_path(&self, session_id: &str) -> Option<Location> {
         if let Ok(cache) = self.path_cache.lock()
             && let Some(p) = cache.get(session_id)
         {
             return Some(p.clone());
         }
-        let target = format!("{session_id}.jsonl");
-        for path in collect_session_files(&self.base_dir, self.kind) {
-            let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+        for loc in collect_sessions(&self.base_dir, self.kind) {
+            let Some(name) = loc.name() else {
                 continue;
             };
             let hit = match self.naming {
-                FileNaming::Plain => name == target,
+                FileNaming::Plain => name == session_id,
                 // A v7 UUID is 36 characters with four hyphens, so
-                // `-{session_id}.jsonl` with a 10-character date in
-                // front of it cannot collide with another session's
-                // file.
+                // `-{session_id}` with a 10-character date in front of
+                // it cannot collide with another session's name.
                 FileNaming::Dated { .. } => name
-                    .strip_suffix(&format!("-{session_id}.jsonl"))
+                    .strip_suffix(&format!("-{session_id}"))
                     .is_some_and(|date| date.len() == 10),
             };
             if hit {
                 if let Ok(mut cache) = self.path_cache.lock() {
-                    cache.insert(session_id.to_string(), path.clone());
+                    cache.insert(session_id.to_string(), loc.clone());
                 }
-                return Some(path);
+                return Some(loc);
             }
         }
         None
@@ -351,7 +473,7 @@ impl SessionStore {
     /// maps to when two candidates exist.
     #[cfg(test)]
     pub fn resolve_path_for_test(&self, session_id: &str) -> Option<PathBuf> {
-        self.resolve_path(session_id)
+        self.absolute_path_for(session_id)
     }
 
     /// Notify the sapphire-framework workspace that a session file was created or modified.
@@ -398,22 +520,43 @@ impl SessionStore {
         }
     }
 
-    /// Delete a session file (used when an empty session is discarded).
+    /// Delete a session (used when an empty session is discarded).
     #[allow(dead_code)]
     pub fn delete_session(&self, session_id: &str) -> anyhow::Result<()> {
-        if let Some(path) = self.resolve_path(session_id) {
-            if path.exists() {
+        match self.resolve_path(session_id) {
+            Some(Location::Dir(dir)) => {
+                let files: Vec<PathBuf> = fs::read_dir(&dir)
+                    .map(|rd| rd.flatten().map(|e| e.path()).collect())
+                    .unwrap_or_default();
+                fs::remove_dir_all(&dir)?;
+                for f in files {
+                    self.notify_deleted(&f);
+                }
+            }
+            Some(Location::Jsonl(path)) => {
                 fs::remove_file(&path)?;
                 self.notify_deleted(&path);
             }
-            if let Ok(mut cache) = self.path_cache.lock() {
-                cache.remove(session_id);
-            }
+            None => {}
+        }
+        if let Ok(mut cache) = self.path_cache.lock() {
+            cache.remove(session_id);
+        }
+        if let Ok(mut tips) = self.tips.lock() {
+            tips.remove(session_id);
         }
         Ok(())
     }
 
-    /// Create a new session file for `key`. Returns the new session_id (ULID string).
+    /// Write a new session's directory and metadata.
+    fn create_dir(&self, meta: &SessionMeta, namespace: &str) -> anyhow::Result<()> {
+        let dir = self.path_for_new(&meta.session_id, namespace);
+        let path = session_log::write_meta(&dir, meta)?;
+        self.notify_updated(&path);
+        Ok(())
+    }
+
+    /// Create a new session for `key`. Returns the new session_id (UUIDv7).
     pub fn create_session(
         &self,
         key: &ConversationKey,
@@ -421,10 +564,6 @@ impl SessionStore {
         namespace: &str,
     ) -> anyhow::Result<String> {
         let session_id = Uuid::now_v7().to_string();
-        let path = self.path_for_new(&session_id, namespace);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
         let meta = SessionMeta {
             session_id: session_id.clone(),
             room_id: key.0.clone(),
@@ -437,11 +576,7 @@ impl SessionStore {
             room_profile: None,
             title: None,
         };
-        let line = serde_json::to_string(&MetaLine { meta })?;
-        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
-        writeln!(file, "{line}")?;
-        drop(file);
-        self.notify_updated(&path);
+        self.create_dir(&meta, namespace)?;
         Ok(session_id)
     }
 
@@ -457,20 +592,108 @@ impl SessionStore {
         self.create_session(&(task.to_string(), None), "server", namespace)
     }
 
+    /// The directory to write `session_id`'s next event into, converting a
+    /// legacy `.jsonl` session first. TODO(#284).
+    fn writable_dir(&self, session_id: &str) -> anyhow::Result<PathBuf> {
+        match self.resolve_path(session_id) {
+            Some(Location::Dir(dir)) => Ok(dir),
+            Some(Location::Jsonl(path)) => {
+                let dir = convert_jsonl(&path)?;
+                for entry in fs::read_dir(&dir)?.flatten() {
+                    self.notify_updated(&entry.path());
+                }
+                if let Ok(mut cache) = self.path_cache.lock() {
+                    cache.insert(session_id.to_string(), Location::Dir(dir.clone()));
+                }
+                Ok(dir)
+            }
+            None => Err(anyhow::anyhow!("Session not found for {session_id}")),
+        }
+    }
+
+    /// Append one event: `make(parent)` builds it, after the current tip.
+    fn append_event(
+        &self,
+        session_id: &str,
+        make: impl FnOnce(Option<Uuid>) -> (Front, String),
+    ) -> anyhow::Result<Uuid> {
+        let mut tips = self.tips.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = self.writable_dir(session_id)?;
+        let parent = match tips.get(session_id) {
+            Some(tip) => Some(*tip),
+            None => {
+                let entries: Vec<EntryFile<Front>> = session_log::read_entries(&dir);
+                session_log::chain(session_id, &entries)
+                    .last()
+                    .map(|e| e.id)
+            }
+        };
+        let id = Uuid::now_v7();
+        let (front, body) = make(parent);
+        let path = session_log::write_entry(&dir, id, &front, &body)?;
+        tips.insert(session_id.to_string(), id);
+        drop(tips);
+        self.notify_updated(&path);
+        Ok(id)
+    }
+
     /// Append a `ChatMessage` (with current timestamp) to an existing session.
     pub fn append(&self, session_id: &str, msg: &ChatMessage) -> anyhow::Result<()> {
         let scrubbed = self.scrub_for_storage(msg);
         let to_store = scrubbed.as_ref().unwrap_or(msg);
-        let stored = StoredMessage::from_chat(to_store);
-        let line = serde_json::to_string(&stored)?;
-        let path = self
-            .resolve_path(session_id)
-            .ok_or_else(|| anyhow::anyhow!("Session file not found for {session_id}"))?;
-        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
-        writeln!(file, "{line}")?;
-        drop(file);
-        self.notify_updated(&path);
+        self.append_stored(session_id, Utc::now(), to_store)
+    }
+
+    fn append_stored(
+        &self,
+        session_id: &str,
+        at: DateTime<Utc>,
+        msg: &ChatMessage,
+    ) -> anyhow::Result<()> {
+        let (parts, body) = session_log::split_body(msg.parts.clone(), text_of);
+        self.append_event(session_id, |parent| {
+            (
+                Front::Message {
+                    parent,
+                    at,
+                    role: msg.role.clone(),
+                    input_kind: msg.input_kind.clone(),
+                    user_id: msg.user_id.clone(),
+                    parts,
+                },
+                body,
+            )
+        })?;
         Ok(())
+    }
+
+    /// Test-only: every file of a session, concatenated — for asserting
+    /// what reached the disk.
+    #[cfg(test)]
+    pub(crate) fn raw_for_test(&self, session_id: &str) -> String {
+        let path = self
+            .absolute_path_for(session_id)
+            .expect("the session exists");
+        if path.is_file() {
+            return fs::read_to_string(path).unwrap();
+        }
+        let mut out = String::new();
+        for entry in fs::read_dir(path).unwrap().flatten() {
+            out.push_str(&fs::read_to_string(entry.path()).unwrap_or_default());
+        }
+        out
+    }
+
+    /// Test-only: append a message as stored, at a chosen time — what the
+    /// tests that backdate a session need.
+    #[cfg(test)]
+    pub(crate) fn append_at_for_test(
+        &self,
+        session_id: &str,
+        at: DateTime<Utc>,
+        msg: &ChatMessage,
+    ) -> anyhow::Result<()> {
+        self.append_stored(session_id, at, msg)
     }
 
     /// Append a compaction summary, recording how far it reaches.
@@ -479,7 +702,7 @@ impl SessionStore {
     /// verbatim (0 for a day-boundary compaction, which replaces the
     /// whole history). The cursor is computed here rather than passed
     /// in: the caller holds an index into its in-memory history, and
-    /// only the store can map that onto its own file, whose message
+    /// only the store can map that onto its own log, whose message
     /// count is at least as large — earlier compactions trimmed memory,
     /// not the log.
     pub fn append_summary(
@@ -488,44 +711,44 @@ impl SessionStore {
         summary: &str,
         keep_recent: usize,
     ) -> anyhow::Result<()> {
-        let path = self
-            .resolve_path(session_id)
-            .ok_or_else(|| anyhow::anyhow!("Session file not found for {session_id}"))?;
-        let line = serde_json::to_string(&SummaryLine {
-            summary_at: Utc::now(),
-            summary: summary.to_string(),
-            up_to_timestamp: None,
-            covers_through: checkpoint_id(&path, keep_recent),
+        // Converted before the cursor is computed, so the cursor is an id
+        // in the directory rather than a position in the legacy file.
+        let dir = self.writable_dir(session_id)?;
+        let covers_through = checkpoint_id(&Location::Dir(dir), keep_recent);
+        self.append_event(session_id, |parent| {
+            (
+                Front::Summary {
+                    parent,
+                    at: Utc::now(),
+                    covers_through,
+                },
+                summary.to_string(),
+            )
         })?;
-        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
-        writeln!(file, "{line}")?;
-        drop(file);
-        self.notify_updated(&path);
         Ok(())
     }
 
-    /// Close a session by appending a `closed_at` marker.
+    /// Close a session by appending a `closed` event.
     /// The session becomes inactive; future messages create a new session.
     pub fn close_session(&self, session_id: &str) -> anyhow::Result<()> {
-        let line = serde_json::to_string(&ClosedLine {
-            closed_at: Utc::now(),
+        self.append_event(session_id, |parent| {
+            (
+                Front::Closed {
+                    parent,
+                    at: Utc::now(),
+                },
+                String::new(),
+            )
         })?;
-        let path = self
-            .resolve_path(session_id)
-            .ok_or_else(|| anyhow::anyhow!("Session file not found for {session_id}"))?;
-        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
-        writeln!(file, "{line}")?;
-        drop(file);
-        self.notify_updated(&path);
         Ok(())
     }
 
     /// Load every active session from disk on startup.
     ///
     /// For each `ConversationKey`, picks the latest session that has no
-    /// `closed_at` marker. Returns:
+    /// `closed` event. Returns:
     ///
-    /// - `active`: which session file is current per conversation
+    /// - `active`: which session is current per conversation
     /// - `histories`: that session's conversation as the model should
     ///   see it — the latest compaction summary as a stub, the messages
     ///   it did not absorb, tool results hydrated, pairing repaired
@@ -543,28 +766,26 @@ impl SessionStore {
     ) {
         let mut entries: Vec<(String, ConversationKey)> = Vec::new();
 
-        for path in collect_session_files(&self.base_dir, self.kind) {
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            let Some(loaded) = load_session_file(&path) else {
+        for loc in collect_sessions(&self.base_dir, self.kind) {
+            let Some(loaded) = load(&loc) else {
                 continue;
             };
             if loaded.is_closed {
                 continue;
             }
+            let session_id = loaded.meta.session_id.clone();
             // Seed the path cache so the first append after bootstrap
             // doesn't pay a scan.
             if let Ok(mut cache) = self.path_cache.lock() {
-                cache.insert(stem.to_string(), path.clone());
+                cache.insert(session_id.clone(), loc.clone());
             }
             entries.push((
-                stem.to_string(),
+                session_id,
                 (loaded.meta.room_id.clone(), loaded.meta.thread_id.clone()),
             ));
         }
 
-        // Session ids are UUIDv7, so the newest file for a key sorts last.
+        // Session ids are UUIDv7, so the newest session for a key sorts last.
         entries.sort_by(|a, b| a.0.cmp(&b.0));
 
         let mut active: HashMap<ConversationKey, String> = HashMap::new();
@@ -586,20 +807,20 @@ impl SessionStore {
 
     /// List metadata for all sessions in this store (used by API for session listing).
     pub fn list_sessions(&self) -> Vec<SessionMeta> {
-        let mut metas: Vec<SessionMeta> = collect_session_files(&self.base_dir, self.kind)
-            .into_iter()
-            .filter_map(|p| load_session_file(&p).map(|loaded| loaded.meta))
+        let mut metas: Vec<SessionMeta> = collect_sessions(&self.base_dir, self.kind)
+            .iter()
+            .filter_map(|l| load(l).map(|loaded| loaded.meta))
             .collect();
         metas.sort_by_key(|m| m.created_at);
         metas
     }
 
     /// Listing rows for every session in this store, newest activity
-    /// last. One pass per file, no message bodies — see [`SessionRow`].
+    /// last. See [`SessionRow`].
     pub fn session_rows(&self) -> Vec<SessionRow> {
-        let mut rows: Vec<SessionRow> = collect_session_files(&self.base_dir, self.kind)
-            .into_iter()
-            .filter_map(|p| load_session_row(&p))
+        let mut rows: Vec<SessionRow> = collect_sessions(&self.base_dir, self.kind)
+            .iter()
+            .filter_map(load_session_row)
             .collect();
         rows.sort_by_key(|r| r.last_at.unwrap_or(r.meta.created_at));
         rows
@@ -616,8 +837,7 @@ impl SessionStore {
     /// wrote it) should use `load_session_full` instead, which does not
     /// trim.
     pub fn load_session(&self, session_id: &str) -> Option<Vec<ChatMessage>> {
-        let path = self.resolve_path(session_id)?;
-        let loaded = load_session_file(&path)?;
+        let loaded = load(&self.resolve_path(session_id)?)?;
         let (summary, tail) = model_history(&loaded);
         let mut out = summary
             .map(crate::context_compression::compaction_stub)
@@ -644,12 +864,11 @@ impl SessionStore {
         &self,
         session_id: &str,
     ) -> Option<(Vec<StoredMessage>, Option<SummaryLine>)> {
-        let path = self.resolve_path(session_id)?;
-        let loaded = load_session_file(&path)?;
+        let loaded = load(&self.resolve_path(session_id)?)?;
         Some((loaded.messages, loaded.latest_summary))
     }
 
-    /// Ensure a session file exists for the given caller-supplied ID.
+    /// Ensure a session exists for the given caller-supplied ID.
     /// Unlike `create_session`, this uses the provided ID rather than generating a new UUID.
     ///
     /// For RPC sessions (`channel == "rpc"`), a grain-id `public_id` is
@@ -665,13 +884,8 @@ impl SessionStore {
         namespace: &str,
     ) -> anyhow::Result<Option<String>> {
         if let Some(existing) = self.resolve_path(session_id) {
-            // Return existing public_id if the file already existed
-            let pub_id = load_session_file(&existing).and_then(|loaded| loaded.meta.public_id);
-            return Ok(pub_id);
-        }
-        let path = self.path_for_new(session_id, namespace);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            // Return existing public_id if the session already existed
+            return Ok(meta_at(&existing).and_then(|meta| meta.public_id));
         }
         let public_id = if channel == "rpc" {
             Some(public_id_override.unwrap_or_else(|| grain_id::GrainId::random().to_string()))
@@ -690,23 +904,19 @@ impl SessionStore {
             room_profile: None,
             title: None,
         };
-        let line = serde_json::to_string(&MetaLine { meta })?;
-        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
-        writeln!(file, "{line}")?;
-        drop(file);
-        self.notify_updated(&path);
+        self.create_dir(&meta, namespace)?;
         Ok(public_id)
     }
 
     /// Find the most-recent device-default session for `(device_id, room_profile)`
     /// that falls within today's local-day window (per `boundary_hour`), or
-    /// create a new file when none qualifies.
+    /// create a new one when none qualifies.
     ///
     /// Used by the voice `/rpc` methods and heartbeat fires to route into a
     /// device's always-on session (#122). Lazy: nothing lands on disk until a
-    /// satellite that's actually used calls this. Closed sessions (those with
-    /// a `closed_at` marker) are skipped so an explicit boundary close still
-    /// rotates the file even before the next day window kicks in.
+    /// satellite that's actually used calls this. Closed sessions are skipped
+    /// so an explicit boundary close still rotates the session even before
+    /// the next day window kicks in.
     ///
     /// Returns the resolved session_id. The caller is expected to follow up
     /// with `append` for the message that triggered the lookup.
@@ -721,8 +931,8 @@ impl SessionStore {
         let (today_start, today_end) = day_window(today, boundary_hour);
 
         let mut best: Option<(DateTime<Utc>, String)> = None;
-        for path in collect_session_files(&self.base_dir, self.kind) {
-            let Some(loaded) = load_session_file(&path) else {
+        for loc in collect_sessions(&self.base_dir, self.kind) {
+            let Some(loaded) = load(&loc) else {
                 continue;
             };
             let meta = loaded.meta;
@@ -753,10 +963,6 @@ impl SessionStore {
         }
 
         let session_id = Uuid::now_v7().to_string();
-        let path = self.path_for_new(&session_id, namespace);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
         let meta = SessionMeta {
             session_id: session_id.clone(),
             room_id: String::new(),
@@ -769,46 +975,42 @@ impl SessionStore {
             room_profile: Some(room_profile.to_string()),
             title: None,
         };
-        let line = serde_json::to_string(&MetaLine { meta })?;
-        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
-        writeln!(file, "{line}")?;
-        drop(file);
-        self.notify_updated(&path);
+        self.create_dir(&meta, namespace)?;
         Ok(session_id)
     }
 
-    /// Append a title for a session (append-only; last line wins on read).
+    /// Set a session's title (a new event; the latest one wins on read).
     pub fn set_title(&self, session_id: &str, title: &str) -> anyhow::Result<()> {
-        let line = serde_json::to_string(&TitleLine {
-            session_title: title.to_string(),
+        self.append_event(session_id, |parent| {
+            (
+                Front::Title {
+                    parent,
+                    at: Utc::now(),
+                    title: title.to_string(),
+                },
+                String::new(),
+            )
         })?;
-        let path = self
-            .resolve_path(session_id)
-            .ok_or_else(|| anyhow::anyhow!("Session file not found for {session_id}"))?;
-        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
-        writeln!(file, "{line}")?;
-        drop(file);
-        self.notify_updated(&path);
         Ok(())
     }
 
     /// Find a session by its human-readable `public_id` (grain-id).
     /// Returns the internal UUID `session_id` if found.
     pub fn find_by_public_id(&self, public_id: &str) -> Option<String> {
-        for path in collect_session_files(&self.base_dir, self.kind) {
-            if let Some(loaded) = load_session_file(&path)
-                && loaded.meta.public_id.as_deref() == Some(public_id)
-            {
-                return Some(loaded.meta.session_id);
-            }
-        }
-        None
+        collect_sessions(&self.base_dir, self.kind)
+            .iter()
+            .filter_map(meta_at)
+            .find(|meta| meta.public_id.as_deref() == Some(public_id))
+            .map(|meta| meta.session_id)
     }
 
     /// Return all sessions that contain at least one message falling within
     /// the given local-time day window.
     ///
     /// The "day" is `[date @ boundary_hour:00:00 local, (date+1) @ boundary_hour:00:00 local)`.
+    ///
+    /// Every message, forked branches included: this feeds the daily log,
+    /// a permanent record that must not lose what a second writer said.
     pub fn sessions_for_day(
         &self,
         date: NaiveDate,
@@ -817,9 +1019,11 @@ impl SessionStore {
         let (day_start, day_end) = day_window(date, boundary_hour);
         let mut results = Vec::new();
 
-        for path in collect_session_files(&self.base_dir, self.kind) {
-            // mtime pre-filter: skip files last modified before day_start - 1 day
-            if let Ok(meta_fs) = path.metadata()
+        for loc in collect_sessions(&self.base_dir, self.kind) {
+            // mtime pre-filter: skip sessions last modified before
+            // day_start - 1 day. A directory's mtime moves whenever an
+            // event file is added to it.
+            if let Ok(meta_fs) = loc.path().metadata()
                 && let Ok(mtime) = meta_fs.modified()
             {
                 let mtime_utc: DateTime<Utc> = mtime.into();
@@ -828,15 +1032,16 @@ impl SessionStore {
                 }
             }
 
-            if let Some(loaded) = load_session_file(&path) {
+            if let Some(loaded) = load(&loc) {
+                let meta = loaded.meta.clone();
                 let day_messages: Vec<StoredMessage> = loaded
-                    .messages
+                    .all_messages()
                     .into_iter()
                     .filter(|m| m.timestamp >= day_start && m.timestamp < day_end)
                     .collect();
 
                 if !day_messages.is_empty() {
-                    results.push((loaded.meta, day_messages));
+                    results.push((meta, day_messages));
                 }
             }
         }
@@ -873,15 +1078,14 @@ impl SessionStore {
     {
         let mut dates = std::collections::HashSet::new();
 
-        for path in collect_session_files(&self.base_dir, self.kind) {
-            if let Some(loaded) = load_session_file(&path) {
+        for loc in collect_sessions(&self.base_dir, self.kind) {
+            if let Some(loaded) = load(&loc) {
                 if !predicate(&loaded.meta) {
                     continue;
                 }
-                for msg in loaded.messages {
+                for msg in loaded.all_messages() {
                     let local_ts = msg.timestamp.with_timezone(&Local);
-                    let date = local_date_for_timestamp(local_ts, boundary_hour);
-                    dates.insert(date);
+                    dates.insert(local_date_for_timestamp(local_ts, boundary_hour));
                 }
             }
         }
@@ -895,21 +1099,7 @@ impl SessionStore {
     /// Used by daily_log to find dates that need a log generated.
     #[allow(dead_code)]
     pub fn all_session_dates(&self, boundary_hour: u8) -> Vec<NaiveDate> {
-        let mut dates = std::collections::HashSet::new();
-
-        for path in collect_session_files(&self.base_dir, self.kind) {
-            if let Some(loaded) = load_session_file(&path) {
-                for msg in loaded.messages {
-                    let local_ts = msg.timestamp.with_timezone(&Local);
-                    let date = local_date_for_timestamp(local_ts, boundary_hour);
-                    dates.insert(date);
-                }
-            }
-        }
-
-        let mut sorted: Vec<NaiveDate> = dates.into_iter().collect();
-        sorted.sort();
-        sorted
+        self.all_session_dates_filtered(boundary_hour, |_| true)
     }
 
     /// What a message looks like on disk.
@@ -1077,10 +1267,12 @@ fn sha256_hex(bytes: &[u8]) -> String {
 // Namespace-scoped filesystem walking
 // ---------------------------------------------------------------------------
 
-/// Enumerate `<base_dir>/<namespace>/<kind>/*.jsonl` across every namespace
-/// directory. Returns an empty Vec when `base_dir` doesn't exist yet (fresh
-/// install) or has no namespace subdirs. Each returned path is absolute.
-pub(crate) fn collect_session_files(base_dir: &Path, kind: &str) -> Vec<PathBuf> {
+/// Enumerate the sessions under `<base_dir>/<namespace>/<kind>/` across
+/// every namespace directory: each session directory, and each legacy
+/// `.jsonl` that has not been converted into one. Returns an empty Vec
+/// when `base_dir` doesn't exist yet (fresh install) or has no namespace
+/// subdirs. Each returned path is absolute.
+pub(crate) fn collect_sessions(base_dir: &Path, kind: &str) -> Vec<Location> {
     let mut out = Vec::new();
     let Ok(entries) = fs::read_dir(base_dir) else {
         return out;
@@ -1096,8 +1288,24 @@ pub(crate) fn collect_session_files(base_dir: &Path, kind: &str) -> Vec<PathBuf>
         };
         for k_entry in kind_entries.flatten() {
             let path = k_entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-                out.push(path);
+            let hidden = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_none_or(|n| n.starts_with('.'));
+            if hidden {
+                // Staging directories of an in-flight conversion.
+                continue;
+            }
+            if path.is_dir() {
+                if session_log::is_session_dir(&path) {
+                    out.push(Location::Dir(path));
+                }
+            } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl")
+                && !session_log::is_session_dir(&path.with_extension(""))
+            {
+                // A converted `.jsonl` stays on disk, superseded by the
+                // directory named after its stem. TODO(#284).
+                out.push(Location::Jsonl(path));
             }
         }
     }
@@ -1147,36 +1355,122 @@ pub fn local_date_for_timestamp(local_ts: DateTime<Local>, boundary_hour: u8) ->
 }
 
 // ---------------------------------------------------------------------------
-// File parsing helpers
+// Loading
 // ---------------------------------------------------------------------------
 
-/// One parsed session file.
+/// One session, parsed.
 struct LoadedSession {
     meta: SessionMeta,
+    /// The messages on the session's chain, in order.
     messages: Vec<StoredMessage>,
+    /// Messages on a forked branch the chain does not follow. Empty unless
+    /// two writers appended without seeing each other. See
+    /// [`LoadedSession::all_messages`].
+    off_chain: Vec<StoredMessage>,
     is_closed: bool,
     latest_summary: Option<SummaryLine>,
-    /// `messages.len()` at the moment the latest summary line was read.
-    /// The file-order fallback for a summary with no `covers_through`.
+    /// `messages.len()` at the moment the latest summary was read.
+    /// The order fallback for a summary with no `covers_through`.
     messages_before_summary: usize,
 }
 
-/// Parse a single session `.jsonl` file.
+impl LoadedSession {
+    fn from_events(meta: SessionMeta, events: impl IntoIterator<Item = Event>) -> LoadedSession {
+        let mut loaded = LoadedSession {
+            meta,
+            messages: Vec::new(),
+            off_chain: Vec::new(),
+            is_closed: false,
+            latest_summary: None,
+            messages_before_summary: 0,
+        };
+        for event in events {
+            match event {
+                Event::Message(m) => loaded.messages.push(m),
+                Event::Summary(s) => {
+                    loaded.latest_summary = Some(s);
+                    loaded.messages_before_summary = loaded.messages.len();
+                }
+                // Last title wins: a session can be retitled.
+                Event::Title(t) => loaded.meta.title = Some(t),
+                Event::Closed => loaded.is_closed = true,
+            }
+        }
+        loaded
+    }
+
+    /// Every message, forked branches included, by time.
+    fn all_messages(self) -> Vec<StoredMessage> {
+        if self.off_chain.is_empty() {
+            return self.messages;
+        }
+        let mut all = self.messages;
+        all.extend(self.off_chain);
+        all.sort_by_key(|m| (m.timestamp, m.id));
+        all
+    }
+}
+
+/// Parse a session. `None` when its metadata is unreadable.
+fn load(loc: &Location) -> Option<LoadedSession> {
+    match loc {
+        Location::Dir(dir) => load_dir(dir),
+        Location::Jsonl(path) => {
+            let (meta, events) = read_jsonl(path)?;
+            Some(LoadedSession::from_events(
+                meta,
+                events.into_iter().map(|(e, _)| e),
+            ))
+        }
+    }
+}
+
+fn load_dir(dir: &Path) -> Option<LoadedSession> {
+    let meta: SessionMeta = session_log::read_meta(dir)?;
+    let entries: Vec<EntryFile<Front>> = session_log::read_entries(dir);
+    let chain = session_log::chain(&meta.session_id, &entries);
+    let on_chain: std::collections::HashSet<Uuid> = chain.iter().map(|e| e.id).collect();
+    let off_chain = entries
+        .iter()
+        .filter(|e| !on_chain.contains(&e.id))
+        .filter_map(|e| match Event::from_entry(e) {
+            Event::Message(m) => Some(m),
+            _ => None,
+        })
+        .collect();
+    let mut loaded = LoadedSession::from_events(meta, chain.into_iter().map(Event::from_entry));
+    loaded.off_chain = off_chain;
+    Some(loaded)
+}
+
+/// A session's metadata alone.
+fn meta_at(loc: &Location) -> Option<SessionMeta> {
+    match loc {
+        Location::Dir(dir) => session_log::read_meta(dir),
+        Location::Jsonl(path) => {
+            let file = fs::File::open(path).ok()?;
+            let first = BufReader::new(file).lines().next()?.ok()?;
+            serde_json::from_str::<MetaLine>(first.trim())
+                .ok()
+                .map(|l| l.meta)
+        }
+    }
+}
+
+/// Parse a legacy `.jsonl` session into its events, in file order.
 ///
 /// Returns `None` if the file is unreadable or has a malformed first line.
-fn load_session_file(path: &Path) -> Option<LoadedSession> {
+/// TODO(#284).
+#[allow(clippy::type_complexity)]
+fn read_jsonl(path: &Path) -> Option<(SessionMeta, Vec<(Event, Option<DateTime<Utc>>)>)> {
     let file = fs::File::open(path).ok()?;
     let mut lines = BufReader::new(file).lines();
 
     let first = lines.next()?.ok()?;
     let meta_line: MetaLine = serde_json::from_str(first.trim()).ok()?;
-    let mut meta = meta_line.meta;
+    let meta = meta_line.meta;
 
-    let mut messages = Vec::new();
-    let mut is_closed = false;
-    let mut latest_summary: Option<SummaryLine> = None;
-    let mut messages_before_summary = 0;
-
+    let mut events = Vec::new();
     for raw in lines.map_while(Result::ok) {
         let raw = raw.trim().to_string();
         if raw.is_empty() {
@@ -1191,15 +1485,16 @@ fn load_session_file(path: &Path) -> Option<LoadedSession> {
             }
         };
 
-        if value.get("closed_at").is_some() {
-            is_closed = true;
+        if let Some(at) = value.get("closed_at") {
+            let at = serde_json::from_value::<DateTime<Utc>>(at.clone()).ok();
+            events.push((Event::Closed, at));
         } else if let Some(title) = value.get("session_title").and_then(|v| v.as_str()) {
-            meta.title = Some(title.to_string());
+            events.push((Event::Title(title.to_string()), None));
         } else if value.get("summary_at").is_some() {
             match serde_json::from_value::<SummaryLine>(value) {
                 Ok(s) => {
-                    latest_summary = Some(s);
-                    messages_before_summary = messages.len();
+                    let at = Some(s.summary_at);
+                    events.push((Event::Summary(s), at));
                 }
                 Err(e) => {
                     warn!("Skipping malformed summary in {}: {e}", path.display());
@@ -1213,7 +1508,10 @@ fn load_session_file(path: &Path) -> Option<LoadedSession> {
             continue;
         } else if value.get("timestamp").is_some() {
             match serde_json::from_value::<StoredMessage>(value) {
-                Ok(stored) => messages.push(stored),
+                Ok(stored) => {
+                    let at = Some(stored.timestamp);
+                    events.push((Event::Message(stored), at));
+                }
                 Err(e) => {
                     warn!("Skipping malformed message in {}: {e}", path.display());
                 }
@@ -1221,13 +1519,71 @@ fn load_session_file(path: &Path) -> Option<LoadedSession> {
         }
     }
 
-    Some(LoadedSession {
-        meta,
-        messages,
-        is_closed,
-        latest_summary,
-        messages_before_summary,
-    })
+    Some((meta, events))
+}
+
+/// Convert a legacy `.jsonl` session into a session directory beside it,
+/// named after its stem, and return that directory. The `.jsonl` is left
+/// in place. TODO(#284).
+///
+/// Each line becomes an event whose parent is the line before it — the
+/// migration rule of decision 3.1: a file written before `parent` existed
+/// cannot hold a fork, so file order is the chain. A message with no id
+/// gets one, and a summary with no `covers_through` gets the last message
+/// before it, which is exactly what such a line meant. Lines without a
+/// time of their own (titles) take the time of the line before them.
+fn convert_jsonl(path: &Path) -> anyhow::Result<PathBuf> {
+    let dest = path.with_extension("");
+    if session_log::is_session_dir(&dest) {
+        return Ok(dest);
+    }
+    let (meta, events) = read_jsonl(path)
+        .ok_or_else(|| anyhow::anyhow!("{} is not a readable session", path.display()))?;
+
+    let staging = session_log::staging_dir_for(&dest)?;
+    session_log::write_meta(&staging, &meta)?;
+    let mut parent: Option<Uuid> = None;
+    let mut last_at = meta.created_at;
+    let mut last_message: Option<Uuid> = None;
+    for (event, own_at) in events {
+        let id = match &event {
+            Event::Message(m) => m.id.unwrap_or_else(Uuid::now_v7),
+            _ => Uuid::now_v7(),
+        };
+        let at = own_at.unwrap_or(last_at);
+        let (front, body) = match event {
+            Event::Message(m) => {
+                last_message = Some(id);
+                let (parts, body) = session_log::split_body(m.parts, text_of);
+                (
+                    Front::Message {
+                        parent,
+                        at,
+                        role: m.role,
+                        input_kind: m.input_kind,
+                        user_id: m.user_id,
+                        parts,
+                    },
+                    body,
+                )
+            }
+            Event::Summary(s) => (
+                Front::Summary {
+                    parent,
+                    at,
+                    covers_through: s.covers_through.or(last_message),
+                },
+                s.summary,
+            ),
+            Event::Title(title) => (Front::Title { parent, at, title }, String::new()),
+            Event::Closed => (Front::Closed { parent, at }, String::new()),
+        };
+        session_log::write_entry(&staging, id, &front, &body)?;
+        parent = Some(id);
+        last_at = last_at.max(at);
+    }
+    session_log::publish_dir(&staging, &dest)?;
+    Ok(dest)
 }
 
 /// The messages a restore should replay, and the summary to prefix them
@@ -1245,7 +1601,7 @@ fn model_history(loaded: &LoadedSession) -> (Option<&str>, &[StoredMessage]) {
         Some(id) => match loaded.messages.iter().position(|m| m.id == Some(id)) {
             Some(pos) => pos + 1,
             None => {
-                warn!("session checkpoint {id} is not in the file; replaying the whole session");
+                warn!("session checkpoint {id} is not in the session; replaying the whole session");
                 0
             }
         },
@@ -1258,11 +1614,6 @@ fn model_history(loaded: &LoadedSession) -> (Option<&str>, &[StoredMessage]) {
 }
 
 /// One session as the `session_list` tool renders it.
-///
-/// Everything here comes out of a single pass over the file that never
-/// materialises a message: the listing wants counts and timestamps, and
-/// a session's messages can be megabytes. That is the whole reason this
-/// is not `list_sessions().map(...)`.
 #[derive(Debug, Clone)]
 pub struct SessionRow {
     pub meta: SessionMeta,
@@ -1273,92 +1624,37 @@ pub struct SessionRow {
     pub is_closed: bool,
 }
 
-/// Scan one session file for its listing row without accumulating
-/// messages. Returns `None` when the first line is not a readable meta.
-fn load_session_row(path: &Path) -> Option<SessionRow> {
-    let file = fs::File::open(path).ok()?;
-    let mut lines = BufReader::new(file).lines();
-    let first = lines.next()?.ok()?;
-    let meta_line: MetaLine = serde_json::from_str(first.trim()).ok()?;
-    let mut row = SessionRow {
-        meta: meta_line.meta,
-        message_count: 0,
-        last_at: None,
-        is_closed: false,
-    };
-    for raw in lines.map_while(Result::ok) {
-        let raw = raw.trim();
-        if raw.is_empty() {
-            continue;
-        }
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
-            continue;
-        };
-        if value.get("closed_at").is_some() {
-            row.is_closed = true;
-        } else if let Some(title) = value.get("session_title").and_then(|v| v.as_str()) {
-            // Last title wins, matching `load_session_file`.
-            row.meta.title = Some(title.to_string());
-        } else if let Some(ts) = value.get("timestamp").and_then(|v| v.as_str()) {
-            row.message_count += 1;
-            if let Ok(at) = DateTime::parse_from_rfc3339(ts) {
-                row.last_at = Some(at.with_timezone(&Utc));
-            }
-        }
-    }
-    Some(row)
+/// One session's listing row. `None` when its metadata is unreadable.
+fn load_session_row(loc: &Location) -> Option<SessionRow> {
+    let loaded = load(loc)?;
+    Some(SessionRow {
+        message_count: loaded.messages.len() + loaded.off_chain.len(),
+        last_at: loaded
+            .messages
+            .iter()
+            .chain(&loaded.off_chain)
+            .map(|m| m.timestamp)
+            .max(),
+        is_closed: loaded.is_closed,
+        meta: loaded.meta,
+    })
 }
 
 /// The id of the last message a summary keeping `keep_recent` trailing
 /// messages absorbs.
 ///
-/// `None` when the file has no messages, or when the message at that
-/// position predates `StoredMessage::id`. The second case costs one
-/// checkpoint's worth of tail on a session that spans the upgrade —
-/// bounded to a day under the default `Reset` policy, which rotates the
-/// file — and the reader's file-order fallback handles it.
-fn checkpoint_id(path: &Path, keep_recent: usize) -> Option<Uuid> {
-    let ids = message_ids_in_order(path);
+/// `None` when the session has no messages.
+fn checkpoint_id(loc: &Location, keep_recent: usize) -> Option<Uuid> {
+    let ids: Vec<Option<Uuid>> = load(loc)?.messages.iter().map(|m| m.id).collect();
     if ids.is_empty() {
         return None;
     }
     // A summary that covers nothing is not reachable from
     // `maybe_compress` (it fires only with at least one message to
-    // summarise, and the file holds at least as many as memory did), but
+    // summarise, and the log holds at least as many as memory did), but
     // clamping costs nothing and keeps the index in range.
     let covered = ids.len().saturating_sub(keep_recent).max(1);
     ids[covered - 1]
-}
-
-/// Every message line's id, in file order. Non-message lines are skipped
-/// so the positions line up with what a reader replays.
-fn message_ids_in_order(path: &Path) -> Vec<Option<Uuid>> {
-    let Ok(file) = fs::File::open(path) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for raw in BufReader::new(file).lines().map_while(Result::ok) {
-        let raw = raw.trim();
-        if raw.is_empty() {
-            continue;
-        }
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
-            continue;
-        };
-        if value.get("timestamp").is_none() {
-            continue;
-        }
-        // Must agree with `load_session_file` on what counts as a
-        // message: a timestamped line that fails to deserialize as a
-        // `StoredMessage` is skipped there too (with a warning), so a
-        // cursor must never be computed against one here — the reader
-        // would not find it and would fall back to replaying everything.
-        let Ok(stored) = serde_json::from_value::<StoredMessage>(value) else {
-            continue;
-        };
-        out.push(stored.id);
-    }
-    out
 }
 
 #[cfg(test)]
@@ -1578,8 +1874,12 @@ mod tests {
             .find_or_create_for_device("device-a", "default", "default", 4)
             .expect("find_or_create");
         // Resolve from disk and verify the meta the store wrote.
-        let path = store.absolute_path_for(&sid).expect("path cached");
-        let loaded = load_session_file(&path).expect("meta line present");
+        let loc = store.resolve_path(&sid).expect("path cached");
+        assert!(
+            matches!(loc, Location::Dir(_)),
+            "new sessions are directories"
+        );
+        let loaded = load(&loc).expect("metadata present");
         let meta = loaded.meta;
         assert_eq!(meta.session_id, sid);
         assert_eq!(meta.channel, "device-default");
@@ -1744,7 +2044,7 @@ mod tests {
         assert_eq!(content.as_deref(), Some("fn main() {}"));
     }
 
-    /// The content must not be in the JSONL — that file is inside the
+    /// The content must not be in the session files — they are inside the
     /// retrieve index, which is the whole reason for the cache.
     #[test]
     fn the_result_content_never_reaches_the_session_file() {
@@ -1754,7 +2054,7 @@ mod tests {
             .append(&sid, &tool_result_msg("c1", "SECRET-CANARY-VALUE"))
             .unwrap();
 
-        let raw = fs::read_to_string(store.absolute_path_for(&sid).unwrap()).unwrap();
+        let raw = store.raw_for_test(&sid);
         assert!(
             !raw.contains("SECRET-CANARY-VALUE"),
             "tool result content leaked into the indexed file:\n{raw}"
@@ -1828,7 +2128,7 @@ mod tests {
             )
             .unwrap();
 
-        let raw = fs::read_to_string(store.absolute_path_for(&sid).unwrap()).unwrap();
+        let raw = store.raw_for_test(&sid);
         assert!(
             !raw.contains("SECRET-INPUT-CANARY"),
             "the input leaked into the indexed file:\n{}",
@@ -1943,6 +2243,77 @@ mod tests {
         );
     }
 
+    /// The text parts of a loaded history, in order.
+    fn texts(history: &[ChatMessage]) -> Vec<String> {
+        history
+            .iter()
+            .flat_map(|m| &m.parts)
+            .filter_map(|p| match p {
+                ContentPart::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Hand-write a legacy `.jsonl` session — a meta line, then `lines` —
+    /// and return its id.
+    fn legacy_session(store: &SessionStore, lines: &[String]) -> String {
+        let sid = Uuid::now_v7().to_string();
+        let dir = store.base_dir.join("default").join(store.kind);
+        fs::create_dir_all(&dir).unwrap();
+        let meta = serde_json::json!({ "meta": {
+            "session_id": sid,
+            "room_id": "!room:example.org",
+            "thread_id": null,
+            "channel": "matrix",
+            "created_at": "2026-04-06T09:00:00Z",
+            "namespace": "default",
+        }});
+        let mut body = format!("{meta}\n");
+        for line in lines {
+            body.push_str(line);
+            body.push('\n');
+        }
+        fs::write(dir.join(format!("{sid}.jsonl")), body).unwrap();
+        sid
+    }
+
+    fn legacy_message(i: usize, text: &str, id: Option<Uuid>) -> String {
+        let mut v = serde_json::json!({
+            "timestamp": format!("2026-04-06T10:{i:02}:00Z"),
+            "role": "user",
+            "parts": [{"Text": text}],
+        });
+        if let Some(id) = id {
+            v["id"] = serde_json::json!(id);
+        }
+        v.to_string()
+    }
+
+    /// Load `sid`, convert it with a write, and load it again: both reads
+    /// must agree on everything before the write.
+    fn texts_before_and_after_conversion(
+        store: &SessionStore,
+        sid: &str,
+    ) -> (Vec<String>, Vec<String>) {
+        let before = texts(&store.load_session(sid).expect("the legacy session loads"));
+        assert!(matches!(store.resolve_path(sid), Some(Location::Jsonl(_))));
+        store
+            .append(sid, &ChatMessage::user("written after"))
+            .unwrap();
+        assert!(
+            matches!(store.resolve_path(sid), Some(Location::Dir(_))),
+            "a write converts the session"
+        );
+        let mut after = texts(
+            &store
+                .load_session(sid)
+                .expect("the converted session loads"),
+        );
+        assert_eq!(after.pop().as_deref(), Some("written after"));
+        (before, after)
+    }
+
     // ── compaction チェックポイント ──────────────────────────────────
 
     /// The checkpoint covers everything but the trailing `keep_recent`
@@ -2002,32 +2373,25 @@ mod tests {
 
     /// A SummaryLine written before covers_through existed means "this
     /// summary stands in for everything before it in the file" — which
-    /// is what the shutdown summary it almost certainly is did mean.
+    /// is what the shutdown summary it almost certainly is did mean. The
+    /// conversion must keep that meaning.
     #[test]
     fn a_legacy_summary_line_replays_only_what_follows_it() {
-        let (_s, _c, store, sid) = cached_store();
-        store.append(&sid, &ChatMessage::user("before")).unwrap();
-
-        let path = store.absolute_path_for(&sid).unwrap();
-        let legacy = r#"{"summary_at":"2026-04-06T11:00:00Z","summary":"what happened"}"#;
-        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
-        writeln!(f, "{legacy}").unwrap();
-        drop(f);
-
-        store.append(&sid, &ChatMessage::user("after")).unwrap();
-
-        let loaded = store.load_session(&sid).unwrap();
-        let texts: Vec<String> = loaded
-            .iter()
-            .flat_map(|m| &m.parts)
-            .filter_map(|p| match p {
-                ContentPart::Text(t) => Some(t.clone()),
-                _ => None,
-            })
-            .collect();
-        assert!(texts[0].contains("what happened"), "stub first: {texts:?}");
-        assert!(texts.iter().any(|t| t == "after"), "{texts:?}");
-        assert!(!texts.iter().any(|t| t == "before"), "{texts:?}");
+        let (_s, _c, store, _) = cached_store();
+        let sid = legacy_session(
+            &store,
+            &[
+                legacy_message(0, "before", None),
+                r#"{"summary_at":"2026-04-06T11:00:00Z","summary":"what happened"}"#.to_string(),
+                legacy_message(30, "after", None),
+            ],
+        );
+        let (before, after) = texts_before_and_after_conversion(&store, &sid);
+        for texts in [before, after] {
+            assert!(texts[0].contains("what happened"), "stub first: {texts:?}");
+            assert!(texts.iter().any(|t| t == "after"), "{texts:?}");
+            assert!(!texts.iter().any(|t| t == "before"), "{texts:?}");
+        }
     }
 
     /// A file with two legacy summary lines must use the count at the
@@ -2037,87 +2401,67 @@ mod tests {
     /// already covers.
     #[test]
     fn a_second_legacy_summary_uses_its_own_count_not_the_first() {
-        let (_s, _c, store, sid) = cached_store();
-        store.append(&sid, &ChatMessage::user("m0")).unwrap();
-
-        let path = store.absolute_path_for(&sid).unwrap();
-        let first = r#"{"summary_at":"2026-04-06T11:00:00Z","summary":"first summary"}"#;
-        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
-        writeln!(f, "{first}").unwrap();
-        drop(f);
-
-        store.append(&sid, &ChatMessage::user("m1")).unwrap();
-
-        let second = r#"{"summary_at":"2026-04-06T12:00:00Z","summary":"second summary"}"#;
-        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
-        writeln!(f, "{second}").unwrap();
-        drop(f);
-
-        store.append(&sid, &ChatMessage::user("m2")).unwrap();
-
-        let loaded = store.load_session(&sid).unwrap();
-        let texts: Vec<String> = loaded
-            .iter()
-            .flat_map(|m| &m.parts)
-            .filter_map(|p| match p {
-                ContentPart::Text(t) => Some(t.clone()),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            texts[0].contains("second summary"),
-            "stub must be the latest summary: {texts:?}"
+        let (_s, _c, store, _) = cached_store();
+        let sid = legacy_session(
+            &store,
+            &[
+                legacy_message(0, "m0", None),
+                r#"{"summary_at":"2026-04-06T11:00:00Z","summary":"first summary"}"#.to_string(),
+                legacy_message(1, "m1", None),
+                r#"{"summary_at":"2026-04-06T12:00:00Z","summary":"second summary"}"#.to_string(),
+                legacy_message(2, "m2", None),
+            ],
         );
-        assert!(texts.iter().any(|t| t == "m2"), "{texts:?}");
-        assert!(
-            !texts.iter().any(|t| t == "m1"),
-            "must not replay what the second summary already covers: {texts:?}"
-        );
-        assert!(!texts.iter().any(|t| t == "m0"), "{texts:?}");
+        let (before, after) = texts_before_and_after_conversion(&store, &sid);
+        for texts in [before, after] {
+            assert!(
+                texts[0].contains("second summary"),
+                "stub must be the latest summary: {texts:?}"
+            );
+            assert!(texts.iter().any(|t| t == "m2"), "{texts:?}");
+            assert!(
+                !texts.iter().any(|t| t == "m1"),
+                "must not replay what the second summary already covers: {texts:?}"
+            );
+            assert!(!texts.iter().any(|t| t == "m0"), "{texts:?}");
+        }
     }
 
-    /// A checkpoint id that is not in the file (corruption, or a partial
-    /// sync) must not silently return nothing — the whole file replays
-    /// behind the stub instead, same as a file with no checkpoint at all.
-    /// This is the failure mode `model_history`'s fallback branch exists
-    /// to prevent.
+    /// A checkpoint id that is not in the session (corruption, or a
+    /// partial sync) must not silently return nothing — the whole session
+    /// replays behind the stub instead, same as one with no checkpoint at
+    /// all. This is the failure mode `model_history`'s fallback branch
+    /// exists to prevent.
     #[test]
     fn a_checkpoint_not_found_in_the_file_replays_everything() {
-        let (_s, _c, store, sid) = cached_store();
-        store.append(&sid, &ChatMessage::user("m0")).unwrap();
-        store.append(&sid, &ChatMessage::user("m1")).unwrap();
-
-        let path = store.absolute_path_for(&sid).unwrap();
-        let missing = Uuid::now_v7();
+        let (_s, _c, store, _) = cached_store();
         let line = serde_json::to_string(&SummaryLine {
-            summary_at: Utc::now(),
+            summary_at: "2026-04-06T11:00:00Z".parse().unwrap(),
             summary: "stale checkpoint".to_string(),
             up_to_timestamp: None,
-            covers_through: Some(missing),
+            covers_through: Some(Uuid::now_v7()),
         })
         .unwrap();
-        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
-        writeln!(f, "{line}").unwrap();
-        drop(f);
-
-        let loaded = store.load_session(&sid).expect("the session still loads");
-        let texts: Vec<String> = loaded
-            .iter()
-            .flat_map(|m| &m.parts)
-            .filter_map(|p| match p {
-                ContentPart::Text(t) => Some(t.clone()),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            texts[0].contains("stale checkpoint"),
-            "stub first: {texts:?}"
+        let sid = legacy_session(
+            &store,
+            &[
+                legacy_message(0, "m0", Some(Uuid::now_v7())),
+                legacy_message(1, "m1", Some(Uuid::now_v7())),
+                line,
+            ],
         );
-        assert!(
-            texts.iter().any(|t| t == "m0"),
-            "checkpoint miss must fall back to replaying everything: {texts:?}"
-        );
-        assert!(texts.iter().any(|t| t == "m1"), "{texts:?}");
+        let (before, after) = texts_before_and_after_conversion(&store, &sid);
+        for texts in [before, after] {
+            assert!(
+                texts[0].contains("stale checkpoint"),
+                "stub first: {texts:?}"
+            );
+            assert!(
+                texts.iter().any(|t| t == "m0"),
+                "checkpoint miss must fall back to replaying everything: {texts:?}"
+            );
+            assert!(texts.iter().any(|t| t == "m1"), "{texts:?}");
+        }
     }
 
     /// keep_recent = 0 is the day-boundary compaction: it replaced the
@@ -2136,42 +2480,171 @@ mod tests {
         assert_eq!(loaded.len(), 2, "stub only: {loaded:?}");
     }
 
-    /// A session spanning the upgrade has messages with no id. The
-    /// cursor cannot point at one, so the checkpoint degrades to the
-    /// file-order rule rather than pointing at nothing — bounded to a
-    /// day under the default Reset policy, which rotates the file.
+    /// A legacy session's messages may have no id. Converting gives each
+    /// one, so a checkpoint written afterwards points at an exact message
+    /// rather than degrading to a file-order rule.
     #[test]
-    fn a_checkpoint_over_id_less_messages_degrades_to_file_order() {
-        let (_s, _c, store, sid) = cached_store();
-        let path = store.absolute_path_for(&sid).unwrap();
-        {
-            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
-            for i in 0..3 {
-                writeln!(
-                    f,
-                    r#"{{"timestamp":"2026-04-06T10:0{i}:00Z","role":"user","parts":[{{"Text":"old{i}"}}]}}"#
-                )
-                .unwrap();
-            }
-        }
+    fn a_checkpoint_over_id_less_messages_is_exact_after_conversion() {
+        let (_s, _c, store, _) = cached_store();
+        let sid = legacy_session(
+            &store,
+            &(0..3)
+                .map(|i| legacy_message(i, &format!("old{i}"), None))
+                .collect::<Vec<_>>(),
+        );
 
         store.append_summary(&sid, "the old ones", 1).unwrap();
         store.append(&sid, &ChatMessage::user("new")).unwrap();
 
-        let loaded = store.load_session(&sid).expect("the session still loads");
-        let texts: Vec<String> = loaded
-            .iter()
-            .flat_map(|m| &m.parts)
+        let texts = texts(&store.load_session(&sid).expect("the session still loads"));
+        assert!(texts[0].contains("the old ones"), "stub first: {texts:?}");
+        // The stub is the summary and its acknowledgement.
+        assert_eq!(&texts[2..], ["old2", "new"], "{texts:?}");
+    }
+
+    /// Conversion keeps everything the legacy file said — ids, order, the
+    /// title, the close — and leaves the `.jsonl` where it was.
+    #[test]
+    fn conversion_keeps_the_record_and_the_original_file() {
+        let (_s, _c, store, _) = cached_store();
+        let kept = Uuid::now_v7();
+        let sid = legacy_session(
+            &store,
+            &[
+                legacy_message(0, "first", Some(kept)),
+                r#"{"session_title":"old title"}"#.to_string(),
+                r#"{"digest_at":"2026-04-06T10:30:00Z","since":"x","digest":"ignored"}"#
+                    .to_string(),
+                legacy_message(1, "second", None),
+            ],
+        );
+        let jsonl = store.absolute_path_for(&sid).unwrap();
+        let row = |store: &SessionStore| {
+            let rows: Vec<SessionRow> = store
+                .session_rows()
+                .into_iter()
+                .filter(|r| r.meta.session_id == sid)
+                .collect();
+            assert_eq!(rows.len(), 1, "one session, not two: {rows:?}");
+            rows.into_iter().next().unwrap()
+        };
+        let before = row(&store);
+
+        store.set_title(&sid, "new title").unwrap();
+
+        assert!(jsonl.exists(), "the legacy file is never deleted");
+        let (messages, _) = store.load_session_full(&sid).unwrap();
+        assert_eq!(messages[0].id, Some(kept), "an existing id survives");
+        assert!(messages[1].id.is_some(), "a missing id is filled in");
+        assert_eq!(
+            texts(
+                &messages
+                    .into_iter()
+                    .map(|m| m.into_chat_message())
+                    .collect::<Vec<_>>()
+            ),
+            ["first", "second"]
+        );
+
+        // The directory supersedes the file.
+        let after = row(&store);
+        assert_eq!(before.meta.title.as_deref(), Some("old title"));
+        assert_eq!(after.meta.title.as_deref(), Some("new title"));
+        assert_eq!(after.message_count, 2);
+
+        store.close_session(&sid).unwrap();
+        assert!(row(&store).is_closed);
+    }
+
+    /// A store that has never seen a session finds its converted
+    /// directory, not the `.jsonl` beside it.
+    #[test]
+    fn a_cold_store_resolves_the_converted_directory() {
+        let (sessions, _c, store, _) = cached_store();
+        let sid = legacy_session(&store, &[legacy_message(0, "hi", None)]);
+        store.append(&sid, &ChatMessage::user("again")).unwrap();
+
+        let cold = SessionStore::new(sessions.path().to_path_buf(), "channel", None);
+        assert!(matches!(cold.resolve_path(&sid), Some(Location::Dir(_))));
+        assert_eq!(cold.load_session(&sid).unwrap().len(), 2);
+    }
+
+    /// Reading never converts: only a write does, so sessions that are
+    /// only ever looked at stay one file.
+    #[test]
+    fn reading_a_legacy_session_does_not_convert_it() {
+        let (_s, _c, store, _) = cached_store();
+        let sid = legacy_session(&store, &[legacy_message(0, "hi", None)]);
+        store.load_session(&sid).unwrap();
+        store.session_rows();
+        let today = local_date_for_timestamp(Local::now(), 4);
+        store.sessions_for_day(today, 4);
+        assert!(matches!(store.resolve_path(&sid), Some(Location::Jsonl(_))));
+        assert!(
+            !store
+                .absolute_path_for(&sid)
+                .unwrap()
+                .with_extension("")
+                .exists()
+        );
+    }
+
+    /// Two writers that did not see each other fork the chain. The model
+    /// follows one branch; the daily log keeps both.
+    #[test]
+    fn a_fork_is_kept_in_the_daily_log() {
+        let (sessions, _c, store, sid) = cached_store();
+        store.append(&sid, &ChatMessage::user("shared")).unwrap();
+        // A second process — its own tip cache — appends after the same
+        // parent as the next append from `store` will.
+        let other = SessionStore::new(sessions.path().to_path_buf(), "channel", None);
+        other
+            .append(&sid, &ChatMessage::user("from the other host"))
+            .unwrap();
+        store
+            .append(&sid, &ChatMessage::user("from this host"))
+            .unwrap();
+
+        let model = texts(&store.load_session(&sid).unwrap());
+        assert_eq!(model.len(), 2, "one branch: {model:?}");
+
+        let today = local_date_for_timestamp(Local::now(), 4);
+        let day: Vec<String> = store
+            .sessions_for_day(today, 4)
+            .into_iter()
+            .flat_map(|(_, ms)| ms)
+            .map(|m| m.into_chat_message())
+            .flat_map(|m| m.parts)
             .filter_map(|p| match p {
-                ContentPart::Text(t) => Some(t.clone()),
+                ContentPart::Text(t) => Some(t),
                 _ => None,
             })
             .collect();
-        assert!(texts[0].contains("the old ones"), "stub first: {texts:?}");
-        assert!(texts.iter().any(|t| t == "new"), "{texts:?}");
+        assert_eq!(day.len(), 3, "both branches: {day:?}");
+    }
+
+    /// A message's text is the file's body, readable as Markdown.
+    #[test]
+    fn a_message_is_its_own_markdown_file() {
+        let (_s, _c, store, sid) = cached_store();
+        store
+            .append(&sid, &ChatMessage::user("# a heading\n\nand a paragraph"))
+            .unwrap();
+        let dir = store.absolute_path_for(&sid).unwrap();
+        let files: Vec<PathBuf> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.file_name().unwrap() != session_log::META_FILE)
+            .collect();
+        assert_eq!(files.len(), 1);
+        let raw = fs::read_to_string(&files[0]).unwrap();
+        assert!(raw.starts_with("---\n"), "{raw}");
+        assert!(raw.ends_with("\n\n# a heading\n\nand a paragraph"), "{raw}");
+        assert!(raw.contains("type: message"), "{raw}");
         assert!(
-            !texts.iter().any(|t| t == "old0"),
-            "file-order fallback must skip everything before the line: {texts:?}"
+            !raw.contains("parts"),
+            "a lone text needs no part list: {raw}"
         );
     }
 
@@ -2294,7 +2767,7 @@ mod tests {
             .expect("the file must resolve");
         let name = path.file_name().unwrap().to_str().unwrap();
         let expected_date = local_date_for_timestamp(Local::now(), 4).to_string();
-        assert_eq!(name, format!("{expected_date}-{sid}.jsonl"));
+        assert_eq!(name, format!("{expected_date}-{sid}"));
         assert!(path.starts_with(tmp.path().join("default").join("autonomous")));
 
         store.append(&sid, &ChatMessage::user("hello")).unwrap();
@@ -2347,8 +2820,8 @@ mod tests {
         );
     }
 
-    /// A plain store must not change: its filename is still exactly
-    /// `{session_id}.jsonl`, and a dated-looking neighbour does not resolve.
+    /// A plain store's directory is named exactly `{session_id}`, and a
+    /// dated-looking neighbour does not resolve.
     ///
     /// The collision check goes through a fresh store, because the one
     /// that created the session answers from `path_cache` and would not
@@ -2363,10 +2836,7 @@ mod tests {
             .unwrap();
 
         let path = store.absolute_path_for(&sid).unwrap();
-        assert_eq!(
-            path.file_name().unwrap().to_str().unwrap(),
-            format!("{sid}.jsonl")
-        );
+        assert_eq!(path.file_name().unwrap().to_str().unwrap(), sid);
 
         // Same id, a dated filename: must not be picked up by the exact match.
         let ns = tmp.path().join("default").join("channel");
@@ -2377,7 +2847,7 @@ mod tests {
                 .unwrap()
                 .file_name()
                 .unwrap(),
-            std::ffi::OsStr::new(&format!("{sid}.jsonl"))
+            std::ffi::OsStr::new(&sid)
         );
 
         // Cold cache: the exact-name branch of `resolve_path` is what
@@ -2385,7 +2855,7 @@ mod tests {
         let cold = SessionStore::new(tmp.path().to_path_buf(), "channel", None);
         assert_eq!(
             cold.absolute_path_for(&sid).unwrap().file_name().unwrap(),
-            std::ffi::OsStr::new(&format!("{sid}.jsonl"))
+            std::ffi::OsStr::new(&sid)
         );
     }
 }

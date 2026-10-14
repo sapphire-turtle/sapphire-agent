@@ -78,7 +78,7 @@ pub struct ServeState {
     /// directory for the same reason the ACP store is: they are ordinary
     /// sessions for the purpose of reading them back, and not chat for
     /// the purpose of anything else. Its files are named by agent-day
-    /// (`{date}-{uuid}.jsonl`) — see `SessionStore::with_dated_files`.
+    /// (`{date}-{uuid}/`) — see `SessionStore::with_dated_files`.
     pub(crate) autonomous_session_store: Arc<SessionStore>,
     /// In-memory conversation history, keyed by session_id.
     /// Lazy-loaded from JSONL on first access.
@@ -5718,31 +5718,28 @@ mod tests {
         )
         .await;
 
-        // Read the raw JSONL rather than `load_session`: `load_session`
-        // runs `repair_tool_pairing`, which synthesises a MISSING_RESULT
-        // stand-in for an orphaned `tool_use` on the way out. That would
-        // make this test pass even if the `tool_result` append were
-        // silently dropped — it would prove only "the tool_use reached
-        // disk and something answers it after loading", not "both
-        // halves reached disk". Reading raw is the same technique
-        // `a_failed_tool_use_append_suppresses_the_tool_result_append_too`
-        // uses against the ACP store, and for the same reason (see its
-        // own comment).
-        let path = state
+        // Read the record as written rather than `load_session`:
+        // `load_session` runs `repair_tool_pairing`, which synthesises a
+        // MISSING_RESULT stand-in for an orphaned `tool_use` on the way
+        // out. That would make this test pass even if the `tool_result`
+        // append were silently dropped — it would prove only "the tool_use
+        // reached disk and something answers it after loading", not "both
+        // halves reached disk".
+        let (messages, _) = state
             .cross_device_session_store
-            .absolute_path_for(&sid)
-            .expect("the session file exists");
-        let raw = std::fs::read_to_string(&path).unwrap();
-        let use_at = raw
-            .find("ToolUse")
+            .load_session_full(&sid)
+            .expect("the session exists");
+        let position =
+            |want: fn(&ContentPart) -> bool| messages.iter().position(|m| m.parts.iter().any(want));
+        let use_at = position(|p| matches!(p, ContentPart::ToolUseRef { .. }))
             .expect("the tool_use never reached disk");
-        let result_at = raw.find("ToolResultRef").expect(
+        let result_at = position(|p| matches!(p, ContentPart::ToolResultRef { .. })).expect(
             "the tool_result never reached disk — repair_tool_pairing \
              would hide this on a load",
         );
         assert!(
             use_at < result_at,
-            "the pair is out of order on disk:\n{raw}"
+            "the pair is out of order on disk: {messages:?}"
         );
     }
 

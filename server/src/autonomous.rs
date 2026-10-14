@@ -292,7 +292,7 @@ impl AutonomousLoop {
                     .map(Path::to_path_buf)
             })
             .map(|p| p.display().to_string())
-            .unwrap_or_else(|| format!("sessions/{namespace}/autonomous/{session_id}.jsonl"));
+            .unwrap_or_else(|| format!("sessions/{namespace}/autonomous/{session_id}"));
 
         loop {
             let text = if turns == 0 {
@@ -531,7 +531,7 @@ mod tests {
         );
         assert!(
             path_line.starts_with("sessions/default/autonomous/")
-                && path_line.ends_with(&format!("-{sid}.jsonl")),
+                && path_line.ends_with(&format!("-{sid}")),
             "path should be dated and workspace-relative: {path_line}"
         );
         assert!(first.ends_with("Summarise the day.\n"));

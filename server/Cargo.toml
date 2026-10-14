@@ -110,7 +110,7 @@ uuid = { version = "1", features = ["v7", "serde"] }
 # redb-store) from bypassing the feature flags below.
 # `keys` provides `keys::BridgeVerifier`, which checks a bearer token against
 # the workgroup's external devices through the running bridge.
-sapphire-framework = { version = "0.18.0", default-features = false, features = ["workspace", "keys"] }
+sapphire-framework = { version = "0.18.0", default-features = false, features = ["workspace", "keys", "frontmatter"] }
 # The bridge's control-plane API and client, which the facade does not
 # re-export: `external-device` reuses the framework's own subcommand
 # (`cli` feature) and sends it to the running bridge, which owns the ledger.

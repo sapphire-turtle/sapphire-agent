@@ -748,7 +748,7 @@ impl TaskTestTool {
             .autonomous_session_store
             .absolute_path_for(session_id)
             .map(|p| self.rel_display(&p))
-            .unwrap_or_else(|| format!("sessions/{ns}/autonomous/{session_id}.jsonl"))
+            .unwrap_or_else(|| format!("sessions/{ns}/autonomous/{session_id}"))
     }
 
     fn load_heartbeat(&self, name: &str) -> Result<crate::heartbeat_config::HeartbeatTask> {

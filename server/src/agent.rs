@@ -322,10 +322,10 @@ impl Agent {
             }
         };
 
-        let Some(session_path) = self.session_store.absolute_path_for(&session_id) else {
+        let Some(created_at) = self.session_store.created_at(&session_id) else {
             return;
         };
-        if read_session_date(&session_path, boundary) >= today {
+        if local_date_for_timestamp(created_at.with_timezone(&Local), boundary) >= today {
             return;
         }
 
@@ -899,40 +899,6 @@ fn build_user_message(text: &str, attachments: &[Attachment]) -> ChatMessage {
         .iter()
         .map(|a| (a.media_type.clone(), STANDARD.encode(&a.data)));
     ChatMessage::user_with_images(text, images)
-}
-
-/// Read the created_at date of a session file and convert to the local day.
-fn read_session_date(path: &std::path::Path, boundary_hour: u8) -> NaiveDate {
-    use std::io::{BufRead, BufReader};
-
-    let fallback = local_date_for_timestamp(Local::now(), boundary_hour);
-
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return fallback,
-    };
-
-    let first_line = match BufReader::new(file).lines().next() {
-        Some(Ok(l)) => l,
-        _ => return fallback,
-    };
-
-    #[derive(serde::Deserialize)]
-    struct MetaLine {
-        meta: MetaCreatedAt,
-    }
-    #[derive(serde::Deserialize)]
-    struct MetaCreatedAt {
-        created_at: chrono::DateTime<chrono::Utc>,
-    }
-
-    match serde_json::from_str::<MetaLine>(&first_line) {
-        Ok(ml) => {
-            let local = ml.meta.created_at.with_timezone(&Local);
-            local_date_for_timestamp(local, boundary_hour)
-        }
-        Err(_) => fallback,
-    }
 }
 
 #[cfg(test)]

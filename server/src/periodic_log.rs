@@ -1619,18 +1619,9 @@ mod tests {
         at: chrono::DateTime<chrono::Utc>,
         text: &str,
     ) {
-        let path = store.absolute_path_for(session_id).expect("session exists");
-        let line = serde_json::json!({
-            "timestamp": at,
-            "role": "user",
-            "parts": [{"Text": text}],
-        });
-        use std::io::Write as _;
-        let mut file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
+        store
+            .append_at_for_test(session_id, at, &crate::provider::ChatMessage::user(text))
             .unwrap();
-        writeln!(file, "{line}").unwrap();
     }
 
     /// Same idea for the ACP store: a raw `Line::Message` written
@@ -1642,7 +1633,6 @@ mod tests {
         at: chrono::DateTime<chrono::Utc>,
         text: &str,
     ) {
-        let path = store.path_for_test(session_id);
         let line = serde_json::json!({
             "kind": "message",
             "id": uuid::Uuid::now_v7(),
@@ -1651,12 +1641,7 @@ mod tests {
             "role": "user",
             "parts": [{"text": text}],
         });
-        use std::io::Write as _;
-        let mut file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .unwrap();
-        writeln!(file, "{line}").unwrap();
+        store.write_line_for_test(session_id, &line);
     }
 
     /// Both sources reach the transcript input, interleaved by

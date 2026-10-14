@@ -26,6 +26,7 @@ mod periodic_log;
 mod provider;
 mod serve;
 mod session;
+mod session_log;
 mod session_storage;
 mod skills;
 mod subagent_cache;
@@ -685,9 +686,9 @@ async fn main() -> Result<()> {
             // Where the idle loop's sessions live. Built unconditionally —
             // construction touches nothing — so `session_list` can read what
             // last night's loop wrote even in a process that has autonomous
-            // sessions turned off. Files are named `{agent-day}-{uuid}.jsonl`
+            // sessions turned off. Directories are named `{agent-day}-{uuid}`
             // so an overnight run reads as a run in a directory listing; the
-            // session's own metadata is one line away and unchanged.
+            // session's own metadata is in its `session.md`, unchanged.
             let autonomous_session_store = Arc::new(
                 SessionStore::with_workspace(
                     sessions_base.clone(),
