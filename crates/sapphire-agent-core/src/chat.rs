@@ -170,7 +170,9 @@ async fn dispatch_event(val: &Value, tx: &mpsc::Sender<ChatEvent>) -> bool {
                     {
                         // s16le pairs → i16.
                         let pcm: Vec<i16> = bytes
-                            .chunks_exact(2)
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
                             .map(|c| i16::from_le_bytes([c[0], c[1]]))
                             .collect();
                         let _ = tx.send(ChatEvent::AudioChunk { pcm }).await;

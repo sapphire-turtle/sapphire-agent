@@ -369,7 +369,9 @@ fn decode_push_audio_chunk(b64: &str) -> Option<VoicePushEvent> {
         return None;
     }
     let pcm: Vec<i16> = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| i16::from_le_bytes([c[0], c[1]]))
         .collect();
     Some(VoicePushEvent::AudioChunk { pcm })
@@ -452,7 +454,9 @@ fn decode_audio_chunk(b64: &str) -> Option<VoiceEvent> {
         return None;
     }
     let pcm: Vec<i16> = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| i16::from_le_bytes([c[0], c[1]]))
         .collect();
     Some(VoiceEvent::AudioChunk { pcm })

@@ -689,10 +689,7 @@ impl AcpSessionStore {
         }
         let mut out = Vec::with_capacity(events.len());
         let mut cursor = None;
-        loop {
-            let Some(next) = children.get(&cursor) else {
-                break;
-            };
+        while let Some(next) = children.get(&cursor) {
             if next.len() > 1 {
                 warn!(
                     "ACP session {session_id}: {} events share one parent; taking the first branch. Two writers appended to this session and there is no merge story yet.",

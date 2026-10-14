@@ -216,7 +216,7 @@ impl CandidateStore {
 
     pub fn list(&self) -> Vec<&Candidate> {
         let mut out: Vec<&Candidate> = self.candidates.values().collect();
-        out.sort_by(|a, b| b.stats.speech_ms.cmp(&a.stats.speech_ms));
+        out.sort_by_key(|c| std::cmp::Reverse(c.stats.speech_ms));
         out
     }
 

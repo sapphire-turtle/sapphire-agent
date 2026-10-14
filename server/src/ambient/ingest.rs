@@ -277,7 +277,9 @@ fn decode_l16(bytes: &[u8]) -> anyhow::Result<Vec<i16>> {
         );
     }
     Ok(bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| i16::from_le_bytes([c[0], c[1]]))
         .collect())
 }

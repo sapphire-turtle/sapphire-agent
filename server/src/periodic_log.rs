@@ -649,9 +649,9 @@ fn strip_code_fence(raw: &str) -> String {
     trimmed.to_string()
 }
 
-/// Coerce a `serde_yaml::Value` into `Vec<String>`, dropping non-string items
+/// Coerce a `serde_norway::Value` into `Vec<String>`, dropping non-string items
 /// with a warn log (non-strings indicate the LLM drifted from the format).
-fn yaml_value_to_string_vec(v: &serde_yaml::Value) -> Option<Vec<String>> {
+fn yaml_value_to_string_vec(v: &serde_norway::Value) -> Option<Vec<String>> {
     let seq = v.as_sequence()?;
     let mut out = Vec::with_capacity(seq.len());
     for item in seq {
@@ -666,14 +666,14 @@ fn yaml_value_to_string_vec(v: &serde_yaml::Value) -> Option<Vec<String>> {
 /// Build a log file string from a digest list and body. Uses the shared
 /// `frontmatter::serialize` helper so the formatting is consistent.
 fn serialize_log_file(digest: &[String], body: &str) -> anyhow::Result<String> {
-    let mut mapping = serde_yaml::Mapping::new();
+    let mut mapping = serde_norway::Mapping::new();
     let seq = digest
         .iter()
-        .map(|s| serde_yaml::Value::String(s.clone()))
+        .map(|s| serde_norway::Value::String(s.clone()))
         .collect::<Vec<_>>();
     mapping.insert(
-        serde_yaml::Value::String("digest".to_string()),
-        serde_yaml::Value::Sequence(seq),
+        serde_norway::Value::String("digest".to_string()),
+        serde_norway::Value::Sequence(seq),
     );
     crate::frontmatter::serialize(&mapping, body)
 }
@@ -759,15 +759,15 @@ fn upsert_digest(raw: &str, digest: &[String]) -> anyhow::Result<String> {
             crate::frontmatter::parse_mapping(fm),
             body.trim_start_matches('\n').to_string(),
         ),
-        None => (serde_yaml::Mapping::new(), raw.to_string()),
+        None => (serde_norway::Mapping::new(), raw.to_string()),
     };
     let seq = digest
         .iter()
-        .map(|s| serde_yaml::Value::String(s.clone()))
+        .map(|s| serde_norway::Value::String(s.clone()))
         .collect::<Vec<_>>();
     mapping.insert(
-        serde_yaml::Value::String("digest".to_string()),
-        serde_yaml::Value::Sequence(seq),
+        serde_norway::Value::String("digest".to_string()),
+        serde_norway::Value::Sequence(seq),
     );
     crate::frontmatter::serialize(&mapping, &body)
 }

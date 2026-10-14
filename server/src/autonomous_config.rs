@@ -99,7 +99,7 @@ pub fn load_autonomous_dir(dir: &Path) -> Vec<AutonomousTask> {
 
 fn parse_task(name: String, raw: &str) -> Option<AutonomousTask> {
     let (fm, body) = crate::frontmatter::split(raw)?;
-    let meta: AutonomousTaskMeta = match serde_yaml::from_str(fm) {
+    let meta: AutonomousTaskMeta = match serde_norway::from_str(fm) {
         Ok(m) => m,
         Err(e) => {
             warn!("autonomous task {name}: yaml parse error: {e}");

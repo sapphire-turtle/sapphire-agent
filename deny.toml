@@ -53,12 +53,19 @@ ignore = [
     # marker in case the wayland stack pins back down.
     # Drop these once wayland-scanner moves off the affected quick-xml range.
 
-    # --- unmaintained, reached only through matrix-sdk 0.16 ---
-    # RustSec lists no safe upgrade for either, and both are several layers
-    # below anything we call. They leave the graph when matrix-sdk moves off
-    # them, so re-check on the next matrix-sdk bump.
-    { id = "RUSTSEC-2026-0247", reason = "bitmaps is unmaintained; transitive via matrix-sdk → eyeball-im → imbl." },
-    { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 is unmaintained; transitive via matrix-sdk → aquamarine, and vodozemac → matrix-pickle-derive." },
+    # --- unmaintained, reached only through matrix-sdk ---
+    # The 0.16 entries (bitmaps, proc-macro-error2) left the graph with
+    # matrix-sdk 0.19. anymap2 is still a direct dependency of matrix-sdk
+    # itself; RustSec lists no safe upgrade. Re-check on the next bump.
+    { id = "RUSTSEC-2026-0319", reason = "anymap2 is unmaintained; a direct dependency of matrix-sdk 0.19. No safe upgrade." },
+
+    # --- ruzstd 0.8 pinned by bevy 0.18 (desktop only) ---
+    # Fixed in ruzstd 0.9.1, but bevy_image 0.18 requires ^0.8 and bevy_egui
+    # 0.39 turns on its `zstd_rust` feature whenever rendering is on, so it
+    # cannot be dropped. It decodes zstd-compressed KTX2 textures, and the
+    # desktop client loads no such assets, let alone untrusted ones. Drop
+    # this when the desktop moves to a bevy whose bevy_image takes 0.9.
+    { id = "RUSTSEC-2026-0344", reason = "ruzstd decompression bomb; reached only via the desktop's bevy_image 0.18 (KTX2 textures, none loaded). Needs a bevy upgrade." },
 ]
 
 [licenses]
