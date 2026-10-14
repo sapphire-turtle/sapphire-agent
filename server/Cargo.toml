@@ -110,15 +110,13 @@ uuid = { version = "1", features = ["v7", "serde"] }
 # redb-store) from bypassing the feature flags below.
 # `keys` provides `keys::BridgeVerifier`, which checks a bearer token against
 # the workgroup's external devices through the running bridge.
-# Pinned to the `feat/workspace-sync-option` branch while v0.18.0 is being
-# prepared; switch back to a crates.io version once it is published.
-sapphire-framework = { git = "https://github.com/sapphire-turtle/sapphire-framework", branch = "feat/workspace-sync-option", default-features = false, features = ["workspace", "keys", "frontmatter"] }
+sapphire-framework = { version = "0.18.0", default-features = false, features = ["workspace", "keys", "frontmatter"] }
 # The bridge's control-plane API and client, which the facade does not
 # re-export: `external-device` reuses the framework's own subcommand
 # (`cli` feature) and sends it to the running bridge, which owns the ledger.
-# Same git ref as `sapphire-framework`, so both resolve to one copy.
-sapphire-framework-bridge-api = { git = "https://github.com/sapphire-turtle/sapphire-framework", branch = "feat/workspace-sync-option", features = ["cli"] }
-sapphire-framework-bridge-client = { git = "https://github.com/sapphire-turtle/sapphire-framework", branch = "feat/workspace-sync-option" }
+# Same release as `sapphire-framework`, so both resolve to one copy.
+sapphire-framework-bridge-api = { version = "2.3.0", features = ["cli"] }
+sapphire-framework-bridge-client = "0.18.0"
 
 # Human-readable ids: session ids, and external device ids. Must match the
 # version sapphire-framework uses — `keys::Authenticated::id` is a `GrainId`, and two semver-incompatible grain-id versions in one graph are
