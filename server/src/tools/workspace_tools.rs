@@ -7,14 +7,14 @@ use sapphire_framework::workspace::{FtsQuery, VectorQuery, WorkspaceState};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Shared helper
 // ---------------------------------------------------------------------------
 
-fn lock(state: &Mutex<WorkspaceState>) -> std::sync::MutexGuard<'_, WorkspaceState> {
-    state.lock().expect("WorkspaceState mutex poisoned")
+fn lock(state: &WorkspaceState) -> &WorkspaceState {
+    state
 }
 
 // ---------------------------------------------------------------------------
@@ -86,7 +86,7 @@ const MEMORY_CATEGORY_GUIDE: &str = "Category is mandatory and free-form, but pr
      Other categories (e.g. 'recipe', 'project') may be introduced freely.";
 
 fn memory_entry_path(
-    state: &Mutex<WorkspaceState>,
+    state: &WorkspaceState,
     category: &str,
     slug: &str,
 ) -> Result<(String, std::path::PathBuf)> {
@@ -170,12 +170,12 @@ fn memory_entry_schema(include_content: bool) -> serde_json::Value {
 
 /// Create a new one-file memory entry under `memory/<category>/<slug>.md`.
 pub struct MemoryAddTool {
-    state: Arc<Mutex<WorkspaceState>>,
+    state: Arc<WorkspaceState>,
     spec: ToolSpec,
 }
 
 impl MemoryAddTool {
-    pub fn new(state: Arc<Mutex<WorkspaceState>>) -> Self {
+    pub fn new(state: Arc<WorkspaceState>) -> Self {
         let description = format!(
             "Create a new memory entry at memory/<category>/<slug>.md. \
              Fails if the file already exists (use memory_update to overwrite). \
@@ -229,12 +229,12 @@ impl Tool for MemoryAddTool {
 
 /// Overwrite an existing memory entry.
 pub struct MemoryUpdateTool {
-    state: Arc<Mutex<WorkspaceState>>,
+    state: Arc<WorkspaceState>,
     spec: ToolSpec,
 }
 
 impl MemoryUpdateTool {
-    pub fn new(state: Arc<Mutex<WorkspaceState>>) -> Self {
+    pub fn new(state: Arc<WorkspaceState>) -> Self {
         Self {
             state,
             spec: ToolSpec {
@@ -286,12 +286,12 @@ impl Tool for MemoryUpdateTool {
 
 /// Append to a memory entry, creating it if missing.
 pub struct MemoryAppendTool {
-    state: Arc<Mutex<WorkspaceState>>,
+    state: Arc<WorkspaceState>,
     spec: ToolSpec,
 }
 
 impl MemoryAppendTool {
-    pub fn new(state: Arc<Mutex<WorkspaceState>>) -> Self {
+    pub fn new(state: Arc<WorkspaceState>) -> Self {
         Self {
             state,
             spec: ToolSpec {
@@ -369,12 +369,12 @@ impl Tool for MemoryAppendTool {
 
 /// Read a memory entry and bump its access counters.
 pub struct MemoryReadTool {
-    state: Arc<Mutex<WorkspaceState>>,
+    state: Arc<WorkspaceState>,
     spec: ToolSpec,
 }
 
 impl MemoryReadTool {
-    pub fn new(state: Arc<Mutex<WorkspaceState>>) -> Self {
+    pub fn new(state: Arc<WorkspaceState>) -> Self {
         Self {
             state,
             spec: ToolSpec {
@@ -424,12 +424,12 @@ impl Tool for MemoryReadTool {
 
 /// Delete a memory entry.
 pub struct MemoryRemoveTool {
-    state: Arc<Mutex<WorkspaceState>>,
+    state: Arc<WorkspaceState>,
     spec: ToolSpec,
 }
 
 impl MemoryRemoveTool {
-    pub fn new(state: Arc<Mutex<WorkspaceState>>) -> Self {
+    pub fn new(state: Arc<WorkspaceState>) -> Self {
         Self {
             state,
             spec: ToolSpec {
@@ -469,12 +469,12 @@ impl Tool for MemoryRemoveTool {
 
 /// Full-text and semantic search across workspace files.
 pub struct WorkspaceSearchTool {
-    state: Arc<Mutex<WorkspaceState>>,
+    state: Arc<WorkspaceState>,
     spec: ToolSpec,
 }
 
 impl WorkspaceSearchTool {
-    pub fn new(state: Arc<Mutex<WorkspaceState>>) -> Self {
+    pub fn new(state: Arc<WorkspaceState>) -> Self {
         Self {
             state,
             spec: ToolSpec {
@@ -574,12 +574,12 @@ impl Tool for WorkspaceSearchTool {
 /// Re-index the workspace so files edited outside the agent become
 /// searchable. There is no git leg — the framework removed auto-sync.
 pub struct WorkspaceSyncTool {
-    state: Arc<Mutex<WorkspaceState>>,
+    state: Arc<WorkspaceState>,
     spec: ToolSpec,
 }
 
 impl WorkspaceSyncTool {
-    pub fn new(state: Arc<Mutex<WorkspaceState>>) -> Self {
+    pub fn new(state: Arc<WorkspaceState>) -> Self {
         Self {
             state,
             spec: ToolSpec {

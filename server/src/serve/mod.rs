@@ -342,6 +342,7 @@ pub async fn run(
     addr: String,
     state: Arc<ServeState>,
     extra: Option<axum::Router>,
+    shutdown: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<()> {
     // Routes are intentionally separated so protocol endpoints can be
     // mounted alongside `/rpc` without colliding with the methods (`chat`,
@@ -368,9 +369,7 @@ pub async fn run(
     spawn_session_residency_log(Arc::clone(&state));
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
-            if let Err(e) = tokio::signal::ctrl_c().await {
-                error!("Failed to install Ctrl-C handler: {e}");
-            }
+            shutdown.cancelled().await;
             info!("HTTP server shutting down...");
         })
         .await?;
@@ -4208,9 +4207,7 @@ mod tests {
         let mut config = state.config.clone();
         config.tools.admin.room_profiles = profiles;
         let sw = sapphire_framework::workspace::Workspace::from_root(ctx, &root).unwrap();
-        let ws = Arc::new(std::sync::Mutex::new(
-            sapphire_framework::workspace::WorkspaceState::open(sw).unwrap(),
-        ));
+        let ws = Arc::new(sapphire_framework::workspace::WorkspaceState::open(sw).unwrap());
 
         state
             .tools

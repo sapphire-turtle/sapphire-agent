@@ -1439,11 +1439,6 @@ api_key = "test"
         .expect("minimal config should parse")
     }
 
-    /// Resolve the workspace directory: explicit config > config file's parent directory.
-    pub fn resolved_workspace_dir(&self, config_path: &Path) -> PathBuf {
-        resolve_workspace_dir(self.workspace_dir.as_deref(), config_path)
-    }
-
     /// Resolve the sessions directory for JSONL persistence.
     ///
     /// Explicit config value > `<workspace_dir>/sessions` (default).
@@ -1936,6 +1931,10 @@ pub fn workspace_config_path(workspace_dir: &Path) -> PathBuf {
 #[derive(Debug)]
 pub struct LoadedConfig {
     pub config: Config,
+    /// The workspace root this load used: the one the caller named (the
+    /// framework's selected workspace), else `workspace_dir`, else the host
+    /// config's own directory.
+    pub workspace_dir: PathBuf,
     /// Workspace-layer keys refused by the allowlist. Reported at startup.
     pub rejected: Vec<String>,
     /// Dot-joined paths of keys in the loaded document that no `Config`
@@ -1990,16 +1989,32 @@ impl Config {
     /// layer that fails on its own (with or without a workspace layer present)
     /// is still a hard error — it is local, hand-written, and belongs to the
     /// person reading the message.
+    #[cfg(test)]
     pub fn load_layered(host_path: &Path) -> Result<LoadedConfig> {
+        Self::load_layered_in(host_path, None)
+    }
+
+    /// [`load_layered`](Self::load_layered) for a known workspace root.
+    ///
+    /// `workspace_root` is the framework's selected workspace when there is
+    /// one: it decides which workspace layer is read, and the host's
+    /// `workspace_dir` is then only a migration source (see `app_server`).
+    pub fn load_layered_in(
+        host_path: &Path,
+        workspace_root: Option<&Path>,
+    ) -> Result<LoadedConfig> {
         let host_text = std::fs::read_to_string(host_path)
             .with_context(|| format!("Failed to read config file: {}", host_path.display()))?;
         let host: toml::Value = toml::from_str(&host_text)
             .with_context(|| format!("Failed to parse config file: {}", host_path.display()))?;
 
-        let workspace_dir = resolve_workspace_dir(
-            host.get("workspace_dir").and_then(toml::Value::as_str),
-            host_path,
-        );
+        let workspace_dir = match workspace_root {
+            Some(root) => root.to_path_buf(),
+            None => resolve_workspace_dir(
+                host.get("workspace_dir").and_then(toml::Value::as_str),
+                host_path,
+            ),
+        };
         let ws_path = workspace_config_path(&workspace_dir);
 
         let mut workspace_path = None;
@@ -2087,6 +2102,7 @@ impl Config {
             let empty = toml::Value::Table(toml::map::Map::new());
             let provenance = config_layer::provenance_of(&empty, &host);
             Ok(LoadedConfig {
+                workspace_dir: workspace_dir.clone(),
                 config: host_config,
                 rejected: Vec::new(),
                 unknown: host_unknown,
@@ -2105,6 +2121,7 @@ impl Config {
                     ))
                 } else {
                     Ok(LoadedConfig {
+                        workspace_dir: workspace_dir.clone(),
                         config,
                         rejected: outcome.rejected,
                         unknown,

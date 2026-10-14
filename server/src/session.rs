@@ -337,7 +337,7 @@ pub struct SessionStore {
     /// Optional sapphire-framework workspace state. When set, file
     /// modifications notify the workspace so the index/cache stay in
     /// sync.
-    ws_state: Option<Arc<Mutex<WorkspaceState>>>,
+    ws_state: Option<Arc<WorkspaceState>>,
     /// `session_id → location` cache. Populated lazily by
     /// `resolve_path` (filesystem scan) and eagerly by `create_session` /
     /// `ensure_session`. Avoids re-scanning per `append` call.
@@ -380,7 +380,7 @@ impl SessionStore {
     pub fn with_workspace(
         base_dir: PathBuf,
         kind: &'static str,
-        ws_state: Arc<Mutex<WorkspaceState>>,
+        ws_state: Arc<WorkspaceState>,
         tool_payloads: Option<Arc<crate::tool_payload_cache::ToolPayloadCache>>,
     ) -> Self {
         Self {
@@ -480,13 +480,7 @@ impl SessionStore {
     /// No-op if no WorkspaceState is attached or the path is outside the workspace.
     fn notify_updated(&self, abs_path: &Path) {
         let Some(state) = &self.ws_state else { return };
-        let guard = match state.lock() {
-            Ok(g) => g,
-            Err(e) => {
-                warn!("WorkspaceState mutex poisoned: {e}");
-                return;
-            }
-        };
+        let guard = state;
         if !abs_path.starts_with(&guard.workspace.root) {
             return;
         }
@@ -502,13 +496,7 @@ impl SessionStore {
     #[allow(dead_code)]
     fn notify_deleted(&self, abs_path: &Path) {
         let Some(state) = &self.ws_state else { return };
-        let guard = match state.lock() {
-            Ok(g) => g,
-            Err(e) => {
-                warn!("WorkspaceState mutex poisoned: {e}");
-                return;
-            }
-        };
+        let guard = state;
         if !abs_path.starts_with(&guard.workspace.root) {
             return;
         }

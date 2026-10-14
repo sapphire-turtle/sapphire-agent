@@ -7,10 +7,10 @@ mod acp_session;
 mod agent;
 mod agents;
 mod ambient;
+mod app_server;
 mod autonomous;
 mod autonomous_config;
 mod channel;
-mod cli_external_device;
 mod cli_init;
 mod config;
 mod config_layer;
@@ -48,7 +48,7 @@ use periodic_log::{
     catchup_pending_weekly_logs, catchup_pending_yearly_logs,
 };
 use provider::registry::ProviderRegistry;
-use sapphire_framework::workspace::{AppContext, Workspace as SwWorkspace, WorkspaceState};
+use sapphire_framework::workspace::AppContext;
 
 static APP_CTX: AppContext = AppContext::new("sapphire-agent").allow_external_paths();
 
@@ -69,10 +69,20 @@ fn init_app_ctx() {
         .join(env!("CARGO_PKG_NAME"));
     APP_CTX.set_cache_dir(cache_dir);
     APP_CTX.set_data_dir(data_dir);
+    // Where the agent's own `config.toml` has always lived, so the
+    // framework's `workspace.toml` and `server.toml` sit beside it.
+    APP_CTX.set_config_dir(
+        base.as_ref()
+            .map(|b| b.config_dir().to_path_buf())
+            .unwrap_or_else(std::env::temp_dir)
+            .join(APP_CTX.app_name),
+    );
 }
 use session::SessionStore;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{EnvFilter, fmt};
 use workspace::Workspace;
 
@@ -104,12 +114,10 @@ enum Command {
     },
     /// Validate the config file and exit
     Verify,
-    /// Manage the external devices that authenticate to this agent with a
-    /// key: the workgroup's ledger, through the running sapphire bridge.
-    ExternalDevice {
-        #[command(subcommand)]
-        command: sapphire_framework_bridge_api::ExternalDeviceCommand,
-    },
+    /// The framework's verbs: serve, status, service, workspace, workgroup,
+    /// device, embedding, external-device.
+    #[command(flatten)]
+    Framework(sapphire_framework::server::FrameworkCommand),
 }
 
 /// Whether `meta`'s session counts toward `namespace`'s daily-log
@@ -265,15 +273,52 @@ async fn main() -> Result<()> {
         return cli_init::run(path.clone());
     }
 
+    // The framework's verbs other than `serve` talk to the running server
+    // or the bridge, and need no agent config either.
+    let cli = match cli.command {
+        Some(Command::Framework(command))
+            if !matches!(command, sapphire_framework::server::FrameworkCommand::Serve) =>
+        {
+            let code = command
+                .dispatch(app_server::build(), app_server::VERSION)
+                .await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            return Ok(());
+        }
+        Some(Command::Framework(_)) => Cli {
+            command: None,
+            ..cli
+        },
+        command => Cli { command, ..cli },
+    };
+
     let config_path = cli.config.unwrap_or_else(Config::default_path);
+    // The framework's selected workspace decides which workspace the agent
+    // serves; `workspace_dir` is only where a first start migrates it from.
+    let selection = app_server::selection()?;
     let LoadedConfig {
         config,
+        workspace_dir,
         rejected,
         unknown,
         provenance,
         workspace_path,
-    } = Config::load_layered(&config_path)
+    } = Config::load_layered_in(&config_path, selection.as_ref().map(|s| s.root.as_path()))
         .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
+    if let (Some(selected), Some(dir)) = (&selection, &config.workspace_dir) {
+        let configured = config::resolve_workspace_dir(Some(dir), &config_path);
+        if configured.canonicalize().ok().as_deref() != Some(selected.root.as_path()) {
+            tracing::warn!(
+                "`workspace_dir` ({}) is ignored: the selected workspace is {}. Change it with \
+                 `sapphire-agent workspace select <dir>`, and remove `workspace_dir` from {}.",
+                configured.display(),
+                selected.root.display(),
+                config_path.display()
+            );
+        }
+    }
 
     if !rejected.is_empty() {
         tracing::warn!(
@@ -331,8 +376,10 @@ async fn main() -> Result<()> {
     match cli.command {
         // Returned above, before the config was loaded.
         Some(Command::Init { .. }) => unreachable!("`init` is dispatched ahead of the config load"),
+        Some(Command::Framework(_)) => {
+            unreachable!("the framework's verbs are dispatched ahead of the config load")
+        }
         Some(Command::Verify) => {
-            let workspace_dir = config.resolved_workspace_dir(&config_path);
             let profile_errors = config.validate_profiles();
             if profile_errors.is_empty() {
                 println!("Config OK");
@@ -399,7 +446,16 @@ async fn main() -> Result<()> {
                 config.anthropic.max_tokens,
                 layer_tag(&provenance, "anthropic.max_tokens")
             );
-            println!("  Workspace dir     : {}", workspace_dir.display());
+            match &selection {
+                Some(_) => println!(
+                    "  Workspace dir     : {} (selected)",
+                    workspace_dir.display()
+                ),
+                None => println!(
+                    "  Workspace dir     : {} (from `workspace_dir`; selected on the next start)",
+                    workspace_dir.display()
+                ),
+            }
             println!(
                 "  Day boundary hour : {}:00 local [{}]",
                 config.day_boundary_hour,
@@ -445,12 +501,20 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Some(Command::ExternalDevice { command }) => {
-            return cli_external_device::run(command).await;
-        }
         None => {
             let bind = cli.bind;
-            let workspace_dir = config.resolved_workspace_dir(&config_path);
+            let workspace_dir = match &selection {
+                Some(selected) => selected.root.clone(),
+                None => {
+                    let root = app_server::adopt(&workspace_dir)?;
+                    tracing::info!(
+                        "selected {} as this agent's workspace (from `workspace_dir`); change it \
+                         with `sapphire-agent workspace select <dir>`",
+                        root.display()
+                    );
+                    root
+                }
+            };
 
             // ── Migrate pre-namespace memory layout (one-time) ─────────────
             if let Err(e) = migrate_pre_namespace_layout(&workspace_dir) {
@@ -485,9 +549,51 @@ async fn main() -> Result<()> {
             // ── Bootstrap file loader (AGENTS.md, SOUL.md, MEMORY.md …) ────
             let workspace = Arc::new(Workspace::new(workspace_dir.clone(), config.digest.clone()));
 
-            // ── framework workspace (search, file ops) ──────────────────────
-            let sw_workspace = SwWorkspace::resolve(&APP_CTX, Some(&workspace_dir))
-                .context("Failed to resolve the framework workspace")?;
+            // ── App server: IPC, the current workspace, signals ─────────────
+            // The framework's server owns the workspace (and its redb cache,
+            // which only one process may open), restores the selection as it
+            // starts, and handles SIGTERM / SIGINT. Everything below is built
+            // around the workspace it opens. `shutdown` is the one signal the
+            // agent's own tasks stop on: the server stopping, or a switch to
+            // another workspace (which is a restart — see `app_server`).
+            let shutdown = CancellationToken::new();
+            let restart = Arc::new(AtomicBool::new(false));
+            let server = app_server::build();
+            let host = Arc::clone(server.host());
+            let server_task = {
+                let shutdown = shutdown.clone();
+                tokio::spawn(async move {
+                    let result = server.run().await;
+                    shutdown.cancel();
+                    result
+                })
+            };
+            let (served_root, ws_state) = tokio::select! {
+                opened = app_server::open_workspace(&host) => opened?,
+                () = shutdown.cancelled() => {
+                    // The server stopped before a workspace opened: a signal,
+                    // or a failed start (another instance holds the endpoint).
+                    server_task.await.context("the app server panicked")??;
+                    return Ok(());
+                }
+            };
+            if served_root != workspace_dir {
+                // Selected in the moment between the config load and the
+                // server's start: the config layer read was another
+                // workspace's. Start again around the one being served.
+                tracing::warn!(
+                    "the server serves {} but the agent was configured for {}; restarting",
+                    served_root.display(),
+                    workspace_dir.display()
+                );
+                std::process::exit(app_server::RESTART_EXIT_CODE);
+            }
+            let switch_watch = app_server::watch_for_switch(
+                Arc::clone(&host),
+                served_root,
+                shutdown.clone(),
+                Arc::clone(&restart),
+            );
             // `sync_interval_minutes` is the re-index cadence. The framework
             // removed local-workspace auto-sync, so a tick is an mtime-based
             // refresh of the retrieve cache and nothing else.
@@ -495,12 +601,9 @@ async fn main() -> Result<()> {
                 .sync_interval_minutes
                 .filter(|&m| m > 0)
                 .map(|m| std::time::Duration::from_secs(m as u64 * 60));
-            let ws_state =
-                WorkspaceState::open(sw_workspace).context("Failed to open WorkspaceState")?;
             if let Err(e) = ws_state.sync_retrieve() {
                 tracing::warn!("Initial workspace re-index failed: {e}");
             }
-            let ws_state = Arc::new(Mutex::new(ws_state));
 
             // ── Timer manager (single-slot, in-memory) ──────────────────────
             // Built before the tool set so the timer_* tools can hold an
@@ -1075,7 +1178,7 @@ async fn main() -> Result<()> {
                         loop {
                             tick.tick().await;
                             {
-                                let state = ws.lock().expect("ws_state mutex poisoned");
+                                let state = &ws;
                                 match state.sync_retrieve() {
                                     Ok((u, r)) => tracing::info!(
                                         "Periodic ws sync: {u} upserted, {r} removed"
@@ -1119,8 +1222,9 @@ async fn main() -> Result<()> {
                 }
 
                 let agent_run = Arc::clone(&agent);
+                let agent_shutdown = shutdown.clone();
                 agent_handle = Some(tokio::spawn(async move {
-                    if let Err(e) = agent_run.run().await {
+                    if let Err(e) = agent_run.run(agent_shutdown).await {
                         tracing::error!("Agent error: {e:#}");
                     }
                 }));
@@ -1136,7 +1240,16 @@ async fn main() -> Result<()> {
                 })
                 .unwrap_or_else(|| "127.0.0.1:3170".to_string());
 
-            serve::run(addr, Arc::clone(&serve_state), ambient_routes).await?;
+            let served = serve::run(
+                addr,
+                Arc::clone(&serve_state),
+                ambient_routes,
+                shutdown.clone(),
+            )
+            .await;
+            // However the HTTP server ended, everything else stops with it.
+            shutdown.cancel();
+            switch_watch.abort();
 
             // Wait for the agent task's graceful shutdown to finish so its
             // flush_digests_on_shutdown LLM call isn't aborted by runtime drop.
@@ -1145,6 +1258,16 @@ async fn main() -> Result<()> {
             {
                 tracing::warn!("Agent task did not finish cleanly: {e}");
             }
+            served?;
+
+            if restart.load(Ordering::SeqCst) {
+                // The app server is still serving the new workspace; the
+                // process exit takes it down with the rest, and the service
+                // manager starts everything again around the new one.
+                tracing::info!("exiting with {} to restart", app_server::RESTART_EXIT_CODE);
+                std::process::exit(app_server::RESTART_EXIT_CODE);
+            }
+            server_task.await.context("the app server panicked")??;
         }
     }
 
@@ -1634,6 +1757,8 @@ mod tests {
 
     #[test]
     fn external_device_add_takes_a_name_and_a_description() {
+        use sapphire_framework::server::FrameworkCommand;
+        use sapphire_framework_bridge_api::ExternalDeviceCommand;
         let cli = Cli::try_parse_from([
             "sapphire-agent",
             "external-device",
@@ -1645,13 +1770,45 @@ mod tests {
         .unwrap();
         assert!(matches!(
             cli.command,
-            Some(Command::ExternalDevice {
-                command: sapphire_framework_bridge_api::ExternalDeviceCommand::Add {
+            Some(Command::Framework(FrameworkCommand::ExternalDevice(
+                ExternalDeviceCommand::Add {
                     ref name,
                     description: Some(_),
                     ..
                 }
-            }) if name == "pendant"
+            ))) if name == "pendant"
+        ));
+    }
+
+    /// The framework's verbs sit beside the agent's own at the top level,
+    /// and a bare invocation is still the server.
+    #[test]
+    fn the_framework_verbs_parse_beside_the_agents() {
+        use sapphire_framework::server::{FrameworkCommand, WorkspaceCommand};
+        let parse = |args: &[&str]| Cli::try_parse_from(args).unwrap().command;
+
+        assert!(parse(&["sapphire-agent"]).is_none());
+        assert!(matches!(
+            parse(&["sapphire-agent", "serve"]),
+            Some(Command::Framework(FrameworkCommand::Serve))
+        ));
+        assert!(matches!(
+            parse(&["sapphire-agent", "status"]),
+            Some(Command::Framework(FrameworkCommand::Status))
+        ));
+        assert!(matches!(
+            parse(&["sapphire-agent", "workspace", "show"]),
+            Some(Command::Framework(FrameworkCommand::Workspace(
+                WorkspaceCommand::Show
+            )))
+        ));
+        assert!(matches!(
+            parse(&["sapphire-agent", "verify"]),
+            Some(Command::Verify)
+        ));
+        assert!(matches!(
+            parse(&["sapphire-agent", "init"]),
+            Some(Command::Init { .. })
         ));
     }
 

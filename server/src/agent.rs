@@ -184,7 +184,11 @@ impl Agent {
         Arc::clone(self).handle_message(incoming).await
     }
 
-    pub async fn run(self: Arc<Self>) -> anyhow::Result<()> {
+    /// Handle channel messages until `shutdown` is cancelled.
+    pub async fn run(
+        self: Arc<Self>,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) -> anyhow::Result<()> {
         let (tx, mut rx) = mpsc::channel(64);
 
         let channels = Arc::clone(&self.channels);
@@ -193,9 +197,6 @@ impl Agent {
                 error!("Channel listen error: {e:#}");
             }
         });
-
-        let shutdown = tokio::signal::ctrl_c();
-        tokio::pin!(shutdown);
 
         info!("Agent is running. Press Ctrl-C to stop.");
 
@@ -217,7 +218,7 @@ impl Agent {
                         }
                     }
                 }
-                _ = &mut shutdown => {
+                () = shutdown.cancelled() => {
                     info!("Shutting down...");
                     break;
                 }
@@ -911,7 +912,7 @@ mod tests {
 
     static TEST_CTX: AppContext = AppContext::new("sapphire-agent").allow_external_paths();
 
-    fn test_workspace() -> Arc<Mutex<WorkspaceState>> {
+    fn test_workspace() -> Arc<WorkspaceState> {
         // `AppContext` panics on `cache_dir()` access until this is set,
         // and `Workspace::from_root` reads it. First writer wins, so
         // calling it on every invocation is safe.
@@ -921,7 +922,7 @@ mod tests {
         let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
         std::fs::create_dir_all(dir.path().join(".sapphire-agent")).unwrap();
         let ws = Workspace::from_root(&TEST_CTX, dir.path()).unwrap();
-        Arc::new(Mutex::new(WorkspaceState::open(ws).unwrap()))
+        Arc::new(WorkspaceState::open(ws).unwrap())
     }
 
     /// Six calls, run through the channel gate under both `host_access`

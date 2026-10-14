@@ -7,7 +7,7 @@ use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use sapphire_framework::workspace::WorkspaceState;
 use serde_json::json;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -32,12 +32,12 @@ fn expand_path(path_str: &str) -> PathBuf {
 // ---------------------------------------------------------------------------
 
 pub struct FileReadTool {
-    state: Arc<Mutex<WorkspaceState>>,
+    state: Arc<WorkspaceState>,
     spec: ToolSpec,
 }
 
 impl FileReadTool {
-    pub fn new(state: Arc<Mutex<WorkspaceState>>) -> Self {
+    pub fn new(state: Arc<WorkspaceState>) -> Self {
         Self {
             state,
             spec: ToolSpec {
@@ -111,8 +111,6 @@ impl Tool for FileReadTool {
 
         let content = self
             .state
-            .lock()
-            .expect("WorkspaceState mutex poisoned")
             .read_file(&path)
             .with_context(|| format!("Failed to read '{}'", path.display()))?;
 
@@ -481,12 +479,12 @@ fn refuse_if_sensitive(path: &Path, workspace_root: Option<&Path>, verb: &str) -
 }
 
 pub struct FileWriteTool {
-    state: Arc<Mutex<WorkspaceState>>,
+    state: Arc<WorkspaceState>,
     spec: ToolSpec,
 }
 
 impl FileWriteTool {
-    pub fn new(state: Arc<Mutex<WorkspaceState>>) -> Self {
+    pub fn new(state: Arc<WorkspaceState>) -> Self {
         Self {
             state,
             spec: ToolSpec {
@@ -541,18 +539,10 @@ impl Tool for FileWriteTool {
         let content = input["content"].as_str().context("missing 'content'")?;
 
         let path = expand_path(path_str);
-        let workspace_root = self
-            .state
-            .lock()
-            .expect("WorkspaceState mutex poisoned")
-            .workspace
-            .root
-            .clone();
+        let workspace_root = self.state.workspace.root.clone();
         refuse_if_sensitive(&path, Some(&workspace_root), "Writing to")?;
 
         self.state
-            .lock()
-            .expect("WorkspaceState mutex poisoned")
             .write_file(&path, content)
             .with_context(|| format!("Failed to write '{}'", path.display()))?;
 
@@ -569,12 +559,12 @@ impl Tool for FileWriteTool {
 // ---------------------------------------------------------------------------
 
 pub struct FileDeleteTool {
-    state: Arc<Mutex<WorkspaceState>>,
+    state: Arc<WorkspaceState>,
     spec: ToolSpec,
 }
 
 impl FileDeleteTool {
-    pub fn new(state: Arc<Mutex<WorkspaceState>>) -> Self {
+    pub fn new(state: Arc<WorkspaceState>) -> Self {
         Self {
             state,
             spec: ToolSpec {
@@ -624,18 +614,10 @@ impl Tool for FileDeleteTool {
 
         let path = expand_path(path_str);
 
-        let workspace_root = self
-            .state
-            .lock()
-            .expect("WorkspaceState mutex poisoned")
-            .workspace
-            .root
-            .clone();
+        let workspace_root = self.state.workspace.root.clone();
         refuse_if_sensitive(&path, Some(&workspace_root), "Deleting")?;
 
         self.state
-            .lock()
-            .expect("WorkspaceState mutex poisoned")
             .delete_file(&path)
             .with_context(|| format!("Failed to delete '{}'", path.display()))?;
 
@@ -648,12 +630,12 @@ impl Tool for FileDeleteTool {
 // ---------------------------------------------------------------------------
 
 pub struct FileAppendTool {
-    state: Arc<Mutex<WorkspaceState>>,
+    state: Arc<WorkspaceState>,
     spec: ToolSpec,
 }
 
 impl FileAppendTool {
-    pub fn new(state: Arc<Mutex<WorkspaceState>>) -> Self {
+    pub fn new(state: Arc<WorkspaceState>) -> Self {
         Self {
             state,
             spec: ToolSpec {
@@ -709,18 +691,10 @@ impl Tool for FileAppendTool {
         let content = input["content"].as_str().context("missing 'content'")?;
 
         let path = expand_path(path_str);
-        let workspace_root = self
-            .state
-            .lock()
-            .expect("WorkspaceState mutex poisoned")
-            .workspace
-            .root
-            .clone();
+        let workspace_root = self.state.workspace.root.clone();
         refuse_if_sensitive(&path, Some(&workspace_root), "Writing to")?;
 
         self.state
-            .lock()
-            .expect("WorkspaceState mutex poisoned")
             .append_file(&path, content)
             .with_context(|| format!("Failed to append to '{}'", path.display()))?;
 
@@ -737,12 +711,12 @@ impl Tool for FileAppendTool {
 // ---------------------------------------------------------------------------
 
 pub struct DirListTool {
-    state: Arc<Mutex<WorkspaceState>>,
+    state: Arc<WorkspaceState>,
     spec: ToolSpec,
 }
 
 impl DirListTool {
-    pub fn new(state: Arc<Mutex<WorkspaceState>>) -> Self {
+    pub fn new(state: Arc<WorkspaceState>) -> Self {
         Self {
             state,
             spec: ToolSpec {
@@ -791,8 +765,6 @@ impl Tool for DirListTool {
 
         let entries = self
             .state
-            .lock()
-            .expect("WorkspaceState mutex poisoned")
             .list_dir(&path)
             .with_context(|| format!("Failed to list '{}'", path.display()))?;
 
@@ -830,12 +802,12 @@ pub(crate) fn truncation_marker(max_entries: usize) -> String {
 // ---------------------------------------------------------------------------
 
 pub struct DirWalkTool {
-    state: Arc<Mutex<WorkspaceState>>,
+    state: Arc<WorkspaceState>,
     spec: ToolSpec,
 }
 
 impl DirWalkTool {
-    pub fn new(state: Arc<Mutex<WorkspaceState>>) -> Self {
+    pub fn new(state: Arc<WorkspaceState>) -> Self {
         Self {
             state,
             spec: ToolSpec {
@@ -937,11 +909,11 @@ impl Tool for DirWalkTool {
 
         let path = expand_path(path_str);
 
-        let state = self.state.lock().expect("WorkspaceState mutex poisoned");
+        let state = &self.state;
         let workspace_root = state.workspace.root.clone();
         let mut results: Vec<(PathBuf, bool)> = Vec::new();
         let truncated = walk_recurse(
-            &state,
+            state,
             &workspace_root,
             &path,
             0,
@@ -950,7 +922,6 @@ impl Tool for DirWalkTool {
             &mut results,
         )
         .with_context(|| format!("Failed to walk '{}'", path.display()))?;
-        drop(state);
 
         if results.is_empty() {
             return Ok(format!("(empty) {}", path.display()));
@@ -2274,7 +2245,6 @@ mod session_routing_tests {
     use super::*;
     use crate::tools::acp_client::{AcpClient, scope_acp_client, tests::FakeClient};
     use sapphire_framework::workspace::{AppContext, Workspace};
-    use std::sync::Mutex;
 
     static TEST_CTX: AppContext = AppContext::new("sapphire-agent").allow_external_paths();
 
@@ -2282,7 +2252,7 @@ mod session_routing_tests {
     /// helper of the same name, duplicated rather than shared because the
     /// intervening `mod tests` is private and this module is not its
     /// descendant.
-    fn test_workspace() -> Arc<Mutex<WorkspaceState>> {
+    fn test_workspace() -> Arc<WorkspaceState> {
         // `AppContext` panics on any `cache_dir()` access until
         // `set_cache_dir` has been called once, and `Workspace::from_root`
         // reads it to compute the workspace's cache path. First writer
@@ -2295,68 +2265,55 @@ mod session_routing_tests {
         let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
         std::fs::create_dir_all(dir.path().join(".sapphire-agent")).unwrap();
         let ws = Workspace::from_root(&TEST_CTX, dir.path()).unwrap();
-        Arc::new(Mutex::new(WorkspaceState::open(ws).unwrap()))
+        Arc::new(WorkspaceState::open(ws).unwrap())
     }
 
-    fn file_read_tool_for_test() -> (Arc<Mutex<WorkspaceState>>, FileReadTool) {
+    fn file_read_tool_for_test() -> (Arc<WorkspaceState>, FileReadTool) {
         let state = test_workspace();
         (Arc::clone(&state), FileReadTool::new(state))
     }
 
-    fn file_write_tool_for_test() -> (Arc<Mutex<WorkspaceState>>, FileWriteTool) {
+    fn file_write_tool_for_test() -> (Arc<WorkspaceState>, FileWriteTool) {
         let state = test_workspace();
         (Arc::clone(&state), FileWriteTool::new(state))
     }
 
-    fn file_append_tool_for_test() -> (Arc<Mutex<WorkspaceState>>, FileAppendTool) {
+    fn file_append_tool_for_test() -> (Arc<WorkspaceState>, FileAppendTool) {
         let state = test_workspace();
         (Arc::clone(&state), FileAppendTool::new(state))
     }
 
-    fn file_delete_tool_for_test() -> (Arc<Mutex<WorkspaceState>>, FileDeleteTool) {
+    fn file_delete_tool_for_test() -> (Arc<WorkspaceState>, FileDeleteTool) {
         let state = test_workspace();
         (Arc::clone(&state), FileDeleteTool::new(state))
     }
 
-    fn dir_list_tool_for_test() -> (Arc<Mutex<WorkspaceState>>, DirListTool) {
+    fn dir_list_tool_for_test() -> (Arc<WorkspaceState>, DirListTool) {
         let state = test_workspace();
         (Arc::clone(&state), DirListTool::new(state))
     }
 
-    fn dir_walk_tool_for_test() -> (Arc<Mutex<WorkspaceState>>, DirWalkTool) {
+    fn dir_walk_tool_for_test() -> (Arc<WorkspaceState>, DirWalkTool) {
         let state = test_workspace();
         (Arc::clone(&state), DirWalkTool::new(state))
     }
 
     /// `ShellTool` takes the workspace root rather than the state: its own
     /// default working directory *is* that root.
-    fn shell_tool_for_test() -> (Arc<Mutex<WorkspaceState>>, ShellTool) {
+    fn shell_tool_for_test() -> (Arc<WorkspaceState>, ShellTool) {
         let state = test_workspace();
-        let root = state
-            .lock()
-            .expect("WorkspaceState mutex poisoned")
-            .workspace
-            .root
-            .clone();
+        let root = state.workspace.root.clone();
         (Arc::clone(&state), ShellTool::new(root))
     }
 
     /// Put `content` in the *agent's* copy of `name` — the machine the
     /// routing tests below must not touch.
-    fn write_workspace_file(state: &Arc<Mutex<WorkspaceState>>, name: &str, content: &str) {
-        state
-            .lock()
-            .expect("WorkspaceState mutex poisoned")
-            .write_file(Path::new(name), content)
-            .unwrap();
+    fn write_workspace_file(state: &Arc<WorkspaceState>, name: &str, content: &str) {
+        state.write_file(Path::new(name), content).unwrap();
     }
 
-    fn read_workspace_file(state: &Arc<Mutex<WorkspaceState>>, name: &str) -> Option<String> {
-        state
-            .lock()
-            .expect("WorkspaceState mutex poisoned")
-            .read_file(Path::new(name))
-            .ok()
+    fn read_workspace_file(state: &Arc<WorkspaceState>, name: &str) -> Option<String> {
+        state.read_file(Path::new(name)).ok()
     }
 
     /// The point of the unification: with an ACP client scoped, `file_read`
@@ -2623,12 +2580,7 @@ mod session_routing_tests {
     #[tokio::test]
     async fn dir_list_still_lists_the_agents_machine_outside_an_acp_session() {
         let (state, tool) = dir_list_tool_for_test();
-        let root = state
-            .lock()
-            .expect("WorkspaceState mutex poisoned")
-            .workspace
-            .root
-            .clone();
+        let root = state.workspace.root.clone();
         write_workspace_file(&state, "a.txt", "a\n");
         write_workspace_file(&state, "b.txt", "b\n");
         write_workspace_file(&state, "sub/inner.txt", "inner\n");
@@ -2659,12 +2611,7 @@ mod session_routing_tests {
     #[tokio::test]
     async fn dir_walk_truncates_on_the_agents_machine_with_the_same_marker() {
         let (state, tool) = dir_walk_tool_for_test();
-        let dir = state
-            .lock()
-            .expect("WorkspaceState mutex poisoned")
-            .workspace
-            .root
-            .join("d");
+        let dir = state.workspace.root.join("d");
         std::fs::create_dir_all(&dir).unwrap();
         write_workspace_file(&state, "d/a.txt", "a\n");
         write_workspace_file(&state, "d/b.txt", "b\n");
@@ -2726,12 +2673,7 @@ mod session_routing_tests {
         };
         let (state, walk) = dir_walk_tool_for_test();
         let list = DirListTool::new(Arc::clone(&state));
-        let root = state
-            .lock()
-            .expect("WorkspaceState mutex poisoned")
-            .workspace
-            .root
-            .clone();
+        let root = state.workspace.root.clone();
         write_workspace_file(&state, "a.txt", "a\n");
         write_workspace_file(&state, "b.txt", "b\n");
         write_workspace_file(&state, "sub/inner.txt", "inner\n");

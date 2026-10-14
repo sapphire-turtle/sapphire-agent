@@ -26,7 +26,7 @@ A personal AI assistant agent that works on file-based, local-first [`sapphire-f
   - `sapphire-agent` — start the channel listeners + JSON-RPC HTTP control API (`/rpc`, `/a2a`, `/acp`)
   - `sapphire-agent-server init [PATH]` — seed a workspace with the files the agent reads (`AGENTS.md`, `SOUL.md`, …), then print the host-local config to paste; never overwrites an existing file
   - `sapphire-agent-server verify` — validate config and report loaded workspace files, including the device -> room_profile bindings
-  - `sapphire-agent-server external-device add|list|rotate|retire|restore|apps` — manage the workgroup's external devices (clients that reach the agent with a bearer token) through the running sapphire bridge; `add` and `rotate` print the token once
+  - The sapphire-framework verbs, which talk to the running server or the bridge: `status`; `service install|uninstall|status`; `workspace init|select|show|…` (the agent serves the selected workspace — `workspace_dir` in `config.toml` is only adopted on the first start, and switching restarts the agent around the new one); `workgroup`; `device`; `embedding`; `external-device add|list|rotate|retire|restore|apps` (clients that reach the agent with a bearer token — `add` and `rotate` print the token once)
   - `sapphire-agent-cli` — interactive REPL / voice satellite client (separate crate; see [cli/](cli/))
 
 ## Install

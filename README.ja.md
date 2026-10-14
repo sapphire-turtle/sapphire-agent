@@ -27,7 +27,7 @@
   - `sapphire-agent` — チャネルリスナー＋JSON-RPC HTTP制御API（`/rpc`、`/a2a`、`/acp`）を開始
   - `sapphire-agent init [PATH]` — エージェントが読むファイル（`AGENTS.md`、`SOUL.md`など）でワークスペースをシードし、貼り付けるホストローカル設定を出力。既存ファイルを決して上書きしない
   - `sapphire-agent verify` — 設定を検証し、device -> room_profileのバインディングを含む読み込まれたワークスペースファイルを報告
-  - `sapphire-agent external-device add|list|rotate|retire|restore|apps` — 稼働中のsapphire bridgeを通じて、ワークグループの外部デバイス（ベアラートークンでエージェントにアクセスするクライアント）を管理。`add`と`rotate`はトークンを一度だけ表示
+  - sapphire-framework の動詞（稼働中のサーバーまたは bridge と話す）: `status`、`service install|uninstall|status`、`workspace init|select|show|…`（エージェントは選択されたワークスペースを扱う。`config.toml` の `workspace_dir` は初回起動時にだけ取り込まれ、切り替えるとエージェントは新しいワークスペースで再起動する）、`workgroup`、`device`、`embedding`、`external-device add|list|rotate|retire|restore|apps`（ベアラートークンでエージェントにアクセスするクライアント。`add` と `rotate` はトークンを一度だけ表示）
   - `sapphire-call` — 対話型REPL／音声サテライトクライアント（別クレート。[cli/](cli/)参照）
 
 ## インストール

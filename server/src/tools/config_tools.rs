@@ -33,7 +33,7 @@ use async_trait::async_trait;
 use sapphire_framework::workspace::WorkspaceState;
 use serde_json::json;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
 use tracing::warn;
 
 /// Which of the three definition directories a [`ConfigTool`] speaks for.
@@ -196,8 +196,8 @@ pub(crate) fn declared_enabled(raw: &str) -> Option<bool> {
     Some(true)
 }
 
-fn lock(state: &Mutex<WorkspaceState>) -> std::sync::MutexGuard<'_, WorkspaceState> {
-    state.lock().expect("WorkspaceState mutex poisoned")
+fn lock(state: &WorkspaceState) -> &WorkspaceState {
+    state
 }
 
 /// `list` / `read` / `write` / `set_enabled` over one definition
@@ -210,7 +210,7 @@ pub struct ConfigTool {
     /// The workspace's own writer, not `std::fs`, so a definition written
     /// here lands in `workspace_search`'s index like any other file —
     /// same path `memory_add` takes.
-    ws: Arc<Mutex<WorkspaceState>>,
+    ws: Arc<WorkspaceState>,
     /// The live `subagent` tool, for `Agents` only: a definition written
     /// while the agent runs is swapped into it so the next delegation can
     /// use it. `Weak` because `ToolSet` owns the tool and the tool must
@@ -229,7 +229,7 @@ impl ConfigTool {
         dir: ConfigDir,
         workspace_root: PathBuf,
         config: Config,
-        ws: Arc<Mutex<WorkspaceState>>,
+        ws: Arc<WorkspaceState>,
         subagent: Option<Weak<SubagentTool>>,
         tool_set: Weak<ToolSet>,
     ) -> Self {
@@ -946,7 +946,7 @@ pub(crate) async fn register_admin_tools(
     tool_set: &Arc<ToolSet>,
     workspace_root: &Path,
     config: Config,
-    ws: Arc<Mutex<WorkspaceState>>,
+    ws: Arc<WorkspaceState>,
     subagent: Option<&Arc<SubagentTool>>,
     serve_state: Arc<ServeState>,
 ) {
@@ -987,11 +987,10 @@ mod tests {
     use sapphire_framework::workspace::{AppContext, Workspace, WorkspaceState};
     use serde_json::json;
     use std::future::Future;
-    use std::sync::Mutex;
 
     /// A workspace with the three definition directories created, plus a
     /// `TempDir` the caller must hold on to for the files to survive.
-    fn test_workspace() -> (tempfile::TempDir, PathBuf, Arc<Mutex<WorkspaceState>>) {
+    fn test_workspace() -> (tempfile::TempDir, PathBuf, Arc<WorkspaceState>) {
         static TEST_CTX: AppContext = AppContext::new("sapphire-agent").allow_external_paths();
         TEST_CTX.set_cache_dir(std::env::temp_dir().join("sapphire-agent-config-tools-test-cache"));
         let dir = tempfile::tempdir().unwrap();
@@ -1001,7 +1000,7 @@ mod tests {
             std::fs::create_dir_all(root.join(sub)).unwrap();
         }
         let ws = Workspace::from_root(&TEST_CTX, &root).unwrap();
-        let state = Arc::new(Mutex::new(WorkspaceState::open(ws).unwrap()));
+        let state = Arc::new(WorkspaceState::open(ws).unwrap());
         (dir, root, state)
     }
 

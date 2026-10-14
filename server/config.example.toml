@@ -1,5 +1,12 @@
 # Directory containing AGENT.md and MEMORY.md.
 # Defaults to the same directory as this config file.
+#
+# Only read on the first start under the app server: the agent then
+# selects this directory as its workspace (the framework's
+# `workspace.toml`, beside this file) and serves the selected workspace
+# from then on. Change it with `sapphire-agent workspace select <dir>`;
+# this key is ignored, with a warning, once a workspace is selected.
+#
 # `workspace_dir` is a top-level key: it must appear before the first
 # `[table]` header (such as [matrix] below). Written after one, it
 # silently becomes a key of that table instead, and the loader never

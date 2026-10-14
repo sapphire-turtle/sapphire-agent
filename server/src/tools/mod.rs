@@ -17,7 +17,7 @@ use crate::provider::{ToolCall, ToolSpec};
 pub use agent_client_protocol::schema::v1::ToolKind;
 use anyhow::Result;
 use async_trait::async_trait;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
@@ -305,7 +305,7 @@ impl ToolSet {
 /// `day_boundary_hour`: what `current_time` reports as the agent's
 /// logical day.
 pub async fn default_tool_set(
-    state: Arc<Mutex<sapphire_framework::workspace::WorkspaceState>>,
+    state: Arc<sapphire_framework::workspace::WorkspaceState>,
     tavily_api_key: Option<String>,
     mcp_servers: &[McpServerConfig],
     timer_manager: Arc<crate::timer::TimerManager>,
@@ -318,12 +318,7 @@ pub async fn default_tool_set(
     use timer_tools::*;
     use workspace_tools::*;
 
-    let workspace_root = state
-        .lock()
-        .expect("WorkspaceState mutex poisoned")
-        .workspace
-        .root
-        .clone();
+    let workspace_root = state.workspace.root.clone();
 
     let mut tools: Vec<Box<dyn Tool>> = vec![
         Box::new(CurrentTimeTool::new(day_boundary_hour)),
@@ -438,11 +433,10 @@ pub(crate) fn truncate_output(s: &str) -> String {
 mod tests {
     use super::*;
     use sapphire_framework::workspace::{AppContext, Workspace, WorkspaceState};
-    use std::sync::Mutex;
 
     static TEST_CTX: AppContext = AppContext::new("sapphire-agent").allow_external_paths();
 
-    fn test_workspace() -> Arc<Mutex<WorkspaceState>> {
+    fn test_workspace() -> Arc<WorkspaceState> {
         // AppContext panics on any cache_dir() access until set_cache_dir has
         // been called once; Workspace::from_root reads it to compute the
         // workspace's cache path. set_cache_dir is "first writer wins" and
@@ -455,7 +449,7 @@ mod tests {
         let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
         std::fs::create_dir_all(dir.path().join(".sapphire-agent")).unwrap();
         let ws = Workspace::from_root(&TEST_CTX, dir.path()).unwrap();
-        Arc::new(Mutex::new(WorkspaceState::open(ws).unwrap()))
+        Arc::new(WorkspaceState::open(ws).unwrap())
     }
 
     /// Every tool declares what it does. A tool added without a `kind()`
