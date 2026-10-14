@@ -99,6 +99,36 @@ WARN Ignoring 1 unrecognised key(s) in /home/you/.config/sapphire-agent/config.t
 newer build unloadable by an older one, which matters most for the workspace
 layer, since it travels between hosts.
 
+## Several hosts (sync)
+
+The agent is a sapphire-framework app: with the host's `sapphire-bridge`
+running, `sapphire-agent workspace sync enable` syncs its workspace —
+sessions, memory, logs, definitions — with the other devices of the
+workgroup, and every device can run its own agent around its copy. Without
+a bridge, or with sync off, the agent runs alone exactly as before.
+
+Work that must happen once is placed on one host:
+
+- **Chat channels** run where their credentials are. `[matrix]` and
+  `[discord]` are host-local settings and never sync; configure each bot on
+  exactly one host. Each host writes the channels it serves — accounts and
+  rooms, no credentials — to `.sapphire-agent/hosts/<device-id>.toml` in the
+  workspace, and warns at startup when another host claims the same account
+  (both would answer every message).
+- **Heartbeats** run on the one host that can deliver them: the device named
+  by `device:` in the task's front matter (name or id), else the host serving
+  its `room_id`, else the host its `voice:` satellite is subscribed to. A task
+  with no target runs on the primary device, delivered to that host's
+  default room. With both `room_id` and `voice`, the room's host runs it and
+  falls back from voice to the room within itself.
+- **The daily, weekly and monthly logs, memory compaction and autonomous
+  sessions** run on the workspace's primary device, which the framework
+  elects (set a device's priority to influence it).
+
+Each host still needs its own host-local `config.toml` — LLM keys are not
+synced. Tool results and images are cached outside the workspace and do not
+sync: a session continued on another host sees placeholders in their place.
+
 ## Subagents
 
 The main agent can delegate a task to a specialised subagent via the

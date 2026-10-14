@@ -170,6 +170,9 @@ pub struct AutonomousLoop {
     /// `cooldown_days = 0` from meaning "a new session every cycle" within
     /// one run (design decision 12).
     not_before: HashMap<String, DateTime<Utc>>,
+    /// Which host runs autonomous sessions once the workspace is synced:
+    /// the primary device only (`placement`).
+    placement: Arc<crate::placement::Placement>,
 }
 
 impl AutonomousLoop {
@@ -186,7 +189,14 @@ impl AutonomousLoop {
             idle,
             poll,
             not_before: HashMap::new(),
+            placement: crate::placement::Placement::alone(),
         }
+    }
+
+    /// Run only where `placement` says background work runs.
+    pub fn with_placement(mut self, placement: Arc<crate::placement::Placement>) -> Self {
+        self.placement = placement;
+        self
     }
 
     /// Which row of the permission table this loop's turns are judged by.
@@ -231,6 +241,12 @@ impl AutonomousLoop {
         tick.tick().await;
         loop {
             tick.tick().await;
+            // Before the cycle, not inside it: an idle cycle still writes
+            // `state/autonomous.json`, which every host would otherwise
+            // keep rewriting in the synced workspace.
+            if !self.placement.runs_background().await {
+                continue;
+            }
             if let Err(e) = self.run_cycle().await {
                 warn!("autonomous cycle failed: {e:#}");
             }

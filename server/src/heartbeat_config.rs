@@ -6,6 +6,7 @@
 //! ---
 //! schedule: "0 8 * * *"
 //! room_id: "..."          # optional chat target, defaults to channel default
+//! device: "laptop"         # optional: the host that runs it, when synced
 //! voice:                   # optional voice satellite target
 //!   device_id: "01J..."   # the satellite's device id (see sapphire-agent-cli)
 //! enabled: true            # optional, default true
@@ -34,6 +35,11 @@ pub struct HeartbeatTaskMeta {
     pub schedule: String,
     #[serde(default)]
     pub room_id: Option<String>,
+    /// The device that runs this task, by name or id, when the workspace
+    /// is synced with other hosts. Without it the task runs where it can be
+    /// delivered (see `placement::heartbeat_runner`).
+    #[serde(default)]
+    pub device: Option<String>,
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// Optional voice satellite target. When set, the cron loop tries

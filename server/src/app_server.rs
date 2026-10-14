@@ -18,8 +18,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
-use sapphire_framework::server::{AppServer, Selection, SelectionFile, WorkspaceHost};
+use sapphire_framework::ipc::ManagedBy;
+use sapphire_framework::server::{AppServer, Selection, SelectionFile, SyncRuntime, WorkspaceHost};
 use sapphire_framework::workspace::WorkspaceState;
+use sapphire_framework_bridge_client::BridgeClient;
 use tokio_util::sync::CancellationToken;
 
 use crate::APP_CTX;
@@ -75,6 +77,34 @@ fn adopt_into(file: &SelectionFile, dir: &Path) -> Result<PathBuf> {
 /// themselves.
 pub fn build() -> AppServer {
     AppServer::new(&APP_CTX, VERSION)
+}
+
+/// Attach sync, through the host's `sapphire-bridge` when one is running.
+///
+/// A bridge that is not running is not fatal — the agent serves its
+/// workspace without sync, and picks the bridge up on its next start — but
+/// any other failure (a bridge of another version, say) stops the start.
+/// Returns the runtime and the bridge for `placement` to ask.
+pub async fn with_sync(
+    server: AppServer,
+) -> Result<(AppServer, Option<(Arc<SyncRuntime>, Arc<BridgeClient>)>)> {
+    match BridgeClient::connect(APP_CTX.app_name, VERSION).await {
+        Ok(bridge) => {
+            let bridge = Arc::new(bridge);
+            let runtime = Arc::new(SyncRuntime::new(
+                &APP_CTX,
+                Arc::clone(&bridge),
+                std::env::current_exe().context("locating this executable")?,
+                ManagedBy::Service,
+            ));
+            Ok((server.sync(Arc::clone(&runtime)), Some((runtime, bridge))))
+        }
+        Err(sapphire_framework::ipc::Error::NotRunning(reason)) => {
+            tracing::warn!("{reason}; serving without sync until the agent is restarted");
+            Ok((server, None))
+        }
+        Err(err) => Err(err).context("connecting to the sapphire bridge"),
+    }
 }
 
 /// The workspace the running server has open, once it has one.

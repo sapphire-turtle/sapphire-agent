@@ -6,6 +6,10 @@
 //!    optionally generates a daily log and compacts MEMORY.md.
 //! 2. **Cron loop**: scans `<workspace>/heartbeat/*.md` and fires `prompt`
 //!    triggers on the agent according to each task's cron schedule.
+//!
+//! When the workspace is synced with other hosts, each runs on one host
+//! only (`placement`): the logs and the compaction on the primary device,
+//! each cron task on the host that can deliver it.
 
 use crate::agent::Agent;
 use crate::config::{Config, DigestConfig};
@@ -38,6 +42,8 @@ struct DueTask {
     /// Voice satellite target, when this task should be delivered as
     /// TTS audio instead of (or in addition to, on failure) chat.
     voice: Option<HeartbeatVoiceTarget>,
+    /// The device that runs it, when the task names one.
+    device: Option<String>,
 }
 
 pub struct Heartbeat {
@@ -53,8 +59,16 @@ pub struct Heartbeat {
     /// namespace can pick its own primary (and optional fallback) instead
     /// of all sharing one provider.
     pub registry: Arc<ProviderRegistry>,
-    pub agent: Arc<Agent>,
+    /// The channel agent. `None` on a host with no chat channel: the logs
+    /// and voice-only tasks still run there, chat delivery does not.
+    pub agent: Option<Arc<Agent>>,
     pub default_room_id: Option<String>,
+    /// Which host runs what, once the workspace is synced.
+    pub placement: Arc<crate::placement::Placement>,
+    /// The rooms this host's channels serve, for placing cron tasks.
+    pub local_rooms: std::collections::HashMap<String, String>,
+    /// Whether one of this host's channels listens in every room.
+    pub local_catch_all: bool,
     /// Config snapshot used to enumerate memory namespaces and resolve
     /// per-room namespace assignment for periodic-log catch-up.
     pub config: Config,
@@ -114,6 +128,9 @@ impl Heartbeat {
         tick.tick().await; // skip immediate fire — startup catchup already ran in main
         loop {
             tick.tick().await;
+            if !self.placement.runs_background().await {
+                continue;
+            }
             let today_local =
                 crate::session::local_date_for_timestamp(Local::now(), self.day_boundary_hour);
             let mut total: usize = 0;
@@ -173,8 +190,10 @@ impl Heartbeat {
                     .await;
                 }
             }
-            if total > 0 {
-                self.agent.invalidate_system_prompts().await;
+            if total > 0
+                && let Some(agent) = &self.agent
+            {
+                agent.invalidate_system_prompts().await;
             }
         }
     }
@@ -194,7 +213,12 @@ impl Heartbeat {
                 self.day_boundary_hour,
             );
 
-            if self.daily_log_enabled {
+            // The logs and the compaction write the synced workspace, so
+            // they run on one host; the subagent prune below is this
+            // host's own cache and runs everywhere.
+            let background = self.placement.runs_background().await;
+
+            if self.daily_log_enabled && background {
                 let today = yesterday + Duration::days(1);
                 let mut any_generated = false;
                 for ns in self.config.all_memory_namespaces() {
@@ -297,8 +321,8 @@ impl Heartbeat {
                     }
                 }
 
-                if any_generated {
-                    self.agent.invalidate_system_prompts().await;
+                if any_generated && let Some(agent) = &self.agent {
+                    agent.invalidate_system_prompts().await;
                 }
             }
 
@@ -319,7 +343,7 @@ impl Heartbeat {
                 }
             }
 
-            if self.memory_compaction_enabled {
+            if self.memory_compaction_enabled && background {
                 for ns in self.config.all_memory_namespaces() {
                     let provider = self.provider_for_namespace(&ns);
                     info!("Heartbeat: compacting MEMORY.md in '{ns}'");
@@ -353,6 +377,7 @@ impl Heartbeat {
                                 body: t.body.clone(),
                                 room_id: t.meta.room_id.clone(),
                                 voice: t.meta.voice.clone(),
+                                device: t.meta.device.clone(),
                             })
                             .collect();
                         (at, extracted)
@@ -370,7 +395,53 @@ impl Heartbeat {
             tokio::time::sleep(wait).await;
 
             for task in due_tasks {
-                self.fire_task(task).await;
+                if self.runs_here(&task).await {
+                    self.fire_task(task).await;
+                }
+            }
+        }
+    }
+
+    /// Whether this host is the one that runs `task` (`placement`).
+    async fn runs_here(&self, task: &DueTask) -> bool {
+        use crate::placement::{
+            HeartbeatTarget, HostView, Role, Runner, heartbeat_runner, read_claims,
+        };
+        let role = self.placement.role().await;
+        let voice_here = match (&task.voice, &self.serve_state) {
+            (Some(v), Some(state)) => state
+                .voice_subscribers
+                .lock()
+                .await
+                .contains_key(&v.device_id),
+            _ => false,
+        };
+        let claims = match role {
+            Role::Alone => Vec::new(),
+            Role::Member { .. } => read_claims(&self.workspace_dir),
+        };
+        let target = HeartbeatTarget {
+            device: task.device.clone(),
+            room_id: task.room_id.clone(),
+            voice: task.voice.as_ref().map(|v| v.device_id.clone()),
+        };
+        let view = HostView {
+            role: &role,
+            local_rooms: &self.local_rooms,
+            local_catch_all: self.local_catch_all,
+            default_room: self.default_room_id.as_deref(),
+            claims: &claims,
+            voice_here,
+        };
+        match heartbeat_runner(&target, &view) {
+            Runner::Here => true,
+            Runner::Elsewhere => {
+                info!("Heartbeat cron: task {} runs on another host", task.name);
+                false
+            }
+            Runner::Nobody(why) => {
+                warn!("Heartbeat cron: no host runs task {}: {why}", task.name);
+                false
             }
         }
     }
@@ -384,6 +455,7 @@ impl Heartbeat {
             body,
             room_id,
             voice,
+            ..
         } = task;
 
         // Voice path: only attempted when a `voice:` target was set on
@@ -441,7 +513,13 @@ impl Heartbeat {
         match room {
             Some(room) => {
                 info!("Heartbeat cron: firing task {name} -> {room}");
-                if let Err(e) = self.agent.trigger(&name, &body, &room).await {
+                let Some(agent) = &self.agent else {
+                    warn!(
+                        "Heartbeat cron: task {name} needs a chat channel, and this host has none"
+                    );
+                    return;
+                };
+                if let Err(e) = agent.trigger(&name, &body, &room).await {
                     warn!("Heartbeat cron: task {name} failed: {e:#}");
                 }
             }
