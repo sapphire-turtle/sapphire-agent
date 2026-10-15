@@ -1257,7 +1257,15 @@ async fn main() -> Result<()> {
             server_task.await.context("the app server panicked")??;
         }
         Command::Verify => {
-            let profile_errors = config.validate_profiles();
+            let mut profile_errors = config.validate_profiles();
+            // `serve` refuses to start on what only the registry can see —
+            // a profile naming `anthropic` with no API key, or no key and no
+            // `[profiles.default]` — so `verify` builds it too.
+            if profile_errors.is_empty()
+                && let Err(e) = ProviderRegistry::from_config(&config)
+            {
+                profile_errors.push(format!("{e:#}"));
+            }
             if profile_errors.is_empty() {
                 println!("Config OK");
             } else {

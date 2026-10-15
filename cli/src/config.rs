@@ -15,6 +15,11 @@ pub struct Config {
     /// Discord channel configuration. May coexist with `matrix`.
     #[serde(default)]
     pub discord: Option<DiscordConfig>,
+    /// The built-in Anthropic provider. Optional: it is registered only
+    /// when an API key resolves (here or in `ANTHROPIC_API_KEY`), and a
+    /// deployment that runs entirely on `[providers.<n>]` can leave the
+    /// table out. See `ProviderRegistry::from_config`.
+    #[serde(default)]
     pub anthropic: AnthropicConfig,
     /// Context compression configuration.
     #[serde(default)]
@@ -1174,6 +1179,21 @@ pub struct AnthropicConfig {
     /// before the call fails. `0` disables. See `crate::provider::retry`.
     #[serde(default = "crate::provider::retry::default_incomplete_retries")]
     pub incomplete_retries: u32,
+}
+
+impl Default for AnthropicConfig {
+    fn default() -> Self {
+        Self {
+            api_key: None,
+            model: default_model(),
+            light_model: None,
+            max_tokens: default_max_tokens(),
+            system_prompt: None,
+            connect_timeout_secs: crate::provider::http::default_connect_timeout_secs(),
+            stream_idle_timeout_secs: crate::provider::http::default_stream_idle_timeout_secs(),
+            incomplete_retries: crate::provider::retry::default_incomplete_retries(),
+        }
+    }
 }
 
 /// Env var consulted when `[anthropic].api_key` is absent.
@@ -3382,6 +3402,19 @@ model = "gemma-4-31b-it"
             crate::config_layer::layer_of("memory_namespace.dev.skils", &loaded.provenance),
             Some(crate::config_layer::Layer::Workspace)
         );
+    }
+
+    /// A deployment that runs entirely on `[providers.<n>]` needs no
+    /// `[anthropic]` table; the registry decides what its absence means.
+    #[test]
+    fn the_anthropic_table_is_optional() {
+        let cfg = parse(
+            "[providers.local]\ntype = \"openai_compatible\"\n\
+             base_url = \"http://127.0.0.1:8080/v1\"\nmodel = \"qwen\"\n\n\
+             [profiles.default]\nprovider = \"local\"\n",
+        );
+        assert!(cfg.anthropic.api_key.is_none());
+        assert_eq!(cfg.anthropic.model, default_model());
     }
 
     /// The example config ships as the thing to copy, so a key in it that

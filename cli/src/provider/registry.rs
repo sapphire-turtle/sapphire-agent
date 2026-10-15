@@ -1,11 +1,15 @@
 //! Provider registry — bundles all configured `Provider` implementations
 //! together with the routing logic that picks one per `room_id`.
 //!
-//! Constructed once at startup from the parsed `Config`. The Anthropic
-//! provider is always present under the name [`ANTHROPIC_PROVIDER_NAME`];
-//! additional providers come from `[providers.<name>]` config entries.
+//! Constructed once at startup from the parsed `Config`. The built-in
+//! Anthropic provider is registered under [`ANTHROPIC_PROVIDER_NAME`] when an
+//! API key resolves; additional providers come from `[providers.<name>]`
+//! config entries.
 
-use crate::config::{ANTHROPIC_PROVIDER_NAME, BACKGROUND_PROFILE_NAME, Config, ProviderConfig};
+use crate::config::{
+    ANTHROPIC_PROVIDER_NAME, AnthropicConfig, BACKGROUND_PROFILE_NAME, Config,
+    DEFAULT_PROFILE_NAME, ProviderConfig,
+};
 use crate::provider::Provider;
 use crate::provider::anthropic::AnthropicProvider;
 use crate::provider::fallback::FallbackProvider;
@@ -17,17 +21,32 @@ use std::sync::Arc;
 
 pub struct ProviderRegistry {
     providers: HashMap<String, Arc<dyn Provider>>,
+    /// Where a request goes when nothing routes it: a room no profile
+    /// claims, a profile name that is not defined, background work with no
+    /// background profile. The built-in Anthropic provider when it is
+    /// registered, else `[profiles.default]`.
+    default: Arc<dyn Provider>,
 }
 
 impl ProviderRegistry {
     /// Build a registry from the parsed config.
     ///
-    /// Always installs the Anthropic provider under `"anthropic"`. Each
+    /// Installs the Anthropic provider under `"anthropic"` when its API key
+    /// resolves (`[anthropic].api_key` or `ANTHROPIC_API_KEY`). Each
     /// `[providers.<name>]` entry adds another provider keyed by its
     /// configured name. Profile validation is performed up front and
     /// returned as an error so misconfigurations fail at startup rather
-    /// than mid-conversation.
+    /// than mid-conversation — including a profile that names `anthropic`
+    /// when no key resolved, and a deployment with neither a key nor a
+    /// `[profiles.default]` to send unrouted requests to.
     pub fn from_config(config: &Config) -> Result<Self> {
+        Self::build(config, config.anthropic.resolve_api_key())
+    }
+
+    /// [`from_config`](Self::from_config) with the Anthropic key already
+    /// resolved, so tests do not depend on the `ANTHROPIC_API_KEY` of
+    /// whoever runs them.
+    fn build(config: &Config, anthropic_key: Result<String>) -> Result<Self> {
         let errors = config.validate_profiles();
         if !errors.is_empty() {
             anyhow::bail!(
@@ -41,13 +60,23 @@ impl ProviderRegistry {
         // back truncated or empty exhausts its own retries first, and only
         // then does the fallback see it as the error it is.
         let mut providers: HashMap<String, Arc<dyn Provider>> = HashMap::new();
-        providers.insert(
-            ANTHROPIC_PROVIDER_NAME.to_string(),
-            Arc::new(RetryProvider::new(
-                Arc::new(AnthropicProvider::new(&config.anthropic)?),
-                config.anthropic.incomplete_retries,
-            )),
-        );
+        let anthropic_missing = match anthropic_key {
+            Ok(key) => {
+                let cfg = AnthropicConfig {
+                    api_key: Some(key),
+                    ..config.anthropic.clone()
+                };
+                providers.insert(
+                    ANTHROPIC_PROVIDER_NAME.to_string(),
+                    Arc::new(RetryProvider::new(
+                        Arc::new(AnthropicProvider::new(&cfg)?),
+                        cfg.incomplete_retries,
+                    )),
+                );
+                None
+            }
+            Err(e) => Some(e),
+        };
 
         for (name, pcfg) in &config.providers {
             if name == ANTHROPIC_PROVIDER_NAME {
@@ -70,26 +99,61 @@ impl ProviderRegistry {
             providers.insert(name.clone(), provider);
         }
 
-        Ok(Self { providers })
+        if let Some(missing) = anthropic_missing {
+            // A profile naming the built-in would otherwise route to a
+            // provider that is not there — refuse rather than reroute it.
+            let mut users: Vec<String> = config
+                .profiles
+                .iter()
+                .filter(|(_, p)| {
+                    p.provider == ANTHROPIC_PROVIDER_NAME
+                        || p.fallback_provider.as_deref() == Some(ANTHROPIC_PROVIDER_NAME)
+                })
+                .map(|(name, _)| format!("[profiles.{name}]"))
+                .collect();
+            users.sort();
+            if !users.is_empty() {
+                anyhow::bail!(
+                    "{} use(s) the built-in `{ANTHROPIC_PROVIDER_NAME}` provider, but {missing:#}",
+                    users.join(", ")
+                );
+            }
+            if !config.profiles.contains_key(DEFAULT_PROFILE_NAME) {
+                anyhow::bail!(
+                    "{missing:#}. Without the built-in `{ANTHROPIC_PROVIDER_NAME}` provider, \
+                     [profiles.{DEFAULT_PROFILE_NAME}] is where unrouted requests go — define it, \
+                     naming one of [providers.<name>]"
+                );
+            }
+        }
+
+        let default = match providers.get(ANTHROPIC_PROVIDER_NAME) {
+            Some(anthropic) => Arc::clone(anthropic),
+            // Validation above guarantees the profile exists and names a
+            // registered provider.
+            None => resolve_profile(&providers, config, DEFAULT_PROFILE_NAME)
+                .expect("[profiles.default] names a registered provider"),
+        };
+
+        Ok(Self { providers, default })
     }
 
     /// Look up a provider by name. Returns `None` if no such provider was
-    /// registered.
+    /// registered. Test-only: routing goes through `resolve_profile`.
+    #[cfg(test)]
     pub fn get(&self, name: &str) -> Option<Arc<dyn Provider>> {
         self.providers.get(name).cloned()
     }
 
-    /// The built-in Anthropic provider — guaranteed to be present.
-    pub fn anthropic(&self) -> Arc<dyn Provider> {
-        self.providers
-            .get(ANTHROPIC_PROVIDER_NAME)
-            .cloned()
-            .expect("anthropic provider is always registered")
+    /// Where unrouted requests go: the built-in Anthropic provider when it
+    /// is registered, else `[profiles.default]`. Always present.
+    pub fn default_provider(&self) -> Arc<dyn Provider> {
+        Arc::clone(&self.default)
     }
 
     /// Resolve the provider that should handle a chat in `room_id`.
     ///
-    /// Falls back to the Anthropic provider if (a) no profile is configured
+    /// Falls back to [`default_provider`](Self::default_provider) if (a) no profile is configured
     /// for the room, (b) the resolved profile names a provider that isn't
     /// registered (validation should have caught this — defensive only).
     /// When the profile defines a `fallback_provider`, the result is
@@ -97,14 +161,15 @@ impl ProviderRegistry {
     /// retry on the secondary.
     pub fn for_room(&self, config: &Config, room_id: &str) -> Arc<dyn Provider> {
         let Some(profile_name) = config.profile_for(room_id) else {
-            return self.anthropic();
+            return self.default_provider();
         };
         self.for_profile(config, profile_name)
     }
 
     /// Resolve the provider for a named profile, honouring its primary +
-    /// optional fallback. Falls back to the Anthropic provider if the
-    /// profile isn't defined or names an unknown provider.
+    /// optional fallback. Falls back to
+    /// [`default_provider`](Self::default_provider) if the profile isn't
+    /// defined or names an unknown provider.
     ///
     /// The single entry point for profile → provider resolution: room and
     /// session turns go through here, and so do subagent definitions'
@@ -114,30 +179,19 @@ impl ProviderRegistry {
     /// (`Config::validate_subagent_profiles`); a future client/local-loop
     /// config that wants warn-and-fallback instead changes only this point.
     pub fn for_profile(&self, config: &Config, profile_name: &str) -> Arc<dyn Provider> {
-        let Some(profile) = config.profiles.get(profile_name) else {
-            return self.anthropic();
-        };
-        let primary = self
-            .get(&profile.provider)
-            .unwrap_or_else(|| self.anthropic());
-        match profile
-            .fallback_provider
-            .as_deref()
-            .and_then(|n| self.get(n))
-        {
-            Some(fallback) => Arc::new(FallbackProvider::new(primary, fallback)),
-            None => primary,
-        }
+        resolve_profile(&self.providers, config, profile_name)
+            .unwrap_or_else(|| self.default_provider())
     }
 
     /// Provider used by background tasks (daily-log, memory compaction,
     /// digests). Resolves the conventional `[profiles.background]`; falls
-    /// back to plain Anthropic when that profile isn't defined.
+    /// back to [`default_provider`](Self::default_provider) when that
+    /// profile isn't defined.
     pub fn background_provider(&self, config: &Config) -> Arc<dyn Provider> {
         if config.profiles.contains_key(BACKGROUND_PROFILE_NAME) {
             self.for_profile(config, BACKGROUND_PROFILE_NAME)
         } else {
-            self.anthropic()
+            self.default_provider()
         }
     }
 
@@ -146,7 +200,7 @@ impl ProviderRegistry {
     ///
     ///   1. `memory_namespace.<n>.background_profile` if set
     ///   2. global `[profiles.background]` if defined
-    ///   3. plain Anthropic
+    ///   3. [`default_provider`](Self::default_provider)
     ///
     /// Lets an NSFW namespace route directly to its permissive local
     /// provider without paying a refusal-fallback hop on every daily-log
@@ -158,18 +212,40 @@ impl ProviderRegistry {
     ) -> Arc<dyn Provider> {
         match config.background_profile_for_namespace(namespace) {
             Some(profile_name) => self.for_profile(config, profile_name),
-            None => self.anthropic(),
+            None => self.default_provider(),
         }
     }
 }
 
+/// A profile's primary provider, wrapped with its fallback when it names one.
+/// `None` when the profile is not defined or its primary is not registered.
+fn resolve_profile(
+    providers: &HashMap<String, Arc<dyn Provider>>,
+    config: &Config,
+    profile_name: &str,
+) -> Option<Arc<dyn Provider>> {
+    let profile = config.profiles.get(profile_name)?;
+    let primary = Arc::clone(providers.get(&profile.provider)?);
+    match profile
+        .fallback_provider
+        .as_deref()
+        .and_then(|n| providers.get(n))
+    {
+        Some(fallback) => Some(Arc::new(FallbackProvider::new(
+            primary,
+            Arc::clone(fallback),
+        ))),
+        None => Some(primary),
+    }
+}
+
 /// Registry holding exactly one provider, registered under every name in
-/// `names`. Test-only: `from_config` always builds a real Anthropic
-/// provider, so fixtures that want to script replies need a way to install
-/// a stub in its place — including under the built-in `"anthropic"` key,
-/// since `ServeState::provider_for_session` falls back to the background
-/// provider (which resolves `"anthropic"` when no `[profiles.background]`
-/// is configured).
+/// `names`, and as the default. Test-only: `from_config` builds real
+/// providers, so fixtures that want to script replies need a way to install
+/// a stub in their place — including as the default, since
+/// `ServeState::provider_for_session` falls back to the background provider
+/// (which resolves to the default when no `[profiles.background]` is
+/// configured).
 #[cfg(test)]
 impl ProviderRegistry {
     pub(crate) fn for_test(names: &[&str], provider: Arc<dyn Provider>) -> Self {
@@ -177,7 +253,10 @@ impl ProviderRegistry {
         for name in names {
             providers.insert(name.to_string(), Arc::clone(&provider));
         }
-        Self { providers }
+        Self {
+            providers,
+            default: provider,
+        }
     }
 }
 
@@ -189,8 +268,95 @@ mod tests {
         toml::from_str(s).expect("config should parse")
     }
 
+    /// Stands in for an `ANTHROPIC_API_KEY`-less environment, whatever the
+    /// environment running the tests actually holds.
+    fn no_key() -> Result<String> {
+        Err(anyhow::anyhow!("no Anthropic API key found"))
+    }
+
     #[test]
-    fn registry_always_has_anthropic() {
+    fn without_a_key_the_default_profile_takes_anthropics_place() {
+        let cfg = parse(
+            r#"
+[providers.local]
+type = "openai_compatible"
+base_url = "http://127.0.0.1:8080/v1"
+model = "qwen"
+
+[profiles.default]
+provider = "local"
+"#,
+        );
+        let reg = ProviderRegistry::build(&cfg, no_key()).unwrap();
+        assert!(reg.get(ANTHROPIC_PROVIDER_NAME).is_none());
+        assert_eq!(reg.default_provider().name(), "local");
+        // Background work with no background profile goes there too.
+        assert_eq!(reg.background_provider(&cfg).name(), "local");
+        assert_eq!(reg.for_profile(&cfg, "undefined").name(), "local");
+    }
+
+    #[test]
+    fn without_a_key_a_profile_naming_anthropic_is_refused() {
+        let cfg = parse(
+            r#"
+[providers.local]
+type = "openai_compatible"
+base_url = "http://127.0.0.1:8080/v1"
+model = "qwen"
+
+[profiles.default]
+provider = "local"
+
+[profiles.smart]
+provider = "local"
+fallback_provider = "anthropic"
+"#,
+        );
+        let err = ProviderRegistry::build(&cfg, no_key())
+            .err()
+            .expect("expected an error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("[profiles.smart]"), "{msg}");
+        assert!(msg.contains("no Anthropic API key found"), "{msg}");
+    }
+
+    #[test]
+    fn without_a_key_or_a_default_profile_startup_is_refused() {
+        let cfg = parse(
+            r#"
+[providers.local]
+type = "openai_compatible"
+base_url = "http://127.0.0.1:8080/v1"
+model = "qwen"
+"#,
+        );
+        let err = ProviderRegistry::build(&cfg, no_key())
+            .err()
+            .expect("expected an error");
+        assert!(format!("{err:#}").contains("[profiles.default]"));
+    }
+
+    #[test]
+    fn with_a_key_anthropic_stays_the_default_even_beside_a_default_profile() {
+        // Unchanged routing for every deployment that has a key: background
+        // work without a background profile kept going to Anthropic.
+        let cfg = parse(
+            r#"
+[providers.local]
+type = "openai_compatible"
+base_url = "http://127.0.0.1:8080/v1"
+model = "qwen"
+
+[profiles.default]
+provider = "local"
+"#,
+        );
+        let reg = ProviderRegistry::build(&cfg, Ok("test".to_string())).unwrap();
+        assert_eq!(reg.default_provider().name(), "anthropic");
+    }
+
+    #[test]
+    fn registry_has_anthropic_when_a_key_resolves() {
         let cfg = parse(
             r#"
 [anthropic]
@@ -290,7 +456,7 @@ fallback_provider = "local"
         // FallbackProvider::name() forwards to the primary, so the name
         // alone doesn't prove wrapping. Two registry pointers differ in
         // identity, though: the wrapped Arc is freshly allocated.
-        let raw_anthropic = reg.anthropic();
+        let raw_anthropic = reg.get(ANTHROPIC_PROVIDER_NAME).unwrap();
         let routed = reg.for_room(&cfg, "!any:srv");
         assert_eq!(routed.name(), "anthropic");
         assert!(
@@ -317,7 +483,7 @@ fallback_provider = "local"
 "#,
         );
         let reg = ProviderRegistry::from_config(&cfg).unwrap();
-        let raw_anthropic = reg.anthropic();
+        let raw_anthropic = reg.get(ANTHROPIC_PROVIDER_NAME).unwrap();
         let bg = reg.background_provider(&cfg);
         assert!(
             !Arc::ptr_eq(&raw_anthropic, &bg),
@@ -376,7 +542,7 @@ fallback_provider = "local"
         // The provider's name forwards to the primary (anthropic), but a
         // FallbackProvider was wrapped around it — verify by Arc identity
         // against the bare anthropic provider.
-        let raw_anthropic = reg.anthropic();
+        let raw_anthropic = reg.get(ANTHROPIC_PROVIDER_NAME).unwrap();
         let p = reg.background_provider_for_namespace(&cfg, "default");
         assert!(
             !Arc::ptr_eq(&raw_anthropic, &p),
@@ -393,7 +559,7 @@ api_key = "test"
 "#,
         );
         let reg = ProviderRegistry::from_config(&cfg).unwrap();
-        let raw_anthropic = reg.anthropic();
+        let raw_anthropic = reg.get(ANTHROPIC_PROVIDER_NAME).unwrap();
         let bg = reg.background_provider(&cfg);
         assert!(
             Arc::ptr_eq(&raw_anthropic, &bg),

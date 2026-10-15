@@ -113,6 +113,12 @@ recovery_key = "EsT... "
 # monthly_enabled = true
 # yearly_enabled  = true
 
+# The built-in `anthropic` provider. Optional: it is registered only when an
+# API key resolves (`api_key` here, or the ANTHROPIC_API_KEY environment
+# variable). It is also where unrouted requests go — a room no profile
+# claims, background work with no background profile. Without a key, that
+# role falls to [profiles.default], which then has to exist, and a profile
+# naming `anthropic` stops startup with an error.
 [anthropic]
 api_key = "sk-ant-..."
 # Model to use. Defaults to claude-opus-4-6.
