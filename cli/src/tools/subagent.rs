@@ -2410,7 +2410,7 @@ mod tests {
         let dispatched = crate::serve::scope_turn_context(
             turn_context(
                 std::sync::Arc::clone(&state),
-                state.registry.anthropic(),
+                state.registry.default_provider(),
                 Vec::new(),
             ),
             SubagentTool::new(vec![base.clone()])
@@ -2427,7 +2427,7 @@ mod tests {
         let resumed = crate::serve::scope_turn_context(
             turn_context(
                 std::sync::Arc::clone(&state),
-                state.registry.anthropic(),
+                state.registry.default_provider(),
                 Vec::new(),
             ),
             SubagentTool::new(vec![resumed_def])
