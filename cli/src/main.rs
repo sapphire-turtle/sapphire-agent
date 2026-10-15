@@ -114,7 +114,8 @@ struct Cli {
     #[arg(short, long, value_name = "FILE")]
     config: Option<PathBuf>,
 
-    /// Override bind address (e.g. 127.0.0.1:3170)
+    /// Listen for HTTP on this address (e.g. 127.0.0.1:3170), overriding
+    /// `[serve]`. Without either, `serve` opens no HTTP port.
     #[arg(long, value_name = "ADDR")]
     bind: Option<String>,
 
@@ -1218,14 +1219,37 @@ async fn main() -> Result<()> {
             }
 
             // ── HTTP API server ─────────────────────────────────────────────
-            let addr = bind
-                .or_else(|| {
-                    config
-                        .serve
-                        .as_ref()
-                        .map(|s| format!("{}:{}", s.host, s.port))
-                })
-                .unwrap_or_else(|| "127.0.0.1:3170".to_string());
+            // Opt-in: only `[serve]` or `--bind` opens a port. Local clients
+            // (`chat`, `acp`, the desktop) use the IPC endpoint, so an agent
+            // without one still works on its own host — and two agents on
+            // one host no longer collide on the default port.
+            let addr = bind.or_else(|| {
+                config
+                    .serve
+                    .as_ref()
+                    .map(|s| format!("{}:{}", s.host, s.port))
+            });
+            if addr.is_none() {
+                for (what, on) in [
+                    (
+                        "[acp] (GET /acp)",
+                        config.acp.as_ref().is_some_and(|c| c.enabled),
+                    ),
+                    (
+                        "[a2a] (/a2a)",
+                        config.a2a.as_ref().is_some_and(|c| c.enabled),
+                    ),
+                    ("ambient ingest (/audio/*)", ambient_routes.is_some()),
+                ] {
+                    if on {
+                        tracing::warn!(
+                            "{what} is enabled but unreachable: the HTTP API is off. Add a \
+                             [serve] table to {} to listen.",
+                            config_path.display()
+                        );
+                    }
+                }
+            }
 
             let served = serve::run(
                 addr,
@@ -1312,6 +1336,10 @@ async fn main() -> Result<()> {
                 println!("  Allowed users     : {:?}", d.allowed_users);
             } else {
                 println!("  Channel           : NONE (add [discord] or [matrix] to config)");
+            }
+            match &config.serve {
+                Some(s) => println!("  HTTP API          : http://{}:{}", s.host, s.port),
+                None => println!("  HTTP API          : disabled (add [serve] to listen)"),
             }
             println!(
                 "  ACP endpoint      : {}",

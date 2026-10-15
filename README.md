@@ -23,7 +23,7 @@ A personal AI assistant agent that works on file-based, local-first [`sapphire-f
 - **Skills**: written procedures (planning, TDD, debugging, code review, …) loaded on request from a checkout on the *editor's* machine, over ACP. Requires an ACP client that declared terminal support — off entirely for Matrix, Discord and voice. See [Skills](#skills) below.
 - **Editor integration**: Zed (or any ACP client) drives the running agent over the Agent Client Protocol — on the agent's own machine by starting `sapphire-agent acp` (stdio, relayed to the running agent over its local IPC endpoint), from elsewhere over the `/acp` WebSocket endpoint (`[acp].enabled = true`); see [Zed / ACP](#zed--acp) below.
 - **Commands**:
-  - `sapphire-agent` (or `sapphire-agent serve`) — start the channel listeners + JSON-RPC HTTP control API (`/rpc`, `/a2a`, `/acp`)
+  - `sapphire-agent serve` — start the agent: channel listeners and the local IPC endpoint, plus the JSON-RPC HTTP API (`/rpc`, `/a2a`, `/acp`) when `[serve]` is configured (HTTP is off by default)
   - `sapphire-agent chat` — interactive REPL with the agent running on this host, over its local IPC endpoint (`-m TEXT` for one message, `--list`, `--history`, `--session ID`, `--json`); runs under `[cli].room_profile`
   - `sapphire-agent acp` — ACP on stdio for an editor, relayed to the running agent over IPC
   - `sapphire-agent init [PATH]` — seed a workspace with the files the agent reads (`AGENTS.md`, `SOUL.md`, …), then print the host-local config to paste; never overwrites an existing file
@@ -420,9 +420,14 @@ Then, in Zed's `settings.json`:
 
 ### From another machine: `/acp`
 
-**1. Enable the endpoint** in your config:
+**1. Enable the endpoint** in your config, and turn the HTTP API on — it is
+off by default. `[serve]` goes in the host-local config; the workspace layer
+refuses it:
 
 ```toml
+[serve]            # host = "127.0.0.1", port = 3170 by default
+host = "0.0.0.0"
+
 [acp]
 enabled = true
 ```
