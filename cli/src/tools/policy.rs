@@ -581,7 +581,12 @@ mod tests {
     /// a workspace-scoped tool is never caught by it.
     #[test]
     fn workspace_tools_are_not_host_tools() {
-        for name in ["memory_add", "workspace_search", "timer_set", "web_search"] {
+        for name in [
+            "memory_add",
+            "workspace_search",
+            "current_time",
+            "web_search",
+        ] {
             assert!(
                 !host_tool_denied(name, false, false),
                 "{name} is not a host tool"

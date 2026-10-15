@@ -42,7 +42,7 @@ use tracing::{debug, info, warn};
 
 /// The handle [`McpClient::listen`] returns: one `subscriptions/listen`
 /// stream. Re-exported so callers need not name `rmcp` for it.
-#[allow(unused_imports)] // For the timer integration, which listens.
+#[allow(unused_imports)] // For callers of `listen`; nothing here names them.
 pub use rmcp::service::{Subscription, SubscriptionEnd};
 
 // ---------------------------------------------------------------------------
@@ -174,6 +174,14 @@ impl Drop for Connection {
 // MCP Client
 // ---------------------------------------------------------------------------
 
+/// Told about every successful call made through one server's [`McpTool`]s.
+///
+/// Called synchronously from the tool's `execute`, so it runs inside the
+/// turn's task-locals — `timer::current_origin` included.
+pub trait ToolCallObserver: Send + Sync {
+    fn tool_called(&self, tool: &str, result: &CallToolResult);
+}
+
 /// Client for a single external MCP server.
 ///
 /// Construction does not touch the server; [`Self::connect`] does, and every
@@ -185,6 +193,7 @@ pub struct McpClient {
     connection: RwLock<Option<Arc<Connection>>>,
     /// Set to `true` when the server reports `tools/list_changed`.
     tools_changed: Arc<AtomicBool>,
+    observer: std::sync::OnceLock<Arc<dyn ToolCallObserver>>,
 }
 
 impl McpClient {
@@ -196,7 +205,14 @@ impl McpClient {
             workspace_root: workspace_root.to_string(),
             connection: RwLock::new(None),
             tools_changed: Arc::new(AtomicBool::new(false)),
+            observer: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Install the observer told about this server's tool calls. One per
+    /// client; a second is refused (returns `false`).
+    pub fn set_observer(&self, observer: Arc<dyn ToolCallObserver>) -> bool {
+        self.observer.set(observer).is_ok()
     }
 
     /// The server name (used as the tool namespace prefix).
@@ -287,7 +303,6 @@ impl McpClient {
     }
 
     /// Read one resource from the remote MCP server.
-    #[allow(dead_code)] // For the timer integration, which reads resources.
     pub async fn read_resource(&self, uri: &str) -> Result<ReadResourceResult> {
         let params = ReadResourceRequestParams::new(uri);
         self.run("resources/read", |c| {
@@ -305,7 +320,6 @@ impl McpClient {
     /// recovering from a dead transport — it ends with
     /// [`SubscriptionEnd::Abrupt`], and the caller listens again. Only a
     /// 2026-07-28 server serves this; a legacy one answers method-not-found.
-    #[allow(dead_code)] // For the timer integration, which listens.
     pub async fn listen(&self, filter: SubscriptionFilter) -> Result<Subscription> {
         self.run("subscriptions/listen", |c| {
             let filter = filter.clone();
@@ -597,7 +611,6 @@ pub fn tool_result_text(result: &CallToolResult) -> Result<String> {
 
 /// The text of a resource read: the text contents joined by newlines.
 /// Binary (`blob`) contents are skipped.
-#[allow(dead_code)] // For the timer integration, which reads resources.
 pub fn resource_text(result: &ReadResourceResult) -> String {
     result
         .contents
@@ -637,6 +650,9 @@ impl Tool for McpTool {
 
     async fn execute(&self, input: &serde_json::Value) -> Result<String> {
         let result = self.client.call_tool(&self.remote_tool_name, input).await?;
+        if let Some(observer) = self.client.observer.get() {
+            observer.tool_called(&self.remote_tool_name, &result);
+        }
         tool_result_text(&result)
     }
 }

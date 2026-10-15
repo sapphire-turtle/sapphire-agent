@@ -143,10 +143,8 @@ pub struct Config {
     /// satellite regardless of which room_profile they connect to.
     #[serde(default)]
     pub voice: VoiceConfig,
-    /// Timer / Pomodoro presets. Single-slot in-memory timers fired from
-    /// the `timer_*` tools — Pomodoro cycles drop into [[timer.preset]]
-    /// blocks so the user can say "ポモドーロ開始" instead of redeclaring
-    /// "25分集中 + 5分休憩を3回" every time.
+    /// Which MCP server is the timer (sapphire-timer), for announcing its
+    /// events. Presets live in sapphire-timer.
     #[serde(default)]
     pub timer: TimerConfig,
     /// Ambient (always-on) audio capture ingest configuration.
@@ -1258,39 +1256,22 @@ fn default_preserve_recent() -> usize {
 // Digest config
 // ---------------------------------------------------------------------------
 
-/// Timer presets (Pomodoro etc.). Each preset names a sequence of
-/// `[label, minutes]` steps and a repeat count. Single-shot timers
-/// don't need a preset — they take `minutes` + `message` directly via
-/// the `timer_set` tool.
+/// Timer notifications. The timer itself runs in sapphire-timer, reached as
+/// one of `[[tools.mcp_servers]]`; this names which one, so the agent can
+/// announce its step and finish events on the channel each timer was set
+/// from.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct TimerConfig {
-    /// Named presets referenced by the `timer_preset` tool.
-    #[serde(default, rename = "preset")]
-    pub presets: Vec<TimerPreset>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct TimerPreset {
-    /// Unique preset name (matched case-insensitively against the
-    /// `name` argument of `timer_preset`).
-    pub name: String,
-    /// How many times to repeat the `steps` sequence. Default 1.
-    #[serde(default = "default_timer_cycles")]
-    pub cycles: u32,
-    /// Ordered steps fired once per cycle.
-    pub steps: Vec<TimerStep>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct TimerStep {
-    /// Short label surfaced in the fire prompt (e.g. "Focus", "Break").
-    pub label: String,
-    /// Step duration in minutes. Fractional minutes are allowed.
-    pub minutes: f64,
-}
-
-fn default_timer_cycles() -> u32 {
-    1
+    /// Name of the `[[tools.mcp_servers]]` entry that is a sapphire-timer
+    /// server. Unset: no timer notifications (the server's tools, if
+    /// configured, still work).
+    #[serde(default)]
+    pub server: Option<String>,
+    /// `[[timer.preset]]` from before presets moved to sapphire-timer.
+    /// Accepted so an old config still loads, never used: start-up warns
+    /// that it is ignored.
+    #[serde(default, rename = "preset", skip_serializing)]
+    pub retired_presets: Option<toml::Value>,
 }
 
 /// Frontmatter-digest injection & generation config.
@@ -3323,6 +3304,28 @@ model = "gemma-4-31b-it"
         );
         // Reported, never fatal: the rest of the file still took effect.
         assert_eq!(loaded.config.room_profiles["default"].profile, "local");
+    }
+
+    /// An old config with `[[timer.preset]]` still loads. The presets moved
+    /// to sapphire-timer; they are kept aside (start-up warns about them
+    /// once, by name) rather than reported as unknown keys one by one.
+    #[test]
+    fn retired_timer_presets_load_and_are_set_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let host_path = dir.path().join("config.toml");
+        std::fs::write(
+            &host_path,
+            "[anthropic]\napi_key = \"sk-test\"\n\n\
+             [timer]\nserver = \"timer\"\n\n\
+             [[timer.preset]]\nname = \"pomodoro\"\ncycles = 4\n\
+             steps = [{ label = \"Focus\", minutes = 25 }]\n",
+        )
+        .unwrap();
+
+        let loaded = Config::load_layered(&host_path).unwrap();
+        assert!(loaded.unknown.is_empty(), "{:?}", loaded.unknown);
+        assert_eq!(loaded.config.timer.server.as_deref(), Some("timer"));
+        assert!(loaded.config.timer.retired_presets.is_some());
     }
 
     /// A key serde accepts under another spelling must not be reported.

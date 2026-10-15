@@ -417,6 +417,14 @@ async fn main() -> Result<()> {
         );
     }
 
+    if config.timer.retired_presets.is_some() {
+        tracing::warn!(
+            "Ignoring [[timer.preset]] in the config: timer presets moved to sapphire-timer, \
+             which the agent reaches through `[timer] server`. Recreate them there (its \
+             `preset_add` tool) and remove them from this file."
+        );
+    }
+
     if config.standby_mode == Some(true) {
         anyhow::bail!(
             "config at {} sets `standby_mode = true`, which was removed in the \
@@ -569,22 +577,40 @@ async fn main() -> Result<()> {
                 tracing::warn!("Initial workspace re-index failed: {e}");
             }
 
-            // ── Timer manager (single-slot, in-memory) ──────────────────────
-            // Built before the tool set so the timer_* tools can hold an
-            // `Arc<TimerManager>`. The agent / serve_state refs are
-            // installed below once those are constructed (Weak both ways).
-            let timer_manager = timer::TimerManager::new();
-
             // ── Tools ───────────────────────────────────────────────────────
             let tool_set = tools::default_tool_set(
                 Arc::clone(&ws_state),
                 config.tools.tavily_api_key.clone(),
                 &config.tools.mcp_servers,
-                Arc::clone(&timer_manager),
-                config.timer.presets.clone(),
                 config.day_boundary_hour,
             )
             .await;
+
+            // ── Timer notifications (sapphire-timer over MCP) ───────────────
+            // The timer runs in the MCP server `[timer] server` names; the
+            // LLM drives it through that server's `mcp__<server>__timer_*`
+            // tools. The bridge records where each run was started from and
+            // announces its step / finish events there. The agent and
+            // serve_state refs are installed into the dispatcher below, once
+            // those exist (Weak both ways).
+            let timer_dispatch = timer::ChannelDispatch::new();
+            if let Some(server) = &config.timer.server {
+                match tool_set.mcp_client(server) {
+                    Some(client) => {
+                        timer::TimerBridge::new(Arc::clone(&timer_dispatch) as _).spawn(client)
+                    }
+                    None if config.tools.mcp_servers.iter().any(|s| &s.name == server) => {
+                        tracing::warn!(
+                            "[timer] server '{server}' did not connect at start-up; timer \
+                             notifications are off until the agent restarts"
+                        )
+                    }
+                    None => tracing::warn!(
+                        "[timer] server '{server}' names no entry in [[tools.mcp_servers]]; \
+                         timer notifications are off"
+                    ),
+                }
+            }
 
             // ── Subagents ─────────────────────────────────────────────────
             // Loaded from `<workspace>/agents/*.md` — same shape as
@@ -939,9 +965,9 @@ async fn main() -> Result<()> {
                 acp_session_store,
                 subagent_cache,
             ));
-            // Wire serve_state into the timer manager so voice-origin
-            // timers can push fire messages back to their satellite.
-            timer_manager.set_serve_state(Arc::downgrade(&serve_state));
+            // Wire serve_state into the timer dispatcher so voice-origin
+            // timers can push their messages back to the satellite.
+            timer_dispatch.set_serve_state(Arc::downgrade(&serve_state));
             acp_tunnel.attach(Arc::clone(&serve_state));
             chat_tunnel.attach(Arc::clone(&serve_state));
 
@@ -1045,9 +1071,9 @@ async fn main() -> Result<()> {
                     Arc::clone(&channel_session_store),
                     image_cache.clone(),
                 ));
-                // Wire the agent into the timer manager so chat-origin
-                // timers fire through `Agent::trigger`.
-                timer_manager.set_agent(Arc::downgrade(&agent));
+                // Wire the agent into the timer dispatcher so chat-origin
+                // timers are announced through `Agent::trigger`.
+                timer_dispatch.set_agent(Arc::downgrade(&agent));
 
                 // ── refresh_system_prompt ───────────────────────────────
                 // Registered here, right after the agent is built, and

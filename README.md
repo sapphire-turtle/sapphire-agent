@@ -13,7 +13,7 @@ A personal AI assistant agent that works on file-based, local-first [`sapphire-f
 - **Channels**: Matrix (E2EE via `matrix-sdk`) and Discord (`serenity`), running concurrently.
 - **Providers**: Anthropic Messages API with SSE streaming and a multi-round tool-use loop, plus OpenAI-compatible backends (local LLMs, OpenRouter, …) selectable per room/session via the `[providers]` / `[profiles]` / `[room_profile]` schema.
 - **Workspace**: backed by [`sapphire-framework`](https://github.com/sapphire-turtle/sapphire-framework) — file index, full-text + vector search (redb + tantivy, plus LanceDB vectors by default).
-- **Built-in tools**: `file_read`, `file_write`, `file_append`, `file_delete`, `dir_list`, `dir_walk`, `shell`, `timer_set` / `timer_preset` / `timer_cancel` / `timer_status` (incl. Pomodoro presets), plus workspace memory / search / sync tools. The seven that touch a filesystem or a shell (`file_read`, `file_write`, `file_append`, `file_delete`, `dir_list`, `dir_walk`, `shell`) plus `shell_start` / `shell_output` / `shell_kill` for long-running commands are **session-routed: which machine they reach is decided by the session, not by the name**. Inside an ACP session they act on the machine the connected editor is running on, over `/acp`'s `fs/*` and `terminal/*` requests, and only for the capabilities that editor declared at `initialize` — with no fallback to the agent's own disk when one is missing. Everywhere else (Matrix, Discord, `/rpc`, voice, `/a2a`, heartbeat, autonomous, subagents) they act on this agent's own machine, and are opt-in: `[tools.host_access] enabled = false` by default, for every origin. Turning that on is a deliberate act; running the agent in a container is the recommended way to do it once it is. See [Shell and file tools: whose machine](#shell-and-file-tools-whose-machine) below.
+- **Built-in tools**: `file_read`, `file_write`, `file_append`, `file_delete`, `dir_list`, `dir_walk`, `shell`, plus workspace memory / search / sync tools. The seven that touch a filesystem or a shell (`file_read`, `file_write`, `file_append`, `file_delete`, `dir_list`, `dir_walk`, `shell`) plus `shell_start` / `shell_output` / `shell_kill` for long-running commands are **session-routed: which machine they reach is decided by the session, not by the name**. Inside an ACP session they act on the machine the connected editor is running on, over `/acp`'s `fs/*` and `terminal/*` requests, and only for the capabilities that editor declared at `initialize` — with no fallback to the agent's own disk when one is missing. Everywhere else (Matrix, Discord, `/rpc`, voice, `/a2a`, heartbeat, autonomous, subagents) they act on this agent's own machine, and are opt-in: `[tools.host_access] enabled = false` by default, for every origin. Turning that on is a deliberate act; running the agent in a container is the recommended way to do it once it is. See [Shell and file tools: whose machine](#shell-and-file-tools-whose-machine) below.
 - **Sessions**: human-readable [`grain-id`](https://crates.io/crates/grain-id) aliases, auto-generated titles, history dump on resume.
 - **Background**: heartbeat cron tasks, periodic memory compaction, periodic workspace re-index, daily / weekly / monthly / yearly logs with catch-up.
 - **Voice**: a server-side STT → turn → TTS pipeline (`voice/*` on `/rpc`) with local STT/TTS via `sherpa-onnx`, for networked voice clients. The `sapphire-agent-cli voice` satellite and the desktop's voice input / spoken replies were dropped when the local clients moved to IPC ([#278](https://github.com/sapphire-turtle/sapphire-agent/issues/278)); the satellite role moves to wearable device firmware.
@@ -572,6 +572,31 @@ It is per server rather than per tool for a smaller reason: a list of tool
 names would go stale the moment the server added a tool, and it would go stale
 *silently* — the new tool falls back to `none`, is refused, and looks like the
 server being broken. Coarser, but it cannot rot.
+
+#### Timers (sapphire-timer)
+
+Timers and Pomodoro presets are not built in: they run in
+[sapphire-timer](https://github.com/sapphire-turtle/sapphire-timer), added as an
+ordinary MCP server, whose `timer_*` and `preset_*` tools the agent calls like
+any other. Naming that server in `[timer] server` lets the agent also *announce*
+the timer: it subscribes to sapphire-timer's `sapphire-timer://active` resource,
+and when a step or the whole run ends it sends a message to the room or voice
+satellite the timer was started from.
+
+```toml
+[[tools.mcp_servers]]
+name    = "timer"
+type    = "stdio"
+command = "sapphire-timer"
+args    = ["mcp"]
+trust   = "edit"
+
+[timer]
+server = "timer"
+```
+
+`[[timer.preset]]` from older configs is ignored with a warning at start-up;
+recreate those presets in sapphire-timer with its `preset_add` tool.
 
 Nothing about `decide` changes. A `read` server's tools take the same path
 `workspace_search` already takes, and an `edit` server's take `file_write`'s.

@@ -8,7 +8,6 @@ pub mod policy;
 pub mod session_tools;
 pub mod skill_tools;
 pub mod subagent;
-pub mod timer_tools;
 pub mod workspace_tools;
 
 use crate::config::McpServerConfig;
@@ -228,6 +227,11 @@ impl ToolSet {
         Ok(())
     }
 
+    /// The connected client for the MCP server called `name`, if it connected.
+    pub fn mcp_client(&self, name: &str) -> Option<Arc<McpClient>> {
+        self.mcp_clients.iter().find(|c| c.name() == name).cloned()
+    }
+
     /// Names of configured MCP servers (for tool discovery / error messages).
     pub fn mcp_server_names(&self) -> Vec<String> {
         self.mcp_clients
@@ -299,23 +303,17 @@ impl ToolSet {
 /// `tavily_api_key`: if provided, the `web_search` tool is included.
 /// `mcp_servers`: external MCP servers whose tools are registered with the
 /// naming convention `mcp__<name>__<tool_name>`.
-/// `timer_manager` + `timer_presets`: drive the `timer_*` tools. Manager
-/// is shared with `main` so the agent/serve fire dispatchers can be
-/// wired in after construction.
 /// `day_boundary_hour`: what `current_time` reports as the agent's
 /// logical day.
 pub async fn default_tool_set(
     state: Arc<sapphire_framework::workspace::WorkspaceState>,
     tavily_api_key: Option<String>,
     mcp_servers: &[McpServerConfig],
-    timer_manager: Arc<crate::timer::TimerManager>,
-    timer_presets: Vec<crate::config::TimerPreset>,
     day_boundary_hour: u8,
 ) -> Arc<ToolSet> {
     use builtin_tools::*;
     use client_tools::*;
     use session_tools::CurrentTimeTool;
-    use timer_tools::*;
     use workspace_tools::*;
 
     let workspace_root = state.workspace.root.clone();
@@ -340,13 +338,6 @@ pub async fn default_tool_set(
         Box::new(ClientShellOutput::new()),
         Box::new(ClientShellKill::new()),
         Box::new(WeatherTool::new()),
-        Box::new(TimerSetTool::new(Arc::clone(&timer_manager))),
-        Box::new(TimerPresetTool::new(
-            Arc::clone(&timer_manager),
-            timer_presets,
-        )),
-        Box::new(TimerCancelTool::new(Arc::clone(&timer_manager))),
-        Box::new(TimerStatusTool::new(Arc::clone(&timer_manager))),
     ];
 
     if let Some(key) = tavily_api_key {
@@ -461,8 +452,6 @@ mod tests {
             test_workspace(),
             Some("test-tavily-key".to_string()),
             &[],
-            crate::timer::TimerManager::new(),
-            Vec::new(),
             4,
         )
         .await;
@@ -488,10 +477,6 @@ mod tests {
             ("shell_kill", ToolKind::Execute),
             ("shell_output", ToolKind::Read),
             ("shell_start", ToolKind::Execute),
-            ("timer_cancel", ToolKind::Delete),
-            ("timer_preset", ToolKind::Edit),
-            ("timer_set", ToolKind::Edit),
-            ("timer_status", ToolKind::Search),
             ("weather", ToolKind::Fetch),
             ("web_search", ToolKind::Fetch),
             ("workspace_search", ToolKind::Search),
