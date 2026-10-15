@@ -4226,8 +4226,7 @@ mod tests {
     /// `[tools.admin].room_profiles` set to `profiles`. The framework
     /// workspace the tool writes through is opened over the same
     /// directory (`Workspace::from_root` needs the `.sapphire-agent`
-    /// marker), with a cache dir under the leaked test TempDir so the
-    /// redb files it creates are reclaimed with the process.
+    /// marker), with a shared cache dir under the system temp dir.
     ///
     /// The returned `TempDir` must be held: it is the only thing keeping
     /// the workspace directory (and everything pointing into it) alive.
@@ -4235,11 +4234,14 @@ mod tests {
     async fn scripted_state_with_agent_config(
         profiles: Vec<String>,
     ) -> (Arc<ServeState>, Box<tempfile::TempDir>) {
-        static TEST_CTX: std::sync::OnceLock<sapphire_framework::workspace::AppContext> =
-            std::sync::OnceLock::new();
-        let ctx = TEST_CTX.get_or_init(|| {
-            sapphire_framework::workspace::AppContext::new("sapphire-agent").allow_external_paths()
-        });
+        static TEST_CTX: sapphire_framework::workspace::AppContext =
+            sapphire_framework::workspace::AppContext::new("sapphire-agent").allow_external_paths();
+        let ctx = &TEST_CTX;
+        // First writer wins, so the cache dir must not live inside any one
+        // call's TempDir: the first test to finish would delete it out
+        // from under the other's still-open redb files (Access denied on
+        // Windows).
+        ctx.set_cache_dir(std::env::temp_dir().join("sapphire-agent-serve-test-cache"));
 
         let state = ServeState::for_test_scripted(
             true,
@@ -4268,7 +4270,6 @@ mod tests {
         // not this one — the tool's `workspace_root` is what matters, so
         // point both at the same root.
         std::fs::create_dir_all(root.join(".sapphire-agent")).unwrap();
-        ctx.set_cache_dir(root.join(".sapphire-agent-cache"));
 
         let mut config = state.config.clone();
         config.tools.admin.room_profiles = profiles;
