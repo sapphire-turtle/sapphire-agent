@@ -73,7 +73,7 @@ serde_ignored = "0.1"
 serde_norway = "0.9"
 
 # Cron expression parsing (heartbeat schedules)
-cron = "0.16"
+cron = "0.17"
 
 # Error handling
 anyhow.workspace = true
