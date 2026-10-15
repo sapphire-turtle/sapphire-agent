@@ -26,11 +26,12 @@
 # It may set everything this file can except credentials: any key named
 # like one — `api_key`, `api_keys`, `*_api_key`, `*_token`, `secret`,
 # `password`, `recovery_key`, at any depth, including an MCP server's `env`
-# entries — `workspace_dir`, and `[tools.host_access]`, which each device
-# grants for itself. If the workspace file sets one, it is ignored and
-# named in a warning at startup. So a deployment can keep
-# providers (base_url included), profiles, room profiles, MCP servers and
-# tool settings in the shared file, and only the keys here:
+# entries — `workspace_dir`, `[tools.host_access]`, which each device
+# grants for itself, and `[serve]`, this machine's bind address. If the
+# workspace file sets one, it is ignored and named in a warning at startup.
+# So a deployment can keep providers (base_url included), profiles, room
+# profiles, MCP servers and tool settings in the shared file, and only the
+# keys here:
 #
 #   [providers.local]
 #   api_key = "..."
@@ -678,6 +679,18 @@ steps  = [
 #   { label = "Focus",      minutes = 50 },
 #   { label = "Break",      minutes = 10 },
 # ]
+
+# HTTP API (`/rpc`, `/a2a`, `/acp`, ambient ingest). Off unless this table
+# is present (or `serve --bind <addr>` is passed): the local clients —
+# `chat`, `acp`, the desktop — reach the agent over its IPC endpoint and
+# need no port, so an agent without [serve] opens none. That also lets
+# several agents share one host (one per OS user) without colliding on a
+# port; give each that needs HTTP its own `port`. Network clients (voice
+# devices, A2A peers, `/acp` from another machine, ambient ingest) need it.
+# Keep it in this host-local file: a bind address is one machine's.
+# [serve]
+# host = "127.0.0.1"   # default
+# port = 3170          # default
 
 # Agent Client Protocol endpoint (GET /acp, WebSocket).
 # Lets an ACP client such as Zed drive this agent. Authentication resolves

@@ -336,6 +336,11 @@ fn error_event(id: &Value, code: i32, message: &str) -> Event {
 // Router entry point
 // ---------------------------------------------------------------------------
 
+/// `addr` is `None` when no HTTP listener is configured (no `[serve]`
+/// table and no `--bind`): the agent then serves only its local IPC
+/// endpoint and channels, and this waits for shutdown without binding a
+/// port — several agents (one per OS user, say) can share a host that way.
+///
 /// `extra` mounts the ambient audio ingest router (`POST /audio/ingest`,
 /// `POST /audio/hello`) alongside `/rpc`, when the subsystem started.
 /// It is a plain `Router` — not a field on `ServeState` — because the
@@ -345,7 +350,7 @@ fn error_event(id: &Value, code: i32, message: &str) -> Event {
 /// own `.with_state()` call, which is what makes `.merge` valid here
 /// despite the two states having nothing in common.
 pub async fn run(
-    addr: String,
+    addr: Option<String>,
     state: Arc<ServeState>,
     extra: Option<axum::Router>,
     shutdown: tokio_util::sync::CancellationToken,
@@ -370,9 +375,16 @@ pub async fn run(
         app = app.merge(extra);
     }
 
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    info!("sapphire-agent: API server listening on http://{addr}");
     spawn_session_residency_log(Arc::clone(&state));
+    let Some(addr) = addr else {
+        info!("sapphire-agent: HTTP API disabled (no [serve] in config)");
+        shutdown.cancelled().await;
+        return Ok(());
+    };
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to listen on {addr} (from [serve] or --bind): {e}"))?;
+    info!("sapphire-agent: API server listening on http://{addr}");
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             shutdown.cancelled().await;
@@ -3947,6 +3959,20 @@ mod tests {
     use super::*;
     use crate::acp_session::{EventBody, StoredPart};
     use crate::provider::{Role, UserInputKind};
+
+    /// Without `[serve]` there is no address, and `run` must neither bind
+    /// nor return early: it is what `serve` waits on, so returning before
+    /// shutdown would stop the whole agent.
+    #[tokio::test]
+    async fn without_an_address_run_waits_for_shutdown_and_binds_nothing() {
+        let state = ServeState::for_test_scripted(false, Vec::new());
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let task = tokio::spawn(run(None, state, None, shutdown.clone()));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!task.is_finished(), "run returned before shutdown");
+        shutdown.cancel();
+        task.await.unwrap().unwrap();
+    }
 
     /// A refused tool still gets a `tool_result`, and the turn carries
     /// on. Refusing must not look to the model like the tool vanished,
