@@ -86,7 +86,7 @@ host-local, so rather than writing that file `init` prints it for you to place
 at `~/.config/sapphire-agent/config.toml` (on Linux). Everything else —
 providers, profiles, channels, MCP servers — can go in either file; the
 workspace's `.sapphire-agent/config.toml` refuses only credentials,
-`workspace_dir` and `[tools.host_access]`. See `config.example.toml`.
+`workspace_dir`, `[tools.host_access]` and `[serve]`. See `config.example.toml`.
 
 Then:
 

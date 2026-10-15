@@ -5,7 +5,7 @@ Date: 2026-08-21
 > **Superseded in part (2026-10-15).** The allowlist below was replaced by a
 > denylist: the workspace layer now refuses only credentials (keys named
 > `api_key`, `api_keys`, `*_api_key`, `*_token`, `secret`, `password`,
-> `recovery_key`, at any depth), `workspace_dir` and `[tools.host_access]`.
+> `recovery_key`, at any depth), `workspace_dir`, `[tools.host_access]` and `[serve]`.
 > Providers (including `base_url`), MCP servers and `[tools.admin]` are
 > shareable, so write access to the workspace config is now equivalent to
 > code execution on every syncing host — accepted deliberately, so that one

@@ -26,11 +26,12 @@
 # It may set everything this file can except credentials: any key named
 # like one — `api_key`, `api_keys`, `*_api_key`, `*_token`, `secret`,
 # `password`, `recovery_key`, at any depth, including an MCP server's `env`
-# entries — `workspace_dir`, and `[tools.host_access]`, which each device
-# grants for itself. If the workspace file sets one, it is ignored and
-# named in a warning at startup. So a deployment can keep
-# providers (base_url included), profiles, room profiles, MCP servers and
-# tool settings in the shared file, and only the keys here:
+# entries — `workspace_dir`, `[tools.host_access]`, which each device
+# grants for itself, and `[serve]`, this machine's bind address. If the
+# workspace file sets one, it is ignored and named in a warning at startup.
+# So a deployment can keep providers (base_url included), profiles, room
+# profiles, MCP servers and tool settings in the shared file, and only the
+# keys here:
 #
 #   [providers.local]
 #   api_key = "..."
