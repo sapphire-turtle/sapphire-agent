@@ -81,7 +81,7 @@ sapphire-agent init ~/sapphire-workspace
 
 ```sh
 sapphire-agent verify   # 設定とワークスペースのサニティチェック
-sapphire-agent          # チャネルリスナー＋HTTP制御APIを開始
+sapphire-agent serve    # チャネルリスナー＋HTTP制御APIを開始
 sapphire-agent chat     # そのエージェントとの対話セッション（[cli].room_profile が必要）
 ```
 
