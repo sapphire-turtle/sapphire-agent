@@ -391,8 +391,8 @@ async fn main() -> Result<()> {
     if !rejected.is_empty() {
         tracing::warn!(
             "Ignoring {} key(s) in the workspace config at {} that the workspace layer may not \
-             set: {}. API keys and other credentials, `workspace_dir` and `[tools.host_access]` \
-             are host-local by design; set them in {} instead.",
+             set: {}. API keys and other credentials, `workspace_dir`, `[tools.host_access]` \
+             and `[serve]` are host-local by design; set them in {} instead.",
             rejected.len(),
             workspace_path
                 .as_deref()

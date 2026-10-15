@@ -45,7 +45,11 @@ pub const CREDENTIAL_SUFFIXES: &[&str] = &["_api_key", "_token", "_secret", "_pa
 /// - `tools.host_access` hands the agent this machine's shell and
 ///   filesystem. Whether a device grants that is the device's own decision,
 ///   not one a synced file makes for every host at once.
-pub const HOST_ONLY_PATHS: &[&[&str]] = &[&["workspace_dir"], &["tools", "host_access"]];
+/// - `serve` is the HTTP bind address, which belongs to one machine and one
+///   OS user: two agents syncing the same workspace on one host would
+///   otherwise both try to listen on the port it names.
+pub const HOST_ONLY_PATHS: &[&[&str]] =
+    &[&["workspace_dir"], &["tools", "host_access"], &["serve"]];
 
 /// True when `key` names a credential. See [`CREDENTIAL_KEYS`].
 pub fn is_credential_key(key: &str) -> bool {
@@ -402,6 +406,8 @@ mod tests {
         assert!(!path_allowed(&["workspace_dir"]));
         assert!(!path_allowed(&["tools", "host_access"]));
         assert!(!path_allowed(&["tools", "host_access", "enabled"]));
+        assert!(!path_allowed(&["serve", "port"]));
+        assert!(!path_allowed(&["serve", "host"]));
         // The rest of `[tools]` is shared.
         assert!(path_allowed(&["tools", "tool_rounds", "unattended"]));
     }
