@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0](https://github.com/sapphire-turtle/sapphire-agent/compare/v0.9.0...v0.10.0) - 2026-10-15
+
+### Added
+
+- [**breaking**] *(timer)* Drive timers through sapphire-timer over MCP
+- *(config)* Share everything but credentials through the workspace config
+- *(providers)* Make the built-in Anthropic provider optional
+- [**breaking**] *(serve)* Open the HTTP API only when [serve] is configured
+- *(config)* Keep [serve] out of the workspace layer
+
+### Changed
+
+- *(mcp)* Move the MCP client onto rmcp
+
+
+
 ## [0.9.0](https://github.com/sapphire-turtle/sapphire-agent/compare/v0.8.0...v0.9.0) - 2026-10-15
 
 ### Added
