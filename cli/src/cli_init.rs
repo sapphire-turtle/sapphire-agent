@@ -112,9 +112,9 @@ pub fn host_config_snippet(workspace_dir: &Path) -> String {
     format!(
         "# Host-local configuration for sapphire-agent.\n\
          #\n\
-         # Everything the workspace may not carry: the API key, bind addresses,\n\
-         # MCP servers, channel credentials, and where the workspace itself is.\n\
-         # See config.example.toml for the rest.\n\
+         # What the workspace may not carry: API keys and other credentials,\n\
+         # and where the workspace itself is. Everything else can live in the\n\
+         # workspace's .sapphire-agent/config.toml (see config.example.toml).\n\
          \n\
          workspace_dir = {dir}\n\
          \n\
@@ -253,9 +253,9 @@ mod tests {
     }
 
     /// The template tells the operator which settings this layer may set, and
-    /// the allowlist decides. A key documented here but refused there would be
-    /// silently dropped with a startup warning — so the template is checked
-    /// against the allowlist rather than against a copy of it.
+    /// the credential filter decides. A key documented here but refused there
+    /// would be silently dropped with a startup warning — so the template is
+    /// checked against the filter rather than against a copy of it.
     #[test]
     fn every_setting_the_workspace_config_documents_is_one_that_layer_may_set() {
         let d = tempfile::tempdir().unwrap();

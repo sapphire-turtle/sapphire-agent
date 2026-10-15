@@ -2,6 +2,15 @@
 
 Date: 2026-08-21
 
+> **Superseded in part (2026-10-15).** The allowlist below was replaced by a
+> denylist: the workspace layer now refuses only credentials (keys named
+> `api_key`, `api_keys`, `*_api_key`, `*_token`, `secret`, `password`,
+> `recovery_key`, at any depth), `workspace_dir` and `[tools.host_access]`.
+> Providers (including `base_url`), MCP servers and `[tools.admin]` are
+> shareable, so write access to the workspace config is now equivalent to
+> code execution on every syncing host — accepted deliberately, so that one
+> shared file can describe the whole deployment. See `cli/src/config_layer.rs`.
+
 ## Context
 
 Phase 2 of `docs/superpowers/specs/2026-08-20-zed-acp-remote-workspace-roadmap.md`.

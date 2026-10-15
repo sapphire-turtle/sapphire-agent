@@ -1,12 +1,17 @@
 # Workspace-level configuration for sapphire-agent.
 #
-# This file travels with the workspace. It may only set what describes the
-# agent — its model, behaviour, routing and namespaces. Credentials, bind
-# addresses, MCP servers and machine paths are host-local: if this file
-# sets one it is dropped and named in a warning at startup. Run
-# `sapphire-agent verify` to see where each effective value came from.
+# This file travels with the workspace. It may set anything the host-local
+# config can — providers and their endpoints, profiles, routing, MCP servers,
+# tools — except credentials: a key named like one (`api_key`, `api_keys`,
+# `*_api_key`, `*_token`, `secret`, `password`, …, at any depth),
+# `workspace_dir` and `[tools.host_access]` (each device decides whether the
+# agent may use its shell) are dropped and named in a warning at startup.
+# Put those in the host-local config, which is layered over this file and
+# wins wherever both set a key. Run `sapphire-agent verify` to see where each effective
+# value came from.
 #
-# Every commented setting below is one this layer is allowed to set.
+# Because this file can define MCP servers and `[tools.admin]`, whoever can
+# write it can run commands on every host that syncs the workspace. Treat write access to it accordingly.
 
 # Heartbeat cron tasks are off in a fresh workspace, so a test rig sharing
 # a machine with a live agent cannot fire duplicate scheduled tasks. Turn
@@ -41,12 +46,6 @@ heartbeat_enabled = false
 # poll_seconds = 60
 # origin = "trusted"   # "trusted" (everything, needs [tools] host_access) | "channel" (no shell)
 
-# The config tools (`heartbeat_config`, `autonomous_config`, `agent_config`,
-# `task_test`) are not configured here: who may run them is the same
-# host-local decision as the API key or the bind address, so `[tools.admin]`
-# belongs in the host config. Written here it is outside this layer's
-# allowlist and is dropped with a warning at startup.
-
 # The agent's model and framing. The API key itself is host-local.
 # [anthropic]
 # model = "claude-sonnet-5"
@@ -68,3 +67,13 @@ heartbeat_enabled = false
 # namespace they read. `default` catches everything not listed elsewhere.
 # [room_profile.default]
 # memory_namespace = "default"
+
+# An OpenAI-compatible provider and a profile that uses it. Its `api_key`
+# goes under the same `[providers.<name>]` in the host-local config.
+# [providers.local]
+# type = "openai_compatible"
+# base_url = "http://127.0.0.1:8080/v1"
+# model = "qwen"
+#
+# [profiles.local]
+# provider = "local"

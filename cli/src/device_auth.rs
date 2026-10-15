@@ -10,10 +10,8 @@
 //!
 //! Which room profile a device runs under is config data, not ledger data:
 //! `[room_profile.<n>].devices`, naming an external device by name or id.
-//! That routing array is one of the few settings the workspace layer may
-//! also set (`config_layer::WORKSPACE_ALLOWLIST` allowlists
-//! `room_profile.*.devices` deliberately) — it is not host-only, just never
-//! ledger data.
+//! That routing array is shared through the workspace layer like every other
+//! non-credential setting — it is not host-only, just never ledger data.
 //!
 //! The ledger is synced and can change under a running agent (a device added
 //! or retired on another host), so the routing is matched against what the
