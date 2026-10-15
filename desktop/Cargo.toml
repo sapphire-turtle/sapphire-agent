@@ -1,6 +1,6 @@
 [package]
 name = "sapphire-agent-desktop"
-version = "0.8.0"
+version = "0.8.1"
 edition.workspace = true
 description = "Desktop GUI client for sapphire-agent (bevy + egui)"
 license-file = "LICENSE"
@@ -14,7 +14,7 @@ path = "src/main.rs"
 [dependencies]
 # The local chat protocol and its client: the desktop talks to the agent
 # running on this host over its IPC endpoint, like `sapphire-agent chat`.
-sapphire-agent-core = { path = "../crates/sapphire-agent-core", version = "0.8.0" }
+sapphire-agent-core = { path = "../crates/sapphire-agent-core", version = "0.9.0" }
 
 # Game engine — needed up front for the eventual 3D character work
 # (desktop-mate-style avatar). For the chat-only first cut we use only

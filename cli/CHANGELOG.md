@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0](https://github.com/sapphire-turtle/sapphire-agent/compare/v0.8.0...v0.9.0) - 2026-10-15
+
+### Added
+
+- [**breaking**] *(desktop)* Talk to the local agent over IPC, like `sapphire-agent chat`
+- [**breaking**] *(cli)* Print the help on a bare invocation instead of starting the server
+- Build and test sapphire-agent on Windows
+- *(acp)* Run every client-side command under bash
+
+### Other
+
+- *(license)* Desktop under GPL-3.0-or-later; license files per component
+
+### Testing
+
+- Clear the clippy findings in test code
+
+
+
 ## [0.8.0](https://github.com/fluo10/sapphire-agent/compare/sapphire-agent-v0.7.2...sapphire-agent-server-v0.8.0) - 2026-09-07
 
 ### Changed
