@@ -821,8 +821,8 @@ fn default_serve_port() -> u16 {
 /// a unit of the deployment, not a room id that has to be translated into
 /// one.
 ///
-/// Host-layer only: `[tools]` is outside the workspace-layer allowlist, so
-/// a synced workspace config cannot hand itself this grant.
+/// Like the rest of `[tools]`, the workspace layer may set this, so whoever
+/// can write the synced workspace config can hand itself this grant.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct AdminToolsConfig {
     /// Room-profile names whose sessions may use the config tools
@@ -2030,7 +2030,7 @@ impl Config {
     ///   treated as absent.
     /// - **The merged document fails to deserialize** into `Config` (a wrong
     ///   type, a required field missing from a table the workspace introduced)
-    ///   — even though every key involved was allowlisted.
+    ///   — even though no key involved was a refused credential.
     /// - **The merged config fails semantic validation**
     ///   (`Config::validate_profiles`) — deserializes fine, references
     ///   something that does not exist.
@@ -3355,8 +3355,8 @@ model = "gemma-4-31b-it"
         );
     }
 
-    /// An unknown key in the workspace layer survives the merge (the
-    /// allowlist admits everything under `memory_namespace`), so it has to
+    /// An unknown key in the workspace layer survives the merge (only
+    /// credentials are filtered out), so it has to
     /// be reported against the merged document — and `layer_of` has to be
     /// able to send the person to the workspace file rather than the host
     /// one they did not write it in.
@@ -3432,7 +3432,7 @@ model = "gemma-4-31b-it"
 
     #[test]
     fn a_workspace_config_that_fails_to_deserialize_falls_back_to_the_host_layer() {
-        // The workspace's bad value for `day_boundary_hour` is fully allowlisted,
+        // The workspace may set `day_boundary_hour`,
         // and the host sets the same key, so `host wins` on the merge already
         // neutralises it before deserialization ever runs. This pins that the
         // fallback decision is made against the *merged* document, not the raw
@@ -3456,7 +3456,7 @@ model = "gemma-4-31b-it"
 
     #[test]
     fn a_workspace_config_that_fails_validation_falls_back_to_the_host_layer() {
-        // `room_profile.*.profile` is allowlisted, but the workspace's chosen
+        // The workspace may set `room_profile.*.profile`, but its chosen
         // profile does not exist. The merged document deserializes fine — it's
         // `Config::validate_profiles` that catches this, one layer past
         // `try_into()`, and it must fall back exactly as a deserialize failure

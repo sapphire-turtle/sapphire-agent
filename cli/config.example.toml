@@ -23,25 +23,26 @@
 # That file is optional. When present its values are used unless this
 # host-local file also sets them, in which case this file wins.
 #
-# It may only set settings that belong to the agent. Credentials
-# ([anthropic].api_key, [matrix], [discord], [tools]), bind addresses,
-# cache and workspace paths, and STT/TTS model paths are host-local: if
-# the workspace file sets one, it is ignored and named in a warning at
-# startup. `[room_profile.<n>].devices` is different: it names external
-# devices by name or id, not a secret, so the workspace layer may set it.
-# The bearer token itself is never stored here — see "External devices"
-# below.
+# It may set everything this file can except credentials: any key named
+# like one — `api_key`, `api_keys`, `*_api_key`, `*_token`, `secret`,
+# `password`, `recovery_key`, at any depth, including an MCP server's `env`
+# entries — `workspace_dir`, and `[tools.host_access]`, which each device
+# grants for itself. If the workspace file sets one, it is ignored and
+# named in a warning at startup. So a deployment can keep
+# providers (base_url included), profiles, room profiles, MCP servers and
+# tool settings in the shared file, and only the keys here:
 #
-# [providers.<n>].base_url is host-local too, and deliberately so even
-# though a private-network DNS name would work from every host: a
-# workspace that could redirect a provider could point it at a hostile
-# server, and that server's replies drive tool calls. Declare each
-# provider completely here — the shared file may refine `model`,
-# `provider_name` and `max_tokens`, not say where the provider lives.
+#   [providers.local]
+#   api_key = "..."
 #
-# Keep each host-local table complete for the same reason the fallback
-# exists: if the shared file is missing or invalid, the agent runs on
-# this file alone, so this file has to be valid on its own.
+# The shared file is input to every host that syncs the workspace, and it
+# can define MCP servers and `[tools.admin]` and point a provider at any
+# endpoint. Whoever can write it can run commands
+# on every such host, so guard write access to it like this file's.
+#
+# If the shared file is missing or invalid, the agent falls back to this
+# file alone, which then has to be valid on its own — a provider table
+# holding only its `api_key` is not, and startup fails with the parse error.
 #
 # `sapphire-agent verify` prints where each setting's effective value came
 # from.
@@ -351,9 +352,8 @@ system_prompt = "You are a helpful personal assistant."
 #     resolves to, an ACP session by the profile its bearer token pinned, and
 #     voice / `/rpc` / A2A / the unattended loops by nothing (refused). Empty
 #     (the default) leaves all of them unregistered, the same shape as
-#     `[tools.host_access]`. Host-layer only: `[tools]` is outside the
-#     workspace-layer allowlist, so a synced workspace config cannot grant
-#     itself this.
+#     `[tools.host_access]`. The workspace layer may set it too, so whoever
+#     can write the synced workspace config can grant itself this.
 #
 #     `room_profiles = ["default"]` is the broad one: it names the implicit
 #     profile that every room no other profile claims falls through to, so
@@ -678,7 +678,7 @@ steps  = [
 # like every other endpoint (token -> external device -> room profile via
 # [room_profile.<name>].devices), and the token that
 # connects selects the room profile the ACP session runs under.
-# Host-local: the workspace config layer cannot set this.
+# The workspace config layer may set this too.
 #
 # Tool permission is NOT configured here. Which tools need approval is
 # decided by what each tool does, and by the session mode the editor picks
@@ -723,6 +723,6 @@ enabled = false
 # `sapphire-agent-desktop` (the GUI) run on the machine the agent runs on and
 # reach it over the local IPC endpoint, the same way `sapphire-agent acp`
 # does, so no token picks their room profile — name it here. Unset, they
-# cannot open a session. Host-local: the workspace layer cannot set it.
+# cannot open a session. The workspace layer may set it too.
 #[cli]
 #room_profile = "default"

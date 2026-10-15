@@ -1,104 +1,87 @@
 //! Layering the workspace-level config under the host-local one.
 //!
-//! Everything here is a pure function over [`toml::Value`]: the allowlist that
-//! bounds what the workspace layer may set, the merge that combines the two
-//! layers, and the provenance calculation that lets `verify` say where a value
-//! came from. Nothing in this module touches the filesystem — `Config::load_layered`
-//! reads the files and calls in.
+//! Everything here is a pure function over [`toml::Value`]: the denylist that
+//! keeps credentials out of the workspace layer, the merge that combines the
+//! two layers, and the provenance calculation that lets `verify` say where a
+//! value came from. Nothing in this module touches the filesystem —
+//! `Config::load_layered` reads the files and calls in.
 
 use std::collections::BTreeMap;
 
-/// TOML key paths the workspace-level config layer is permitted to set.
+/// Key names the workspace layer may never set, wherever they appear.
 ///
-/// An entry authorises that path **and everything beneath it**. A key that must
-/// stay host-only therefore may not sit under any entry, which is why the
-/// `providers` and `room_profile` entries name their permitted leaves one by one
-/// instead of using a bare wildcard — `providers.*` would drag `api_key` in with
-/// it.
-///
-/// `*` matches exactly one path segment.
-///
-/// These are **TOML** names, which are not always the Rust field names: serde
-/// renames `room_profiles` to `room_profile`, `memory_namespaces` to
-/// `memory_namespace`, `voice_pipelines` to `voice_pipeline`, and
-/// `stt_providers` / `tts_providers` to `stt_provider` / `tts_provider`. Whoever
-/// adds voice-identity sharing to this allowlist (issue #173) needs the Rust
-/// name translated the same way, or the new entries will silently miss every
-/// leaf. The fixture test in this module exists to catch a path written in the
-/// wrong namespace.
-pub const WORKSPACE_ALLOWLIST: &[&[&str]] = &[
-    // The agent's identity and model choice.
-    &["anthropic", "model"],
-    &["anthropic", "light_model"],
-    &["anthropic", "max_tokens"],
-    &["anthropic", "system_prompt"],
-    // Behaviour.
-    &["compression"],
-    &["day_boundary_hour"],
-    &["session_policy"],
-    &["daily_log_enabled"],
-    &["memory_compaction_enabled"],
-    &["heartbeat_enabled"],
-    // The autonomous loop's switch and cadence. Allowed for the same
-    // reason `heartbeat_enabled` is: it describes how the agent behaves,
-    // not where its credentials live. The cost of allowing it is that
-    // whoever can write the workspace can set `enabled = true` and
-    // `idle_minutes = 0` — the same power `heartbeat_enabled` already
-    // hands them, so not a new hole (design doc, risk 5).
-    &["autonomous"],
-    &["sync_interval_minutes"],
-    &["digest"],
-    &["timer"],
-    // Routing and namespaces.
-    &["profiles"],
-    &["memory_namespace"],
-    &["room_profile", "*", "profile"],
-    &["room_profile", "*", "memory_namespace"],
-    &["room_profile", "*", "rooms"],
-    // Routing, like `rooms` above — which device runs under which profile. Not
-    // a credential: the tokens belong to the bridge's external devices, so a
-    // poisoned workspace layer can re-route a device but cannot admit one.
-    &["room_profile", "*", "devices"],
-    &["room_profile", "*", "session_policy"],
-    &["room_profile", "*", "voice_pipeline"],
-    // Provider refinements. `api_key` and `base_url` are deliberately absent:
-    // the endpoint a provider talks to is the one thing that turns a shareable
-    // config into remote code execution, because a redirected provider's
-    // responses drive tool calls and the tool set includes `shell`. The host
-    // decides where a provider lives; the workspace may only refine what it
-    // does there.
-    &["providers", "*", "type"],
-    &["providers", "*", "model"],
-    &["providers", "*", "provider_name"],
-    &["providers", "*", "max_tokens"],
-    // Which named STT/TTS provider a pipeline uses. The providers themselves are
-    // host-only because they name model files on disk (see issue #173).
-    &["voice_pipeline"],
+/// The workspace config is shared: everything that describes the agent —
+/// providers and their endpoints, profiles, room routing, MCP servers, tool
+/// settings — travels with it, and each host only adds its secrets. A key is
+/// a secret by its **name**, not its position, so a credential field added
+/// later under any table is caught without touching this list, as long as it
+/// is spelled like one (see [`CREDENTIAL_SUFFIXES`]). Names are compared
+/// case-insensitively, which also covers an MCP server's `env` table
+/// (`GITHUB_TOKEN = "…"`).
+pub const CREDENTIAL_KEYS: &[&str] = &[
+    "api_key",
+    // `[room_profile.<n>].api_keys`, the removed raw-token list.
+    "api_keys",
+    "token",
+    "secret",
+    "password",
+    // `[matrix].recovery_key`, the E2EE recovery key.
+    "recovery_key",
 ];
+
+/// Suffixes that mark a key as a credential: `tools.tavily_api_key`,
+/// `matrix.access_token`, `discord.bot_token`, …
+///
+/// `max_tokens` is not one: the match is on the whole suffix, and `_tokens`
+/// is not `_token`.
+pub const CREDENTIAL_SUFFIXES: &[&str] = &["_api_key", "_token", "_secret", "_password"];
+
+/// Paths the workspace layer may not set although they are no credential.
+/// An entry covers that path and everything beneath it.
+///
+/// - `workspace_dir` locates the workspace config, so a workspace config
+///   naming it is circular — and the path is one machine's, which another
+///   host syncing the same workspace does not have.
+/// - `tools.host_access` hands the agent this machine's shell and
+///   filesystem. Whether a device grants that is the device's own decision,
+///   not one a synced file makes for every host at once.
+pub const HOST_ONLY_PATHS: &[&[&str]] = &[&["workspace_dir"], &["tools", "host_access"]];
+
+/// True when `key` names a credential. See [`CREDENTIAL_KEYS`].
+pub fn is_credential_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    CREDENTIAL_KEYS.contains(&key.as_str())
+        || CREDENTIAL_SUFFIXES
+            .iter()
+            .any(|suffix| key.ends_with(suffix))
+}
 
 /// True when the workspace layer may set `path`.
 ///
-/// `path` is a TOML key path split into segments. A path is authorised when some
-/// allowlist entry is a segment-wise prefix of it.
+/// `path` is a TOML key path split into segments, its last segment the key
+/// being set. Everything is allowed except a credential key (at any depth)
+/// and the [`HOST_ONLY_PATHS`].
 pub fn path_allowed(path: &[&str]) -> bool {
-    WORKSPACE_ALLOWLIST.iter().any(|entry| {
-        entry.len() <= path.len()
-            && entry
-                .iter()
-                .zip(path.iter())
-                .all(|(entry_seg, path_seg)| *entry_seg == "*" || entry_seg == path_seg)
-    })
+    if path.last().is_some_and(|key| is_credential_key(key)) {
+        return false;
+    }
+    !HOST_ONLY_PATHS.iter().any(|entry| path.starts_with(entry))
 }
 
-/// Drop every leaf of `workspace` the allowlist does not authorise.
+/// Drop every leaf of `workspace` that [`path_allowed`] refuses.
 ///
 /// Returns the filtered document and the sorted dot-joined paths that were
 /// dropped, so the caller can name them all in one warning.
 ///
 /// A "leaf" is any value that is not a table — arrays included, because arrays
-/// are replaced wholesale rather than merged, so they are authorised or rejected
-/// as a unit. Tables left empty by filtering are pruned; an empty table would
-/// contribute nothing to the merge anyway.
+/// are replaced wholesale rather than merged, so a whole array of credentials
+/// (`api_keys = […]`) is rejected as a unit. An array of tables is still
+/// searched element by element, so the credential inside one entry
+/// (`tools.mcp_servers.0.api_key`) is dropped while the entry itself is
+/// shared; the element stays in place, even when nothing is left of it, so
+/// the indices the warning names match the file. Tables left empty by
+/// filtering are pruned; an empty table would contribute nothing to the
+/// merge anyway.
 pub fn filter_allowed(workspace: toml::Value) -> (toml::Value, Vec<String>) {
     let mut rejected = Vec::new();
     let mut trail = Vec::new();
@@ -114,6 +97,13 @@ fn filter_inner(
     trail: &mut Vec<String>,
     rejected: &mut Vec<String>,
 ) -> Option<toml::Value> {
+    if !trail.is_empty() {
+        let segments: Vec<&str> = trail.iter().map(String::as_str).collect();
+        if !path_allowed(&segments) {
+            rejected.push(trail.join("."));
+            return None;
+        }
+    }
     match value {
         toml::Value::Table(table) => {
             let mut kept = toml::map::Map::new();
@@ -130,15 +120,29 @@ fn filter_inner(
                 Some(toml::Value::Table(kept))
             }
         }
-        leaf => {
-            let segments: Vec<&str> = trail.iter().map(String::as_str).collect();
-            if path_allowed(&segments) {
-                Some(leaf)
-            } else {
-                rejected.push(trail.join("."));
-                None
-            }
-        }
+        toml::Value::Array(items) => Some(toml::Value::Array(
+            items
+                .into_iter()
+                .enumerate()
+                .map(|(index, item)| match item {
+                    toml::Value::Table(table) => {
+                        let mut kept = toml::map::Map::new();
+                        for (key, child) in table {
+                            trail.push(index.to_string());
+                            trail.push(key.clone());
+                            if let Some(child) = filter_inner(child, trail, rejected) {
+                                kept.insert(key, child);
+                            }
+                            trail.pop();
+                            trail.pop();
+                        }
+                        toml::Value::Table(kept)
+                    }
+                    other => other,
+                })
+                .collect(),
+        )),
+        leaf => Some(leaf),
     }
 }
 
@@ -177,8 +181,8 @@ pub enum Layer {
 pub struct MergeOutcome {
     /// The merged document, ready to deserialize into `Config`.
     pub merged: toml::Value,
-    /// Dot-joined paths dropped from the workspace layer because the allowlist
-    /// does not authorise them. Sorted.
+    /// Dot-joined paths dropped from the workspace layer because they name a
+    /// credential or a host-only path. Sorted.
     pub rejected: Vec<String>,
     /// Which layer supplied each leaf. See [`provenance_of`].
     pub provenance: BTreeMap<String, Layer>,
@@ -347,79 +351,78 @@ mod tests {
     }
 
     #[test]
-    fn exact_leaf_is_allowed() {
+    fn shared_settings_are_allowed() {
         assert!(path_allowed(&["anthropic", "model"]));
-        assert!(path_allowed(&["anthropic", "system_prompt"]));
-    }
-
-    #[test]
-    fn sibling_of_an_allowed_leaf_is_not_allowed() {
-        assert!(!path_allowed(&["anthropic", "api_key"]));
-    }
-
-    #[test]
-    fn an_entry_authorises_everything_beneath_it() {
-        assert!(path_allowed(&["timer"]));
-        assert!(path_allowed(&["timer", "preset"]));
-        assert!(path_allowed(&["timer", "preset", "steps", "label"]));
-    }
-
-    #[test]
-    fn wildcard_matches_any_single_map_key() {
-        assert!(path_allowed(&["room_profile", "work", "profile"]));
-        assert!(path_allowed(&["room_profile", "anything-at-all", "rooms"]));
-    }
-
-    #[test]
-    fn the_workspace_layer_may_route_devices_but_not_hold_tokens() {
-        // `devices` is routing, exactly like `rooms`, which is already allowed.
-        // `api_keys` held raw credentials and stays refused.
+        assert!(path_allowed(&["providers", "local", "base_url"]));
+        assert!(path_allowed(&["providers", "local", "model"]));
+        assert!(path_allowed(&["providers", "local", "max_tokens"]));
+        assert!(path_allowed(&["profiles", "default", "provider"]));
         assert!(path_allowed(&["room_profile", "work", "devices"]));
-        assert!(!path_allowed(&["room_profile", "work", "api_keys"]));
+        assert!(path_allowed(&["tools", "mcp_servers"]));
+        assert!(path_allowed(&["tools", "admin", "room_profiles"]));
+        assert!(path_allowed(&["stt_provider", "whisper", "model"]));
+        assert!(path_allowed(&["matrix", "homeserver"]));
+        // The name of an env var holding a key is not the key.
+        assert!(path_allowed(&["stt_provider", "whisper", "api_key_env"]));
     }
 
     #[test]
-    fn wildcard_does_not_authorise_a_host_only_sibling() {
-        assert!(!path_allowed(&["room_profile", "work", "api_keys"]));
+    fn credentials_are_refused_at_any_depth() {
+        assert!(!path_allowed(&["anthropic", "api_key"]));
         assert!(!path_allowed(&["providers", "local", "api_key"]));
-        // The endpoint is host-only: a workspace that could redirect a provider
-        // could point it at a hostile server, whose responses drive tool calls.
-        assert!(!path_allowed(&["providers", "local", "base_url"]));
-    }
-
-    #[test]
-    fn provider_definition_fields_are_allowed() {
-        assert!(path_allowed(&["providers", "local", "type"]));
-        assert!(path_allowed(&["providers", "local", "model"]));
-        assert!(path_allowed(&["providers", "local", "model"]));
-    }
-
-    #[test]
-    fn host_only_tables_are_not_allowed() {
         assert!(!path_allowed(&["tools", "tavily_api_key"]));
-        assert!(!path_allowed(&["tools", "mcp_servers"]));
-        assert!(!path_allowed(&["tools", "admin"]));
-        assert!(!path_allowed(&["tools", "admin", "rooms"]));
+        assert!(!path_allowed(&["tools", "mcp_servers", "0", "api_key"]));
+        assert!(!path_allowed(&["room_profile", "work", "api_keys"]));
         assert!(!path_allowed(&["matrix", "access_token"]));
-        assert!(!path_allowed(&["serve", "port"]));
+        assert!(!path_allowed(&["matrix", "recovery_key"]));
+        assert!(!path_allowed(&["discord", "bot_token"]));
+    }
+
+    #[test]
+    fn credential_names_match_case_insensitively() {
+        // An MCP server's `env` table is spelled the way env vars are.
+        assert!(!path_allowed(&[
+            "tools",
+            "mcp_servers",
+            "0",
+            "env",
+            "GITHUB_TOKEN"
+        ]));
+        assert!(path_allowed(&[
+            "tools",
+            "mcp_servers",
+            "0",
+            "env",
+            "RUST_LOG"
+        ]));
+    }
+
+    #[test]
+    fn host_only_paths_are_refused_with_everything_beneath_them() {
         assert!(!path_allowed(&["workspace_dir"]));
-        assert!(!path_allowed(&["stt_provider", "whisper", "model_dir"]));
+        assert!(!path_allowed(&["tools", "host_access"]));
+        assert!(!path_allowed(&["tools", "host_access", "enabled"]));
+        // The rest of `[tools]` is shared.
+        assert!(path_allowed(&["tools", "tool_rounds", "unattended"]));
     }
 
     #[test]
-    fn a_table_shorter_than_its_entry_is_not_a_leaf_and_is_not_allowed() {
-        // Only leaves are ever tested, so this case cannot arise in practice;
-        // pinning it keeps the matcher total.
-        assert!(!path_allowed(&["room_profile", "work"]));
-    }
+    fn a_host_access_table_is_rejected_as_a_whole() {
+        let (kept, rejected) = filter_allowed(parse(
+            r#"
+[tools.host_access]
+enabled = true
 
-    #[test]
-    fn acp_is_host_only() {
-        // The endpoint a host exposes is a property of the host, not of the
-        // shared workspace. The allowlist is default-deny, so this passes
-        // without an entry — the test exists to catch someone adding one.
-        assert!(!path_allowed(&["acp"]));
-        assert!(!path_allowed(&["acp", "enabled"]));
+[tools.tool_rounds]
+unattended = 100
+"#,
+        ));
+        assert_eq!(rejected, vec!["tools.host_access".to_string()]);
+        assert!(kept["tools"].get("host_access").is_none());
+        assert_eq!(
+            kept["tools"]["tool_rounds"]["unattended"].as_integer(),
+            Some(100)
+        );
     }
 
     fn parse(s: &str) -> toml::Value {
@@ -445,7 +448,7 @@ system_prompt = "you are sapphire"
     }
 
     #[test]
-    fn non_allowlisted_leaves_are_dropped_and_reported() {
+    fn credentials_are_dropped_and_reported() {
         let (kept, rejected) = filter_allowed(parse(
             r#"
 [anthropic]
@@ -465,12 +468,32 @@ tavily_api_key = "also-not"
         );
         assert_eq!(kept["anthropic"]["model"].as_str(), Some("claude-opus-5"));
         assert!(kept["anthropic"].get("api_key").is_none());
-        // `tools` had nothing allowed in it, so the empty table is pruned too.
+        // `tools` had nothing but a credential in it, so the empty table is
+        // pruned too.
         assert!(kept.get("tools").is_none());
     }
 
     #[test]
-    fn filtering_is_per_leaf_inside_a_wildcard_table() {
+    fn a_provider_is_shared_without_its_key() {
+        let (kept, rejected) = filter_allowed(parse(
+            r#"
+[providers.local]
+type = "openai_compatible"
+base_url = "https://llm.example/v1"
+model = "qwen"
+api_key = "sk-secret"
+"#,
+        ));
+        assert_eq!(rejected, vec!["providers.local.api_key".to_string()]);
+        assert_eq!(
+            kept["providers"]["local"]["base_url"].as_str(),
+            Some("https://llm.example/v1")
+        );
+        assert!(kept["providers"]["local"].get("api_key").is_none());
+    }
+
+    #[test]
+    fn a_whole_array_of_credentials_is_rejected_as_a_unit() {
         let (kept, rejected) = filter_allowed(parse(
             r#"
 [room_profile.work]
@@ -488,21 +511,35 @@ api_keys = ["sa-secret"]
     }
 
     #[test]
-    fn an_array_is_authorised_as_a_unit() {
-        // Arrays are replaced wholesale rather than merged, so they are a leaf.
+    fn an_array_of_tables_is_searched_element_by_element() {
         let (kept, rejected) = filter_allowed(parse(
             r#"
-[[timer.preset]]
-name = "pomodoro"
+[[tools.mcp_servers]]
+name = "remote"
+type = "http"
+url = "https://mcp.example/mcp"
+api_key = "sk-secret"
 
 [[tools.mcp_servers]]
-name = "evil"
+name = "local"
 type = "stdio"
-command = "rm"
+command = "sapphire-journal"
+env = { GITHUB_TOKEN = "ghp-secret", RUST_LOG = "info" }
 "#,
         ));
-        assert_eq!(rejected, vec!["tools.mcp_servers".to_string()]);
-        assert!(kept["timer"]["preset"].is_array());
+        assert_eq!(
+            rejected,
+            vec![
+                "tools.mcp_servers.0.api_key".to_string(),
+                "tools.mcp_servers.1.env.GITHUB_TOKEN".to_string()
+            ]
+        );
+        let servers = kept["tools"]["mcp_servers"].as_array().unwrap();
+        assert_eq!(servers.len(), 2);
+        assert_eq!(servers[0]["url"].as_str(), Some("https://mcp.example/mcp"));
+        assert!(servers[0].get("api_key").is_none());
+        assert_eq!(servers[1]["env"]["RUST_LOG"].as_str(), Some("info"));
+        assert!(servers[1]["env"].get("GITHUB_TOKEN").is_none());
     }
 
     #[test]
@@ -511,8 +548,8 @@ command = "rm"
             r#"
 workspace_dir = "/tmp/ws"
 
-[serve]
-port = 9000
+[discord]
+bot_token = "b"
 
 [matrix]
 access_token = "t"
@@ -521,8 +558,8 @@ access_token = "t"
         assert_eq!(
             rejected,
             vec![
+                "discord.bot_token".to_string(),
                 "matrix.access_token".to_string(),
-                "serve.port".to_string(),
                 "workspace_dir".to_string()
             ]
         );
@@ -640,7 +677,8 @@ rooms = ["!c:example.org"]"#,
         );
     }
 
-    /// A realistic workspace-level config exercising every allowlist entry.
+    /// A realistic workspace-level config: everything but the credentials,
+    /// which the host layer adds.
     ///
     /// Written by hand so the values carry the types the real `Config` expects.
     const FIXTURE: &str = r#"
@@ -697,6 +735,7 @@ voice_pipeline = "desk"
 
 [providers.local]
 type = "openai_compatible"
+base_url = "http://llm.lan:8080/v1"
 model = "qwen"
 provider_name = "local"
 max_tokens = 4096
@@ -704,51 +743,43 @@ max_tokens = 4096
 [voice_pipeline.desk]
 stt_provider = "whisper"
 tts_provider = "piper"
+
+[tools.tool_rounds]
+unattended = 100
+
+[[tools.mcp_servers]]
+name = "sapphire-journal"
+type = "stdio"
+command = "sapphire-journal"
+args = ["mcp"]
+trust = "edit"
 "#;
 
     #[test]
-    fn the_fixture_is_entirely_allowlisted() {
+    fn the_fixture_has_no_credentials_to_drop() {
         let (_, rejected) = filter_allowed(parse(FIXTURE));
         assert!(
             rejected.is_empty(),
-            "fixture has non-allowlisted keys: {rejected:?}"
+            "fixture has keys the workspace layer refuses: {rejected:?}"
         );
     }
 
     #[test]
-    fn every_allowlist_entry_is_exercised_by_the_fixture() {
-        let mut paths = Vec::new();
-        leaf_paths(&parse(FIXTURE), &mut Vec::new(), &mut paths);
-        for entry in WORKSPACE_ALLOWLIST {
-            let hit = paths.iter().any(|p| {
-                let segments: Vec<&str> = p.split('.').collect();
-                entry.len() <= segments.len()
-                    && entry
-                        .iter()
-                        .zip(segments.iter())
-                        .all(|(e, s)| *e == "*" || e == s)
-            });
-            assert!(hit, "no fixture key exercises allowlist entry {entry:?}");
-        }
-    }
-
-    #[test]
     fn every_fixture_key_reaches_a_real_config_field() {
-        // The allowlist is string paths, and `Config` does not deny unknown
-        // fields, so a path naming a renamed or deleted field would otherwise be
-        // ignored in silence. Round-tripping through the type catches it: serde
-        // drops an unknown key on the way in, so it is missing on the way out.
-        // `providers.local.base_url` is host-only, so the host layer has to
-        // supply it for the merged provider to deserialize at all — which is the
-        // shape a real deployment takes: the host says where a provider lives,
-        // the workspace says what to run there.
+        // `Config` does not deny unknown fields, so a fixture key naming a
+        // renamed or deleted field would otherwise be ignored in silence.
+        // Round-tripping through the type catches it: serde drops an unknown
+        // key on the way in, so it is missing on the way out. The host layer
+        // holds only the keys — the shape a real deployment takes: the
+        // workspace says where each provider lives and what to run there, the
+        // host says how to authenticate.
         let host = parse(
             r#"
 [anthropic]
 api_key = "sk-test"
 
 [providers.local]
-base_url = "http://llm.lan:8080/v1"
+api_key = "sk-local"
 "#,
         );
         let outcome = merge_layers(parse(FIXTURE), host);

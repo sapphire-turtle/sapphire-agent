@@ -81,11 +81,12 @@ into `IDENTITY.md` and `SOUL.md`, and then delete itself.
 `init` never overwrites, so it is safe to re-run — that is also how a workspace
 made by an older build picks up a file added since.
 
-It writes nothing outside the workspace. Credentials and machine paths are
+It writes nothing outside the workspace. API keys and other credentials are
 host-local, so rather than writing that file `init` prints it for you to place
-at `~/.config/sapphire-agent/config.toml` (on Linux). See `config.example.toml`
-for everything else it can hold — channels, bind addresses, MCP servers,
-STT/TTS model paths.
+at `~/.config/sapphire-agent/config.toml` (on Linux). Everything else —
+providers, profiles, channels, MCP servers — can go in either file; the
+workspace's `.sapphire-agent/config.toml` refuses only credentials,
+`workspace_dir` and `[tools.host_access]`. See `config.example.toml`.
 
 Then:
 
@@ -419,8 +420,7 @@ Then, in Zed's `settings.json`:
 
 ### From another machine: `/acp`
 
-**1. Enable the endpoint** in your config (host-local; the workspace config
-layer cannot turn this on):
+**1. Enable the endpoint** in your config:
 
 ```toml
 [acp]
@@ -964,7 +964,6 @@ action — including the read-only `list` — is refused in a session whose prof
 not on it:
 
 ```toml
-# host-local config, never the workspace's
 [tools.admin]
 room_profiles = ["ops", "developer"]   # [room_profile.<name>] keys, not room ids
 ```
@@ -989,12 +988,9 @@ exception, and the reason a listed profile's rooms should not also be a task's
 delivery target: the grant follows the room, not the caller, so such a turn can
 author unattended work with nobody watching.
 
-`[tools]` is deliberately outside the workspace layer's allowlist, so a synced
-workspace `config.toml` cannot grant itself this — a `[tools.admin]` written there is
-dropped and named in a startup warning, the same as any other key that layer may not
-set. Who may run these tools is the same kind of host-local decision as the API key or
-the bind address, and it has to be: a listed profile can rewrite, through the agent,
-what runs unattended. **Pair it with that profile's own `[room_profile.<name>].devices`
+The workspace layer may set `[tools.admin]` too, so whoever can write the synced
+workspace `config.toml` can grant this. Guard that file accordingly: a listed profile
+can rewrite, through the agent, what runs unattended. **Pair it with that profile's own `[room_profile.<name>].devices`
 or the room's `allowed_users`**, or everyone who can reach a session of that profile
 can author code-adjacent work that runs with nobody watching. `[tools.admin].rooms`
 from an earlier build is rejected at startup and names `room_profiles` in the error.
