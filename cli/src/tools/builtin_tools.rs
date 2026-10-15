@@ -949,7 +949,71 @@ impl Tool for DirWalkTool {
 // ---------------------------------------------------------------------------
 
 /// Default shell used when neither the `shell` parameter nor `$SHELL` is set.
+#[cfg(not(windows))]
 const FALLBACK_SHELL: &str = "/bin/sh";
+/// Windows has no `/bin/sh`, and `$SHELL` is not a Windows convention — when
+/// it is set at all it is usually an MSYS path like `/usr/bin/bash` that
+/// cannot be spawned natively — so the default there is Windows PowerShell,
+/// which every Windows install carries.
+#[cfg(windows)]
+const FALLBACK_SHELL: &str = "powershell";
+
+/// How the tool describes its default shell to the model.
+#[cfg(not(windows))]
+const DEFAULT_SHELL_DOC: &str = "the shell named by the `$SHELL` environment variable \
+    (falling back to `/bin/sh`)";
+#[cfg(windows)]
+const DEFAULT_SHELL_DOC: &str = "Windows PowerShell (`powershell`)";
+
+/// The shell to run a command with: the `shell` parameter, else `$SHELL`
+/// (not on Windows — see [`FALLBACK_SHELL`]), else the fallback.
+fn resolve_shell(requested: Option<&str>) -> String {
+    let from_env = if cfg!(windows) {
+        None
+    } else {
+        std::env::var("SHELL").ok()
+    };
+    requested
+        .map(str::to_string)
+        .or(from_env)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| FALLBACK_SHELL.to_string())
+}
+
+/// Hand `command` to `shell` as one command line. POSIX shells take `-c`;
+/// PowerShell and `cmd` spell it their own way, and are matched by file
+/// stem so `pwsh.exe` or a full path to `cmd.exe` is recognised too.
+fn push_command_line(cmd: &mut tokio::process::Command, shell: &str, command: &str) {
+    let stem = Path::new(shell)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(shell)
+        .to_ascii_lowercase();
+    match stem.as_str() {
+        "powershell" | "pwsh" => {
+            cmd.args(["-NoProfile", "-NonInteractive", "-Command", command]);
+        }
+        "cmd" => {
+            // `cmd` does not parse its command line the way the C runtime
+            // does, so the escaping `Command::arg` applies would reach it
+            // as literal backslashes. Pass the line raw instead, the way
+            // Node's `shell: true` does: `/s` strips exactly the outer
+            // quotes and leaves the rest of the line alone.
+            #[cfg(windows)]
+            {
+                cmd.args(["/d", "/s", "/c"])
+                    .raw_arg(format!("\"{command}\""));
+            }
+            #[cfg(not(windows))]
+            {
+                cmd.args(["/c", command]);
+            }
+        }
+        _ => {
+            cmd.arg("-c").arg(command);
+        }
+    }
+}
 
 pub struct ShellTool {
     workspace_root: PathBuf,
@@ -966,10 +1030,12 @@ impl ShellTool {
                     "{REACHES_SENTENCE}Execute a shell command and return its output. \
                     Returns stdout, stderr, and exit code. \
                     The default working directory is the workspace root. \
-                    By default the command runs under the shell named by the \
-                    `$SHELL` environment variable (falling back to `/bin/sh`); \
+                    By default the command runs under {DEFAULT_SHELL_DOC}; \
                     override per call with the `shell` parameter (e.g. `bash`, \
-                    `zsh`, `fish`, or an absolute path). \
+                    `zsh`, `fish`, `pwsh`, `cmd`, or an absolute path). \
+                    Inside an ACP session the command always runs under `bash` \
+                    on the editor's machine (Git Bash on Windows), and the \
+                    `shell` parameter is ignored. \
                     Use the timeout parameter for long-running commands (default 60 s, max 600 s). \
                     Not suitable for interactive commands or persistent daemons.",
                 )
@@ -979,11 +1045,11 @@ impl ShellTool {
                     "properties": {
                         "command": {
                             "type": "string",
-                            "description": "The shell command to execute (run via `<shell> -c`)."
+                            "description": "The shell command to execute (run via `<shell> -c`, or the shell's own equivalent for PowerShell and `cmd`)."
                         },
                         "shell": {
                             "type": "string",
-                            "description": "Shell executable to run the command with — a name resolved via PATH (e.g. `bash`, `zsh`, `fish`) or an absolute path. Defaults to `$SHELL`, or `/bin/sh` if unset."
+                            "description": format!("Shell executable to run the command with — a name resolved via PATH (e.g. `bash`, `zsh`, `fish`, `pwsh`, `cmd`) or an absolute path. Defaults to {DEFAULT_SHELL_DOC}.")
                         },
                         "timeout": {
                             "type": "integer",
@@ -1029,13 +1095,19 @@ impl Tool for ShellTool {
             let cwd = input["workdir"].as_str();
             // ACP's `terminal/create` takes a command plus an argv, not a
             // shell string, while this tool's `command` parameter *is* one —
-            // so the shell is spelled out here, the same way the agent-side
-            // body below runs the line under `$SHELL -c`.
+            // so the shell is spelled out here: `bash`, like every other
+            // command on the client, which a Windows editor finds in Git Bash
+            // where `sh` would not resolve.
             let args = vec!["-c".to_string(), command.to_string()];
 
-            let run =
-                crate::tools::client_exec::run_client_command(&client, "sh", &args, cwd, timeout)
-                    .await?;
+            let run = crate::tools::client_exec::run_client_command(
+                &client,
+                crate::tools::client_exec::CLIENT_SHELL,
+                &args,
+                cwd,
+                timeout,
+            )
+            .await?;
             return match run.timed_out_handle {
                 Some(handle) => Ok(crate::tools::client_tools::format_timed_out(
                     &handle, timeout,
@@ -1064,17 +1136,11 @@ impl Tool for ShellTool {
             .map(expand_path)
             .unwrap_or_else(|| self.workspace_root.clone());
 
-        let shell = input["shell"]
-            .as_str()
-            .map(|s| s.to_string())
-            .or_else(|| std::env::var("SHELL").ok())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| FALLBACK_SHELL.to_string());
+        let shell = resolve_shell(input["shell"].as_str());
 
         let mut cmd = Command::new(&shell);
-        cmd.arg("-c")
-            .arg(command)
-            .stdout(std::process::Stdio::piped())
+        push_command_line(&mut cmd, &shell, command);
+        cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .current_dir(&workdir)
             // The turn running this tool can be cancelled: the ACP endpoint
@@ -2474,10 +2540,10 @@ mod session_routing_tests {
 
     /// ACP's `terminal/create` takes a command plus an argv, not a shell
     /// string, while this tool's own `command` parameter *is* a shell string.
-    /// So the ACP path has to spell `sh -c` out itself, and `workdir` maps
+    /// So the ACP path has to spell `bash -c` out itself, and `workdir` maps
     /// onto the client call's `cwd`.
     #[tokio::test]
-    async fn shell_runs_the_command_line_through_sh_c_on_the_client() {
+    async fn shell_runs_the_command_line_through_bash_c_on_the_client() {
         let (_state, tool) = shell_tool_for_test();
         let client = Arc::new(FakeClient::default());
         client.queue_terminal_stdout("hi\n");
@@ -2491,7 +2557,7 @@ mod session_routing_tests {
 
         assert!(out.contains("hi"), "got: {out}");
         let creates = client.creates.lock().unwrap();
-        assert_eq!(creates[0].0, "sh");
+        assert_eq!(creates[0].0, "bash");
         assert_eq!(creates[0].1, vec!["-c".to_string(), "echo hi".to_string()]);
         assert_eq!(
             creates[0].2.as_deref(),
@@ -2506,7 +2572,9 @@ mod session_routing_tests {
     async fn shell_runs_on_the_agents_machine_outside_an_acp_session() {
         let (_state, tool) = shell_tool_for_test();
         let out = tool
-            .execute(&json!({"command": "echo agent side"}))
+            // Quoted, so it reads as one argument to PowerShell's `echo`
+            // (the Windows default) as well as to `sh`'s.
+            .execute(&json!({"command": "echo \"agent side\""}))
             .await
             .unwrap();
         assert!(out.contains("agent side"), "got: {out}");
@@ -2630,7 +2698,16 @@ mod session_routing_tests {
     /// shell running on someone else's machine, so a Rust-side assertion that
     /// never evaluates them would prove nothing about the order the two
     /// machines produce.
+    ///
+    /// `None` on Windows as well: there `bash` on `PATH` is usually WSL's
+    /// `System32\bash.exe`, which runs (and fails) without a distribution, and
+    /// even Git's `sh` would see the agent's `C:\...` paths rather than the
+    /// POSIX ones these scripts are written for. The scripts target a POSIX
+    /// client, so a POSIX host is where they can be run against the agent.
     fn shell_for_scripts() -> Option<&'static str> {
+        if !cfg!(unix) {
+            return None;
+        }
         ["bash", "sh"].into_iter().find(|c| {
             std::process::Command::new(c)
                 .arg("-c")

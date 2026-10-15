@@ -10,6 +10,14 @@ use crate::tools::OUTPUT_CAP_BYTES;
 use crate::tools::acp_client::{ExitStatus, TerminalHandle, TerminalOutput};
 use crate::tools::client_tools::cap_error;
 
+/// The interpreter every command run on the editor's machine goes through:
+/// `shell`'s command line, the skill tools' probes, and the file tools'
+/// scripts. `bash`, not `sh`, because `bash` is what a Windows developer has
+/// in Git Bash, while `sh` there names nothing reliable; Linux and macOS
+/// ship it too. Resolving the name is the client's job, so on Windows with
+/// WSL enabled the client may find WSL's `System32\bash.exe` before Git's.
+pub(crate) const CLIENT_SHELL: &str = "bash";
+
 /// The result of running one command to completion, or to its timeout.
 pub(crate) struct ClientRun {
     pub output: TerminalOutput,

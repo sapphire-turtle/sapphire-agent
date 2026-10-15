@@ -29,7 +29,7 @@ use crate::tools::builtin_tools::truncation_marker;
 // tools); this module only constructs one inside its test module.
 #[cfg(test)]
 use crate::tools::builtin_tools::ShellTool;
-use crate::tools::client_exec::run_client_command;
+use crate::tools::client_exec::{CLIENT_SHELL, run_client_command};
 use crate::tools::{OUTPUT_CAP_BYTES, Tool, ToolKind};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -138,10 +138,10 @@ pub(crate) const CLIENT_LOCAL_TIMEOUT: std::time::Duration = std::time::Duration
 /// 8-terminal cap (`MAX_TERMINALS_PER_SESSION`), so the model has to be told
 /// which one to free.
 ///
-/// `bash` rather than `sh`, and rather than whatever the client happens to
-/// ship as `/bin/sh`: the scripts here use nothing beyond POSIX, but naming
-/// the interpreter keeps the same script from meaning two things depending
-/// on where it lands.
+/// [`CLIENT_SHELL`] rather than whatever the client happens to ship as
+/// `/bin/sh`: the scripts here use nothing beyond POSIX, but naming the
+/// interpreter keeps the same script from meaning two things depending on
+/// where it lands.
 pub(crate) async fn run_client_bash(
     client: &std::sync::Arc<dyn AcpClient>,
     script: &str,
@@ -152,7 +152,8 @@ pub(crate) async fn run_client_bash(
     bash_args.push(argv0.to_string());
     bash_args.extend(args.iter().cloned());
 
-    let run = run_client_command(client, "bash", &bash_args, None, CLIENT_LOCAL_TIMEOUT).await?;
+    let run =
+        run_client_command(client, CLIENT_SHELL, &bash_args, None, CLIENT_LOCAL_TIMEOUT).await?;
     if let Some(handle) = run.timed_out_handle {
         anyhow::bail!(
             "timed out after {}s on the editor's machine; the command is still \

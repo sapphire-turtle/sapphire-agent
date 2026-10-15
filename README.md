@@ -36,6 +36,11 @@ A personal AI assistant agent that works on file-based, local-first [`sapphire-f
 curl -fsSL https://raw.githubusercontent.com/sapphire-turtle/sapphire-framework/main/install/install.sh | sh -s -- agent
 ```
 
+```powershell
+# Windows
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/sapphire-turtle/sapphire-framework/main/install/install.ps1))) agent
+```
+
 This installs `sapphire-agent` into `~/.local/bin` together with `sapphire-bridge`, which it syncs through. Add `agent-desktop` for the desktop client. See the [install script's README](https://github.com/sapphire-turtle/sapphire-framework/tree/main/install) for the options.
 
 Or with cargo:
@@ -52,9 +57,9 @@ cd sapphire-agent
 cargo build --release
 ```
 
-Release binaries are published for **Linux** (x86_64, aarch64) and **macOS** (aarch64). Each is a single self-contained file — `sherpa-onnx` and its ONNX Runtime are linked statically, so there is nothing to install alongside it.
+Release binaries are published for **Linux** (x86_64, aarch64), **macOS** (aarch64) and **Windows** (x86_64). Each is a single self-contained file — `sherpa-onnx` and its ONNX Runtime are linked statically, so there is nothing to install alongside it.
 
-The agent is a headless server application and is not built for Windows ([#182](https://github.com/sapphire-turtle/sapphire-agent/issues/182)), and neither is `sapphire-agent-desktop`, which talks to the agent on its own host.
+On Windows the `shell` tool runs commands under Windows PowerShell unless a call names another shell (`pwsh`, `cmd`, `bash`, …); elsewhere it uses `$SHELL`, falling back to `/bin/sh`. Inside an ACP session, commands (and the file and skill tools' scripts) run on the editor's machine under `bash`, so a Windows editor needs Git Bash on `PATH`; with WSL enabled the editor may pick WSL's `bash.exe` instead (#303).
 
 The server and its CLI are one binary ([#278](https://github.com/sapphire-turtle/sapphire-agent/issues/278)), the way `sapphire-ledger` and the other sapphire-framework apps are: the client commands (`chat`, `acp`, `status`, …) talk to the server already running on the same host over its local IPC endpoint. So does `sapphire-agent-desktop`, the GUI chat client; like `chat` it runs under `[cli].room_profile`.
 
