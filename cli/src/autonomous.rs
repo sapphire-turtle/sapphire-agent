@@ -307,7 +307,7 @@ impl AutonomousLoop {
                     .ok()
                     .map(Path::to_path_buf)
             })
-            .map(|p| p.display().to_string())
+            .map(|p| crate::workspace::slash_path(&p))
             .unwrap_or_else(|| format!("sessions/{namespace}/autonomous/{session_id}"));
 
         loop {
@@ -570,7 +570,7 @@ mod tests {
                     .ok()
                     .map(std::path::PathBuf::from)
             })
-            .map(|p| p.display().to_string())
+            .map(|p| crate::workspace::slash_path(&p))
             .unwrap()
     }
 

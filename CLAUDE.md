@@ -44,7 +44,7 @@ The resolution is to keep `ort` out of the default graph, which restores static 
 - The old voice-satellite CLI's openWakeWord detector is gone, and so is the satellite (#278).
 - **`desktop/`** — never pulled `ort`; it only followed the workspace's link mode.
 
-So `cargo build --workspace` works on Linux and macOS. It still does **not** link on Windows for `cli/`. Since the CLI and the server became one binary (#278) that is no longer fine — the CLI has to run on Windows — and making it link there is #299 (reversing #182).
+So `cargo build --workspace` links and tests on Linux, macOS and Windows; CI's `test-platforms (windows-latest)` keeps it that way. Windows is a release target again (#299, reversing #182): since the CLI and the server became one binary (#278) the CLI has to run there, which means the server does too. Code that names paths or spawns processes has to hold up on Windows — show workspace-relative paths with `workspace::slash_path`, not `Path::display`, and gate tests that run POSIX shell scripts to `cfg(unix)`.
 
 ### Historical note: agent false-positive release PRs (now fixed)
 

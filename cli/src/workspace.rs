@@ -9,6 +9,21 @@ use tracing::{debug, info};
 /// Maximum characters loaded from a single workspace file (matches openclaw default).
 const MAX_FILE_CHARS: usize = 20_000;
 
+/// A workspace-relative path as the model and the reports see it: always
+/// `/`-separated. `Path::display` uses the platform's separator, so on
+/// Windows a `Session:` line or a `Wrote …` report would otherwise read
+/// `sessions\default\…` — a spelling that differs from every other path the
+/// agent names and that a POSIX client's tools cannot take back. Only Windows
+/// is rewritten: on Unix a `\` is an ordinary file-name character.
+pub fn slash_path(path: &Path) -> String {
+    let shown = path.display().to_string();
+    if cfg!(windows) {
+        shown.replace('\\', "/")
+    } else {
+        shown
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Workspace file definitions
 // ---------------------------------------------------------------------------

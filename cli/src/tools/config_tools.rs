@@ -28,6 +28,7 @@ use crate::provider::ToolSpec;
 use crate::serve::{AutonomousHost, LlmTurnOutcome, ServeState, TurnStop};
 use crate::tools::subagent::SubagentTool;
 use crate::tools::{Tool, ToolKind, ToolSet};
+use crate::workspace::slash_path;
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use sapphire_framework::workspace::WorkspaceState;
@@ -411,7 +412,8 @@ impl ConfigTool {
         // is exactly the case worth reporting, and the `?` names it
         // rather than falling back to the absolute path.
         let rel = self.rel(&abs)?;
-        std::fs::read_to_string(&abs).with_context(|| format!("failed to read {}", rel.display()))
+        std::fs::read_to_string(&abs)
+            .with_context(|| format!("failed to read {}", slash_path(&rel)))
     }
 
     async fn write(&self, input: &serde_json::Value) -> Result<String> {
@@ -427,10 +429,10 @@ impl ConfigTool {
             let state = lock(&self.ws);
             state
                 .write_file(&rel, content)
-                .with_context(|| format!("failed to write {}", rel.display()))?;
+                .with_context(|| format!("failed to write {}", slash_path(&rel)))?;
         }
         self.after_write().await;
-        Ok(format!("Wrote {}", rel.display()))
+        Ok(format!("Wrote {}", slash_path(&rel)))
     }
 
     async fn set_enabled(&self, input: &serde_json::Value) -> Result<String> {
@@ -448,23 +450,23 @@ impl ConfigTool {
         let abs = definition_path(&self.workspace_root, self.dir.dir_name(), name)?;
         let rel = self.rel(&abs)?;
         let raw = std::fs::read_to_string(&abs)
-            .with_context(|| format!("failed to read {}", rel.display()))?;
+            .with_context(|| format!("failed to read {}", slash_path(&rel)))?;
         let Some(updated) = crate::frontmatter::set_enabled(&raw, enabled) else {
             // Not repaired by inventing a frontmatter block: the file is
             // markdown the agent does not load, and pretending otherwise
             // would be this tool writing a definition nobody asked for.
             anyhow::bail!(
                 "{} has no YAML frontmatter, so there is no `enabled:` key to set",
-                rel.display()
+                slash_path(&rel)
             );
         };
         {
             let state = lock(&self.ws);
             state
                 .write_file(&rel, &updated)
-                .with_context(|| format!("failed to write {}", rel.display()))?;
+                .with_context(|| format!("failed to write {}", slash_path(&rel)))?;
         }
-        Ok(format!("Set enabled: {enabled} in {}", rel.display()))
+        Ok(format!("Set enabled: {enabled} in {}", slash_path(&rel)))
     }
 
     /// Refuse content the corresponding loader would not be able to use.
@@ -733,10 +735,7 @@ impl TaskTestTool {
     /// [`ConfigTool::rel`] — it reports on the path it was handed, and
     /// `write_file` is where external resolution would happen.
     fn rel_display(&self, abs: &Path) -> String {
-        abs.strip_prefix(&self.workspace_root)
-            .unwrap_or(abs)
-            .display()
-            .to_string()
+        slash_path(abs.strip_prefix(&self.workspace_root).unwrap_or(abs))
     }
 
     /// The session's own path, workspace-relative — the report's `Session:`
