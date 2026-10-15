@@ -10,6 +10,22 @@ version with `sapphire-agent-server`) are recorded in the root `CHANGELOG.md`.
 
 ## [Unreleased]
 
+## [0.9.0](https://github.com/sapphire-turtle/sapphire-agent/compare/sapphire-agent-core-v0.8.0...sapphire-agent-core-v0.9.0) - 2026-10-15
+
+### Added
+
+- [**breaking**] *(desktop)* Talk to the local agent over IPC, like `sapphire-agent chat`
+
+### Fixed
+
+- Clear the RustSec advisories cargo-deny reports
+
+### Other
+
+- *(license)* Desktop under GPL-3.0-or-later; license files per component
+
+
+
 ## [0.8.0] - 2026-09-07
 
 ### Changed

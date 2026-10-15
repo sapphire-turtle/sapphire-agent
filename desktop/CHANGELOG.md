@@ -13,6 +13,14 @@ were inherited from the workspace at the pre-release scaffolding stage
 and predate any user-facing release of this binary.
 
 ## [Unreleased]
+
+## [0.8.1](https://github.com/sapphire-turtle/sapphire-agent/compare/desktop-v0.8.0...desktop-v0.8.1) - 2026-10-15
+
+### Other
+
+- Update Cargo.lock dependencies
+
+
 ### Changed
 
 - **Renamed from `sapphire-call-desktop` to `sapphire-agent-desktop`**
