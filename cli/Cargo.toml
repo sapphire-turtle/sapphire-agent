@@ -188,7 +188,7 @@ a2a = { package = "a2a-lf", version = "0.3" }
 # OS-standard cache / data / config directory resolution. Used by the
 # image cache to default to `$XDG_CACHE_HOME/sapphire-agent/images/`
 # (or the platform equivalent) when no explicit dir is configured.
-dirs = "6"
+dirs = "7"
 
 # Agent Client Protocol SDK (Zed's official Rust SDK). Backs `GET /acp`: the
 # JSON-RPC dispatch loop, the v1 schema types, and the `Lines` transport the
