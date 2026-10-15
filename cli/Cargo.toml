@@ -190,6 +190,17 @@ a2a = { package = "a2a-lf", version = "0.3" }
 # (or the platform equivalent) when no explicit dir is configured.
 dirs = "7"
 
+# MCP client for the external servers in `[[tools.mcp_servers]]`: the
+# Streamable HTTP and child-process transports, the 2026-07-28 lifecycle with
+# its fallback to `initialize`, and `subscriptions/listen`. Same major as the
+# server side sapphire-framework apps are built on.
+rmcp = { version = "3.5", default-features = false, features = [
+    "client",
+    "reqwest",
+    "transport-streamable-http-client-reqwest",
+    "transport-child-process",
+] }
+
 # Agent Client Protocol SDK (Zed's official Rust SDK). Backs `GET /acp`: the
 # JSON-RPC dispatch loop, the v1 schema types, and the `Lines` transport the
 # WebSocket is wrapped in. Default features only — `unstable_protocol_v2`
@@ -211,3 +222,9 @@ tokio-tungstenite = "0.30.0"
 # `ServiceExt::oneshot` to drive an axum `Router` directly in tests,
 # without binding a real listener.
 tower = { version = "0.5", default-features = false, features = ["util"] }
+
+# An in-process MCP server for the client's tests.
+rmcp = { version = "3.5", default-features = false, features = [
+    "server",
+    "transport-streamable-http-server",
+] }

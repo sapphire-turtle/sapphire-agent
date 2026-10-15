@@ -2769,7 +2769,7 @@ impl TurnLoop<'_> {
                                 );
                                 let fut = scope_turn_context(turn_ctx, fut);
                                 // Both remaining scopes have to wrap
-                                // execution too: the timer tool reads one
+                                // execution too: the timer bridge reads one
                                 // task-local and the client-side tools read
                                 // the other, and either missing breaks that
                                 // set of tools. Each arm awaits in place

@@ -2,24 +2,48 @@
 //!
 //! Each configured MCP server's tools are registered in the agent's `ToolSet`
 //! using the naming convention `mcp__<server_name>__<tool_name>`.
-
-pub mod transport;
+//!
+//! The protocol itself is `rmcp`'s: its Streamable HTTP and child-process
+//! transports, its lifecycle negotiation, and its multi-round-trip handling
+//! for server-initiated input. What lives here is the agent's side of it —
+//! which callbacks a server gets answered ([`AgentClientHandler`]), when a
+//! dead connection is replaced, and how a remote tool becomes a local
+//! [`Tool`].
 
 use crate::config::{McpServerConfig, McpTransportConfig, McpTrust};
 use crate::provider::ToolSpec;
 use crate::tools::{Tool, ToolKind};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
-use serde_json::{Value, json};
+use rmcp::model::{
+    CallToolRequestParams, CallToolResult, ClientCapabilities, ClientConfig, ElicitRequestParams,
+    ElicitResult, ElicitationAction, ElicitationCapability, ErrorData, Implementation,
+    ProtocolVersion, ReadResourceRequestParams, ReadResourceResult, ResourceContents,
+    RootsCapabilities, ServerNotification, SubscriptionFilter,
+};
+#[allow(deprecated)] // Roots are deprecated by SEP-2577, but servers still ask.
+use rmcp::model::{ListRootsResult, Root};
+use rmcp::service::{
+    ClientInitializeError, ClientLifecycleMode, ClientServiceExt, NotificationContext,
+    RequestContext, RoleClient, RunningService,
+};
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
+use rmcp::{ClientHandler, ServiceError};
+use serde_json::Value;
 use std::borrow::Cow;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::Mutex;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::sync::RwLock;
+use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
-use transport::{
-    HttpTransport, McpTransport, NotificationHandler, ServerRequestHandler, SessionExpired,
-    StdioTransport,
-};
+
+/// The handle [`McpClient::listen`] returns: one `subscriptions/listen`
+/// stream. Re-exported so callers need not name `rmcp` for it.
+#[allow(unused_imports)] // For callers of `listen`; nothing here names them.
+pub use rmcp::service::{Subscription, SubscriptionEnd};
 
 // ---------------------------------------------------------------------------
 // Remote tool metadata
@@ -33,75 +57,162 @@ pub struct RemoteToolSpec {
 }
 
 // ---------------------------------------------------------------------------
-// MCP Client
+// Client handler — what the agent answers when a server asks
 // ---------------------------------------------------------------------------
 
-/// Client for a single external MCP server.
-pub struct McpClient {
+/// The agent's answers to server-initiated requests and notifications.
+///
+/// On a legacy (`initialize`) server these arrive as JSON-RPC requests over
+/// the connection; on a 2026-07-28 server they arrive as `input_required`
+/// rounds of the call that needed them, which `rmcp` drives through these
+/// same methods. Either way the answers are the ones the hand-written client
+/// gave.
+#[derive(Clone)]
+struct AgentClientHandler {
     name: String,
-    config: McpServerConfig,
-    transport: tokio::sync::RwLock<Arc<dyn McpTransport>>,
     workspace_root: String,
-    request_id: Mutex<u64>,
-    /// Set to `true` when the server sends `notifications/tools/list_changed`.
+    /// Set when the server reports its tool list changed. Shared with
+    /// [`McpClient`], which outlives any one connection.
     tools_changed: Arc<AtomicBool>,
 }
 
-impl McpClient {
-    /// Create a new client and establish the transport.
-    pub async fn new(config: &McpServerConfig, workspace_root: &str) -> Result<Self> {
-        let transport = Self::build_transport(&config.transport).await?;
+impl ClientHandler for AgentClientHandler {
+    /// The workspace is the one root the agent works in.
+    #[allow(deprecated)] // Roots are deprecated by SEP-2577, but still asked for.
+    async fn list_roots(
+        &self,
+        _context: RequestContext<RoleClient>,
+    ) -> Result<ListRootsResult, ErrorData> {
+        Ok(ListRootsResult::new(vec![
+            Root::new(format!("file://{}", self.workspace_root)).with_name("workspace"),
+        ]))
+    }
 
-        Ok(Self {
+    /// Accept a form elicitation unasked, echoing its message as the content.
+    ///
+    /// There is no person on the other end of most turns to ask, and this is
+    /// what the agent has always answered. A URL elicitation is declined
+    /// instead: accepting one asserts that someone opened the page.
+    async fn create_elicitation(
+        &self,
+        request: ElicitRequestParams,
+        _context: RequestContext<RoleClient>,
+    ) -> Result<ElicitResult, ErrorData> {
+        Ok(match request {
+            ElicitRequestParams::FormElicitationParams { message, .. } => {
+                ElicitResult::new(ElicitationAction::Accept).with_content(Value::String(message))
+            }
+            _ => ElicitResult::new(ElicitationAction::Decline),
+        })
+    }
+
+    // `sampling/createMessage` keeps rmcp's default: method-not-found, and
+    // no `sampling` capability is declared.
+
+    async fn on_tool_list_changed(&self, _context: NotificationContext<RoleClient>) {
+        info!("MCP '{}': tool list changed, will refresh", self.name);
+        self.tools_changed.store(true, Ordering::Relaxed);
+    }
+
+    #[allow(deprecated)] // Roots, as above.
+    fn get_info(&self) -> ClientConfig {
+        let mut capabilities = ClientCapabilities::default();
+        capabilities.roots = Some(RootsCapabilities::default());
+        capabilities.elicitation = Some(ElicitationCapability::new());
+        // The version offered to `initialize`. `server/discover` negotiates
+        // from `ClientLifecycleMode`'s own list and does not read this.
+        ClientConfig::new(
+            capabilities,
+            Implementation::new("sapphire-agent", env!("CARGO_PKG_VERSION")),
+        )
+        .with_protocol_version(ProtocolVersion::LATEST_WITH_INITIALIZE)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Connection — one negotiated session with a server
+// ---------------------------------------------------------------------------
+
+type Service = RunningService<RoleClient, AgentClientHandler>;
+
+/// One live connection, and the background task watching it for tool-list
+/// changes. Replaced whole by [`McpClient::reconnect`].
+struct Connection {
+    service: Service,
+    /// The `subscriptions/listen` task that stands in for the unsolicited
+    /// `tools/list_changed` notification on a 2026-07-28 server.
+    watcher: Option<JoinHandle<()>>,
+}
+
+impl Connection {
+    /// Whether the service loop has ended — the child exited, the transport
+    /// worker gave up, or the connection was closed on purpose.
+    fn is_closed(&self) -> bool {
+        self.service.is_closed() || self.service.peer().is_transport_closed()
+    }
+
+    /// Stop the service without waiting for it, for a connection that may
+    /// still be shared with calls in flight. Those calls then fail with
+    /// `TransportClosed`, which sends them through the reconnect path.
+    fn close(&self) {
+        if let Some(watcher) = &self.watcher {
+            watcher.abort();
+        }
+        self.service.cancellation_token().cancel();
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        if let Some(watcher) = &self.watcher {
+            watcher.abort();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MCP Client
+// ---------------------------------------------------------------------------
+
+/// Told about every successful call made through one server's [`McpTool`]s.
+///
+/// Called synchronously from the tool's `execute`, so it runs inside the
+/// turn's task-locals — `timer::current_origin` included.
+pub trait ToolCallObserver: Send + Sync {
+    fn tool_called(&self, tool: &str, result: &CallToolResult);
+}
+
+/// Client for a single external MCP server.
+///
+/// Construction does not touch the server; [`Self::connect`] does, and every
+/// call after it reconnects on its own when it finds the connection gone.
+pub struct McpClient {
+    name: String,
+    config: McpServerConfig,
+    workspace_root: String,
+    connection: RwLock<Option<Arc<Connection>>>,
+    /// Set to `true` when the server reports `tools/list_changed`.
+    tools_changed: Arc<AtomicBool>,
+    observer: std::sync::OnceLock<Arc<dyn ToolCallObserver>>,
+}
+
+impl McpClient {
+    /// Create a client for `config`. Nothing is spawned or contacted yet.
+    pub fn new(config: &McpServerConfig, workspace_root: &str) -> Self {
+        Self {
             name: config.name.clone(),
             config: config.clone(),
-            transport: tokio::sync::RwLock::new(transport),
             workspace_root: workspace_root.to_string(),
-            request_id: Mutex::new(1),
+            connection: RwLock::new(None),
             tools_changed: Arc::new(AtomicBool::new(false)),
-        })
-    }
-
-    /// Build a new transport instance from the config.
-    async fn build_transport(transport: &McpTransportConfig) -> Result<Arc<dyn McpTransport>> {
-        Ok(match transport {
-            McpTransportConfig::Http { url, api_key } => {
-                Arc::new(HttpTransport::new(url.clone(), api_key.clone()))
-            }
-            McpTransportConfig::Stdio { command, args, env } => {
-                Arc::new(StdioTransport::new(command, args, env).await?)
-            }
-        })
-    }
-
-    /// Tear down the existing transport and establish a fresh one.
-    ///
-    /// The request-id counter resets to 1 (the new session starts fresh).
-    /// On failure the old transport is already gone; the caller may retry.
-    pub async fn reconnect(&self) -> Result<()> {
-        info!("MCP '{}': reconnecting", self.name);
-
-        // Shut down the old transport first so we don't leak a child process
-        // if the new transport fails to spawn.
-        {
-            let old = self.transport.read().await.clone();
-            if let Err(e) = old.shutdown().await {
-                warn!(
-                    "MCP '{}': shutdown during reconnect failed: {e:#}",
-                    self.name
-                );
-            }
+            observer: std::sync::OnceLock::new(),
         }
+    }
 
-        let new_transport = Self::build_transport(&self.config.transport)
-            .await
-            .with_context(|| format!("MCP '{}': failed to build new transport", self.name))?;
-        *self.transport.write().await = new_transport;
-        *self.request_id.lock().await = 1;
-        self.tools_changed.store(false, Ordering::Relaxed);
-
-        self.connect().await?;
-        Ok(())
+    /// Install the observer told about this server's tool calls. One per
+    /// client; a second is refused (returns `false`).
+    pub fn set_observer(&self, observer: Arc<dyn ToolCallObserver>) -> bool {
+        self.observer.set(observer).is_ok()
     }
 
     /// The server name (used as the tool namespace prefix).
@@ -120,198 +231,49 @@ impl McpClient {
         self.tools_changed.swap(false, Ordering::Relaxed)
     }
 
-    /// Get the next request ID.
-    async fn next_id(&self) -> u64 {
-        let mut id = self.request_id.lock().await;
-        let current = *id;
-        *id += 1;
-        current
-    }
-
-    /// Build the server-request handler that handles Elicitation, Roots, and
-    /// Sampling callbacks from the MCP server.
-    fn server_request_handler(&self) -> ServerRequestHandler {
-        let workspace_root = self.workspace_root.clone();
-        Arc::new(move |method: &str, params: &Value| -> Value {
-            match method {
-                "roots/list" => {
-                    json!({
-                        "result": {
-                            "roots": [{
-                                "uri": format!("file://{workspace_root}"),
-                                "name": "workspace"
-                            }]
-                        }
-                    })
-                }
-                "elicitation/create" => {
-                    let message = params.get("message").and_then(|v| v.as_str()).unwrap_or("");
-                    json!({
-                        "result": {
-                            "action": "accept",
-                            "content": message
-                        }
-                    })
-                }
-                "sampling/createMessage" => {
-                    json!({
-                        "error": {
-                            "code": -32601,
-                            "message": "Sampling is not supported by this client"
-                        }
-                    })
-                }
-                _ => {
-                    json!({
-                        "error": {
-                            "code": -32601,
-                            "message": format!("Unknown method: {method}")
-                        }
-                    })
-                }
-            }
-        })
-    }
-
-    /// Build the notification handler that watches for `tools/list_changed`.
-    fn notification_handler(&self) -> NotificationHandler {
-        let tools_changed = Arc::clone(&self.tools_changed);
-        let name = self.name.clone();
-        Arc::new(move |method: &str, _params: &Value| {
-            debug!("MCP '{name}': notification: {method}");
-            if method == "notifications/tools/list_changed" {
-                info!("MCP '{name}': tool list changed, will refresh");
-                tools_changed.store(true, Ordering::Relaxed);
-            }
-        })
-    }
-
-    /// Send a JSON-RPC request, re-establishing the session once if the
-    /// server has forgotten it.
-    ///
-    /// A Streamable HTTP server drops idle sessions — `rmcp` after five
-    /// minutes — and the id this client holds is only ever refreshed by a
-    /// handshake, which until now happened exactly once at startup. So a
-    /// quiet afternoon was enough to turn every later tool call into a
-    /// permanent failure that nothing but a restart or a hand-run
-    /// `mcp_reconnect` could clear.
-    ///
-    /// The retry is deliberately once. A fresh session being rejected too is
-    /// not staleness, and repeating the handshake against a server that is
-    /// down or misconfigured only buries the real error.
-    async fn send(&self, method: &str, params: Value) -> Result<Value> {
-        match self.send_once(method, params.clone()).await {
-            Err(e) if e.downcast_ref::<SessionExpired>().is_some() => {
-                info!(
-                    "MCP '{}': {method} found the session gone; re-establishing it",
-                    self.name
-                );
-                self.connect().await.with_context(|| {
-                    format!("MCP '{}': failed to re-establish the session", self.name)
-                })?;
-                self.send_once(method, params).await
-            }
-            other => other,
-        }
-    }
-
-    /// Send a JSON-RPC request through the transport, exactly once.
-    ///
-    /// [`Self::connect`] uses this rather than [`Self::send`]: the recovery
-    /// path *is* the handshake, and routing the handshake back through it
-    /// would recurse.
-    async fn send_once(&self, method: &str, params: Value) -> Result<Value> {
-        let id = self.next_id().await;
-        let body = json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params,
-        });
-
-        let req_handler = self.server_request_handler();
-        let notif_handler = self.notification_handler();
-        let transport = self.transport.read().await.clone();
-        let response = transport
-            .request(&body, &req_handler, &notif_handler)
-            .await?;
-
-        if let Some(err) = response.get("error") {
-            let msg = err["message"].as_str().unwrap_or("unknown error");
-            let code = err["code"].as_i64().unwrap_or(-1);
-            bail!("MCP server error {code}: {msg}");
-        }
-
-        Ok(response.get("result").cloned().unwrap_or(Value::Null))
-    }
-
-    /// Initialize the MCP session (handshake).
+    /// Establish the connection (spawn the process or reach the endpoint and
+    /// negotiate the protocol), replacing any existing one.
     pub async fn connect(&self) -> Result<()> {
-        let params = json!({
-            "protocolVersion": "2025-03-26",
-            "capabilities": {
-                "roots": { "listChanged": false },
-                "elicitation": {}
-            },
-            "clientInfo": {
-                "name": "sapphire-agent",
-                "version": env!("CARGO_PKG_VERSION")
-            }
-        });
-
-        let result = self.send_once("initialize", params).await?;
-        info!(
-            "MCP '{}': connected (server: {})",
-            self.name,
-            result
-                .get("serverInfo")
-                .and_then(|s| s.get("name"))
-                .and_then(|n| n.as_str())
-                .unwrap_or("unknown")
-        );
-
-        // Send initialized notification (no id, no response expected).
-        // Must use `notify` — `request` would block reading stdout for a
-        // response that the spec says will never arrive.
-        let notification = json!({
-            "jsonrpc": "2.0",
-            "method": "notifications/initialized",
-        });
-        let transport = self.transport.read().await.clone();
-        if let Err(e) = transport.notify(&notification).await {
-            warn!(
-                "MCP '{}': initialized notification failed: {e:#}",
-                self.name
-            );
+        let mut slot = self.connection.write().await;
+        if let Some(old) = slot.take() {
+            old.close();
         }
+        *slot = Some(self.open().await?);
+        Ok(())
+    }
 
+    /// Tear down the existing connection and establish a fresh one.
+    ///
+    /// On failure the old connection is already gone; the caller may retry.
+    pub async fn reconnect(&self) -> Result<()> {
+        info!("MCP '{}': reconnecting", self.name);
+        self.tools_changed.store(false, Ordering::Relaxed);
+        self.connect().await
+    }
+
+    /// Close the connection. A later call reconnects.
+    #[allow(dead_code)]
+    pub async fn shutdown(&self) -> Result<()> {
+        if let Some(old) = self.connection.write().await.take() {
+            old.close();
+        }
         Ok(())
     }
 
     /// List tools available on the remote MCP server.
     pub async fn list_tools(&self) -> Result<Vec<RemoteToolSpec>> {
-        let result = self.send("tools/list", json!({})).await?;
-        let tools = result
-            .get("tools")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-
+        let tools = self
+            .run(
+                "tools/list",
+                |c| async move { c.service.list_all_tools().await },
+            )
+            .await?;
         let specs: Vec<RemoteToolSpec> = tools
             .into_iter()
-            .filter_map(|t| {
-                let name = t.get("name")?.as_str()?.to_string();
-                let description = t
-                    .get("description")
-                    .and_then(|d| d.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let input_schema = t.get("inputSchema").cloned().unwrap_or(json!({}));
-                Some(RemoteToolSpec {
-                    name,
-                    description,
-                    input_schema,
-                })
+            .map(|t| RemoteToolSpec {
+                name: t.name.into_owned(),
+                description: t.description.map(Cow::into_owned).unwrap_or_default(),
+                input_schema: Value::Object((*t.input_schema).clone()),
             })
             .collect();
 
@@ -320,20 +282,345 @@ impl McpClient {
     }
 
     /// Call a tool on the remote MCP server.
-    pub async fn call_tool(&self, name: &str, arguments: &Value) -> Result<Value> {
-        let params = json!({
-            "name": name,
-            "arguments": arguments,
-        });
-        self.send("tools/call", params).await
+    ///
+    /// The result is returned whole — `content`, `structuredContent` and
+    /// `isError` alike; [`tool_result_text`] flattens it the way the LLM
+    /// sees it. Input the server asks for along the way is answered by
+    /// [`AgentClientHandler`].
+    pub async fn call_tool(&self, name: &str, arguments: &Value) -> Result<CallToolResult> {
+        let arguments = match arguments {
+            Value::Object(map) => Some(map.clone()),
+            Value::Null => None,
+            other => anyhow::bail!("MCP tool arguments must be an object, got: {other}"),
+        };
+        let mut params = CallToolRequestParams::new(name.to_string());
+        params.arguments = arguments;
+        self.run("tools/call", |c| {
+            let params = params.clone();
+            async move { c.service.call_tool(params).await }
+        })
+        .await
     }
 
-    /// Shut down the transport.
-    #[allow(dead_code)]
-    pub async fn shutdown(&self) -> Result<()> {
-        let transport = self.transport.read().await.clone();
-        transport.shutdown().await
+    /// Read one resource from the remote MCP server.
+    pub async fn read_resource(&self, uri: &str) -> Result<ReadResourceResult> {
+        let params = ReadResourceRequestParams::new(uri);
+        self.run("resources/read", |c| {
+            let params = params.clone();
+            async move { c.service.read_resource(params).await }
+        })
+        .await
     }
+
+    /// Open a `subscriptions/listen` stream with `filter` and wait for the
+    /// server to acknowledge it.
+    ///
+    /// The subscription is bound to the connection it was opened on: when
+    /// that connection is replaced — by [`Self::reconnect`], or by a call
+    /// recovering from a dead transport — it ends with
+    /// [`SubscriptionEnd::Abrupt`], and the caller listens again. Only a
+    /// 2026-07-28 server serves this; a legacy one answers method-not-found.
+    pub async fn listen(&self, filter: SubscriptionFilter) -> Result<Subscription> {
+        self.run("subscriptions/listen", |c| {
+            let filter = filter.clone();
+            async move { c.service.peer().listen(filter).await }
+        })
+        .await
+    }
+
+    /// The live connection, establishing one if there is none or the last
+    /// one has died.
+    async fn connection(&self) -> Result<Arc<Connection>> {
+        if let Some(c) = self.connection.read().await.as_ref()
+            && !c.is_closed()
+        {
+            return Ok(Arc::clone(c));
+        }
+        self.replace(None).await
+    }
+
+    /// Replace the connection `stale` with a fresh one — unless another
+    /// caller already has, in which case theirs is returned. `None` means
+    /// "whatever is there, if it is dead or missing".
+    async fn replace(&self, stale: Option<&Arc<Connection>>) -> Result<Arc<Connection>> {
+        let mut slot = self.connection.write().await;
+        if let Some(current) = slot.as_ref() {
+            let superseded = stale.is_some_and(|s| !Arc::ptr_eq(s, current));
+            if (superseded || stale.is_none()) && !current.is_closed() {
+                return Ok(Arc::clone(current));
+            }
+            current.close();
+        }
+        *slot = None;
+        let fresh = self.open().await.with_context(|| {
+            format!("MCP '{}': failed to re-establish the connection", self.name)
+        })?;
+        *slot = Some(Arc::clone(&fresh));
+        Ok(fresh)
+    }
+
+    /// Run `op` against the connection, replacing the connection once if
+    /// the transport turns out to be closed.
+    ///
+    /// What "closed" covers is narrower than it was in the hand-written
+    /// client, because `rmcp` already absorbs the common case: a Streamable
+    /// HTTP server that forgets an idle session answers `404`, and `rmcp`'s
+    /// transport re-runs the handshake and replays the request itself
+    /// (`reinit_on_expired_session`, on by default). A 2026-07-28 server has
+    /// no session to forget at all. What is left is the connection's service
+    /// loop ending — a stdio server that exited, a transport worker that
+    /// gave up — after which every request fails with `TransportClosed`
+    /// until something replaces it. A plain send failure (the HTTP endpoint
+    /// refusing a connection) is *not* retried here: the worker is still
+    /// alive and the next call goes through it again.
+    ///
+    /// The retry is deliberately once. A fresh connection failing the same
+    /// way is not staleness, and repeating the handshake against a server
+    /// that is down only buries the real error.
+    async fn run<T, F, Fut>(&self, method: &str, op: F) -> Result<T>
+    where
+        F: Fn(Arc<Connection>) -> Fut,
+        Fut: Future<Output = Result<T, ServiceError>>,
+    {
+        let conn = self.connection().await?;
+        let result = match op(Arc::clone(&conn)).await {
+            Err(ServiceError::TransportClosed) => {
+                info!(
+                    "MCP '{}': {method} found the connection closed; re-establishing it",
+                    self.name
+                );
+                let conn = self.replace(Some(&conn)).await?;
+                op(conn).await
+            }
+            other => other,
+        };
+        result.map_err(|e| {
+            anyhow!(
+                "MCP '{}': {method} failed: {}",
+                self.name,
+                describe_service_error(&e)
+            )
+        })
+    }
+
+    /// Build the transport, negotiate the protocol, and start watching for
+    /// tool-list changes.
+    async fn open(&self) -> Result<Arc<Connection>> {
+        // Prefer the stateless 2026-07-28 lifecycle, falling back to the
+        // `initialize` handshake. rmcp's `Auto` mode falls back on its own
+        // for a server that rejects `server/discover` (one that ignores it
+        // costs a ten-second probe first). It does not for a server that
+        // answers `server/discover` but lists only versions that still have
+        // `initialize` — an rmcp server capped below 2026-07-28 — so that
+        // case gets a second handshake, on a fresh transport, here.
+        let auto = ClientLifecycleMode::Auto {
+            preferred_versions: vec![ProtocolVersion::LATEST],
+            legacy_version: None,
+        };
+        let service = match self.handshake(auto).await {
+            Err(e) if offers_only_legacy(&e) => {
+                info!(
+                    "MCP '{}': server offers only legacy protocol versions; using initialize",
+                    self.name
+                );
+                self.handshake(ClientLifecycleMode::Initialize).await
+            }
+            other => other,
+        };
+        let service = service.map_err(|e| match e.downcast_ref::<ClientInitializeError>() {
+            Some(init) => anyhow!(
+                "MCP '{}': handshake failed: {}",
+                self.name,
+                describe_init_error(init)
+            ),
+            None => e,
+        })?;
+
+        let peer_info = service.peer().peer_info();
+        info!(
+            "MCP '{}': connected (server: {}, protocol {})",
+            self.name,
+            peer_info
+                .as_ref()
+                .and_then(|i| i.server_info.as_ref())
+                .map(|s| s.name.as_str())
+                .unwrap_or("unknown"),
+            peer_info
+                .as_ref()
+                .map(|i| i.protocol_version.to_string())
+                .unwrap_or_default(),
+        );
+
+        let watcher = self.watch_tool_list(&service);
+        Ok(Arc::new(Connection { service, watcher }))
+    }
+
+    /// Build a fresh transport and run one handshake over it.
+    async fn handshake(&self, lifecycle: ClientLifecycleMode) -> Result<Service> {
+        let handler = AgentClientHandler {
+            name: self.name.clone(),
+            workspace_root: self.workspace_root.clone(),
+            tools_changed: Arc::clone(&self.tools_changed),
+        };
+        let service = match &self.config.transport {
+            McpTransportConfig::Http { url, api_key } => {
+                let mut config = StreamableHttpClientTransportConfig::with_uri(url.as_str());
+                if let Some(key) = api_key {
+                    // rmcp adds the `Bearer ` prefix itself, and sends it on
+                    // every POST and GET — replies to server requests too.
+                    config = config.auth_header(key.clone());
+                }
+                let transport = StreamableHttpClientTransport::from_config(config);
+                handler.serve_with_lifecycle(transport, lifecycle).await?
+            }
+            McpTransportConfig::Stdio { command, args, env } => {
+                let mut cmd = tokio::process::Command::new(command);
+                cmd.args(args).envs(env);
+                let (transport, stderr) = TokioChildProcess::builder(cmd)
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .with_context(|| format!("Failed to spawn MCP server process: {command}"))?;
+                if let Some(stderr) = stderr {
+                    forward_stderr(self.name.clone(), stderr);
+                }
+                handler.serve_with_lifecycle(transport, lifecycle).await?
+            }
+        };
+        Ok(service)
+    }
+
+    /// Keep `tools_changed` fed on a 2026-07-28 server.
+    ///
+    /// A legacy server pushes `notifications/tools/list_changed` down the
+    /// connection unasked, and [`AgentClientHandler::on_tool_list_changed`]
+    /// catches it. A 2026-07-28 server sends notifications only on a
+    /// `subscriptions/listen` stream someone opened, so open one — for a
+    /// server that advertises the notification, and only then.
+    fn watch_tool_list(&self, service: &Service) -> Option<JoinHandle<()>> {
+        let info = service.peer().peer_info()?;
+        if info.protocol_version.has_initialize() {
+            return None;
+        }
+        let advertised = info
+            .capabilities
+            .tools
+            .as_ref()
+            .and_then(|t| t.list_changed)
+            .unwrap_or(false);
+        if !advertised {
+            return None;
+        }
+        let peer = service.peer().clone();
+        let name = self.name.clone();
+        let tools_changed = Arc::clone(&self.tools_changed);
+        Some(tokio::spawn(async move {
+            let filter = SubscriptionFilter::builder().tools_list_changed().build();
+            let mut subscription = match peer.listen(filter).await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("MCP '{name}': could not subscribe to tool-list changes: {e}");
+                    return;
+                }
+            };
+            loop {
+                match subscription.next().await {
+                    Ok(Some(ServerNotification::ToolListChangedNotification(_))) => {
+                        info!("MCP '{name}': tool list changed, will refresh");
+                        tools_changed.store(true, Ordering::Relaxed);
+                    }
+                    Ok(Some(other)) => debug!("MCP '{name}': notification: {other:?}"),
+                    Ok(None) => break,
+                    Err(e) => {
+                        warn!("MCP '{name}': tool-list subscription failed: {e}");
+                        break;
+                    }
+                }
+            }
+            debug!(
+                "MCP '{name}': tool-list subscription ended: {:?}",
+                subscription.end()
+            );
+        }))
+    }
+}
+
+/// Log a stdio server's stderr line by line instead of letting it write
+/// over the terminal the agent may be drawing on.
+fn forward_stderr(name: String, stderr: tokio::process::ChildStderr) {
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            debug!("MCP '{name}' stderr: {line}");
+        }
+    });
+}
+
+/// Whether a handshake failed only because the server answered
+/// `server/discover` with versions that all still use `initialize`.
+fn offers_only_legacy(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<ClientInitializeError>(),
+        Some(ClientInitializeError::NoCompatibleProtocolVersion { server_supported, .. })
+            if !server_supported.is_empty()
+                && server_supported.iter().all(ProtocolVersion::has_initialize)
+    )
+}
+
+/// Render a handshake failure with everything in it, and nothing else.
+///
+/// Two of rmcp's messages need help. `LegacyFallbackFailed` says only
+/// "discover and legacy initialize both failed"; the two failures are the
+/// diagnosis. A transport error leads with the transport's full generic
+/// type name, which drowns the HTTP status that follows it.
+fn describe_init_error(e: &ClientInitializeError) -> String {
+    match e {
+        ClientInitializeError::LegacyFallbackFailed { discover, fallback } => format!(
+            "server/discover: {}; initialize: {}",
+            describe_init_error(discover),
+            describe_init_error(fallback)
+        ),
+        ClientInitializeError::TransportError { error, context } => {
+            format!("{}: {context}", error.error)
+        }
+        other => other.to_string(),
+    }
+}
+
+/// Render a request failure; see [`describe_init_error`] for why a
+/// transport error is unwrapped.
+fn describe_service_error(e: &ServiceError) -> String {
+    match e {
+        ServiceError::TransportSend(error) => format!("transport error: {}", error.error),
+        other => other.to_string(),
+    }
+}
+
+/// Flatten a tool result into the text the LLM sees: the text content
+/// blocks joined by newlines, or failing that the whole result as JSON.
+pub fn tool_result_text(result: &CallToolResult) -> Result<String> {
+    let texts: Vec<&str> = result
+        .content
+        .iter()
+        .filter_map(|c| c.as_text().map(|t| t.text.as_str()))
+        .collect();
+    if !texts.is_empty() {
+        return Ok(texts.join("\n"));
+    }
+    Ok(serde_json::to_string_pretty(result)?)
+}
+
+/// The text of a resource read: the text contents joined by newlines.
+/// Binary (`blob`) contents are skipped.
+pub fn resource_text(result: &ReadResourceResult) -> String {
+    result
+        .contents
+        .iter()
+        .filter_map(|c| match c {
+            ResourceContents::TextResourceContents { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 // ---------------------------------------------------------------------------
@@ -363,27 +650,10 @@ impl Tool for McpTool {
 
     async fn execute(&self, input: &serde_json::Value) -> Result<String> {
         let result = self.client.call_tool(&self.remote_tool_name, input).await?;
-
-        // MCP tools/call returns { content: [...] } where each item has
-        // type "text" with a text field.  Concatenate all text content.
-        if let Some(contents) = result.get("content").and_then(|c| c.as_array()) {
-            let texts: Vec<&str> = contents
-                .iter()
-                .filter_map(|c| {
-                    if c.get("type").and_then(|t| t.as_str()) == Some("text") {
-                        c.get("text").and_then(|t| t.as_str())
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            if !texts.is_empty() {
-                return Ok(texts.join("\n"));
-            }
+        if let Some(observer) = self.client.observer.get() {
+            observer.tool_called(&self.remote_tool_name, &result);
         }
-
-        // Fallback: pretty-print the raw result.
-        Ok(serde_json::to_string_pretty(&result)?)
+        tool_result_text(&result)
     }
 }
 
@@ -440,13 +710,7 @@ pub async fn create_mcp_tools(
     let mut clients: Vec<Arc<McpClient>> = Vec::new();
 
     for config in configs {
-        let client = match McpClient::new(config, workspace_root).await {
-            Ok(c) => Arc::new(c),
-            Err(e) => {
-                warn!("MCP '{}': failed to create client: {e:#}", config.name);
-                continue;
-            }
-        };
+        let client = Arc::new(McpClient::new(config, workspace_root));
 
         if let Err(e) = client.connect().await {
             warn!("MCP '{}': failed to connect: {e:#}", config.name);
@@ -469,108 +733,4 @@ pub async fn create_mcp_tools(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A client over the HTTP transport, which connects lazily — nothing
-    /// here reaches the network.
-    async fn client_with(trust: McpTrust) -> Arc<McpClient> {
-        let config = McpServerConfig {
-            name: "ledger".to_string(),
-            transport: McpTransportConfig::Http {
-                url: "http://127.0.0.1:1/mcp".to_string(),
-                api_key: None,
-            },
-            trust,
-        };
-        Arc::new(
-            McpClient::new(&config, "/tmp")
-                .await
-                .expect("http transport is lazy"),
-        )
-    }
-
-    fn remote(name: &str) -> RemoteToolSpec {
-        RemoteToolSpec {
-            name: name.to_string(),
-            description: "a remote tool".to_string(),
-            input_schema: json!({"type": "object"}),
-        }
-    }
-
-    async fn kinds_for(trust: McpTrust) -> Vec<(String, ToolKind)> {
-        let client = client_with(trust).await;
-        build_tools_for_client(&client, vec![remote("list"), remote("record")])
-            .iter()
-            .map(|t| (t.spec().name.to_string(), t.kind()))
-            .collect()
-    }
-
-    /// The default, and the behaviour every existing config keeps: the
-    /// server's tools are `Other`, the strictest bucket, so a channel
-    /// refuses them.
-    #[tokio::test]
-    async fn an_untrusted_server_classifies_its_tools_as_other() {
-        for (name, kind) in kinds_for(McpTrust::None).await {
-            assert_eq!(kind, ToolKind::Other, "{name}");
-        }
-    }
-
-    #[tokio::test]
-    async fn a_read_trusted_server_classifies_its_tools_as_read() {
-        for (name, kind) in kinds_for(McpTrust::Read).await {
-            assert_eq!(kind, ToolKind::Read, "{name}");
-        }
-    }
-
-    #[tokio::test]
-    async fn an_edit_trusted_server_classifies_its_tools_as_edit() {
-        for (name, kind) in kinds_for(McpTrust::Edit).await {
-            assert_eq!(kind, ToolKind::Edit, "{name}");
-        }
-    }
-
-    /// The point of the field, stated as the policy outcome rather than
-    /// the classification: an untrusted server stays unreachable from a
-    /// channel — which is the heartbeat's chat leg too — and a trusted
-    /// one becomes reachable, without `decide` changing at all.
-    #[tokio::test]
-    async fn trust_decides_whether_a_channel_can_reach_the_server() {
-        use crate::tools::policy::{Decision, Origin, SessionMode, decide};
-
-        let kind = |kinds: Vec<(String, ToolKind)>| kinds[0].1;
-
-        let untrusted = kind(kinds_for(McpTrust::None).await);
-        assert_eq!(decide(Origin::Channel, untrusted), Decision::Deny);
-
-        let read = kind(kinds_for(McpTrust::Read).await);
-        assert_eq!(decide(Origin::Channel, read), Decision::Allow);
-        assert_eq!(
-            decide(Origin::Acp(SessionMode::Default), read),
-            Decision::Allow,
-            "a read is safe on every origin"
-        );
-
-        let edit = kind(kinds_for(McpTrust::Edit).await);
-        assert_eq!(
-            decide(Origin::Channel, edit),
-            Decision::Allow,
-            "chat-driven recording is the case this unblocks"
-        );
-        assert_eq!(
-            decide(Origin::Acp(SessionMode::Default), edit),
-            Decision::Ask,
-            "an editor still asks before a write, as it does for file_write"
-        );
-    }
-
-    /// The classification is per server, not per tool: `trust` is coarse
-    /// on purpose, so a tool the server adds later cannot silently fall
-    /// back to `Other` and look like the server being broken.
-    #[tokio::test]
-    async fn trust_applies_to_every_tool_the_server_lists() {
-        let kinds = kinds_for(McpTrust::Edit).await;
-        let names: Vec<&str> = kinds.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names, vec!["mcp__ledger__list", "mcp__ledger__record"]);
-    }
-}
+mod tests;

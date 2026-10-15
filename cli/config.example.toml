@@ -651,34 +651,33 @@ system_prompt = "You are a helpful personal assistant."
 # profile and which memory namespace its conversations use — ambient-only
 # devices included.
 
-# ── Timer / Pomodoro presets ────────────────────────────────────────
-# Single-shot timers ("5分後に教えて") don't need configuration — the
-# `timer_set` tool takes minutes + label directly. Presets are for
-# multi-step routines like Pomodoro so the user can say "ポモドーロ開始"
-# instead of redictating "25分集中 + 5分休憩を3回" every time.
+# ── Timer (sapphire-timer over MCP) ─────────────────────────────────
+# Timers and Pomodoro presets live in sapphire-timer, which the agent
+# reaches as an ordinary MCP server: add it under [[tools.mcp_servers]]
+# and the LLM drives it through `mcp__<name>__timer_start`,
+# `timer_start_preset`, `timer_cancel`, `timer_status` and the
+# `preset_*` tools. Presets are sapphire-timer's (create them with its
+# `preset_add` tool); `[[timer.preset]]` here is no longer read.
 #
-# Only ONE timer (single-shot or preset) can be active per process;
-# starting a new one cancels the previous. Timers are in-memory and
-# reset on restart. When a timer fires the agent is re-invoked to send
-# a notification on the same channel it was set from — voice → voice,
-# chat → chat, no cross-fallback.
+# `server` names that entry so the agent can also *announce* the timer:
+# it watches sapphire-timer's `sapphire-timer://active` resource and,
+# when a step or the whole run ends, sends a message on the channel the
+# timer was started from — voice → voice, chat → chat, no fallback.
+# Without it the tools still work, but nothing is announced.
+#
+# sapphire-timer gives each MCP client one timer: over stdio the
+# `sapphire-timer mcp` process the agent launched, over HTTP the external
+# device the api_key belongs to. Starting a new one replaces the old.
 
-[[timer.preset]]
-name   = "pomodoro"
-cycles = 4
-steps  = [
-  { label = "Focus", minutes = 25 },
-  { label = "Break", minutes = 5 },
-]
-
-# Example: a long-form variant for deep work.
-# [[timer.preset]]
-# name   = "deep_work"
-# cycles = 2
-# steps  = [
-#   { label = "Focus",      minutes = 50 },
-#   { label = "Break",      minutes = 10 },
-# ]
+# [[tools.mcp_servers]]
+# name    = "timer"
+# type    = "stdio"
+# command = "sapphire-timer"
+# args    = ["mcp"]
+# trust   = "edit"                          # so chat and voice can start it
+#
+# [timer]
+# server = "timer"
 
 # HTTP API (`/rpc`, `/a2a`, `/acp`, ambient ingest). Off unless this table
 # is present (or `serve --bind <addr>` is passed): the local clients —

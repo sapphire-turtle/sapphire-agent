@@ -933,8 +933,6 @@ mod tests {
             test_workspace(),
             Some("test-tavily-key".to_string()),
             &[],
-            crate::timer::TimerManager::new(),
-            Vec::new(),
             4,
         )
         .await;

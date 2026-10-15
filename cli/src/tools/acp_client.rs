@@ -7,7 +7,7 @@
 //! `tokio::task_local` scoped around tool execution instead.
 //!
 //! `src/timer.rs` solves the same problem the same way: the turn loops
-//! wrap `tools.execute(...)` in `scope_timer_origin` so the timer tool
+//! wrap `tools.execute(...)` in `scope_timer_origin` so a timer start
 //! can read where its call came from.
 //!
 //! This is a trait rather than the SDK's connection type so the tools
