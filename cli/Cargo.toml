@@ -194,7 +194,7 @@ dirs = "6"
 # JSON-RPC dispatch loop, the v1 schema types, and the `Lines` transport the
 # WebSocket is wrapped in. Default features only — `unstable_protocol_v2`
 # stays off, which is what pins this build to ACP v1.
-agent-client-protocol = "2.0.0"
+agent-client-protocol = "3.3.0"
 
 # The local chat protocol (method names, APP_API) and its client, shared
 # with sapphire-agent-desktop.
