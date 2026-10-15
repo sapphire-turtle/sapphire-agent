@@ -59,7 +59,7 @@ cargo build --release
 
 リリースバイナリは**Linux**（x86_64、aarch64）、**macOS**（aarch64）、**Windows**（x86_64）向けに公開されています。それぞれ単一の自己完結ファイル — `sherpa-onnx`とそのONNX Runtimeは静的リンクされているため、一緒にインストールするものは何もありません。
 
-Windows では `shell` ツールは、呼び出しで別のシェル（`pwsh`、`cmd`、`bash` など）を指定しない限り Windows PowerShell でコマンドを実行します。それ以外の OS では `$SHELL`、未設定なら `/bin/sh` を使います。
+Windows では `shell` ツールは、呼び出しで別のシェル（`pwsh`、`cmd`、`bash` など）を指定しない限り Windows PowerShell でコマンドを実行します。それ以外の OS では `$SHELL`、未設定なら `/bin/sh` を使います。ACP セッション中のコマンド（ファイル系・スキル系ツールのスクリプトも）はエディタ側のマシンで `bash` を使って実行するため、Windows のエディタでは Git Bash が `PATH` 上に必要です。WSL が有効だとエディタが WSL の `bash.exe` を選ぶことがあります（#303）。
 
 サーバーとその CLI は 1 つのバイナリです（[#278](https://github.com/sapphire-turtle/sapphire-agent/issues/278)）。`sapphire-ledger` など他の sapphire-framework アプリと同じく、クライアント系のコマンド（`chat`、`acp`、`status` など）は同じホストで動いているサーバーにローカル IPC で問い合わせます。GUI チャットクライアントの `sapphire-agent-desktop` も同じで、`chat` と同じく `[cli].room_profile` のルームプロファイルで動きます。
 

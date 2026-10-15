@@ -59,7 +59,7 @@ cargo build --release
 
 Release binaries are published for **Linux** (x86_64, aarch64), **macOS** (aarch64) and **Windows** (x86_64). Each is a single self-contained file — `sherpa-onnx` and its ONNX Runtime are linked statically, so there is nothing to install alongside it.
 
-On Windows the `shell` tool runs commands under Windows PowerShell unless a call names another shell (`pwsh`, `cmd`, `bash`, …); elsewhere it uses `$SHELL`, falling back to `/bin/sh`.
+On Windows the `shell` tool runs commands under Windows PowerShell unless a call names another shell (`pwsh`, `cmd`, `bash`, …); elsewhere it uses `$SHELL`, falling back to `/bin/sh`. Inside an ACP session, commands (and the file and skill tools' scripts) run on the editor's machine under `bash`, so a Windows editor needs Git Bash on `PATH`; with WSL enabled the editor may pick WSL's `bash.exe` instead (#303).
 
 The server and its CLI are one binary ([#278](https://github.com/sapphire-turtle/sapphire-agent/issues/278)), the way `sapphire-ledger` and the other sapphire-framework apps are: the client commands (`chat`, `acp`, `status`, …) talk to the server already running on the same host over its local IPC endpoint. So does `sapphire-agent-desktop`, the GUI chat client; like `chat` it runs under `[cli].room_profile`.
 

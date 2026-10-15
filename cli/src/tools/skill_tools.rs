@@ -25,7 +25,7 @@ use crate::skills::{
     parse_index, parse_resolved_dir, validate_entry_name, validate_source_url,
 };
 use crate::tools::acp_client::{AcpClient, ExitStatus, current_acp_client};
-use crate::tools::client_exec::{ClientRun, run_client_command};
+use crate::tools::client_exec::{CLIENT_SHELL, ClientRun, run_client_command};
 use crate::tools::client_tools::format_exit_status;
 use crate::tools::{Tool, ToolKind};
 use anyhow::{Context, Result};
@@ -159,7 +159,7 @@ impl SkillTool {
 
         let run = run_client_command(
             client,
-            "sh",
+            CLIENT_SHELL,
             &["-c".to_string(), RESOLVE_AND_INDEX_SH.to_string()],
             None,
             CLIENT_TIMEOUT,
@@ -512,7 +512,7 @@ fn shell_quote(s: &str) -> String {
 async fn resolve_or_create_dir(client: &Arc<dyn AcpClient>) -> Result<String> {
     let run = run_client_command(
         client,
-        "sh",
+        CLIENT_SHELL,
         &["-c".to_string(), RESOLVE_OR_CREATE_SH.to_string()],
         None,
         LOCAL_TIMEOUT,
@@ -632,7 +632,7 @@ impl Tool for SkillInstallTool {
         // failure" reading isn't tripped by the ordinary case.
         let probe = run_client_command(
             &client,
-            "sh",
+            CLIENT_SHELL,
             &[
                 "-c".to_string(),
                 format!(
@@ -931,7 +931,7 @@ impl Tool for SkillUninstallTool {
         // on git's wording for either.
         let probe = run_client_command(
             &client,
-            "sh",
+            CLIENT_SHELL,
             &[
                 "-c".to_string(),
                 format!(
@@ -1621,8 +1621,8 @@ mod tests {
 
         let creates = client.creates.lock().unwrap();
         assert_eq!(creates.len(), 3, "{creates:?}");
-        assert_eq!(creates[0].0, "sh", "resolving the directory");
-        assert_eq!(creates[1].0, "sh", "the existence probe");
+        assert_eq!(creates[0].0, CLIENT_SHELL, "resolving the directory");
+        assert_eq!(creates[1].0, CLIENT_SHELL, "the existence probe");
         assert_eq!(
             creates[2].0, "env",
             "the clone, run through env for GIT_TERMINAL_PROMPT"

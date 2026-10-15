@@ -1033,6 +1033,9 @@ impl ShellTool {
                     By default the command runs under {DEFAULT_SHELL_DOC}; \
                     override per call with the `shell` parameter (e.g. `bash`, \
                     `zsh`, `fish`, `pwsh`, `cmd`, or an absolute path). \
+                    Inside an ACP session the command always runs under `bash` \
+                    on the editor's machine (Git Bash on Windows), and the \
+                    `shell` parameter is ignored. \
                     Use the timeout parameter for long-running commands (default 60 s, max 600 s). \
                     Not suitable for interactive commands or persistent daemons.",
                 )
@@ -1092,13 +1095,19 @@ impl Tool for ShellTool {
             let cwd = input["workdir"].as_str();
             // ACP's `terminal/create` takes a command plus an argv, not a
             // shell string, while this tool's `command` parameter *is* one —
-            // so the shell is spelled out here, the same way the agent-side
-            // body below runs the line under `$SHELL -c`.
+            // so the shell is spelled out here: `bash`, like every other
+            // command on the client, which a Windows editor finds in Git Bash
+            // where `sh` would not resolve.
             let args = vec!["-c".to_string(), command.to_string()];
 
-            let run =
-                crate::tools::client_exec::run_client_command(&client, "sh", &args, cwd, timeout)
-                    .await?;
+            let run = crate::tools::client_exec::run_client_command(
+                &client,
+                crate::tools::client_exec::CLIENT_SHELL,
+                &args,
+                cwd,
+                timeout,
+            )
+            .await?;
             return match run.timed_out_handle {
                 Some(handle) => Ok(crate::tools::client_tools::format_timed_out(
                     &handle, timeout,
@@ -2531,10 +2540,10 @@ mod session_routing_tests {
 
     /// ACP's `terminal/create` takes a command plus an argv, not a shell
     /// string, while this tool's own `command` parameter *is* a shell string.
-    /// So the ACP path has to spell `sh -c` out itself, and `workdir` maps
+    /// So the ACP path has to spell `bash -c` out itself, and `workdir` maps
     /// onto the client call's `cwd`.
     #[tokio::test]
-    async fn shell_runs_the_command_line_through_sh_c_on_the_client() {
+    async fn shell_runs_the_command_line_through_bash_c_on_the_client() {
         let (_state, tool) = shell_tool_for_test();
         let client = Arc::new(FakeClient::default());
         client.queue_terminal_stdout("hi\n");
@@ -2548,7 +2557,7 @@ mod session_routing_tests {
 
         assert!(out.contains("hi"), "got: {out}");
         let creates = client.creates.lock().unwrap();
-        assert_eq!(creates[0].0, "sh");
+        assert_eq!(creates[0].0, "bash");
         assert_eq!(creates[0].1, vec!["-c".to_string(), "echo hi".to_string()]);
         assert_eq!(
             creates[0].2.as_deref(),
