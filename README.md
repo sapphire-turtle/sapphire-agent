@@ -43,6 +43,14 @@ curl -fsSL https://raw.githubusercontent.com/sapphire-turtle/sapphire-framework/
 
 This installs `sapphire-agent` into `~/.local/bin` together with `sapphire-bridge`, which it syncs through. Add `agent-desktop` for the desktop client. See the [install script's README](https://github.com/sapphire-turtle/sapphire-framework/tree/main/install) for the options.
 
+Or with [cargo-binstall](https://github.com/cargo-bins/cargo-binstall), which downloads the same release files into `~/.cargo/bin` rather than building them:
+
+```sh
+cargo binstall sapphire-agent
+# The desktop client is not on crates.io
+cargo binstall --git https://github.com/sapphire-turtle/sapphire-agent sapphire-agent-desktop
+```
+
 Or with cargo:
 
 ```sh

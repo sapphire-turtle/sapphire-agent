@@ -64,3 +64,24 @@ anyhow.workspace = true
 # Logging
 tracing = "0.1"
 tracing-subscriber.workspace = true
+
+# `cargo binstall --git https://github.com/sapphire-turtle/sapphire-agent sapphire-agent-desktop`
+# downloads the release file instead of building it (this crate is not on crates.io), following
+# sapphire-framework's ci/README.md#conventions: the files are bare binaries named
+# `<binary>-<os>-<arch>`, so each release platform names its own. quick-install is a third
+# party's build: only this repository's files, or a build from source, are installed.
+[package.metadata.binstall]
+pkg-fmt = "bin"
+disabled-strategies = ["quick-install"]
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/desktop-v{ version }/{ name }-linux-x86_64"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/desktop-v{ version }/{ name }-linux-aarch64"
+
+[package.metadata.binstall.overrides.aarch64-apple-darwin]
+pkg-url = "{ repo }/releases/download/desktop-v{ version }/{ name }-macos-aarch64"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/desktop-v{ version }/{ name }-windows-x86_64.exe"
