@@ -7,6 +7,8 @@
 > **ステータス：パーソナルプロジェクト。** これは私自身の利用のために作ったものです。私の環境で動くことだけが必要であり、私がテストするのもその環境だけです。使っていただいても、フォークしていただいても、プルリクエストを送っていただいても構いませんが、私自身が使わないプロバイダ・チャネル・機能のメンテナンスはしません。ユースケースが私と重なればラッキー、そうでなければ自由にフォークしてください。
 >
 > もともとこれが存在する理由は、試した他のエージェント（openclaw、zeroclawなど）が、必要としていた機能をサポートしていなかったり、私が気にする部分を実際にテストしていなかったり、修正を受け入れてくれなかったりしたからです。それで自分で書きました。期待値はそのあたりで調整してください。
+>
+> この点で、誰でも使えるように作っている他のsapphireアプリ（[sapphire-journal](https://github.com/sapphire-turtle/sapphire-journal)、[sapphire-ledger](https://github.com/sapphire-turtle/sapphire-ledger)、[sapphire-tally](https://github.com/sapphire-turtle/sapphire-tally)、[sapphire-timer](https://github.com/sapphire-turtle/sapphire-timer)）とは想定ユーザーが異なります。それらのAI連携は汎用的なMCPサーバーとして実装しているので、sapphire-agentがなくても、MCPクライアント機能を持つ任意のAIハーネスから使えます。
 
 ## できること
 

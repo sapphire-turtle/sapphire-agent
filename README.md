@@ -7,6 +7,8 @@ A personal AI assistant agent that works on file-based, local-first [`sapphire-f
 > **Status: personal project.** This is something I built for my own use. It only has to work in my environment, and that is the only environment I test it in. You are welcome to use it, fork it, or send pull requests, but I am not going to maintain providers, channels, or features I do not personally use. If your use case overlaps with mine, great; if not, fork freely.
 >
 > The reason this exists at all is that other agents I tried (openclaw, zeroclaw, …) either did not support what I needed, were not actually tested for the parts I cared about, or did not accept fixes. So I wrote my own. Please calibrate expectations accordingly.
+>
+> This also sets it apart from the other sapphire apps ([sapphire-journal](https://github.com/sapphire-turtle/sapphire-journal), [sapphire-ledger](https://github.com/sapphire-turtle/sapphire-ledger), [sapphire-tally](https://github.com/sapphire-turtle/sapphire-tally), [sapphire-timer](https://github.com/sapphire-turtle/sapphire-timer)), which are built for anyone to use and so have a different intended audience. They expose their AI integration as a standard MCP server, so they do not need sapphire-agent: any AI harness with MCP client support works with them.
 
 ## What it does
 
