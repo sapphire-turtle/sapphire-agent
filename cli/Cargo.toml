@@ -123,7 +123,7 @@ sapphire-framework = { version = "0.20.0", default-features = false, features = 
 # (`cli` feature) and sends it to the running bridge, which owns the ledger.
 # Same release as `sapphire-framework`, so both resolve to one copy.
 sapphire-framework-bridge-api = { version = "2.3.0", features = ["cli"] }
-sapphire-framework-bridge-client = "0.20.0"
+sapphire-framework-bridge-client = "0.21.0"
 # The app server's API version, which `sapphire-agent acp` names in its
 # IPC handshake. The facade does not re-export it either.
 sapphire-framework-server-api = "4.2.0"

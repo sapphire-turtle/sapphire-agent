@@ -7689,7 +7689,7 @@ dependencies = [
  "sapphire-agent-core",
  "sapphire-framework",
  "sapphire-framework-bridge-api",
- "sapphire-framework-bridge-client",
+ "sapphire-framework-bridge-client 0.21.0",
  "sapphire-framework-server-api",
  "serde",
  "serde_ignored",
@@ -7746,7 +7746,7 @@ checksum = "c443092d033387bc409c7873fad0d3f6671a2666173ef41eb4b0f01039981463"
 dependencies = [
  "sapphire-framework-backend",
  "sapphire-framework-frontmatter",
- "sapphire-framework-ipc",
+ "sapphire-framework-ipc 0.20.0",
  "sapphire-framework-keys",
  "sapphire-framework-server",
  "sapphire-framework-workspace",
@@ -7762,7 +7762,7 @@ dependencies = [
  "chrono",
  "grain-id",
  "indexmap 2.14.2",
- "sapphire-framework-ipc",
+ "sapphire-framework-ipc 0.20.0",
  "sapphire-framework-server-api",
  "sapphire-framework-workspace",
  "serde",
@@ -7791,7 +7791,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5213044fa80860b98d2bc0ecdeeaf62df747cd6ca6fc51fc28fb8c2dd86a8d19"
 dependencies = [
  "sapphire-framework-bridge-api",
- "sapphire-framework-ipc",
+ "sapphire-framework-ipc 0.20.0",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "sapphire-framework-bridge-client"
+version = "0.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef34b702c22e521934e853bcdd156782fabeaef72a87c8341d39d715213509cb"
+dependencies = [
+ "sapphire-framework-bridge-api",
+ "sapphire-framework-ipc 0.21.0",
  "serde_json",
  "tokio",
  "tracing",
@@ -7827,6 +7840,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "sapphire-framework-ipc"
+version = "0.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e32e82f0f3b10c2e9e5936a58e3a3768e288a49da6a6eac3263a6ad62bed2ff"
+dependencies = [
+ "dirs 7.0.0",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "sapphire-framework-keys"
 version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7836,8 +7866,8 @@ dependencies = [
  "axum",
  "grain-id",
  "sapphire-framework-bridge-api",
- "sapphire-framework-bridge-client",
- "sapphire-framework-ipc",
+ "sapphire-framework-bridge-client 0.20.0",
+ "sapphire-framework-ipc 0.20.0",
  "sha2 0.11.1",
  "tokio",
  "tracing",
@@ -7869,8 +7899,8 @@ dependencies = [
  "notify",
  "sapphire-framework-backend",
  "sapphire-framework-bridge-api",
- "sapphire-framework-bridge-client",
- "sapphire-framework-ipc",
+ "sapphire-framework-bridge-client 0.20.0",
+ "sapphire-framework-ipc 0.20.0",
  "sapphire-framework-service",
  "sapphire-framework-session",
  "sapphire-framework-sync",
@@ -7981,8 +8011,8 @@ dependencies = [
  "indexmap 2.14.2",
  "md-5",
  "sapphire-framework-bridge-api",
- "sapphire-framework-bridge-client",
- "sapphire-framework-ipc",
+ "sapphire-framework-bridge-client 0.20.0",
+ "sapphire-framework-ipc 0.20.0",
  "sapphire-framework-retrieve",
  "sapphire-framework-track",
  "serde",
