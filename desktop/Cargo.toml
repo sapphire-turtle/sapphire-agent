@@ -51,7 +51,7 @@ bevy_egui = "0.43"
 # feature pulls in resvg, which turns each SVG into a texture at the
 # requested DPI on first use. Pinned to 0.36 so it matches the egui
 # 0.36.x re-export from bevy_egui 0.43.
-egui_extras = { version = "0.36", features = ["svg"] }
+egui_extras = { version = "0.37", features = ["svg"] }
 
 # The agent client is async but bevy's scheduler is sync, so it gets its
 # own runtime. Multi-threaded so an in-flight turn doesn't hold up a
