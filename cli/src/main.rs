@@ -84,7 +84,8 @@ fn init_app_ctx() {
     APP_CTX.set_cache_dir(cache_dir);
     APP_CTX.set_data_dir(data_dir);
     // Where the agent's own `config.toml` has always lived, so the
-    // framework's `workspace.toml` and `server.toml` sit beside it.
+    // framework's `workspace.toml` sits beside it, and the framework's
+    // `[http]` and `[update]` tables share the file itself.
     APP_CTX.set_config_dir(
         base.as_ref()
             .map(|b| b.config_dir().to_path_buf())
@@ -162,8 +163,8 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// The framework's verbs: serve, status, service, workspace, workgroup,
-    /// device, embedding, external-device.
+    /// The framework's verbs: serve, status, service, update, workspace,
+    /// workgroup, device, embedding, external-device, config.
     #[command(flatten)]
     Framework(sapphire_framework::server::FrameworkCommand),
 }
@@ -346,13 +347,20 @@ async fn main() -> Result<()> {
     }
 
     // The framework's verbs other than `serve` talk to the running server
-    // or the bridge, and need no agent config either.
+    // (which relays the bridge's), and need no agent config either.
     let cli = match cli.command {
         Command::Framework(command)
             if !matches!(command, sapphire_framework::server::FrameworkCommand::Serve) =>
         {
+            // The agent has no keys of its own in the framework's settings
+            // registry (`()`): its `config.toml` tables are its own to read.
             let code = command
-                .dispatch(app_server::build(), app_server::VERSION)
+                .dispatch(
+                    &APP_CTX,
+                    (),
+                    |_: &sapphire_framework::server::Settings| app_server::build(),
+                    app_server::VERSION,
+                )
                 .await?;
             if code != 0 {
                 std::process::exit(code);
