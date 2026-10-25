@@ -45,6 +45,9 @@ ignore = [
     { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.102.x URI name-constraint acceptance; transitive via serenity → tokio-tungstenite 0.21." },
     { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.102.x wildcard-name constraint acceptance; transitive via serenity → tokio-tungstenite 0.21." },
     { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.102.x CRL parsing panic; transitive via serenity → tokio-tungstenite 0.21." },
+    # Fixed in 0.103.16, which the 0.103 copy in the graph is on; this covers
+    # just the 0.102 copy, i.e. the Discord gateway's TLS to discord.com.
+    { id = "RUSTSEC-2026-0382", reason = "rustls-webpki 0.102.x accepts distrusted intermediates; transitive via serenity → tokio-tungstenite 0.21. The 0.103 copy is on the fix (0.103.16)." },
 
     # --- rustls 0.22.x advisories, same serenity path ---
     # Fixed only in rustls 0.23.46; the 0.23 copy in the graph is on it, so
