@@ -45,6 +45,14 @@ curl -fsSL https://raw.githubusercontent.com/sapphire-turtle/sapphire-framework/
 
 `sapphire-agent` と、同期に使う `sapphire-bridge` が一緒に `~/.local/bin` へ入ります。デスクトップクライアントも入れるには `agent-desktop` を足してください。オプションは[インストールスクリプトの README](https://github.com/sapphire-turtle/sapphire-framework/tree/main/install)を参照してください。
 
+[cargo-binstall](https://github.com/cargo-bins/cargo-binstall) で入れる場合（同じリリースファイルをビルドせずに `~/.cargo/bin` へダウンロードします）：
+
+```sh
+cargo binstall sapphire-agent
+# デスクトップクライアントは crates.io にない
+cargo binstall --git https://github.com/sapphire-turtle/sapphire-agent sapphire-agent-desktop
+```
+
 cargo で入れる場合：
 
 ```sh
