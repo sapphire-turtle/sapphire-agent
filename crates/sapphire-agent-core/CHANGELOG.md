@@ -10,6 +10,14 @@ version with `sapphire-agent-server`) are recorded in the root `CHANGELOG.md`.
 
 ## [Unreleased]
 
+## [0.10.0](https://github.com/sapphire-turtle/sapphire-agent/compare/sapphire-agent-core-v0.9.0...sapphire-agent-core-v0.10.0) - 2026-10-26
+
+### Changed
+
+- [**breaking**] Built on sapphire-framework 0.22 and sapphire-framework-server-api 5
+
+
+
 ## [0.9.0](https://github.com/sapphire-turtle/sapphire-agent/compare/sapphire-agent-core-v0.8.0...sapphire-agent-core-v0.9.0) - 2026-10-15
 
 ### Added

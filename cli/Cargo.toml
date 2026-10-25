@@ -1,6 +1,6 @@
 [package]
 name = "sapphire-agent"
-version = "0.10.0"
+version = "0.11.0"
 edition.workspace = true
 description = "A personal AI assistant agent that works on file-based, local-first sapphire-framework workspaces together with you"
 license.workspace = true
@@ -209,7 +209,7 @@ agent-client-protocol = "3.3.0"
 
 # The local chat protocol (method names, APP_API) and its client, shared
 # with sapphire-agent-desktop.
-sapphire-agent-core = { path = "../crates/sapphire-agent-core", version = "0.9.0" }
+sapphire-agent-core = { path = "../crates/sapphire-agent-core", version = "0.10.0" }
 
 # Line editing for the `chat` REPL (CJK-safe input, history, cursor movement).
 reedline = "0.49"
