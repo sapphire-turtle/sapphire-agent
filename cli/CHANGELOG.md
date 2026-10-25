@@ -5,11 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.10.1](https://github.com/sapphire-turtle/sapphire-agent/compare/v0.10.0...v0.10.1) - 2026-10-25
+## [0.11.0](https://github.com/sapphire-turtle/sapphire-agent/compare/v0.10.0...v0.11.0) - 2026-10-26
 
 ### Added
 
 - Let cargo binstall install the release binaries
+- The framework's `config` verb (`sapphire-agent config get|set|...`) for the agent's own `config.toml`
+
+### Changed
+
+- [**breaking**] Built on sapphire-framework 0.22 (server API 5, bridge API 3): the app server's settings moved from `server.toml` into the agent's `config.toml` (`[http]`, `[update]`), which the first start migrates. Update `sapphire-bridge` and the other sapphire apps together with this release
+- Bump agent-client-protocol to 3.5: an `initialize` asking for a protocol version above v1 must be v2-shaped (`info`, `capabilities`) and is negotiated down to v1
 
 
 

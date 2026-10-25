@@ -14,7 +14,11 @@ and predate any user-facing release of this binary.
 
 ## [Unreleased]
 
-## [0.8.2](https://github.com/sapphire-turtle/sapphire-agent/compare/desktop-v0.8.1...desktop-v0.8.2) - 2026-10-25
+## [0.8.2](https://github.com/sapphire-turtle/sapphire-agent/compare/desktop-v0.8.1...desktop-v0.8.2) - 2026-10-26
+
+### Changed
+
+- Built on sapphire-agent-core 0.10 (sapphire-framework 0.22, server API 5): use it with sapphire-agent 0.11
 
 ### Added
 
