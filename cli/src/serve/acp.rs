@@ -2063,8 +2063,23 @@ mod tests {
         initialize_request_asking_for(id, 1)
     }
 
-    /// An `initialize` that asks for a specific protocol version.
+    /// An `initialize` that asks for a specific protocol version, shaped the
+    /// way a client of that version sends it: above v1, the library parses
+    /// the request as v2 (`info` and `capabilities`, not `clientInfo` and
+    /// `clientCapabilities`) before negotiating it down.
     fn initialize_request_asking_for(id: i64, protocol_version: u16) -> serde_json::Value {
+        if protocol_version > 1 {
+            return serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": protocol_version,
+                    "info": { "name": "test-client", "version": "0.0.0" },
+                    "capabilities": {}
+                }
+            });
+        }
         serde_json::json!({
             "jsonrpc": "2.0",
             "id": id,
