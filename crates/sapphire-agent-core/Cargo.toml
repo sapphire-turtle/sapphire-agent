@@ -9,10 +9,10 @@ repository.workspace = true
 [dependencies]
 # The app server's IPC transport: endpoint discovery, handshake, calls and
 # notifications. Only the `ipc` module of the facade.
-sapphire-framework = { version = "0.20.0", default-features = false, features = ["ipc"] }
+sapphire-framework = { version = "0.22.0", default-features = false, features = ["ipc"] }
 # The framework's API version, named in the handshake. Not re-exported by
 # the facade.
-sapphire-framework-server-api = "4.2.0"
+sapphire-framework-server-api = "5.0.0"
 
 # Serialization
 serde_json.workspace = true

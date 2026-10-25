@@ -117,16 +117,16 @@ uuid = { version = "1", features = ["v7", "serde"] }
 # redb-store) from bypassing the feature flags below.
 # `keys` provides `keys::BridgeVerifier`, which checks a bearer token against
 # the workgroup's external devices through the running bridge.
-sapphire-framework = { version = "0.20.0", default-features = false, features = ["workspace", "keys", "frontmatter", "server", "ipc"] }
+sapphire-framework = { version = "0.22.0", default-features = false, features = ["workspace", "keys", "frontmatter", "server", "ipc"] }
 # The bridge's control-plane API and client, which the facade does not
 # re-export: `external-device` reuses the framework's own subcommand
 # (`cli` feature) and sends it to the running bridge, which owns the ledger.
 # Same release as `sapphire-framework`, so both resolve to one copy.
-sapphire-framework-bridge-api = { version = "2.3.0", features = ["cli"] }
-sapphire-framework-bridge-client = "0.20.0"
+sapphire-framework-bridge-api = { version = "3.0.0", features = ["cli"] }
+sapphire-framework-bridge-client = "0.22.0"
 # The app server's API version, which `sapphire-agent acp` names in its
 # IPC handshake. The facade does not re-export it either.
-sapphire-framework-server-api = "4.2.0"
+sapphire-framework-server-api = "5.0.0"
 
 # Human-readable ids: session ids, and external device ids. Must match the
 # version sapphire-framework uses — `keys::Authenticated::id` is a `GrainId`, and two semver-incompatible grain-id versions in one graph are

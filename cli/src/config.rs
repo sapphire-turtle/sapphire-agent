@@ -2112,6 +2112,7 @@ impl Config {
             serde_ignored::deserialize(outcome.merged.clone(), |path| {
                 unknown.push(path.to_string());
             });
+        unknown.retain(|path| !is_framework_key(path));
         unknown.sort();
         unknown.dedup();
 
@@ -2136,6 +2137,7 @@ impl Config {
                     host_path.display()
                 )
             })?;
+            host_unknown.retain(|path| !is_framework_key(path));
             host_unknown.sort();
             host_unknown.dedup();
             let host_errors = host_config.validate_profiles();
@@ -2189,6 +2191,19 @@ impl Config {
             Err(e) => Err(e).with_context(|| "Failed to parse config file"),
         }
     }
+}
+
+/// The top-level tables sapphire-framework keeps in the agent's own
+/// `config.toml`: its app server's settings (`http.listen`, `http.mcp`,
+/// `update.check`, …), which `sapphire-agent config` reads and writes and
+/// the framework validates. Not unknown to the agent, only not its own.
+const FRAMEWORK_TABLES: &[&str] = &["http", "update"];
+
+/// Whether `path`, as `serde_ignored` names a dropped key, is in one of the
+/// [`FRAMEWORK_TABLES`].
+fn is_framework_key(path: &str) -> bool {
+    let top = path.split('.').next().unwrap_or(path);
+    FRAMEWORK_TABLES.contains(&top)
 }
 
 /// Parse a TOML string into a [`Config`]. Test-only; shared by `mod
@@ -3376,6 +3391,28 @@ model = "gemma-4-31b-it"
             loaded.config.matrix.as_ref().unwrap().room_ids,
             vec!["!a:srv".to_string()]
         );
+    }
+
+    /// The framework keeps its app server's settings in the agent's own
+    /// `config.toml` (and moves an old `server.toml` there): its tables are
+    /// not the agent's, but not a typo either. A misspelt top-level table
+    /// beside them still is.
+    #[test]
+    fn the_frameworks_tables_are_not_reported_as_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let host_path = dir.path().join("config.toml");
+        std::fs::write(
+            &host_path,
+            "[anthropic]\napi_key = \"sk-test\"\n\n\
+             [http]\nlisten = \"127.0.0.1:3170\"\n\n\
+             [http.mcp]\nenabled = true\n\n\
+             [update]\ncheck = false\n\n\
+             [htp]\nlisten = \"x\"\n",
+        )
+        .unwrap();
+
+        let loaded = Config::load_layered(&host_path).unwrap();
+        assert_eq!(loaded.unknown, vec!["htp".to_string()]);
     }
 
     /// An unknown key in the workspace layer survives the merge (only
