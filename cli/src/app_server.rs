@@ -163,6 +163,80 @@ pub fn watch_for_switch(
     })
 }
 
+/// Run the app server without the agent, for a config the agent cannot use.
+///
+/// A new host has no workspace yet, and the agent's config is partly in it
+/// (`.sapphire-agent/config.toml`): the workspace verbs that would fetch it —
+/// `workspace init --sync --remote-workspace` above all — need a running
+/// server, so refusing to serve would leave nothing to fetch it with. The
+/// server comes up as it would around the agent (IPC, the selected
+/// workspace, sync through the bridge), and the agent with it once the
+/// config can be used.
+///
+/// The host config and the served workspace's config are watched; a change
+/// to either — written by hand, or arriving through sync — exits with
+/// [`RESTART_EXIT_CODE`] so the service manager starts again and tries the
+/// config again. A start that still fails comes back here.
+pub async fn serve_without_agent(
+    error: anyhow::Error,
+    host_config: &Path,
+    selected: Option<&Path>,
+) -> Result<()> {
+    tracing::error!("{error:#}");
+    tracing::warn!(
+        "the agent is not running, only the {0} server: `{0} workspace` and the other \
+         framework verbs work, and the agent starts once the config at {1} (or the \
+         workspace's .{0}/config.toml) is fixed",
+        APP_CTX.app_name,
+        host_config.display()
+    );
+
+    let shutdown = CancellationToken::new();
+    let (server, _sync) = with_sync(build())?;
+    let host = Arc::clone(server.host());
+    let server_task = {
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let result = server.run().await;
+            shutdown.cancel();
+            result
+        })
+    };
+
+    // Until the server has restored the selection its root is unset; the
+    // selection stands in so that is not mistaken for a switch.
+    let selected = selected.map(Path::to_path_buf);
+    let configs = || {
+        let root = host.root().or_else(|| selected.clone());
+        config_contents(host_config, root.as_deref())
+    };
+    let at_start = configs();
+    loop {
+        tokio::select! {
+            () = shutdown.cancelled() => break,
+            () = tokio::time::sleep(SWITCH_POLL) => {}
+        }
+        if configs() != at_start {
+            tracing::info!(
+                "the config changed; exiting with {RESTART_EXIT_CODE} to start the agent again"
+            );
+            std::process::exit(RESTART_EXIT_CODE);
+        }
+    }
+    server_task.await.context("the app server panicked")??;
+    Ok(())
+}
+
+/// The host config and `root`'s workspace config, as they read now: what
+/// [`serve_without_agent`] compares to notice a change. A file that cannot
+/// be read is `None`, so one appearing is a change too.
+fn config_contents(host_config: &Path, root: Option<&Path>) -> [Option<Vec<u8>>; 2] {
+    [
+        std::fs::read(host_config).ok(),
+        root.and_then(|root| std::fs::read(crate::config::workspace_config_path(root)).ok()),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,6 +273,29 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(marker.join("config.toml")).unwrap(),
             "x = 1\n"
+        );
+    }
+
+    /// What brings a config-less server back to the agent: the host config
+    /// appearing, and the workspace config arriving (through sync, say).
+    #[test]
+    fn a_config_appearing_reads_as_a_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = tmp.path().join("config.toml");
+        let root = tmp.path().join("ws");
+        let at_start = config_contents(&host, Some(&root));
+
+        std::fs::write(&host, "[anthropic]\n").unwrap();
+        let with_host = config_contents(&host, Some(&root));
+        assert_ne!(with_host, at_start);
+
+        std::fs::create_dir_all(root.join(".sapphire-agent")).unwrap();
+        std::fs::write(root.join(".sapphire-agent/config.toml"), "x = 1\n").unwrap();
+        assert_ne!(config_contents(&host, Some(&root)), with_host);
+        assert_eq!(
+            config_contents(&host, Some(&root)),
+            config_contents(&host, Some(&root)),
+            "unchanged files are no change"
         );
     }
 

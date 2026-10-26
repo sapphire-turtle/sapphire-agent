@@ -297,6 +297,38 @@ async fn verify_external_devices(auth: &device_auth::DeviceAuth) {
     }
 }
 
+/// Load the layered config, refusing one that uses removed settings.
+fn load_config(
+    config_path: &std::path::Path,
+    workspace_root: Option<&std::path::Path>,
+) -> Result<LoadedConfig> {
+    let loaded = Config::load_layered_in(config_path, workspace_root)
+        .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
+    if loaded.config.standby_mode == Some(true) {
+        anyhow::bail!(
+            "config at {} sets `standby_mode = true`, which was removed in the \
+             sapphire-framework `main` migration: the framework no longer ships \
+             local-workspace auto-sync, so a standby node has nothing left to \
+             sync and would instead come up as a second fully-active agent \
+             (duplicate Matrix/Discord replies, two processes racing on \
+             MEMORY.md compaction and daily-log generation in the same \
+             workspace). Delete the `standby_mode` line from this config to \
+             upgrade.",
+            config_path.display()
+        );
+    }
+
+    let migration_errors = loaded.config.migration_errors();
+    if !migration_errors.is_empty() {
+        anyhow::bail!(
+            "config at {} uses settings that were removed:\n\n  - {}\n",
+            config_path.display(),
+            migration_errors.join("\n\n  - ")
+        );
+    }
+    Ok(loaded)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     fmt()
@@ -366,6 +398,20 @@ async fn main() -> Result<()> {
     // The framework's selected workspace decides which workspace the agent
     // serves; `workspace_dir` is only where a first start migrates it from.
     let selection = app_server::selection()?;
+    let serving = matches!(
+        cli.command,
+        Command::Framework(sapphire_framework::server::FrameworkCommand::Serve)
+    );
+    let loaded = load_config(&config_path, selection.as_ref().map(|s| s.root.as_path()))
+        // `serve` refuses to start on what only the registry can see, so a
+        // config it would refuse is one it serves without below.
+        .and_then(|loaded| {
+            if serving {
+                ProviderRegistry::from_config(&loaded.config)
+                    .context("Failed to build provider registry")?;
+            }
+            Ok(loaded)
+        });
     let LoadedConfig {
         config,
         workspace_dir,
@@ -373,8 +419,18 @@ async fn main() -> Result<()> {
         unknown,
         provenance,
         workspace_path,
-    } = Config::load_layered_in(&config_path, selection.as_ref().map(|s| s.root.as_path()))
-        .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
+    } = match loaded {
+        Ok(loaded) => loaded,
+        // Without a usable config there is no agent to run, but the app
+        // server still has to be up: `workspace init --remote-workspace`
+        // and the other workspace verbs are how a new host gets the
+        // workspace its config lives in.
+        Err(e) if serving => {
+            let selected = selection.as_ref().map(|s| s.root.as_path());
+            return app_server::serve_without_agent(e, &config_path, selected).await;
+        }
+        Err(e) => return Err(e),
+    };
     if let (Some(selected), Some(dir)) = (&selection, &config.workspace_dir) {
         let configured = config::resolve_workspace_dir(Some(dir), &config_path);
         if configured.canonicalize().ok().as_deref() != Some(selected.root.as_path()) {
@@ -423,29 +479,6 @@ async fn main() -> Result<()> {
             "Ignoring [[timer.preset]] in the config: timer presets moved to sapphire-timer, \
              which the agent reaches through `[timer] server`. Recreate them there (its \
              `preset_add` tool) and remove them from this file."
-        );
-    }
-
-    if config.standby_mode == Some(true) {
-        anyhow::bail!(
-            "config at {} sets `standby_mode = true`, which was removed in the \
-             sapphire-framework `main` migration: the framework no longer ships \
-             local-workspace auto-sync, so a standby node has nothing left to \
-             sync and would instead come up as a second fully-active agent \
-             (duplicate Matrix/Discord replies, two processes racing on \
-             MEMORY.md compaction and daily-log generation in the same \
-             workspace). Delete the `standby_mode` line from this config to \
-             upgrade.",
-            config_path.display()
-        );
-    }
-
-    let migration_errors = config.migration_errors();
-    if !migration_errors.is_empty() {
-        anyhow::bail!(
-            "config at {} uses settings that were removed:\n\n  - {}\n",
-            config_path.display(),
-            migration_errors.join("\n\n  - ")
         );
     }
 
