@@ -563,10 +563,12 @@ pub async fn generate_summary(
         }
     }
 
-    // Cap the transcript to avoid exceeding context on the summary call itself
+    // Cap the transcript to avoid exceeding context on the summary call itself.
+    // The cap is a byte index, so it needs the same `floor_char_boundary` as
+    // the tool-result cutoff above: `truncate` panics inside a character.
     let max_transcript_chars = 50_000;
     if transcript.len() > max_transcript_chars {
-        transcript.truncate(max_transcript_chars);
+        transcript.truncate(transcript.floor_char_boundary(max_transcript_chars));
         transcript.push_str("\n... (transcript truncated for summarization)");
     }
 
@@ -717,6 +719,19 @@ mod tests {
         // Must not panic, and must produce a summary (the stub's fixed
         // text — what matters here is that generate_summary returned at
         // all rather than unwinding inside the tokio task).
+        let summary = generate_summary(&StubProvider, &messages).await.unwrap();
+        assert_eq!(summary, "a summary");
+    }
+
+    /// The whole-transcript cap is a byte index too, and the same CJK
+    /// history that the per-result cutoff above guards against reaches it
+    /// through plain text messages. `"User: "` is 6 bytes, so 3-byte
+    /// characters after it put byte 50 000 (≡ 2 mod 3 past the prefix)
+    /// inside a character.
+    #[tokio::test]
+    async fn a_long_cjk_transcript_does_not_panic_on_the_transcript_cap() {
+        let messages = vec![ChatMessage::user("日".repeat(20_000))];
+
         let summary = generate_summary(&StubProvider, &messages).await.unwrap();
         assert_eq!(summary, "a summary");
     }
