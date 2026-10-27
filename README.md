@@ -1,3 +1,5 @@
+<img src="docs/icon.svg" alt="" width="72" height="72">
+
 # sapphire-agent
 
 > Language: **English** | [日本語](README.ja.md)
