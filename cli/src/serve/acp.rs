@@ -80,7 +80,7 @@ use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -767,6 +767,10 @@ enum TurnEnd {
     /// The shared executor finished — successfully or not; the outcome says
     /// which.
     Ran(super::LlmTurnOutcome),
+    /// The shared executor panicked. Caught so the prompt is still answered:
+    /// a panic that unwinds the spawned task drops the `Responder` unsent,
+    /// and the client waits on that `session/prompt` forever.
+    Panicked,
 }
 
 /// Log, rather than propagate, a failure to answer a `session/prompt`.
@@ -1773,13 +1777,17 @@ pub(crate) async fn serve_connection<O, I>(
                                 // the token has fired.
                                 biased;
                                 () = turn_cancel.cancelled() => TurnEnd::Cancelled,
-                                outcome = super::run_llm_turn(
+                                outcome = std::panic::AssertUnwindSafe(super::run_llm_turn(
                                     state,
                                     agent_session_id,
                                     crate::provider::ChatMessage::user(&text),
                                     Arc::clone(&progress) as Arc<dyn super::TurnHost>,
                                     None,
-                                ) => TurnEnd::Ran(outcome),
+                                ))
+                                .catch_unwind() => match outcome {
+                                    Ok(outcome) => TurnEnd::Ran(outcome),
+                                    Err(_) => TurnEnd::Panicked,
+                                },
                             };
 
                             // This turn is no longer an "ongoing operation",
@@ -1794,11 +1802,25 @@ pub(crate) async fn serve_connection<O, I>(
                                 session.turns.remove(&turn);
                             }
 
-                            let TurnEnd::Ran(outcome) = end else {
-                                return answered(
-                                    &session_id,
-                                    responder.respond(PromptResponse::new(StopReason::Cancelled)),
-                                );
+                            let outcome = match end {
+                                TurnEnd::Ran(outcome) => outcome,
+                                TurnEnd::Cancelled => {
+                                    return answered(
+                                        &session_id,
+                                        responder
+                                            .respond(PromptResponse::new(StopReason::Cancelled)),
+                                    );
+                                }
+                                // The panic message itself already went to
+                                // the log through the panic hook.
+                                TurnEnd::Panicked => {
+                                    return answered(
+                                        &session_id,
+                                        responder.respond_with_internal_error(
+                                            "the turn panicked; see the server log".to_string(),
+                                        ),
+                                    );
+                                }
                             };
 
                             let Some(_reply) = outcome.text else {
