@@ -102,23 +102,38 @@ mobile/                      （将来）bin：AgentGuiPlugin + 全画面 presen
 
 ### 6. 表情・アクションのツール（cli / core）
 
-#### ターンごとの申告
+#### ターンごとの申告（クライアントの能力）
 
-`sapphire-agent.chat.send` に省略可能な `avatar` を足す。
+`sapphire-agent.chat.send` に省略可能な `client` を足す。クライアントがこのターンで
+何をできるかの申告で、クライアント依存のツールの出し分けはすべてこれ一つで行う。
+今回解釈するのは `avatar` だけで、`speech` / `capture`（§12）は形だけ予約する。
+サーバーは知らないキーを無視する。
 
 ```jsonc
 { "session_id": "...", "content": "...",
-  "avatar": {
-    "expressions": ["neutral", "happy", "angry", "sad", "relaxed", "surprised"],
-    "actions": ["peace", "wave"]
+  "attachments": [{ "mime": "image/png", "data": "<base64>" }],   // 省略可（後述）
+  "client": {
+    "avatar": {
+      "expressions": ["neutral", "happy", "angry", "sad", "relaxed", "surprised"],
+      "actions": ["peace", "wave"]
+    }
+    // "speech": {...}, "capture": [...]  — §12、今回は未実装
   } }
 ```
 
 - 申告を `open` ではなく `send` に載せるのは、同じセッションを desktop で開いた後で
   CLI の `chat` から再開しうるため。ターン単位ならサーバーは状態を持たない。
-- `avatar` があるターンだけ LLM のツール一覧に `set_expression` を加え、
+- `client.avatar` があるターンだけ LLM のツール一覧に `set_expression` を加え、
   `actions` が空でなければ `play_action` も加える。heartbeat / autonomous / Discord / Matrix の
   ターンには出ない。
+
+#### 添付（今回実装する）
+
+`attachments` はユーザーのメッセージに付ける画像。各要素は `{mime, data}`（base64）で、
+`image/png` / `image/jpeg` / `image/webp` を受ける。サーバーは既存の `ContentPart::Image`
+としてメッセージに載せ、`image_cache` の扱い（sha256 で外に逃がす）にそのまま乗せる。
+1 件 20 MiB・1 ターン 8 件まで。超過や未対応の mime は `send` のエラーにする
+（ターンは始めない）。GUI 側の添付 UI（ファイル選択・撮影）は今回作らない。
 - 今回クライアントが申告する `expressions` は VRM 1.0 の感情プリセット 6 種のみ。
   モデル独自の custom expression への拡張はクライアントの申告だけで済む（サーバーは一覧から
   enum を組むだけ）。
@@ -164,20 +179,30 @@ pub enum ChatEvent {
     Action { name: String },
 }
 
+#[derive(Default)]
+pub struct ClientCaps { pub avatar: Option<AvatarCaps> /* speech, capture は §12 で追加 */ }
 pub struct AvatarCaps { pub expressions: Vec<String>, pub actions: Vec<String> }
+pub struct Attachment { pub mime: String, pub data: Vec<u8> }
+
+pub struct Turn<'a> {
+    pub content: &'a str,
+    pub attachments: &'a [Attachment],
+    pub client: &'a ClientCaps,
+}
 
 impl ChatClient {
     pub async fn send(
         &self,
         session_id: &str,
-        content: &str,
-        avatar: Option<&AvatarCaps>,
+        turn: Turn<'_>,
         on_event: impl FnMut(ChatEvent),
     ) -> Result<String>;
 }
 ```
 
-CLI の `chat` は `avatar: None` で呼び、`ChatEvent::Tool` だけ扱う。
+引数を `Turn` にまとめるのは、§12 の `speak` などを足しても `send` の呼び出し側を
+壊さないため。`ChatEvent` は `#[non_exhaustive]` にする。CLI の `chat` は
+`ClientCaps::default()` で呼び、`ChatEvent::Tool` だけ扱う。
 
 ### 7. モデルデータはサーバーが持ち、同期する
 
@@ -250,15 +275,56 @@ CLI の `chat` は `avatar: None` で呼び、`ChatEvent::Tool` だけ扱う。
 
 ### 10. バージョン
 
-- `APP_API` を 2 → **3**。変更履歴: 「3: `chat.send` に `avatar`、`chat.progress` に
-  `expression` / `action`、`sapphire-agent.avatar.*` を追加」。
+- `APP_API` を 2 → **3**。変更履歴: 「3: `chat.send` に `client`（`avatar`）と
+  `attachments`、`chat.progress` に `expression` / `action`、`sapphire-agent.avatar.*` を追加」。
 - ハンドシェイクが別の `APP_API` のサーバーを拒否するので、互換の分岐は持たない。
+- §12 の機能はそれぞれ実装するときに `APP_API` を上げる。
 
 ### 11. リリース・changelog
 
 - `sapphire-agent-gui` は `publish = false`。`release-plz.toml` で `release = false`
   （タグもリリースも作らない）。
 - `cliff.toml` の除外スコープに `gui` を、最初の `(gui)` コミットと同時に足す。
+
+### 12. 将来の拡張（形だけ決め、今回は実装しない）
+
+音声入出力とカメラ・スクリーンショットは別の設計書・別の段階で実装する。ここでは、
+後から足すときにプロトコルの骨格を変えずに済むよう、形だけを決める。名前・フィールドは
+その設計書で詰めてよいが、次の方針は変えない。
+
+#### 音声入力（STT、ウェイクワード）
+
+- **ウェイクワードは GUI 側**で検出する（常時マイクを聞くため）。sherpa-onnx の
+  keyword spotting を使い、`ort` は入れない（CLAUDE.md の ONNX Runtime 二重リンク問題）。
+- 検出 → 発話区間の録音 → **サーバーで STT**（既存の `cli/src/voice` の `SttProvider`）→ 通常のターン。
+- メソッド: `sapphire-agent.voice.transcribe {audio: base64, format: "s16le", rate: 16000}`
+  → `{text}`。クライアントは得た文字列で `chat.send` する（文字起こしを見せてから送れる）。
+- 申告: `client.speech.input = true` は現状ツールに影響しないが、ログと将来の
+  「音声で話しかけられた」前提のプロンプト調整のために予約する。
+
+#### 音声出力（TTS、リップシンク）
+
+- `chat.send` の `Turn` に `speak: bool` を足す。真なら返答本文を**サーバーで合成**
+  （既存の `TtsProvider`）し、`chat.progress {kind: "audio", seq, pcm: base64, rate, final}`
+  で流す。返答の `content` は従来どおり返る（吹き出しと履歴のため）。
+- 再生とリップシンクは **GUI 側**。再生中の PCM から音量・母音を推定して VRM の
+  `aa` / `ih` / `ou` / `ee` / `oh` を動かす。表情（§8）とは別の層で、口以外の表情は保つ。
+- 申告: `client.speech.output = { formats: ["s16le"], rates: [16000, 24000] }`。
+
+#### カメラ・スクリーンショット
+
+- **ユーザーが送るとき**: §6 の `attachments` に載せる（今回実装済みの経路）。
+- **エージェントが取るとき**: ツール `capture(source: enum<申告された capture>)`。
+  申告は `client.capture = ["screen", "camera"]`。エージェントからクライアントへの
+  問い合わせとして、次の往復で行う。
+  1. ツールが `chat.progress {kind: "capture_request", request_id, source}` を通知する。
+  2. クライアントは撮影して `sapphire-agent.chat.capture_result {request_id, image?: {mime, data}, error?}` を呼ぶ。
+  3. ツールは画像を `ContentPart::Image` としてツール結果に載せて返す。
+     **30 秒**で応答がなければタイムアウトのツールエラー。`error`（拒否・失敗）もツールエラー。
+- 撮影のたびに GUI で許可を求めるか、設定で常時許可するかは GUI 側の判断で、
+  プロトコルは関与しない（拒否は `error` で返る）。
+- この「通知で頼み、メソッドで答える」往復は、今後エージェントがクライアントに何かを
+  頼む別のツールでも同じ形で使う。
 
 ## エラー処理
 
@@ -272,7 +338,9 @@ CLI の `chat` は `avatar: None` で呼び、`ChatEvent::Tool` だけ扱う。
 
 ## テスト
 
-- **cli**: `avatar` の有無・`actions` の空でツールが出し分けられる、`play_action` の
+- **cli**: `attachments` が `ContentPart::Image` になる・上限と mime の拒否、
+  `client` の知らないキーを無視する、
+  `client.avatar` の有無・`actions` の空でツールが出し分けられる、`play_action` の
   1 ターン 1 回、不正な名前のエラー、avatar IPC のパス検証、commit 時のハッシュ照合と
   置き換え、`set_manifest` の参照確認、`progress` に expression / action が載る。
 - **core**: `progress` の各 kind が `ChatEvent` に解析される。
@@ -285,7 +353,8 @@ CLI の `chat` は `avatar: None` で呼び、`ChatEvent::Tool` だけ扱う。
 1. fork: bevy_egui（egui 0.37）、bevy_vrm1（bevy 0.20）
 2. `crates/sapphire-agent-gui` を作り、今の desktop のチャットを移す（振る舞いは変えない）
 3. framework-gui 0.23 の `Settings` を組み込む
-4. core / cli: `APP_API` 3、`set_expression` / `play_action`、`progress` の拡張
+4. core / cli: `APP_API` 3、`Turn` / `ClientCaps`、`attachments`、`set_expression` /
+   `play_action`、`progress` の拡張
 5. cli: avatar IPC と `avatar/` の保存
 6. gui: avatar の取得・キャッシュ、VRM 表示、表情・まばたき・視線・アクション
 7. desktop: 透過メイトウィンドウ、クリック透過、ジェスチャー UI、吹き出し・履歴・メニュー
@@ -297,4 +366,5 @@ CLI の `chat` は `avatar: None` で呼び、`ChatEvent::Tool` だけ扱う。
 - キャラクターがパネルをよけて覗き込むモーション
 - custom expression の申告（拡張点のみ用意）
 - avatar の変更通知、heartbeat / autonomous ターンでの表情
-- リップシンク（音声との連動）
+- §12 の実装すべて: ウェイクワード・STT、TTS・リップシンク、`capture` ツールと
+  クライアントへの問い合わせ、GUI の添付 UI（それぞれ別の設計書で）
