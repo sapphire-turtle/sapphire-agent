@@ -10,6 +10,7 @@ mod ambient;
 mod app_server;
 mod autonomous;
 mod autonomous_config;
+mod avatar_store;
 mod channel;
 mod chat;
 mod cli_init;

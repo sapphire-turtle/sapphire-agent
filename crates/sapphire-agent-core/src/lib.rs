@@ -305,6 +305,42 @@ impl ChatClient {
     }
 }
 
+/// The most one avatar file may weigh, in bytes.
+pub const AVATAR_MAX_FILE: u64 = 256 * 1024 * 1024;
+/// The most one `avatar.read` / `avatar.write_chunk` carries, in bytes.
+pub const AVATAR_CHUNK: usize = 1024 * 1024;
+
+/// What `<workspace>/avatar/avatar.toml` says: which file is the model, which
+/// is the idle loop, and which file plays each named action. Every value is a
+/// `/`-separated path relative to `avatar/`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct AvatarConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle: Option<String>,
+    #[serde(default)]
+    pub actions: std::collections::BTreeMap<String, String>,
+}
+
+/// One file under `avatar/`, with the hash a client compares to decide
+/// whether its copy is current.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AvatarFile {
+    pub path: String,
+    pub size: u64,
+    pub sha256: String,
+}
+
+/// The avatar config plus every file in `avatar/` except `avatar.toml`,
+/// ordered by path.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct AvatarManifest {
+    #[serde(flatten)]
+    pub config: AvatarConfig,
+    pub files: Vec<AvatarFile>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
