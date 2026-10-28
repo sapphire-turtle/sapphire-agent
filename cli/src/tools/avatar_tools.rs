@@ -105,7 +105,13 @@ pub(crate) fn specialize_specs(specs: &mut Vec<ToolSpec>, caps: Option<&AvatarCa
             PLAY_ACTION => ("action", &caps.actions),
             _ => continue,
         };
-        spec.input_schema["properties"][field]["enum"] = json!(names);
+        let mut unique: Vec<&String> = Vec::new();
+        for n in names {
+            if !unique.contains(&n) {
+                unique.push(n);
+            }
+        }
+        spec.input_schema["properties"][field]["enum"] = json!(unique);
     }
 }
 
@@ -385,6 +391,20 @@ mod tests {
         assert_eq!(
             no_actions[0].input_schema["properties"]["expression"]["enum"],
             json!(["neutral", "happy"])
+        );
+
+        let mut dup = all();
+        specialize_specs(
+            &mut dup,
+            Some(&caps(&["happy", "sad", "happy"], &["peace", "peace"])),
+        );
+        assert_eq!(
+            dup[0].input_schema["properties"]["expression"]["enum"],
+            json!(["happy", "sad"])
+        );
+        assert_eq!(
+            dup[1].input_schema["properties"]["action"]["enum"],
+            json!(["peace"])
         );
 
         let mut both = all();
