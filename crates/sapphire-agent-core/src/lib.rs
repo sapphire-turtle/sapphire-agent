@@ -20,6 +20,14 @@
 //!   `intensity?`, `"action"` with `action`); see [`parse_progress`].
 //! - [`HISTORY`] `{session_id}` answers `{messages}`.
 //! - [`SESSIONS`] answers `{sessions}`.
+//! - The avatar's files, kept in the workspace's `avatar/` folder, move in
+//!   [`AVATAR_CHUNK`]-sized pieces: [`AVATAR_MANIFEST`] answers an
+//!   [`AvatarManifest`]; [`AVATAR_READ`] `{path, offset, len}` answers
+//!   `{data, eof}` (base64); [`AVATAR_WRITE_BEGIN`] `{path, size, sha256}`
+//!   answers `{upload_id}`, then [`AVATAR_WRITE_CHUNK`]
+//!   `{upload_id, offset, data}` per piece and [`AVATAR_WRITE_COMMIT`]
+//!   `{upload_id}` to put the file in place; [`AVATAR_SET_MANIFEST`] takes an
+//!   [`AvatarConfig`]; [`AVATAR_REMOVE`] `{path}` deletes a file.
 //!
 //! There is no token: the IPC endpoint admits only the OS user that runs
 //! the server, and the agent's `[cli].room_profile` names the room profile.
@@ -51,6 +59,20 @@ pub const SEND: &str = "sapphire-agent.chat.send";
 pub const HISTORY: &str = "sapphire-agent.chat.history";
 /// The client sessions.
 pub const SESSIONS: &str = "sapphire-agent.chat.sessions";
+/// The avatar's config and file list.
+pub const AVATAR_MANIFEST: &str = "sapphire-agent.avatar.manifest";
+/// One piece of an avatar file.
+pub const AVATAR_READ: &str = "sapphire-agent.avatar.read";
+/// Start uploading an avatar file.
+pub const AVATAR_WRITE_BEGIN: &str = "sapphire-agent.avatar.write_begin";
+/// One piece of an upload.
+pub const AVATAR_WRITE_CHUNK: &str = "sapphire-agent.avatar.write_chunk";
+/// Finish an upload and put the file in place.
+pub const AVATAR_WRITE_COMMIT: &str = "sapphire-agent.avatar.write_commit";
+/// Replace the avatar config.
+pub const AVATAR_SET_MANIFEST: &str = "sapphire-agent.avatar.set_manifest";
+/// Delete an avatar file.
+pub const AVATAR_REMOVE: &str = "sapphire-agent.avatar.remove";
 /// Notification: progress in a [`SEND`] turn (a tool call, an avatar cue).
 pub const PROGRESS: &str = "sapphire-agent.chat.progress";
 
@@ -302,6 +324,105 @@ impl ChatClient {
             .await
             .map_err(|e| anyhow!(e))?;
         Ok(result["sessions"].as_array().cloned().unwrap_or_default())
+    }
+
+    /// The avatar's config and every file in it.
+    pub async fn avatar_manifest(&self) -> Result<AvatarManifest> {
+        let result: Value = self
+            .client
+            .call(AVATAR_MANIFEST, json!({}))
+            .await
+            .map_err(|e| anyhow!(e))?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    /// A whole avatar file, read [`AVATAR_CHUNK`] at a time.
+    pub async fn avatar_download(&self, path: &str) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        loop {
+            let result: Value = self
+                .client
+                .call(
+                    AVATAR_READ,
+                    json!({ "path": path, "offset": out.len(), "len": AVATAR_CHUNK }),
+                )
+                .await
+                .map_err(|e| anyhow!(e))?;
+            let data = result["data"].as_str().unwrap_or_default();
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .context("avatar chunk is not valid base64")?;
+            let eof = result["eof"].as_bool().unwrap_or(true);
+            if bytes.is_empty() && !eof {
+                bail!("the agent sent an empty avatar chunk before the end of {path}");
+            }
+            out.extend_from_slice(&bytes);
+            if eof {
+                return Ok(out);
+            }
+        }
+    }
+
+    /// Put `bytes` at `path` in the avatar folder.
+    pub async fn avatar_upload(&self, path: &str, bytes: &[u8]) -> Result<()> {
+        use sha2::{Digest as _, Sha256};
+        let sha256: String = Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let begun: Value = self
+            .client
+            .call(
+                AVATAR_WRITE_BEGIN,
+                json!({ "path": path, "size": bytes.len(), "sha256": sha256 }),
+            )
+            .await
+            .map_err(|e| anyhow!(e))?;
+        let upload_id = begun["upload_id"]
+            .as_str()
+            .context("the agent answered no upload_id")?;
+        let mut offset = 0usize;
+        for chunk in bytes.chunks(AVATAR_CHUNK) {
+            let _: Value = self
+                .client
+                .call(
+                    AVATAR_WRITE_CHUNK,
+                    json!({
+                        "upload_id": upload_id,
+                        "offset": offset,
+                        "data": base64::engine::general_purpose::STANDARD.encode(chunk),
+                    }),
+                )
+                .await
+                .map_err(|e| anyhow!(e))?;
+            offset += chunk.len();
+        }
+        let _: Value = self
+            .client
+            .call(AVATAR_WRITE_COMMIT, json!({ "upload_id": upload_id }))
+            .await
+            .map_err(|e| anyhow!(e))?;
+        Ok(())
+    }
+
+    /// Replace the avatar config.
+    pub async fn avatar_set_config(&self, config: &AvatarConfig) -> Result<()> {
+        let _: Value = self
+            .client
+            .call(AVATAR_SET_MANIFEST, serde_json::to_value(config)?)
+            .await
+            .map_err(|e| anyhow!(e))?;
+        Ok(())
+    }
+
+    /// Delete the avatar file at `path`.
+    pub async fn avatar_remove(&self, path: &str) -> Result<()> {
+        let _: Value = self
+            .client
+            .call(AVATAR_REMOVE, json!({ "path": path }))
+            .await
+            .map_err(|e| anyhow!(e))?;
+        Ok(())
     }
 }
 

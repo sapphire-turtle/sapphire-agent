@@ -16,6 +16,7 @@ pub mod a2a;
 pub mod acp;
 pub mod acp_permissions;
 pub mod acp_tunnel;
+pub mod avatar_ipc;
 pub mod chat_ipc;
 
 use crate::acp_session::AcpSessionStore;

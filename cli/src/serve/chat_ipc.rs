@@ -17,6 +17,7 @@
 //! that runs the server, and the room profile a token would have picked is
 //! named by `[cli].room_profile` instead.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use base64::Engine as _;
@@ -32,6 +33,7 @@ use super::{
     ServeState, TurnHost, open_session, run_llm_turn, session_history, session_list,
     spawn_session_title,
 };
+use crate::avatar_store::AvatarStore;
 use crate::provider::ChatMessage;
 use crate::tools::avatar_tools::{AvatarSink, AvatarTurn};
 
@@ -44,6 +46,8 @@ use crate::tools::avatar_tools::{AvatarSink, AvatarTurn};
 #[derive(Clone, Default)]
 pub struct ChatTunnel {
     state: Arc<OnceLock<Arc<ServeState>>>,
+    /// The avatar's files, opened with the agent in [`attach`](Self::attach).
+    avatar: Arc<OnceLock<Arc<AvatarStore>>>,
 }
 
 #[derive(Deserialize)]
@@ -136,12 +140,29 @@ fn failed(message: impl Into<String>) -> RpcError {
     }
 }
 
+/// Where uploads wait until they are verified: outside the workspace, so a
+/// half-written file never syncs.
+fn avatar_staging_dir() -> PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("sapphire-agent")
+        .join("avatar-uploads")
+}
+
 impl ChatTunnel {
     /// Start answering, with the agent now built.
     pub fn attach(&self, state: Arc<ServeState>) {
+        let store = AvatarStore::new(state.workspace.dir().join("avatar"), avatar_staging_dir());
         if self.state.set(state).is_err() {
             warn!("chat tunnel: attached twice; keeping the first agent");
         }
+        let _ = self.avatar.set(Arc::new(store));
+    }
+
+    /// Serve the avatar from `store` instead of the workspace's folder.
+    #[cfg(test)]
+    pub(super) fn attach_avatar_for_test(&self, store: AvatarStore) {
+        let _ = self.avatar.set(Arc::new(store));
     }
 
     /// Register the methods on `router`.
@@ -150,6 +171,7 @@ impl ChatTunnel {
         let send = self.clone();
         let history = self.clone();
         let sessions = self.clone();
+        let router = super::avatar_ipc::register(router, Arc::clone(&self.avatar));
         router
             .method(OPEN, move |ctx| {
                 let tunnel = open.clone();
@@ -368,7 +390,7 @@ impl TurnHost for IpcProgress {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::provider::ContentPart;
     use crate::provider::{ChatResponse, ToolCall};
@@ -379,7 +401,7 @@ mod tests {
 
     /// A tunnel served on one end of an in-process IPC connection, and a
     /// chat client handshaken on the other.
-    async fn connected(tunnel: &ChatTunnel) -> ChatClient {
+    pub(in crate::serve) async fn connected(tunnel: &ChatTunnel) -> ChatClient {
         ChatClient::from_client(connected_raw(tunnel).await)
     }
 

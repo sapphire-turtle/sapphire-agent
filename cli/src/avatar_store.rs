@@ -16,9 +16,6 @@
 //!   `:`, no `.`/`..`), so the same rules hold on Windows and no path can
 //!   leave `avatar/`.
 
-// Task 5 wires the store into the IPC methods; until then only tests use it.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};

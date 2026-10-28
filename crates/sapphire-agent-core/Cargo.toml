@@ -19,6 +19,8 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json.workspace = true
 # Attachments travel base64-encoded.
 base64 = "0.23"
+# Hashes an avatar upload.
+sha2 = "0.11"
 
 # Error handling
 anyhow.workspace = true
