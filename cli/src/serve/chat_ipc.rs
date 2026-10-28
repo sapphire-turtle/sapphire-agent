@@ -22,7 +22,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use base64::Engine as _;
 use sapphire_agent_core::{
-    Attachment, ClientCaps, HISTORY, KIND_ACTION, KIND_EXPRESSION, OPEN, PROGRESS, SEND, SESSIONS,
+    Attachment, ClientCaps, HISTORY, KIND_ACTION, KIND_EXPRESSION, KIND_TOOL_END, KIND_TOOL_START,
+    OPEN, PROGRESS, SEND, SESSIONS,
 };
 use sapphire_framework::ipc::{PeerHandle, RequestCtx, Router, RpcError, codes};
 use serde::Deserialize;
@@ -364,11 +365,11 @@ impl IpcProgress {
 #[async_trait::async_trait]
 impl TurnHost for IpcProgress {
     async fn tool_start(&self, id: &str, name: &str, _input: &Value) {
-        self.tool("tool_start", id, name).await;
+        self.tool(KIND_TOOL_START, id, name).await;
     }
 
     async fn tool_end(&self, id: &str, name: &str) {
-        self.tool("tool_end", id, name).await;
+        self.tool(KIND_TOOL_END, id, name).await;
     }
 
     async fn turn_error(&self, message: &str) {

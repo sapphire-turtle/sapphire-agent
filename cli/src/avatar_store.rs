@@ -73,7 +73,12 @@ pub(crate) fn validate_path(path: &str) -> Result<(), AvatarError> {
     {
         return invalid(format!("path {path:?} has an empty, '.' or '..' component"));
     }
-    if path == CONFIG_FILE {
+    if path.split('/').any(is_transient) {
+        return invalid(format!(
+            "path {path:?} has a hidden or '.uploading' component"
+        ));
+    }
+    if path.eq_ignore_ascii_case(CONFIG_FILE) {
         return invalid(format!("{CONFIG_FILE} is managed by set_manifest"));
     }
     Ok(())
@@ -114,6 +119,9 @@ pub(crate) struct AvatarStore {
     dir: PathBuf,
     staging: PathBuf,
     uploads: Mutex<HashMap<String, Upload>>,
+    /// Held around the mutations that read or write `avatar.toml`'s view of
+    /// the files (`set_config`, `remove`, placing a commit).
+    config_lock: Mutex<()>,
 }
 
 fn sha256_file(path: &Path) -> std::io::Result<String> {
@@ -137,6 +145,7 @@ impl AvatarStore {
             dir,
             staging,
             uploads: Mutex::new(HashMap::new()),
+            config_lock: Mutex::new(()),
         }
     }
 
@@ -165,13 +174,27 @@ impl AvatarStore {
                 format!("{rel}/{name}")
             };
             let ty = entry.file_type()?;
+            if is_transient(&name) {
+                continue;
+            }
             if ty.is_dir() {
                 self.collect(&child, out)?;
-            } else if ty.is_file() && child != CONFIG_FILE && !is_transient(&name) {
+            } else if ty.is_file() && child != CONFIG_FILE {
                 let p = entry.path();
+                // A file may vanish mid-walk (sync, `remove`); skip it.
+                let size = match entry.metadata() {
+                    Ok(m) => m.len(),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e.into()),
+                };
+                let sha256 = match sha256_file(&p) {
+                    Ok(h) => h,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e.into()),
+                };
                 out.push(AvatarFile {
-                    size: entry.metadata()?.len(),
-                    sha256: sha256_file(&p)?,
+                    size,
+                    sha256,
                     path: child,
                 });
             }
@@ -310,6 +333,7 @@ impl AvatarStore {
             return invalid(m);
         }
         let dest = self.dir.join(&u.path);
+        let _guard = self.config_lock.lock().unwrap();
         let placed = (|| -> std::io::Result<()> {
             if let Some(parent) = dest.parent() {
                 fs::create_dir_all(parent)?;
@@ -328,6 +352,7 @@ impl AvatarStore {
     }
 
     pub(crate) fn set_config(&self, config: &AvatarConfig) -> Result<(), AvatarError> {
+        let _guard = self.config_lock.lock().unwrap();
         let refs = config
             .model
             .iter()
@@ -342,8 +367,13 @@ impl AvatarStore {
         let text = toml::to_string_pretty(config)
             .map_err(|e| AvatarError::Invalid(format!("{CONFIG_FILE}: {e}")))?;
         fs::create_dir_all(&self.dir)?;
-        let tmp = self.dir.join(format!("{CONFIG_FILE}.tmp"));
-        fs::write(&tmp, text)?;
+        let tmp = self
+            .dir
+            .join(format!(".{CONFIG_FILE}.{}.tmp", uuid::Uuid::now_v7()));
+        if let Err(e) = fs::write(&tmp, text) {
+            let _ = fs::remove_file(&tmp);
+            return Err(e.into());
+        }
         if let Err(e) = fs::rename(&tmp, self.dir.join(CONFIG_FILE)) {
             let _ = fs::remove_file(&tmp);
             return Err(e.into());
@@ -353,6 +383,7 @@ impl AvatarStore {
 
     pub(crate) fn remove(&self, path: &str) -> Result<(), AvatarError> {
         validate_path(path)?;
+        let _guard = self.config_lock.lock().unwrap();
         let cfg = self.read_config()?;
         let used = cfg
             .model
@@ -433,6 +464,13 @@ mod tests {
             "C:x",
             "avatar.toml",
             "./a",
+            "Avatar.toml",
+            "AVATAR.TOML",
+            ".m.vrm",
+            "x/.d/m.vrm",
+            ".hidden/m.vrm",
+            "m.vrm.uploading",
+            "x/m.uploading/a.vrm",
         ] {
             assert!(
                 matches!(validate_path(p), Err(AvatarError::Invalid(_))),
