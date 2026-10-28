@@ -82,6 +82,28 @@ pub(crate) fn validate_path(path: &str) -> Result<(), AvatarError> {
     Ok(())
 }
 
+/// Hidden or in-flight names never belong in the manifest: a copy in
+/// progress is partial, and the workspace sync must not mistake it for a file.
+fn is_transient(name: &str) -> bool {
+    name.starts_with('.') || name.ends_with(".uploading")
+}
+
+/// Put `staged` at `dest` when a plain rename cannot: copy to a unique hidden
+/// sibling (`.<name>.<upload_id>.uploading`), then rename within the
+/// destination's filesystem. The sibling is removed on any failure.
+fn place_by_copy(staged: &Path, dest: &Path, upload_id: &str) -> std::io::Result<()> {
+    let name = dest.file_name().unwrap_or_default().to_os_string();
+    let mut tmp_name = std::ffi::OsString::from(".");
+    tmp_name.push(&name);
+    tmp_name.push(format!(".{upload_id}.uploading"));
+    let tmp = dest.with_file_name(tmp_name);
+    let r = fs::copy(staged, &tmp).and_then(|_| fs::rename(&tmp, dest));
+    if r.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    r
+}
+
 struct Upload {
     path: String,
     size: u64,
@@ -148,7 +170,7 @@ impl AvatarStore {
             let ty = entry.file_type()?;
             if ty.is_dir() {
                 self.collect(&child, out)?;
-            } else if ty.is_file() && child != CONFIG_FILE {
+            } else if ty.is_file() && child != CONFIG_FILE && !is_transient(&name) {
                 let p = entry.path();
                 out.push(AvatarFile {
                     size: entry.metadata()?.len(),
@@ -296,14 +318,8 @@ impl AvatarStore {
                 fs::create_dir_all(parent)?;
             }
             if fs::rename(&u.file, &dest).is_err() {
-                // staging may be on another filesystem: copy beside the
-                // destination, then rename within it
-                let tmp = PathBuf::from(format!("{}.uploading", dest.display()));
-                let r = fs::copy(&u.file, &tmp).and_then(|_| fs::rename(&tmp, &dest));
-                if r.is_err() {
-                    let _ = fs::remove_file(&tmp);
-                }
-                r?;
+                // staging may be on another filesystem
+                place_by_copy(&u.file, &dest, upload_id)?;
                 let _ = fs::remove_file(&u.file);
             }
             Ok(())
@@ -500,6 +516,43 @@ mod tests {
         f.store.sweep(now + Duration::from_secs(11 * 60));
         assert_eq!(staged(&f), 0);
         assert!(f.store.write_chunk(&id, 0, b"a").is_err());
+    }
+
+    #[test]
+    fn hidden_and_in_flight_files_stay_out_of_the_manifest() {
+        let f = fx();
+        put(&f, "model.vrm", b"m");
+        std::fs::write(f.dir.join(".x.uploading"), b"p").unwrap();
+        std::fs::write(f.dir.join(".hidden"), b"h").unwrap();
+        std::fs::write(f.dir.join("y.vrm.uploading"), b"p").unwrap();
+        let paths: Vec<_> = f
+            .store
+            .manifest()
+            .unwrap()
+            .files
+            .into_iter()
+            .map(|x| x.path)
+            .collect();
+        assert_eq!(paths, vec!["model.vrm"]);
+    }
+
+    #[test]
+    fn the_copy_fallback_places_the_file_and_leaves_no_sibling() {
+        let f = fx();
+        std::fs::create_dir_all(f.dir.join("a")).unwrap();
+        let staged = f.dir.join("staged.bin");
+        std::fs::write(&staged, b"abcdef").unwrap();
+        let dest = f.dir.join("a/m.vrm");
+        place_by_copy(&staged, &dest, "id1").unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"abcdef");
+        let left: Vec<_> = std::fs::read_dir(f.dir.join("a"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("m.vrm")]);
+        // a failed copy also leaves nothing behind
+        assert!(place_by_copy(&f.dir.join("nope"), &dest, "id2").is_err());
+        assert_eq!(std::fs::read_dir(f.dir.join("a")).unwrap().count(), 1);
     }
 
     #[test]

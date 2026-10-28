@@ -241,6 +241,7 @@ framework の indexer は markdown 系（`md` / `markdown` / `txt` / `rst` / `or
 - 1 ファイル 256 MiB まで。
 - 書き込みは `avatar/` の外の一時領域に置き、commit で照合してから置き換える。
   未完成のファイルが同期に乗らないようにするため。放置されたアップロードは、サーバー側の `PeerHandle` に切断の通知が無いため、最後の書き込みから 10 分で捨てる（次の `write_begin` のときに掃除する）。
+  別ファイルシステムで rename できないときは、`avatar/` 内の隠しファイル `.<名前>.<upload_id>.uploading` にコピーしてから rename する。隠しファイルは manifest に載せない。
 - `set_manifest` は、参照するファイルが存在しなければ拒否する。
 
 #### GUI 側
