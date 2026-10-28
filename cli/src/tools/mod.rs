@@ -1,5 +1,6 @@
 pub mod acp_client;
 pub mod ambient_tools;
+pub mod avatar_tools;
 pub mod builtin_tools;
 pub mod client_exec;
 pub mod client_tools;

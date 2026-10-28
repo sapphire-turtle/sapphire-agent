@@ -20,7 +20,9 @@
 use std::sync::{Arc, Mutex, OnceLock};
 
 use base64::Engine as _;
-use sapphire_agent_core::{Attachment, ClientCaps, HISTORY, OPEN, PROGRESS, SEND, SESSIONS};
+use sapphire_agent_core::{
+    Attachment, ClientCaps, HISTORY, KIND_ACTION, KIND_EXPRESSION, OPEN, PROGRESS, SEND, SESSIONS,
+};
 use sapphire_framework::ipc::{PeerHandle, RequestCtx, Router, RpcError, codes};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -31,6 +33,7 @@ use super::{
     spawn_session_title,
 };
 use crate::provider::ChatMessage;
+use crate::tools::avatar_tools::{AvatarSink, AvatarTurn};
 
 /// The server's side: the methods above, registered on the app server's
 /// router.
@@ -230,6 +233,7 @@ impl ChatTunnel {
             peer: ctx.peer,
             session_id: params.session_id.clone(),
             client: params.client,
+            avatar: OnceLock::new(),
             error: Mutex::new(None),
         });
         let outcome = run_llm_turn(
@@ -275,10 +279,51 @@ struct IpcProgress {
     peer: PeerHandle,
     session_id: String,
     /// What the client declared on this turn.
-    #[allow(dead_code)] // read by `TurnHost::avatar`, which the next change adds
     client: ClientCaps,
+    /// The turn's avatar, built from `client` on first ask. Held rather
+    /// than rebuilt per ask: the `AvatarTurn` carries the turn's one
+    /// gesture, and an `IpcProgress` lives exactly one [`SEND`].
+    avatar: OnceLock<Option<Arc<AvatarTurn>>>,
     /// What [`TurnHost::turn_error`] reported, for the answer to carry.
     error: Mutex<Option<String>>,
+}
+
+/// Where an [`AvatarTurn`]'s cues go: [`PROGRESS`] notifications to the
+/// client that declared the avatar. Its own type rather than
+/// [`IpcProgress`] itself, which holds the `AvatarTurn` and so cannot also
+/// be held by it.
+struct IpcAvatarSink {
+    peer: PeerHandle,
+    session_id: String,
+}
+
+#[async_trait::async_trait]
+impl AvatarSink for IpcAvatarSink {
+    async fn expression(&self, name: &str, intensity: f32) {
+        // Best effort, as for tool events.
+        let _ = self
+            .peer
+            .notify(
+                PROGRESS,
+                json!({
+                    "session_id": self.session_id,
+                    "kind": KIND_EXPRESSION,
+                    "expression": name,
+                    "intensity": intensity,
+                }),
+            )
+            .await;
+    }
+
+    async fn action(&self, name: &str) {
+        let _ = self
+            .peer
+            .notify(
+                PROGRESS,
+                json!({ "session_id": self.session_id, "kind": KIND_ACTION, "action": name }),
+            )
+            .await;
+    }
 }
 
 impl IpcProgress {
@@ -306,6 +351,19 @@ impl TurnHost for IpcProgress {
 
     async fn turn_error(&self, message: &str) {
         *self.error.lock().unwrap() = Some(message.to_owned());
+    }
+
+    fn avatar(&self) -> Option<Arc<AvatarTurn>> {
+        self.avatar
+            .get_or_init(|| {
+                let caps = self.client.avatar.clone()?;
+                let sink = IpcAvatarSink {
+                    peer: self.peer.clone(),
+                    session_id: self.session_id.clone(),
+                };
+                Some(AvatarTurn::new(caps, Arc::new(sink)))
+            })
+            .clone()
     }
 }
 
@@ -459,6 +517,104 @@ mod tests {
                 (false, "call-1".to_owned(), "risky".to_owned()),
             ]
         );
+    }
+
+    fn call_tool(name: &str, input: Value) -> ChatResponse {
+        ChatResponse {
+            prompt_usage: None,
+            text: None,
+            tool_calls: vec![ToolCall {
+                id: "call-1".to_string(),
+                name: name.to_string(),
+                input,
+            }],
+            stop_reason: None,
+        }
+    }
+
+    /// The avatar tools the first provider call offered.
+    fn avatar_tools_offered(log: &crate::serve::ChatLog) -> Vec<String> {
+        log.calls()[0]
+            .1
+            .iter()
+            .filter(|n| crate::tools::avatar_tools::is_avatar_tool(n))
+            .cloned()
+            .collect()
+    }
+
+    /// The model's `set_expression` reaches the client that declared the
+    /// avatar as an expression event, and only the tools its declaration
+    /// supports were offered.
+    #[tokio::test]
+    async fn an_expression_tool_call_reaches_the_client_as_an_event() {
+        let (state, log) = ServeState::for_test_scripted_with_log(
+            false,
+            vec![
+                call_tool("set_expression", json!({"expression": "happy"})),
+                reply_text("done"),
+            ],
+        );
+        state
+            .tools
+            .register_tool(Box::new(crate::tools::avatar_tools::SetExpressionTool))
+            .await;
+        state
+            .tools
+            .register_tool(Box::new(crate::tools::avatar_tools::PlayActionTool))
+            .await;
+        let tunnel = ChatTunnel::default();
+        tunnel.attach(state);
+        let chat = connected(&tunnel).await;
+
+        let opened = chat.open(None).await.unwrap();
+        let client = ClientCaps {
+            avatar: Some(sapphire_agent_core::AvatarCaps {
+                expressions: vec!["neutral".into(), "happy".into()],
+                actions: vec![],
+            }),
+        };
+        let turn = Turn {
+            content: "hi",
+            attachments: &[],
+            client: &client,
+        };
+        let mut expressions = Vec::new();
+        let reply = chat
+            .send(&opened.session_id, turn, |e| {
+                if let ChatEvent::Expression { name, intensity } = e {
+                    expressions.push((name, intensity));
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(reply, "done");
+        assert_eq!(expressions, [("happy".to_owned(), 1.0)]);
+        // No actions declared, so no `play_action` to offer.
+        assert_eq!(avatar_tools_offered(&log), ["set_expression"]);
+    }
+
+    /// A client that declared nothing is offered neither avatar tool.
+    #[tokio::test]
+    async fn a_turn_without_a_declaration_offers_no_avatar_tools() {
+        let (state, log) =
+            ServeState::for_test_scripted_with_log(false, vec![reply_text("hello back")]);
+        state
+            .tools
+            .register_tool(Box::new(crate::tools::avatar_tools::SetExpressionTool))
+            .await;
+        state
+            .tools
+            .register_tool(Box::new(crate::tools::avatar_tools::PlayActionTool))
+            .await;
+        let tunnel = ChatTunnel::default();
+        tunnel.attach(state);
+        let chat = connected(&tunnel).await;
+
+        let opened = chat.open(None).await.unwrap();
+        chat.send(&opened.session_id, Turn::text("hi"), |_| {})
+            .await
+            .unwrap();
+        assert!(avatar_tools_offered(&log).is_empty());
     }
 
     /// A session no `open` pinned is refused, not run under no profile.
