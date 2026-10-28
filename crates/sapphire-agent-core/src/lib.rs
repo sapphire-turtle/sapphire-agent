@@ -48,7 +48,8 @@ pub const APP: &str = "sapphire-agent";
 ///
 /// 2: added `sapphire-agent.chat.*`.
 /// 3: `chat.send` takes `attachments` and `client` (the client's declared
-/// capabilities); `chat.progress` carries `expression` and `action`.
+/// capabilities); `chat.progress` carries `expression` and `action`;
+/// added `sapphire-agent.avatar.*`.
 pub const APP_API: u32 = 3;
 
 /// Open (resume or reserve) a session.
