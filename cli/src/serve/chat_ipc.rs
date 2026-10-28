@@ -19,7 +19,8 @@
 
 use std::sync::{Arc, Mutex, OnceLock};
 
-use sapphire_agent_core::{HISTORY, OPEN, PROGRESS, SEND, SESSIONS};
+use base64::Engine as _;
+use sapphire_agent_core::{Attachment, ClientCaps, HISTORY, OPEN, PROGRESS, SEND, SESSIONS};
 use sapphire_framework::ipc::{PeerHandle, RequestCtx, Router, RpcError, codes};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -51,7 +52,64 @@ struct OpenParams {
 #[derive(Deserialize)]
 struct SendParams {
     session_id: String,
+    /// May be empty when images are attached.
+    #[serde(default)]
     content: String,
+    #[serde(default)]
+    attachments: Vec<Attachment>,
+    /// What this client can do. Fields this server does not know are
+    /// ignored, so a newer client can declare more than an older server
+    /// understands.
+    #[serde(default)]
+    client: ClientCaps,
+}
+
+/// At most this many attachments on one turn.
+const MAX_ATTACHMENTS: usize = 8;
+/// The largest one attachment may be once decoded, which is what a provider
+/// bills and limits by — not the base64 length on the wire.
+const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
+/// The image types every provider takes.
+const ATTACHMENT_MIMES: &[&str] = &["image/png", "image/jpeg", "image/webp"];
+
+/// The user message for a turn: `content` plus any images, after checking
+/// the attachments. A violation is the text of the `invalid params` error.
+fn user_message(content: &str, attachments: Vec<Attachment>) -> Result<ChatMessage, String> {
+    let content = content.trim();
+    if attachments.is_empty() {
+        if content.is_empty() {
+            return Err("nothing to send".to_owned());
+        }
+        return Ok(ChatMessage::user(content));
+    }
+    if attachments.len() > MAX_ATTACHMENTS {
+        return Err(format!(
+            "too many attachments: {} (at most {MAX_ATTACHMENTS})",
+            attachments.len()
+        ));
+    }
+    for a in &attachments {
+        if !ATTACHMENT_MIMES.contains(&a.mime.as_str()) {
+            return Err(format!(
+                "unsupported attachment type {} (expected one of {})",
+                a.mime,
+                ATTACHMENT_MIMES.join(", ")
+            ));
+        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&a.data)
+            .map_err(|e| format!("attachment is not valid base64: {e}"))?;
+        if bytes.len() > MAX_ATTACHMENT_BYTES {
+            return Err(format!(
+                "attachment is too large: {} bytes (at most {MAX_ATTACHMENT_BYTES})",
+                bytes.len()
+            ));
+        }
+    }
+    Ok(ChatMessage::user_with_images(
+        content,
+        attachments.into_iter().map(|a| (a.mime, a.data)),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -152,10 +210,8 @@ impl ChatTunnel {
         let state = self.agent()?;
         let params: SendParams = serde_json::from_value(ctx.params)
             .map_err(|e| invalid(format!("bad {SEND} parameters: {e}")))?;
-        let content = params.content.trim();
-        if content.is_empty() {
-            return Err(invalid("nothing to send"));
-        }
+        let content = params.content.trim().to_owned();
+        let message = user_message(&content, params.attachments).map_err(invalid)?;
         // Only a session `open` pinned to a room profile: a stale id (from
         // before a restart, say) would otherwise run under no profile.
         if !state
@@ -173,12 +229,13 @@ impl ChatTunnel {
         let host = Arc::new(IpcProgress {
             peer: ctx.peer,
             session_id: params.session_id.clone(),
+            client: params.client,
             error: Mutex::new(None),
         });
         let outcome = run_llm_turn(
             Arc::clone(&state),
             params.session_id.clone(),
-            ChatMessage::user(content),
+            message,
             Arc::clone(&host) as Arc<dyn TurnHost>,
             None,
         )
@@ -194,7 +251,7 @@ impl ChatTunnel {
             return Err(failed(message));
         };
         if outcome.was_first_turn {
-            spawn_session_title(state, params.session_id, content.to_owned(), text.clone());
+            spawn_session_title(state, params.session_id, content, text.clone());
         }
         Ok(json!({ "content": text }))
     }
@@ -217,6 +274,9 @@ impl ChatTunnel {
 struct IpcProgress {
     peer: PeerHandle,
     session_id: String,
+    /// What the client declared on this turn.
+    #[allow(dead_code)] // read by `TurnHost::avatar`, which the next change adds
+    client: ClientCaps,
     /// What [`TurnHost::turn_error`] reported, for the answer to carry.
     error: Mutex<Option<String>>,
 }
@@ -252,6 +312,7 @@ impl TurnHost for IpcProgress {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::ContentPart;
     use crate::provider::{ChatResponse, ToolCall};
     use sapphire_agent_core::{APP_API, ChatClient, ChatEvent, Turn};
     use sapphire_framework::ipc::{Client, ClientInfo, Connection, ManagedBy, ServerInfo, serve};
@@ -261,6 +322,12 @@ mod tests {
     /// A tunnel served on one end of an in-process IPC connection, and a
     /// chat client handshaken on the other.
     async fn connected(tunnel: &ChatTunnel) -> ChatClient {
+        ChatClient::from_client(connected_raw(tunnel).await)
+    }
+
+    /// The same, as the bare IPC client, for calls the typed client cannot
+    /// make (a field it has no type for).
+    async fn connected_raw(tunnel: &ChatTunnel) -> Client {
         let (server_end, client_end) = Connection::pair();
         let router = Arc::new(tunnel.router(Router::new()));
         let server_info = ServerInfo {
@@ -281,7 +348,7 @@ mod tests {
         let (client, _) = Client::handshake(client_end, APP, client_info)
             .await
             .unwrap();
-        ChatClient::from_client(client)
+        client
     }
 
     fn reply_text(text: &str) -> ChatResponse {
@@ -406,6 +473,77 @@ mod tests {
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("no open session"), "{err:#}");
+    }
+
+    #[test]
+    fn attachments_become_image_parts() {
+        let png = Attachment::from_bytes("image/png", b"\x89PNG....");
+        let msg = user_message("look", vec![png.clone()]).unwrap();
+        assert!(msg.parts.iter().any(
+            |p| matches!(p, ContentPart::Image { media_type, data_base64 }
+            if media_type == "image/png" && *data_base64 == png.data)
+        ));
+        assert!(
+            msg.parts
+                .iter()
+                .any(|p| matches!(p, ContentPart::Text(t) if t == "look"))
+        );
+    }
+
+    #[test]
+    fn attachments_over_the_limits_are_refused() {
+        let one = Attachment::from_bytes("image/png", b"x");
+        assert!(
+            user_message("", vec![one.clone(); 9])
+                .unwrap_err()
+                .contains('8')
+        );
+        let big = Attachment::from_bytes("image/png", &vec![0u8; 20 * 1024 * 1024 + 1]);
+        assert!(user_message("", vec![big]).is_err());
+        let gif = Attachment::from_bytes("image/gif", b"GIF89a");
+        assert!(
+            user_message("", vec![gif])
+                .unwrap_err()
+                .contains("image/gif")
+        );
+        let bad = Attachment {
+            mime: "image/png".into(),
+            data: "not base64!".into(),
+        };
+        assert!(user_message("", vec![bad]).is_err());
+    }
+
+    #[test]
+    fn an_empty_turn_is_nothing_to_send_but_an_image_alone_is_not() {
+        assert_eq!(user_message("  ", vec![]).unwrap_err(), "nothing to send");
+        let png = Attachment::from_bytes("image/png", b"x");
+        let msg = user_message("", vec![png]).unwrap();
+        assert!(!msg.parts.iter().any(|p| matches!(p, ContentPart::Text(_))));
+    }
+
+    /// A capability this server has never heard of must not fail the turn:
+    /// newer clients declare more than older servers know.
+    #[tokio::test]
+    async fn an_unknown_client_capability_is_ignored() {
+        let tunnel = ChatTunnel::default();
+        tunnel.attach(ServeState::for_test_scripted(
+            false,
+            vec![reply_text("hello back")],
+        ));
+        let raw = connected_raw(&tunnel).await;
+        let opened: Value = raw.call(OPEN, json!({})).await.unwrap();
+        let reply: Value = raw
+            .call(
+                SEND,
+                json!({
+                    "session_id": opened["session_id"],
+                    "content": "hi",
+                    "client": { "future": 1, "avatar": { "expressions": ["happy"], "actions": [], "x": 2 } },
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply["content"], "hello back");
     }
 
     /// Until the agent is attached, every method says it is still starting.
