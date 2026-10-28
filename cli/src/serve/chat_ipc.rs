@@ -253,7 +253,7 @@ impl TurnHost for IpcProgress {
 mod tests {
     use super::*;
     use crate::provider::{ChatResponse, ToolCall};
-    use sapphire_agent_core::{APP_API, ChatClient};
+    use sapphire_agent_core::{APP_API, ChatClient, ChatEvent, Turn};
     use sapphire_framework::ipc::{Client, ClientInfo, Connection, ManagedBy, ServerInfo, serve};
 
     const APP: &str = "sapphire-agent";
@@ -320,7 +320,7 @@ mod tests {
         );
 
         let reply = chat
-            .send(&opened.session_id, "hello", |_| {})
+            .send(&opened.session_id, Turn::text("hello"), |_| {})
             .await
             .unwrap();
         assert_eq!(reply, "hello back");
@@ -377,8 +377,10 @@ mod tests {
         let opened = chat.open(None).await.unwrap();
         let mut events = Vec::new();
         let reply = chat
-            .send(&opened.session_id, "go", |e| {
-                events.push((e.started, e.id, e.name))
+            .send(&opened.session_id, Turn::text("go"), |e| {
+                if let ChatEvent::Tool(e) = e {
+                    events.push((e.started, e.id, e.name))
+                }
             })
             .await
             .unwrap();
@@ -399,7 +401,10 @@ mod tests {
         tunnel.attach(ServeState::for_test_scripted(false, vec![reply_text("x")]));
         let chat = connected(&tunnel).await;
 
-        let err = chat.send("not-a-session", "hi", |_| {}).await.unwrap_err();
+        let err = chat
+            .send("not-a-session", Turn::text("hi"), |_| {})
+            .await
+            .unwrap_err();
         assert!(format!("{err:#}").contains("no open session"), "{err:#}");
     }
 

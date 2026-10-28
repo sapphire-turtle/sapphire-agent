@@ -10,7 +10,7 @@ use reedline::{
 };
 use serde_json::{Value, json};
 
-use sapphire_agent_core::{ChatClient, ToolEvent};
+use sapphire_agent_core::{ChatClient, ChatEvent, ToolEvent, Turn};
 
 /// What `sapphire-agent chat` was asked to do.
 pub struct ChatOptions {
@@ -143,7 +143,7 @@ pub async fn run(options: ChatOptions) -> Result<()> {
 /// reply to stdout, or one JSON object at the end.
 async fn send(client: &ChatClient, session_id: &str, content: &str, json_mode: bool) -> Result<()> {
     let mut tools: Vec<Value> = Vec::new();
-    let on_tool = |event: ToolEvent| {
+    let mut on_tool = |event: ToolEvent| {
         if json_mode {
             if event.started {
                 tools.push(json!({ "id": event.id, "name": event.name }));
@@ -157,7 +157,13 @@ async fn send(client: &ChatClient, session_id: &str, content: &str, json_mode: b
             let _ = stderr().flush();
         }
     };
-    let reply = client.send(session_id, content, on_tool).await;
+    let reply = client
+        .send(session_id, Turn::text(content), |event| {
+            if let ChatEvent::Tool(e) = event {
+                on_tool(e)
+            }
+        })
+        .await;
 
     if json_mode {
         let mut out = json!({ "tools": tools });

@@ -15,7 +15,10 @@ sapphire-framework = { version = "0.22.0", default-features = false, features = 
 sapphire-framework-server-api = "5.0.0"
 
 # Serialization
+serde = { version = "1.0", features = ["derive"] }
 serde_json.workspace = true
+# Attachments travel base64-encoded.
+base64 = "0.23"
 
 # Error handling
 anyhow.workspace = true
