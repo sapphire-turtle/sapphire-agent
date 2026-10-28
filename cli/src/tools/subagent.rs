@@ -184,6 +184,12 @@ pub(crate) fn subagent_tool_specs(
     let mut specs: Vec<ToolSpec> = parent_visible
         .iter()
         .filter(|s| s.name.as_ref() != SUBAGENT_TOOL_NAME)
+        // A delegate is not the character speaking, so it gets no avatar:
+        // `SubagentHost` answers `avatar()` with `None` rather than share
+        // the parent's (and with it the turn's one gesture), and a tool
+        // that can only refuse is worse than absent. Stripped even when
+        // `tools:` names one.
+        .filter(|s| !crate::tools::avatar_tools::is_avatar_tool(s.name.as_ref()))
         .filter(|s| match &def.tools {
             Some(allowed) => allowed.iter().any(|a| a == s.name.as_ref()),
             None => true,
@@ -1363,6 +1369,32 @@ mod tests {
         let parent_visible = [spec_named("file_read"), spec_named(SUBAGENT_TOOL_NAME)];
         let inherited = subagent_tool_specs(&greedy, &parent_visible, &defs(), 0, 0);
         assert!(!inherited.iter().any(|s| s.name == SUBAGENT_TOOL_NAME));
+    }
+
+    /// A delegate is not the character speaking: the avatar tools the
+    /// parent turn was offered never reach it, inherited or named.
+    #[test]
+    fn a_subagent_is_never_offered_the_avatar_tools() {
+        let parent_visible = [
+            spec_named("file_read"),
+            spec_named("set_expression"),
+            spec_named("play_action"),
+        ];
+        let unrestricted = crate::agents::AgentDef {
+            tools: None,
+            ..defs()[0].clone()
+        };
+        let naming = crate::agents::AgentDef {
+            tools: Some(vec!["set_expression".to_string(), "file_read".to_string()]),
+            ..defs()[0].clone()
+        };
+        for def in [unrestricted, naming] {
+            let names: Vec<_> = subagent_tool_specs(&def, &parent_visible, &defs(), 0, 0)
+                .into_iter()
+                .map(|s| s.name.to_string())
+                .collect();
+            assert_eq!(names, ["file_read"]);
+        }
     }
 
     /// An empty list is a definition, not an omission.

@@ -393,6 +393,10 @@ mod tests {
             both[1].input_schema["properties"]["action"]["enum"],
             json!(["peace"])
         );
+
+        let mut no_expressions = all();
+        specialize_specs(&mut no_expressions, Some(&caps(&[], &["peace"])));
+        assert_eq!(names(&no_expressions), ["play_action"]);
     }
 
     #[test]
