@@ -14,26 +14,10 @@ const ICON_SEND: egui::ImageSource<'_> = egui::include_image!("../../assets/icon
 /// the on-screen footprint avoids visible aliasing.
 const ICON_PX: f32 = 18.0;
 
-fn icon_image(src: egui::ImageSource<'_>) -> egui::Image<'_> {
+fn icon_image<'a>(ui: &egui::Ui, src: egui::ImageSource<'a>) -> egui::Image<'a> {
     egui::Image::new(src)
         .fit_to_exact_size(egui::vec2(ICON_PX, ICON_PX))
-        .tint(egui::Color32::from_gray(220))
-}
-
-/// The `Ui` a screen lays its panels out in: the whole window, on the
-/// background layer.
-///
-/// egui 0.36+ shows panels inside a `Ui` rather than straight on the
-/// `Context`, and bevy_egui hands systems only the context, so each frame
-/// starts by making the root one — what egui's own integrations do.
-fn root_ui(ctx: &egui::Context) -> egui::Ui {
-    egui::Ui::new(
-        ctx.clone(),
-        egui::Id::unique("root"),
-        egui::UiBuilder::new()
-            .layer_id(egui::LayerId::background())
-            .max_rect(ctx.content_rect()),
-    )
+        .tint(ui.visuals().text_color())
 }
 
 pub(crate) fn ui(
@@ -45,9 +29,19 @@ pub(crate) fn ui(
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
     };
-    let mut settings = settings.as_deref_mut();
+    let settings = settings.as_deref_mut();
+    // egui 0.37 keeps one root `Ui` per viewport, so every system that
+    // shows panels stacks them on the same one.
+    ctx.root_ui(|root| show(root, &mut state, &bridge, settings));
+}
+
+fn show(
+    root: &mut egui::Ui,
+    state: &mut ChatState,
+    bridge: &ChatBridge,
+    mut settings: Option<&mut GuiSettings>,
+) {
     let layout = Layout::of(settings.as_ref().map(|s| (s.open, s.settings.health())));
-    let root = &mut root_ui(ctx);
     egui::Panel::top("chat_topbar").show(root, |ui| {
         ui.horizontal(|ui| {
             ui.heading("sapphire-agent-desktop");
@@ -83,7 +77,7 @@ pub(crate) fn ui(
             });
         });
         if let Session::Failed { message } = &state.session {
-            ui.colored_label(egui::Color32::from_rgb(200, 80, 80), message);
+            ui.colored_label(ui.visuals().error_fg_color, message);
         }
         if layout.banner
             && let Some(settings) = settings.as_deref_mut()
@@ -112,7 +106,8 @@ pub(crate) fn ui(
                 let enter_pressed =
                     resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
 
-                let send_btn = ui.add_enabled(can_send, egui::Button::image(icon_image(ICON_SEND)));
+                let send_btn =
+                    ui.add_enabled(can_send, egui::Button::image(icon_image(ui, ICON_SEND)));
                 let send_clicked = send_btn.on_hover_text("Send").clicked();
                 // `take_submission` holds the rest of the rule: a ready,
                 // idle session and a draft that isn't blank.
@@ -144,10 +139,13 @@ pub(crate) fn ui(
 }
 
 fn render_entry(ui: &mut egui::Ui, entry: &ChatEntry) {
+    let visuals = ui.visuals().clone();
     let (prefix, color) = match entry.role {
-        ChatRole::User => ("You", egui::Color32::from_rgb(120, 170, 230)),
-        ChatRole::Assistant => ("Saphina", egui::Color32::from_rgb(180, 220, 180)),
-        ChatRole::System => ("system", egui::Color32::GRAY),
+        // From the active visuals, so light and dark both read: the link
+        // colour, the strong text colour and the weak one stay apart.
+        ChatRole::User => ("You", visuals.hyperlink_color),
+        ChatRole::Assistant => ("Saphina", visuals.strong_text_color()),
+        ChatRole::System => ("system", visuals.weak_text_color()),
     };
     ui.horizontal_wrapped(|ui| {
         ui.label(egui::RichText::new(prefix).strong().color(color));

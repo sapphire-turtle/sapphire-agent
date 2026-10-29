@@ -24,7 +24,8 @@ pub struct GuiWaker(pub Waker);
 /// The tokio runtime the agent client runs on. Bevy's scheduler is sync and
 /// the client is async, so the GUI keeps its own. On `AppExit` it is shut
 /// down with `shutdown_background`: a blocking drop could hold the window
-/// open behind an in-flight turn.
+/// open behind an in-flight turn. Don't keep clones of the `Arc` past
+/// `AppExit` (hold a `Handle` instead), or shutdown falls back to leaking.
 #[derive(Resource)]
 pub struct GuiRuntime(pub Arc<Runtime>);
 

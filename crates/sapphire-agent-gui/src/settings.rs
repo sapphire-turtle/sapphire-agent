@@ -13,7 +13,7 @@
 
 use bevy::prelude::*;
 use bevy_egui::EguiContexts;
-use corundum_framework_gui::{look, store};
+use corundum_framework_gui::store;
 use sapphire_framework_gui::client::{AppIdentity, ClientConfig, FrameworkClient};
 use sapphire_framework_gui::{Health, Settings};
 use tracing::{info, warn};
@@ -126,9 +126,8 @@ pub(crate) fn attach_look_store(mut contexts: EguiContexts, mut done: Local<bool
     if store::attach(ctx, look_store) {
         info!("put back the look kept in {}", path.display());
     }
-    if let Some(saved) = store::state(ctx).look {
-        look::apply(ctx, &saved);
-    }
+    // `attach` has already installed the saved look; applying it again
+    // would only write the same look back to the store.
 }
 
 /// Every frame, before the screens: the framework's strings, the
