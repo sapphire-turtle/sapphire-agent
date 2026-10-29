@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Move the desktop's chat into a new `crates/sapphire-agent-gui` library on egui 0.37 (a bevy_egui fork), show sapphire-framework-gui 0.23's `Settings` in it, and port bevy_vrm1 to bevy 0.20 for plan 3. Throughout, the desktop keeps behaving as it does today.
+**Goal:** Move the desktop's chat into a new `crates/sapphire-agent-gui` library on egui 0.37 (a bevy_egui fork), show sapphire-framework-gui 0.23's `Settings` in it, and (originally) port bevy_vrm1 to bevy 0.20 for plan 3 — superseded: upstream bevy_vrm1 0.11.0 targets bevy 0.20, so plan 3 uses it from crates.io. Throughout, the desktop keeps behaving as it does today.
 
 **Architecture:** `sapphire-agent-gui` owns everything a future `mobile/` shares:
 - `app`: one tokio runtime, a waker that rouses bevy's event loop from other threads, fonts and theme.
@@ -17,7 +17,7 @@
 - bevy_egui: fork of 0.43.1 on egui 0.37
 - sapphire-framework(-gui) 0.23
 - corundum-framework-gui 0.3
-- bevy_vrm1: fork of 0.10.0 on bevy 0.20
+- bevy_vrm1: upstream 0.11 from crates.io (the fork in Task 5 is superseded; it is kept only for future bevy bumps that run ahead of upstream)
 
 **Spec:** `docs/superpowers/specs/2026-10-28-desktop-mate-design.md`. This plan covers work-order steps 1–3 and §1, §2, §3 and §11.
 
@@ -217,6 +217,8 @@
 - [ ] **Step 8: Commit** `feat(gui): the framework's settings, and the theme and language they hold`
 
 ### Task 5: bevy_vrm1 fork on bevy 0.20
+
+> **Superseded.** Upstream bevy_vrm1 0.11.0 (2026-10-29, upstream PR #73) targets bevy 0.20, so plan 3 uses `bevy_vrm1 = "0.11"` from crates.io and this fork is not needed. `sapphire-turtle/bevy_vrm1` (branch `bevy-0.20`) stays only for future bevy bumps that run ahead of upstream. The text below is kept as written.
 
 **Files:**
 - Outside this repo: fork `not-elm/bevy_vrm1` to `sapphire-turtle/bevy_vrm1`, clone it to `../forks/bevy_vrm1`, and create branch `bevy-0.20` from upstream `main` (380076d, which is 0.10.0 plus the partial-extension fix).

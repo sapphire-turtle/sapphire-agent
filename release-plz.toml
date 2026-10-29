@@ -33,7 +33,10 @@ changelog_path = "./crates/sapphire-agent-core/CHANGELOG.md"
 
 # sapphire-agent-gui is the GUI the desktop (and later a mobile app) is built
 # on: a library inside their binaries, `publish = false`, with no tag or
-# release of its own. Its changes ship as the apps' releases.
+# release of its own. Its changes ship as the apps' releases — but release-plz
+# picks packages by path, so a change only under crates/sapphire-agent-gui/
+# makes no desktop release: a user-visible GUI change must also touch
+# desktop/ (a `(desktop)` commit, its CHANGELOG or version) in the same PR.
 [[package]]
 name = "sapphire-agent-gui"
 release = false
