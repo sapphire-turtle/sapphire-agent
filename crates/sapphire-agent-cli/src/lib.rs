@@ -22,6 +22,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 #[derive(Parser)]
 #[command(
     name = "sapphire-agent",
+    version,
     arg_required_else_help = true,
     about = "Personal AI assistant — Anthropic + Matrix/Discord",
     // Without this, `--help` shows the flattened `FrameworkCommand`'s doc
@@ -211,6 +212,18 @@ mod tests {
     use super::*;
     use sapphire_framework::server::WorkspaceCommand;
     use sapphire_framework_bridge_api::ExternalDeviceCommand;
+
+    #[test]
+    fn version_flag_prints_the_version() {
+        let err = Cli::try_parse_from(["sapphire-agent", "--version"])
+            .err()
+            .expect("--version stops the parse");
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert_eq!(
+            err.to_string(),
+            format!("sapphire-agent {}\n", env!("CARGO_PKG_VERSION"))
+        );
+    }
 
     #[test]
     fn device_add_requires_a_name() {
