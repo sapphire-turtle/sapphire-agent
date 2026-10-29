@@ -19,7 +19,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
-    uses: sapphire-turtle/sapphire-framework/.github/workflows/shared-release-plz.yml@main
+    uses: sapphire-turtle/.github/.github/workflows/release-plz.yml@v1
     secrets: inherit
 
   build-cli:

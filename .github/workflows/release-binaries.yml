@@ -28,7 +28,7 @@ jobs:
     if: inputs.target == 'cli'
     permissions:
       contents: write
-    uses: sapphire-turtle/sapphire-framework/.github/workflows/shared-release-binary.yml@main
+    uses: sapphire-turtle/.github/.github/workflows/release-binary.yml@v1
     with:
       tag: ${{ inputs.tag }}
       package: sapphire-agent
@@ -42,7 +42,7 @@ jobs:
     if: inputs.target == 'desktop'
     permissions:
       contents: write
-    uses: sapphire-turtle/sapphire-framework/.github/workflows/shared-release-binary.yml@main
+    uses: sapphire-turtle/.github/.github/workflows/release-binary.yml@v1
     with:
       tag: ${{ inputs.tag }}
       package: sapphire-agent-desktop
