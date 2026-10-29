@@ -16,6 +16,7 @@ pub mod a2a;
 pub mod acp;
 pub mod acp_permissions;
 pub mod acp_tunnel;
+pub mod avatar_ipc;
 pub mod chat_ipc;
 
 use crate::acp_session::AcpSessionStore;
@@ -1971,6 +1972,18 @@ pub(crate) trait TurnHost: Send + Sync {
         false
     }
 
+    /// The avatar this turn's client declared, when it shows one.
+    ///
+    /// `None` by default: only the desktop mate over IPC draws a
+    /// character. `run_llm_turn` offers `set_expression`/`play_action`
+    /// only when this answers, and the tools read it through a task-local,
+    /// so a host that does not override it keeps both out of its turns.
+    /// A host must return the same `AvatarTurn` for the whole turn — it
+    /// carries the turn's one gesture.
+    fn avatar(&self) -> Option<Arc<crate::tools::avatar_tools::AvatarTurn>> {
+        None
+    }
+
     /// This call cleared the gate and is about to run.
     ///
     /// Separate from `tool_start`, which fires *before* the gate and so
@@ -2206,6 +2219,14 @@ pub(crate) fn visible_tool_predicate(
         // `/rpc`, voice, the heartbeat) the gate is exactly the old rule
         // and every name it lets through is the agent's own.
         if crate::tools::policy::host_tool_denied(name, host_access_enabled, has_client) {
+            return false;
+        }
+
+        // Hidden on every path, including the channels': an avatar is a
+        // per-turn declaration, not a capability any of these flags
+        // speaks for. `run_llm_turn` lets them back in when the turn's
+        // client declared one.
+        if crate::tools::avatar_tools::is_avatar_tool(name) {
             return false;
         }
 
@@ -2713,6 +2734,10 @@ impl TurnLoop<'_> {
                     // client-side tools refusing there rather than reaching
                     // for a connection that does not exist.
                     let acp_client = progress.acp_client();
+                    // Likewise `None` on every turn whose client declared
+                    // no avatar, which is what makes the avatar tools
+                    // refuse there.
+                    let avatar = progress.avatar();
                     // What `tools::subagent::SubagentTool` needs to run a
                     // nested conversation, scoped around every call this
                     // round the same way the timer/ACP task-locals are —
@@ -2740,6 +2765,7 @@ impl TurnLoop<'_> {
                             let client = acp_client.clone();
                             let turn_ctx = Arc::clone(&turn_ctx);
                             let admin_room_profile = admin_room_profile.clone();
+                            let avatar = avatar.clone();
                             async move {
                                 let fut = crate::tools::workspace_tools::scope_memory_namespace(
                                     ns,
@@ -2767,6 +2793,10 @@ impl TurnLoop<'_> {
                                     admin_room_profile.clone(),
                                     fut,
                                 );
+                                // Unconditional for the same reason: `None`
+                                // is the answer the avatar tools refuse on.
+                                let fut =
+                                    crate::tools::avatar_tools::scope_avatar_turn(avatar, fut);
                                 let fut = scope_turn_context(turn_ctx, fut);
                                 // Both remaining scopes have to wrap
                                 // execution too: the timer bridge reads one
@@ -3068,9 +3098,17 @@ pub(crate) async fn run_llm_turn(
         client_fs_write,
         client_terminal,
     );
-    let tool_specs = state
+    // The avatar tools are the one exception to `base`, which hides them:
+    // offered when this turn's client declared an avatar, and then fitted
+    // to what it declared.
+    let avatar = progress.avatar();
+    let has_avatar = avatar.is_some();
+    let mut tool_specs = state
         .tools
         .specs_filtered(move |name: &str| {
+            if crate::tools::avatar_tools::is_avatar_tool(name) {
+                return has_avatar;
+            }
             if !base(name) {
                 return false;
             }
@@ -3085,6 +3123,10 @@ pub(crate) async fn run_llm_turn(
             true
         })
         .await;
+    crate::tools::avatar_tools::specialize_specs(
+        &mut tool_specs,
+        avatar.as_ref().map(|a| a.caps()),
+    );
     let persistence = TurnPersistence {
         store: Arc::clone(&store),
         acp_store: Arc::clone(&state.acp_session_store),
@@ -6241,6 +6283,33 @@ mod tests {
         }
         let no_term = visible_tool_predicate(false, true, true, true, false);
         assert!(!no_term("skill"), "skill offered without a terminal");
+    }
+
+    /// The avatar tools are no capability an editor or a host switch can
+    /// grant: only a turn whose client declared an avatar offers them, and
+    /// that is decided in `run_llm_turn`, not here. So the predicate hides
+    /// them on every path — including the channels', which use nothing
+    /// else.
+    #[tokio::test]
+    async fn avatar_tools_are_hidden_from_turns_without_a_declaration() {
+        let set = client_filtering_test_set();
+        set.register_tool(Box::new(crate::tools::avatar_tools::SetExpressionTool))
+            .await;
+        set.register_tool(Box::new(crate::tools::avatar_tools::PlayActionTool))
+            .await;
+        for predicate in [
+            visible_tool_predicate(false, false, false, false, false),
+            visible_tool_predicate(true, true, true, true, true),
+        ] {
+            let names: Vec<String> = set
+                .specs_filtered(predicate)
+                .await
+                .into_iter()
+                .map(|s| s.name.to_string())
+                .collect();
+            assert!(!names.contains(&"set_expression".to_string()), "{names:?}");
+            assert!(!names.contains(&"play_action".to_string()), "{names:?}");
+        }
     }
 
     /// A turn with an editor on the other end, for the two tests below.

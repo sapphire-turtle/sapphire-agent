@@ -9,18 +9,33 @@
 //!
 //! - [`OPEN`] `{session?}` resumes the session with that public id, or
 //!   reserves a new one: `{session_id, public_id?, is_new, room_profile}`.
-//! - [`SEND`] `{session_id, content}` runs one turn and answers
-//!   `{content}` once it is done. While it runs, [`PROGRESS`]
-//!   `{session_id, kind, id, name}` notifies each tool call starting
-//!   (`kind: "tool_start"`) and ending (`"tool_end"`).
+//! - [`SEND`] `{session_id, content, attachments?, client?}` runs one turn
+//!   and answers `{content}` once it is done. `attachments` are
+//!   [`Attachment`]s (`{mime, data}`, base64) sent with the message, and
+//!   `client` is the [`ClientCaps`] the client declares for this turn; both
+//!   are left out when empty. While the turn runs, [`PROGRESS`]
+//!   `{session_id, kind, ..}` notifies each tool call starting
+//!   (`kind: "tool_start"`, `"tool_end"`, with `id` and `name`), and the
+//!   avatar cues the reply carries (`"expression"` with `expression` and
+//!   `intensity?`, `"action"` with `action`); see [`parse_progress`].
 //! - [`HISTORY`] `{session_id}` answers `{messages}`.
 //! - [`SESSIONS`] answers `{sessions}`.
+//! - The avatar's files, kept in the workspace's `avatar/` folder, move in
+//!   [`AVATAR_CHUNK`]-sized pieces: [`AVATAR_MANIFEST`] answers an
+//!   [`AvatarManifest`]; [`AVATAR_READ`] `{path, offset, len}` answers
+//!   `{data, eof}` (base64); [`AVATAR_WRITE_BEGIN`] `{path, size, sha256}`
+//!   answers `{upload_id}`, then [`AVATAR_WRITE_CHUNK`]
+//!   `{upload_id, offset, data}` per piece and [`AVATAR_WRITE_COMMIT`]
+//!   `{upload_id}` to put the file in place; [`AVATAR_SET_MANIFEST`] takes an
+//!   [`AvatarConfig`]; [`AVATAR_REMOVE`] `{path}` deletes a file.
 //!
 //! There is no token: the IPC endpoint admits only the OS user that runs
 //! the server, and the agent's `[cli].room_profile` names the room profile.
 
 use anyhow::{Context as _, Result, anyhow, bail};
+use base64::Engine as _;
 use sapphire_framework::ipc::{Client, ClientInfo, Notification};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 /// The app name the agent's IPC endpoint is registered under.
@@ -32,7 +47,10 @@ pub const APP: &str = "sapphire-agent";
 /// agent that would read its calls differently, or lacks them.
 ///
 /// 2: added `sapphire-agent.chat.*`.
-pub const APP_API: u32 = 2;
+/// 3: `chat.send` takes `attachments` and `client` (the client's declared
+/// capabilities); `chat.progress` carries `expression` and `action`;
+/// added `sapphire-agent.avatar.*`.
+pub const APP_API: u32 = 3;
 
 /// Open (resume or reserve) a session.
 pub const OPEN: &str = "sapphire-agent.chat.open";
@@ -42,8 +60,132 @@ pub const SEND: &str = "sapphire-agent.chat.send";
 pub const HISTORY: &str = "sapphire-agent.chat.history";
 /// The client sessions.
 pub const SESSIONS: &str = "sapphire-agent.chat.sessions";
-/// Notification: a tool call in a [`SEND`] turn started or ended.
+/// The avatar's config and file list.
+pub const AVATAR_MANIFEST: &str = "sapphire-agent.avatar.manifest";
+/// One piece of an avatar file.
+pub const AVATAR_READ: &str = "sapphire-agent.avatar.read";
+/// Start uploading an avatar file.
+pub const AVATAR_WRITE_BEGIN: &str = "sapphire-agent.avatar.write_begin";
+/// One piece of an upload.
+pub const AVATAR_WRITE_CHUNK: &str = "sapphire-agent.avatar.write_chunk";
+/// Finish an upload and put the file in place.
+pub const AVATAR_WRITE_COMMIT: &str = "sapphire-agent.avatar.write_commit";
+/// Replace the avatar config.
+pub const AVATAR_SET_MANIFEST: &str = "sapphire-agent.avatar.set_manifest";
+/// Delete an avatar file.
+pub const AVATAR_REMOVE: &str = "sapphire-agent.avatar.remove";
+/// Notification: progress in a [`SEND`] turn (a tool call, an avatar cue).
 pub const PROGRESS: &str = "sapphire-agent.chat.progress";
+
+/// [`PROGRESS`] `kind`: a tool call started.
+pub const KIND_TOOL_START: &str = "tool_start";
+/// [`PROGRESS`] `kind`: a tool call ended.
+pub const KIND_TOOL_END: &str = "tool_end";
+/// [`PROGRESS`] `kind`: the reply sets the avatar's expression.
+pub const KIND_EXPRESSION: &str = "expression";
+/// [`PROGRESS`] `kind`: the reply makes the avatar perform an action.
+pub const KIND_ACTION: &str = "action";
+
+/// What a client can do, declared on each [`SEND`] turn.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct ClientCaps {
+    /// Present when the client shows an avatar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<AvatarCaps>,
+}
+
+/// The cues an avatar can play.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct AvatarCaps {
+    pub expressions: Vec<String>,
+    #[serde(default)]
+    pub actions: Vec<String>,
+}
+
+/// A file sent with a message. `data` is base64, as on the wire.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Attachment {
+    pub mime: String,
+    pub data: String,
+}
+
+impl Attachment {
+    pub fn from_bytes(mime: impl Into<String>, bytes: &[u8]) -> Self {
+        Self {
+            mime: mime.into(),
+            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+        }
+    }
+}
+
+static NO_CAPS: ClientCaps = ClientCaps { avatar: None };
+
+/// One turn to [`ChatClient::send`].
+pub struct Turn<'a> {
+    pub content: &'a str,
+    pub attachments: &'a [Attachment],
+    pub client: &'a ClientCaps,
+}
+
+impl<'a> Turn<'a> {
+    /// A text-only turn from a client declaring nothing.
+    pub fn text(content: &'a str) -> Turn<'a> {
+        Turn {
+            content,
+            attachments: &[],
+            client: &NO_CAPS,
+        }
+    }
+}
+
+/// The [`SEND`] params for `turn`. Empty `attachments` and a default
+/// `client` are left out, so a plain turn is the same JSON as in API 2.
+pub(crate) fn send_params(session_id: &str, turn: &Turn) -> Value {
+    let mut params = json!({ "session_id": session_id, "content": turn.content });
+    if !turn.attachments.is_empty() {
+        params["attachments"] = json!(turn.attachments);
+    }
+    if *turn.client != ClientCaps::default() {
+        params["client"] = json!(turn.client);
+    }
+    params
+}
+
+/// Progress in a [`SEND`] turn, from [`PROGRESS`].
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq)]
+pub enum ChatEvent {
+    Tool(ToolEvent),
+    Expression { name: String, intensity: f32 },
+    Action { name: String },
+}
+
+/// Read a [`PROGRESS`] notification's `params`. `None` for another
+/// session's, or for a `kind` this client does not know.
+pub fn parse_progress(session_id: &str, params: &Value) -> Option<ChatEvent> {
+    if params["session_id"].as_str() != Some(session_id) {
+        return None;
+    }
+    let tool = |started| {
+        ChatEvent::Tool(ToolEvent {
+            started,
+            id: params["id"].as_str().unwrap_or_default().to_owned(),
+            name: params["name"].as_str().unwrap_or("?").to_owned(),
+        })
+    };
+    match params["kind"].as_str()? {
+        KIND_TOOL_START => Some(tool(true)),
+        KIND_TOOL_END => Some(tool(false)),
+        KIND_EXPRESSION => Some(ChatEvent::Expression {
+            name: params["expression"].as_str()?.to_owned(),
+            intensity: params["intensity"].as_f64().map_or(1.0, |i| i as f32),
+        }),
+        KIND_ACTION => Some(ChatEvent::Action {
+            name: params["action"].as_str()?.to_owned(),
+        }),
+        _ => None,
+    }
+}
 
 /// The running agent, reached over its IPC endpoint.
 pub struct ChatClient {
@@ -61,7 +203,7 @@ pub struct Opened {
 }
 
 /// One tool call starting or ending, from [`PROGRESS`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ToolEvent {
     pub started: bool,
     pub id: String,
@@ -122,35 +264,27 @@ impl ChatClient {
         })
     }
 
-    /// Run one turn in `session_id`, handing each tool event to `on_tool`
-    /// as it arrives, and return the reply.
+    /// Run one turn in `session_id`, handing each [`ChatEvent`] to
+    /// `on_event` as it arrives, and return the reply.
     pub async fn send(
         &self,
         session_id: &str,
-        content: &str,
-        mut on_tool: impl FnMut(ToolEvent),
+        turn: Turn<'_>,
+        mut on_event: impl FnMut(ChatEvent),
     ) -> Result<String> {
         // Subscribed before the call, so no notification can be missed.
         let mut events = self.client.notifications();
-        let call = self.client.call::<_, Value>(
-            SEND,
-            json!({ "session_id": session_id, "content": content }),
-        );
+        let call = self
+            .client
+            .call::<_, Value>(SEND, send_params(session_id, &turn));
         tokio::pin!(call);
         let mut handle = |event: Notification| {
-            if event.method != PROGRESS || event.params["session_id"].as_str() != Some(session_id) {
+            if event.method != PROGRESS {
                 return;
             }
-            let started = match event.params["kind"].as_str() {
-                Some("tool_start") => true,
-                Some("tool_end") => false,
-                _ => return,
-            };
-            on_tool(ToolEvent {
-                started,
-                id: event.params["id"].as_str().unwrap_or_default().to_owned(),
-                name: event.params["name"].as_str().unwrap_or("?").to_owned(),
-            });
+            if let Some(event) = parse_progress(session_id, &event.params) {
+                on_event(event);
+            }
         };
         let answered = loop {
             tokio::select! {
@@ -191,5 +325,242 @@ impl ChatClient {
             .await
             .map_err(|e| anyhow!(e))?;
         Ok(result["sessions"].as_array().cloned().unwrap_or_default())
+    }
+
+    /// The avatar's config and every file in it.
+    pub async fn avatar_manifest(&self) -> Result<AvatarManifest> {
+        let result: Value = self
+            .client
+            .call(AVATAR_MANIFEST, json!({}))
+            .await
+            .map_err(|e| anyhow!(e))?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    /// A whole avatar file, read [`AVATAR_CHUNK`] at a time.
+    pub async fn avatar_download(&self, path: &str) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        loop {
+            let result: Value = self
+                .client
+                .call(
+                    AVATAR_READ,
+                    json!({ "path": path, "offset": out.len(), "len": AVATAR_CHUNK }),
+                )
+                .await
+                .map_err(|e| anyhow!(e))?;
+            let data = result["data"].as_str().unwrap_or_default();
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .context("avatar chunk is not valid base64")?;
+            let eof = result["eof"].as_bool().unwrap_or(true);
+            if bytes.is_empty() && !eof {
+                bail!("the agent sent an empty avatar chunk before the end of {path}");
+            }
+            out.extend_from_slice(&bytes);
+            if eof {
+                return Ok(out);
+            }
+        }
+    }
+
+    /// Put `bytes` at `path` in the avatar folder.
+    pub async fn avatar_upload(&self, path: &str, bytes: &[u8]) -> Result<()> {
+        use sha2::{Digest as _, Sha256};
+        let sha256: String = Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let begun: Value = self
+            .client
+            .call(
+                AVATAR_WRITE_BEGIN,
+                json!({ "path": path, "size": bytes.len(), "sha256": sha256 }),
+            )
+            .await
+            .map_err(|e| anyhow!(e))?;
+        let upload_id = begun["upload_id"]
+            .as_str()
+            .context("the agent answered no upload_id")?;
+        let mut offset = 0usize;
+        for chunk in bytes.chunks(AVATAR_CHUNK) {
+            let _: Value = self
+                .client
+                .call(
+                    AVATAR_WRITE_CHUNK,
+                    json!({
+                        "upload_id": upload_id,
+                        "offset": offset,
+                        "data": base64::engine::general_purpose::STANDARD.encode(chunk),
+                    }),
+                )
+                .await
+                .map_err(|e| anyhow!(e))?;
+            offset += chunk.len();
+        }
+        let _: Value = self
+            .client
+            .call(AVATAR_WRITE_COMMIT, json!({ "upload_id": upload_id }))
+            .await
+            .map_err(|e| anyhow!(e))?;
+        Ok(())
+    }
+
+    /// Replace the avatar config.
+    pub async fn avatar_set_config(&self, config: &AvatarConfig) -> Result<()> {
+        let _: Value = self
+            .client
+            .call(AVATAR_SET_MANIFEST, serde_json::to_value(config)?)
+            .await
+            .map_err(|e| anyhow!(e))?;
+        Ok(())
+    }
+
+    /// Delete the avatar file at `path`.
+    pub async fn avatar_remove(&self, path: &str) -> Result<()> {
+        let _: Value = self
+            .client
+            .call(AVATAR_REMOVE, json!({ "path": path }))
+            .await
+            .map_err(|e| anyhow!(e))?;
+        Ok(())
+    }
+}
+
+/// The most one avatar file may weigh, in bytes.
+pub const AVATAR_MAX_FILE: u64 = 256 * 1024 * 1024;
+/// The most one `avatar.read` / `avatar.write_chunk` carries, in bytes.
+pub const AVATAR_CHUNK: usize = 1024 * 1024;
+
+/// What `<workspace>/avatar/avatar.toml` says: which file is the model, which
+/// is the idle loop, and which file plays each named action. Every value is a
+/// `/`-separated path relative to `avatar/`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct AvatarConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle: Option<String>,
+    #[serde(default)]
+    pub actions: std::collections::BTreeMap<String, String>,
+}
+
+/// One file under `avatar/`, with the hash a client compares to decide
+/// whether its copy is current.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AvatarFile {
+    pub path: String,
+    pub size: u64,
+    pub sha256: String,
+}
+
+/// The avatar config plus every file in `avatar/` except `avatar.toml`,
+/// ordered by path.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct AvatarManifest {
+    #[serde(flatten)]
+    pub config: AvatarConfig,
+    pub files: Vec<AvatarFile>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn progress_kinds_parse_into_events() {
+        let s = "s1";
+        assert_eq!(
+            parse_progress(
+                s,
+                &json!({"session_id":"s1","kind":"tool_start","id":"c1","name":"risky"})
+            ),
+            Some(ChatEvent::Tool(ToolEvent {
+                started: true,
+                id: "c1".into(),
+                name: "risky".into()
+            }))
+        );
+        assert_eq!(
+            parse_progress(
+                s,
+                &json!({"session_id":"s1","kind":"expression","expression":"happy","intensity":0.5})
+            ),
+            Some(ChatEvent::Expression {
+                name: "happy".into(),
+                intensity: 0.5
+            })
+        );
+        assert_eq!(
+            parse_progress(
+                s,
+                &json!({"session_id":"s1","kind":"action","action":"peace"})
+            ),
+            Some(ChatEvent::Action {
+                name: "peace".into()
+            })
+        );
+    }
+
+    #[test]
+    fn progress_for_another_session_or_kind_is_ignored() {
+        assert_eq!(
+            parse_progress(
+                "s1",
+                &json!({"session_id":"s2","kind":"action","action":"peace"})
+            ),
+            None
+        );
+        assert_eq!(
+            parse_progress("s1", &json!({"session_id":"s1","kind":"audio"})),
+            None
+        );
+    }
+
+    #[test]
+    fn an_expression_without_intensity_is_full() {
+        assert_eq!(
+            parse_progress(
+                "s1",
+                &json!({"session_id":"s1","kind":"expression","expression":"sad"})
+            ),
+            Some(ChatEvent::Expression {
+                name: "sad".into(),
+                intensity: 1.0
+            })
+        );
+    }
+
+    #[test]
+    fn a_plain_turn_serialises_like_api_2() {
+        assert_eq!(
+            send_params("s1", &Turn::text("hi")),
+            json!({"session_id":"s1","content":"hi"})
+        );
+    }
+
+    #[test]
+    fn attachments_and_caps_are_sent_when_present() {
+        let attachments = [Attachment::from_bytes("image/png", b"abc")];
+        let client = ClientCaps {
+            avatar: Some(AvatarCaps {
+                expressions: vec!["happy".into()],
+                actions: vec![],
+            }),
+        };
+        let turn = Turn {
+            content: "hi",
+            attachments: &attachments,
+            client: &client,
+        };
+        assert_eq!(
+            send_params("s1", &turn),
+            json!({
+                "session_id": "s1",
+                "content": "hi",
+                "attachments": [{"mime": "image/png", "data": "YWJj"}],
+                "client": {"avatar": {"expressions": ["happy"], "actions": []}},
+            })
+        );
     }
 }

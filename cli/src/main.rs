@@ -10,6 +10,7 @@ mod ambient;
 mod app_server;
 mod autonomous;
 mod autonomous_config;
+mod avatar_store;
 mod channel;
 mod chat;
 mod cli_init;
@@ -952,6 +953,16 @@ async fn main() -> Result<()> {
                 }
                 ambient_routes = Some(routes);
             }
+
+            // The avatar tools are always registered and never offered by
+            // default: `run_llm_turn` adds them only to a turn whose client
+            // declared an avatar (see `tools::avatar_tools`).
+            tool_set
+                .register_tool(Box::new(tools::avatar_tools::SetExpressionTool))
+                .await;
+            tool_set
+                .register_tool(Box::new(tools::avatar_tools::PlayActionTool))
+                .await;
 
             // ── ACP session store (sessions/<namespace>/acp/) ───────────────
             // Separate from `cross_device_session_store`: ACP is an

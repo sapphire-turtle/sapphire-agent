@@ -7680,9 +7680,12 @@ name = "sapphire-agent-core"
 version = "0.10.0"
 dependencies = [
  "anyhow",
+ "base64 0.23.1",
  "sapphire-framework",
  "sapphire-framework-server-api",
+ "serde",
  "serde_json",
+ "sha2 0.11.1",
  "tokio",
 ]
 

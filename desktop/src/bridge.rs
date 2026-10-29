@@ -16,7 +16,7 @@
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use sapphire_agent_core::ChatClient;
+use sapphire_agent_core::{ChatClient, ChatEvent, Turn};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
@@ -133,12 +133,14 @@ impl RpcBridge {
         self.runtime.spawn(async move {
             let tool_tx = tx.clone();
             let reply = client
-                .send(&session_id, &content, |event| {
-                    let _ = tool_tx.send(if event.started {
-                        BridgeEvent::ToolStart { name: event.name }
-                    } else {
-                        BridgeEvent::ToolEnd { name: event.name }
-                    });
+                .send(&session_id, Turn::text(&content), |event| {
+                    if let ChatEvent::Tool(event) = event {
+                        let _ = tool_tx.send(if event.started {
+                            BridgeEvent::ToolStart { name: event.name }
+                        } else {
+                            BridgeEvent::ToolEnd { name: event.name }
+                        });
+                    }
                 })
                 .await;
             let _ = tx.send(match reply {
