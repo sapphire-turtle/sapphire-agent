@@ -67,7 +67,7 @@ tracing-subscriber.workspace = true
 
 # `cargo binstall --git https://github.com/sapphire-turtle/sapphire-agent sapphire-agent-desktop`
 # downloads the release file instead of building it (this crate is not on crates.io), following
-# sapphire-framework's ci/README.md#conventions: the files are bare binaries named
+# sapphire-turtle/.github's README.md#conventions: the files are bare binaries named
 # `<binary>-<os>-<arch>`, so each release platform names its own. quick-install is a third
 # party's build: only this repository's files, or a build from source, are installed.
 [package.metadata.binstall]

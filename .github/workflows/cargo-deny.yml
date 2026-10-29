@@ -16,4 +16,4 @@ on:
 
 jobs:
   cargo-deny:
-    uses: sapphire-turtle/sapphire-framework/.github/workflows/shared-cargo-deny.yml@main
+    uses: sapphire-turtle/.github/.github/workflows/cargo-deny.yml@v1

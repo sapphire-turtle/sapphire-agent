@@ -1,6 +1,6 @@
 [workspace]
 # Tags and GitHub releases follow the sapphire-turtle convention
-# (sapphire-framework's ci/README.md): `v{version}` for sapphire-agent, the
+# (sapphire-turtle/.github's README.md): `v{version}` for sapphire-agent, the
 # CLI and server binary; `desktop-v{version}` for the desktop app; none for
 # the library crate. Before the CLI and the server became one binary, tags
 # were per package (`sapphire-agent-server-v…`, `sapphire-agent-cli-v…`).

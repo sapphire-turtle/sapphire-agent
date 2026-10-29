@@ -5,7 +5,7 @@ on:
 
 jobs:
   ci:
-    uses: sapphire-turtle/sapphire-framework/.github/workflows/shared-rust-ci.yml@main
+    uses: sapphire-turtle/.github/.github/workflows/rust-ci.yml@v1
     with:
       # bevy (the desktop) needs X11, Wayland and xkbcommon; bevy_winit talks
       # to udev for device hot-plug events.
