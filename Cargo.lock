@@ -7900,6 +7900,7 @@ dependencies = [
  "anyhow",
  "bevy",
  "bevy_egui",
+ "corundum-framework-gui",
  "egui_extras",
  "sapphire-agent-core",
  "sapphire-framework-gui",

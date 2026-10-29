@@ -14,9 +14,14 @@ publish = false
 # running on this host over its IPC endpoint, like `sapphire-agent chat`.
 sapphire-agent-core = { path = "../sapphire-agent-core", version = "0.10.0" }
 
-# Only for `AppIdentity`, which the app passes to `AgentGuiPlugin`. No
-# eframe: the GUI runs inside bevy, not framework-gui's own shell.
-sapphire-framework-gui = { version = "0.23.0", default-features = false }
+# The framework's Settings screen (workspace, devices, appearance, about…)
+# and its client, plus `AppIdentity`. No eframe: the GUI runs inside bevy,
+# not framework-gui's own shell, so only `Settings` is used.
+sapphire-framework-gui = { version = "0.23", default-features = false }
+
+# The look store: keeps the theme and language last applied on the device,
+# so the window opens in them before the bridge answers. No eframe either.
+corundum-framework-gui = { version = "0.3", default-features = false, features = ["serde"] }
 
 # The engine the GUI lives in. The app adds `DefaultPlugins` and picks the
 # rest (window backends, fonts for bevy's own text, …); this crate asks only

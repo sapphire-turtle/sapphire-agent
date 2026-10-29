@@ -1,9 +1,11 @@
-//! Chat screen: scrolling history + input row.
+//! Chat screen: scrolling history + input row, or the framework's
+//! settings in their place.
 
 use bevy::prelude::*;
 use bevy_egui::{EguiContexts, egui};
 
 use super::{ChatBridge, ChatEntry, ChatRole, ChatState, Session, TurnState};
+use crate::settings::{GuiSettings, Layout, Screen, Toggle};
 
 const ICON_SEND: egui::ImageSource<'_> = egui::include_image!("../../assets/icons/send.svg");
 
@@ -38,15 +40,30 @@ pub(crate) fn ui(
     mut contexts: EguiContexts,
     mut state: ResMut<ChatState>,
     bridge: Res<ChatBridge>,
+    mut settings: Option<NonSendMut<GuiSettings>>,
 ) {
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
     };
+    let mut settings = settings.as_deref_mut();
+    let layout = Layout::of(settings.as_ref().map(|s| (s.open, s.settings.health())));
     let root = &mut root_ui(ctx);
     egui::Panel::top("chat_topbar").show(root, |ui| {
         ui.horizontal(|ui| {
             ui.heading("sapphire-agent-desktop");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if let (Some(toggle), Some(settings)) = (layout.toggle, settings.as_deref_mut()) {
+                    let label = match toggle {
+                        Toggle::OpenSettings => "Settings",
+                        Toggle::BackToChat => "Back to chat",
+                    };
+                    if ui.button(label).clicked() {
+                        settings.open = !settings.open;
+                        // This frame's layout is already decided; the
+                        // next one shows the other screen.
+                        ui.ctx().request_repaint();
+                    }
+                }
                 let failed = matches!(state.session, Session::Failed { .. });
                 if failed
                     && ui
@@ -68,7 +85,19 @@ pub(crate) fn ui(
         if let Session::Failed { message } = &state.session {
             ui.colored_label(egui::Color32::from_rgb(200, 80, 80), message);
         }
+        if layout.banner
+            && let Some(settings) = settings.as_deref_mut()
+        {
+            settings.settings.status_ui(ui);
+        }
     });
+
+    if layout.screen == Screen::Settings
+        && let Some(settings) = settings
+    {
+        egui::CentralPanel::default().show(root, |ui| settings.settings.ui(ui));
+        return;
+    }
 
     egui::Panel::bottom("chat_input")
         .min_size(60.0)
