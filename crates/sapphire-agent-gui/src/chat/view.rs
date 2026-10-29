@@ -1,11 +1,11 @@
-//! Chat panel: scrolling history + input row.
+//! Chat screen: scrolling history + input row, or the framework's
+//! settings in their place.
 
 use bevy::prelude::*;
 use bevy_egui::{EguiContexts, egui};
 
-use crate::AppState;
-use crate::bridge::RpcBridge;
-use crate::state::{ChatEntry, ChatRole, Session, TurnState};
+use super::{ChatBridge, ChatEntry, ChatRole, ChatState, Session, TurnState};
+use crate::settings::{GuiSettings, Layout, Screen, Toggle};
 
 const ICON_SEND: egui::ImageSource<'_> = egui::include_image!("../../assets/icons/send.svg");
 
@@ -14,21 +14,50 @@ const ICON_SEND: egui::ImageSource<'_> = egui::include_image!("../../assets/icon
 /// the on-screen footprint avoids visible aliasing.
 const ICON_PX: f32 = 18.0;
 
-fn icon_image(src: egui::ImageSource<'_>) -> egui::Image<'_> {
+fn icon_image<'a>(ui: &egui::Ui, src: egui::ImageSource<'a>) -> egui::Image<'a> {
     egui::Image::new(src)
         .fit_to_exact_size(egui::vec2(ICON_PX, ICON_PX))
-        .tint(egui::Color32::from_gray(220))
+        .tint(ui.visuals().text_color())
 }
 
-pub fn ui(mut contexts: EguiContexts, mut state: ResMut<AppState>, bridge: NonSend<RpcBridge>) {
+pub(crate) fn ui(
+    mut contexts: EguiContexts,
+    mut state: ResMut<ChatState>,
+    bridge: Res<ChatBridge>,
+    mut settings: Option<NonSendMut<GuiSettings>>,
+) {
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
     };
-    let root = &mut super::root_ui(ctx);
+    let settings = settings.as_deref_mut();
+    // egui 0.37 keeps one root `Ui` per viewport, so every system that
+    // shows panels stacks them on the same one.
+    ctx.root_ui(|root| show(root, &mut state, &bridge, settings));
+}
+
+fn show(
+    root: &mut egui::Ui,
+    state: &mut ChatState,
+    bridge: &ChatBridge,
+    mut settings: Option<&mut GuiSettings>,
+) {
+    let layout = Layout::of(settings.as_ref().map(|s| (s.open, s.settings.health())));
     egui::Panel::top("chat_topbar").show(root, |ui| {
         ui.horizontal(|ui| {
             ui.heading("sapphire-agent-desktop");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if let (Some(toggle), Some(settings)) = (layout.toggle, settings.as_deref_mut()) {
+                    let label = match toggle {
+                        Toggle::OpenSettings => "Settings",
+                        Toggle::BackToChat => "Back to chat",
+                    };
+                    if ui.button(label).clicked() {
+                        settings.open = !settings.open;
+                        // This frame's layout is already decided; the
+                        // next one shows the other screen.
+                        ui.ctx().request_repaint();
+                    }
+                }
                 let failed = matches!(state.session, Session::Failed { .. });
                 if failed
                     && ui
@@ -48,9 +77,21 @@ pub fn ui(mut contexts: EguiContexts, mut state: ResMut<AppState>, bridge: NonSe
             });
         });
         if let Session::Failed { message } = &state.session {
-            ui.colored_label(egui::Color32::from_rgb(200, 80, 80), message);
+            ui.colored_label(ui.visuals().error_fg_color, message);
+        }
+        if layout.banner
+            && let Some(settings) = settings.as_deref_mut()
+        {
+            settings.settings.status_ui(ui);
         }
     });
+
+    if layout.screen == Screen::Settings
+        && let Some(settings) = settings
+    {
+        egui::CentralPanel::default().show(root, |ui| settings.settings.ui(ui));
+        return;
+    }
 
     egui::Panel::bottom("chat_input")
         .min_size(60.0)
@@ -65,10 +106,15 @@ pub fn ui(mut contexts: EguiContexts, mut state: ResMut<AppState>, bridge: NonSe
                 let enter_pressed =
                     resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
 
-                let send_btn = ui.add_enabled(can_send, egui::Button::image(icon_image(ICON_SEND)));
+                let send_btn =
+                    ui.add_enabled(can_send, egui::Button::image(icon_image(ui, ICON_SEND)));
                 let send_clicked = send_btn.on_hover_text("Send").clicked();
-                if (send_clicked || (enter_pressed && can_send)) && !state.draft.trim().is_empty() {
-                    submit_chat(&mut state, &bridge);
+                // `take_submission` holds the rest of the rule: a ready,
+                // idle session and a draft that isn't blank.
+                if (send_clicked || enter_pressed)
+                    && let Some(text) = state.take_submission()
+                {
+                    bridge.submit_chat(text);
                 }
             });
             if let Some(status) = state.last_status.as_deref() {
@@ -93,24 +139,16 @@ pub fn ui(mut contexts: EguiContexts, mut state: ResMut<AppState>, bridge: NonSe
 }
 
 fn render_entry(ui: &mut egui::Ui, entry: &ChatEntry) {
+    let visuals = ui.visuals().clone();
     let (prefix, color) = match entry.role {
-        ChatRole::User => ("You", egui::Color32::from_rgb(120, 170, 230)),
-        ChatRole::Assistant => ("Saphina", egui::Color32::from_rgb(180, 220, 180)),
-        ChatRole::System => ("system", egui::Color32::GRAY),
+        // From the active visuals, so light and dark both read: the link
+        // colour, the strong text colour and the weak one stay apart.
+        ChatRole::User => ("You", visuals.hyperlink_color),
+        ChatRole::Assistant => ("Saphina", visuals.strong_text_color()),
+        ChatRole::System => ("system", visuals.weak_text_color()),
     };
     ui.horizontal_wrapped(|ui| {
         ui.label(egui::RichText::new(prefix).strong().color(color));
         ui.label(&entry.text);
     });
-}
-
-fn submit_chat(state: &mut AppState, bridge: &RpcBridge) {
-    let content = std::mem::take(&mut state.draft);
-    state.history.push(ChatEntry {
-        role: ChatRole::User,
-        text: content.clone(),
-    });
-    state.turn = TurnState::Sending;
-    state.last_status = None;
-    bridge.submit_chat(content);
 }

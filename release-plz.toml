@@ -31,6 +31,16 @@ git_release_name = "v{{ version }}"
 name = "sapphire-agent-core"
 changelog_path = "./crates/sapphire-agent-core/CHANGELOG.md"
 
+# sapphire-agent-gui is the GUI the desktop (and later a mobile app) is built
+# on: a library inside their binaries, `publish = false`, with no tag or
+# release of its own. Its changes ship as the apps' releases — but release-plz
+# picks packages by path, so a change only under crates/sapphire-agent-gui/
+# makes no desktop release: a user-visible GUI change must also touch
+# desktop/ (a `(desktop)` commit, its CHANGELOG or version) in the same PR.
+[[package]]
+name = "sapphire-agent-gui"
+release = false
+
 # sapphire-agent-desktop ships as a GitHub-release-only binary (bevy + bundled
 # font + ISC-licensed Lucide SVGs — not intended for crates.io, hence
 # `publish = false` in its Cargo.toml); release-binaries.yml builds the

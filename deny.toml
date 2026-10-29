@@ -108,17 +108,20 @@ confidence-threshold = 0.93
 # embeds as its fallback UI font, not the code; blanket-allowing them would
 # also wave through a code dependency that happened to pick one. This crate
 # is `(MIT OR Apache-2.0) AND OFL-1.1 AND Ubuntu-font-1.0` — the code half is
-# already allowed, and we ship an OFL font of our own in `desktop/assets/`.
+# already allowed, and we ship an OFL font of our own in `crates/sapphire-agent-gui/assets/`.
 #
 # Only visible since the workspace root became a virtual manifest: cargo-deny
 # assumes `--workspace` for a virtual manifest, but takes a root *package* as
 # the sole graph root otherwise, so `sapphire-agent-desktop`'s tree had never
 # been checked before.
 exceptions = [
-    # Our own desktop app is GPL-3.0-or-later with an app store exception
-    # (desktop/LICENSE.App-Store-Exception). Scoped to it, so a GPL dependency
-    # cannot slip in unnoticed.
+    # Our own desktop app and the GUI library it is built on are
+    # GPL-3.0-or-later with an app store exception
+    # (desktop/LICENSE.App-Store-Exception,
+    # crates/sapphire-agent-gui/LICENSE.App-Store-Exception). Scoped to them,
+    # so a GPL dependency cannot slip in unnoticed.
     { name = "sapphire-agent-desktop", allow = ["GPL-3.0-or-later"] },
+    { name = "sapphire-agent-gui", allow = ["GPL-3.0-or-later"] },
     { name = "epaint_default_fonts", allow = ["OFL-1.1", "Ubuntu-font-1.0"] },
 ]
 
@@ -135,6 +138,13 @@ allow-wildcard-paths = true
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-# sapphire-framework is published to crates.io as of 0.13.0, so nothing in the
-# graph comes from git any more.
+# Git sources are limited to our own org's forks. They exist where a
+# dependency lags bevy/egui: `bevy_egui` is pinned to the
+# sapphire-turtle fork (branch egui-0.37) until upstream releases egui 0.37
+# (upstream PR #508), at which point that entry goes away. The GUI is not
+# published to crates.io, so a git dependency costs nothing there. Everything
+# else, sapphire-framework included, comes from crates.io.
 allow-git = []
+
+[sources.allow-org]
+github = ["sapphire-turtle"]

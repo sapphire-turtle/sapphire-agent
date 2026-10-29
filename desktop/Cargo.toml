@@ -12,9 +12,10 @@ name = "sapphire-agent-desktop"
 path = "src/main.rs"
 
 [dependencies]
-# The local chat protocol and its client: the desktop talks to the agent
-# running on this host over its IPC endpoint, like `sapphire-agent chat`.
-sapphire-agent-core = { path = "../crates/sapphire-agent-core", version = "0.10.0" }
+# Everything a future mobile app shares with the desktop: the chat, its
+# connection to the agent running on this host and the egui setup. The
+# desktop adds only the window, the camera and logging.
+sapphire-agent-gui = { path = "../crates/sapphire-agent-gui" }
 
 # Game engine — needed up front for the eventual 3D character work
 # (desktop-mate-style avatar). For the chat-only first cut we use only
@@ -42,27 +43,7 @@ bevy = { version = "0.20", default-features = false, features = [
     "multi_threaded",
 ] }
 
-# Immediate-mode UI inside the bevy app — drives every panel until /
-# unless we eventually replace specific panels with native bevy_ui.
-bevy_egui = "0.43"
-
-# egui_extras supplies the image loader plumbing we use to render the
-# bundled Lucide SVG icons (send). The `svg`
-# feature pulls in resvg, which turns each SVG into a texture at the
-# requested DPI on first use. Pinned to 0.36 so it matches the egui
-# 0.36.x re-export from bevy_egui 0.43.
-egui_extras = { version = "0.36", features = ["svg"] }
-
-# The agent client is async but bevy's scheduler is sync, so it gets its
-# own runtime. Multi-threaded so an in-flight turn doesn't hold up a
-# reconnect.
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
-
-# Error handling
-anyhow.workspace = true
-
 # Logging
-tracing = "0.1"
 tracing-subscriber.workspace = true
 
 # `cargo binstall --git https://github.com/sapphire-turtle/sapphire-agent sapphire-agent-desktop`

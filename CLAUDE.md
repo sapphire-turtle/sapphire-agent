@@ -4,11 +4,12 @@ Loaded by Claude Code at session start. Keep it short and operational; deep desi
 
 ## Conventional commit scopes
 
-This workspace ships three crates and uses **conventional-commit scopes** to route changelog entries (and only changelog entries — see "Misattribution" below).
+This workspace ships four crates and uses **conventional-commit scopes** to route changelog entries (and only changelog entries — see "Misattribution" below).
 
 | Scope | Targets |
 |---|---|
 | `(desktop)` | `desktop/` (bevy GUI client) |
+| `(gui)` | `crates/sapphire-agent-gui/` (the bevy + egui GUI shared by the desktop and a future mobile app) |
 | `(rpc)` | `crates/sapphire-agent-core/` (local IPC chat protocol + client, shared by `chat` and the desktop) |
 | `(core)` | retired with `crates/sapphire-agent-client/` (#278); still skipped by `cliff.toml` |
 | unscoped, or `(agent)` / `(messages)` / `(voice)` / `(serve)` / `(channel)` / `(matrix)` / `(discord)` / `(sessions)` / `(chat)` / `(timer)` / `(heartbeat)` / `(memory)` / `(image-cache)` / `(api)` / `(tools)` / `(search)` / `(fts)` / `(mcp)` / `(features)` / `(workspace)` / `(deps)` | the agent binary (`cli/`); `(cli)` / `(call)` too |
@@ -25,6 +26,7 @@ The repo root is a **virtual workspace manifest** (`[workspace]` only, no `[pack
 | `cli/` | `sapphire-agent` | bin (`sapphire-agent`) — the server and its CLI |
 | `desktop/` | `sapphire-agent-desktop` | bin (`sapphire-agent-desktop`) |
 | `crates/sapphire-agent-core/` | `sapphire-agent-core` | lib |
+| `crates/sapphire-agent-gui/` | `sapphire-agent-gui` | lib (`publish = false`) |
 
 **One app, one binary** (#278): the server and its CLI are the single `sapphire-agent` binary in `cli/`, the way `sapphire-ledger` and the other sapphire-framework apps are. The directory is `cli/` because the CLI is what people face; serving is one of its modes. `sapphire-agent-desktop` is a local IPC client the same way, sharing `sapphire-agent-core` with `chat`. `serve` runs the server (a bare invocation prints the help); the client commands (`chat`, `acp`, and the framework's `status`, `workspace`, …) talk to the server already running on the host over the app server's IPC endpoint — never over HTTP, and they start none. The agent's own IPC methods are versioned by `APP_API` in `cli/src/serve/acp_tunnel.rs`; bump it when adding or changing one.
 
@@ -55,7 +57,7 @@ So `cargo build --workspace` links and tests on Linux, macOS and Windows; CI's `
 `cliff.toml` skips commits whose scope is in this list:
 
 ```
-desktop | rpc | core | release | release-plz | fmt | ci | test | deps
+desktop | rpc | core | gui | release | release-plz | fmt | ci | test | deps
 ```
 
 - **Sibling crate scope, new addition**: extend the alternation in `cliff.toml` → `[[git.commit_parsers]] message = '^[a-z]+\\((…)\\):'` at the same time as the first commit using it. Otherwise the first such commit will pollute the agent changelog.
@@ -68,4 +70,5 @@ Rust's `regex` crate has no negative lookahead, so the filter is an allowlist of
 - `release-plz` creates the tags and GitHub releases on push to main: `v{version}` for `sapphire-agent`, `desktop-v{version}` for `sapphire-agent-desktop`, none for `sapphire-agent-core` (the sapphire-turtle convention; per-package `sapphire-agent-*-v*` tags are history).
 - `.github/workflows/release-plz.yml` calls sapphire-turtle/.github's shared `release-plz.yml` and, for each released package, `release-binaries.yml`, which builds through the shared `release-binary.yml` and attaches platform binaries to the release (`v{version}` for `sapphire-agent`, `desktop-v{version}` for the desktop). CI is the shared `rust-ci.yml`; the sherpa-onnx cache refresh and the self-contained check live in `.github/scripts/`.
 - Tags a workflow pushes don't fire downstream workflows on their own — the `workflow_call` chain inside `release-plz.yml` is the path; running `release-binaries.yml` by hand (`-f tag=… -f target=cli|desktop`) is the retroactive escape hatch.
+- **A GUI-only change makes no desktop release.** release-plz picks packages by path, and `sapphire-agent-gui` has `release = false` while `(gui)` is skipped by `cliff.toml`, so a commit touching only `crates/sapphire-agent-gui/` produces no `desktop-v*` release. A user-visible GUI change must also touch `desktop/` in the same PR (a `(desktop)` commit, its CHANGELOG or version), or the desktop will not ship it.
 - `sapphire-agent-desktop` carries `publish = false`; release-plz still tags + releases it because `release-plz.toml` sets `git_only = true` (it skips a `publish = false` crate without it; `release = true` alone no longer does it).

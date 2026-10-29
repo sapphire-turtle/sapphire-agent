@@ -1,0 +1,28 @@
+# sapphire-agent-desktop GPL / Application Marketplace Compatibility Statement
+
+The sapphire-agent-desktop development team acknowledges that the distribution terms
+of certain official application marketplaces (including restrictions on
+redistribution, DRM requirements, or other platform-imposed conditions) may
+conflict with certain requirements of the GNU General Public License version 3.
+
+To allow distribution of sapphire-agent-desktop through such marketplaces, we grant
+the following exception:
+
+As long as you comply with the GPL in all other respects — including its
+requirements to make the source code available and to provide users with the
+text of this license — we will not assert that distributing sapphire-agent-desktop
+through any official application marketplace (including but not limited to
+Apple App Store, Google Play, Microsoft Store, or similar platform-operated
+stores) constitutes a violation of the GPL solely because of that
+marketplace's standard distribution terms.
+
+This exception does not waive any other rights or obligations under the GPL.
+In particular:
+
+- You must make the corresponding source code publicly available.
+- You must include a prominent copyright notice and the full text of the GPL
+  (or a pointer to it) in your distribution.
+- Derivative works must also be licensed under the GPL-3.0-or-later,
+  including this exception or a compatible one.
+
+Copyright (C) 2026 fluo10 <fluo10@fireturtle.net>

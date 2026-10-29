@@ -4,7 +4,7 @@
   `cli/src/tools/`、`cli/src/serve/`（chat IPC と avatar IPC）、`cliff.toml`、`release-plz.toml`
 - **参照（framework）**: `sapphire-framework-gui` 0.23 の `Settings`（`settings.rs`）、
   `mobile/`（サーバー内蔵の型）
-- **外部**: bevy 0.20、bevy_egui（fork）、bevy_vrm1（fork）
+- **外部**: bevy 0.20、bevy_egui（fork）、bevy_vrm1 0.11（crates.io）
 - **状態**: 提案
 
 ## なぜ
@@ -42,7 +42,7 @@ fork して git 参照してよい。
 | 依存 | 理由 | 変更 |
 |---|---|---|
 | bevy_egui | 最新 0.43.x は egui 0.36、framework-gui 0.22 以降は egui 0.37 | egui を 0.37 に上げる（上流 dependabot PR #508 相当）。上流が出たら戻す |
-| bevy_vrm1 | VRM 1.0 の expressions / look-at / spring bone / MToon / VRMA を持つ唯一の候補。bevy 0.19 | bevy 0.20 に上げる |
+| bevy_vrm1 | VRM 1.0 の expressions / look-at / spring bone / MToon / VRMA を持つ唯一の候補 | fork 不要。上流の 0.11.0（2026-10-29、上流 PR #73）が bevy 0.20 対応済みなので crates.io の `bevy_vrm1 = "0.11"` を使う。`sapphire-turtle/bevy_vrm1`（branch `bevy-0.20`）は、今後 bevy の更新が上流より先に進むときのためだけに残す |
 
 `bevy_vrm`（unavi）0.5 は bevy 0.20 対応済みだが expressions と look-at が未対応なので採らない。
 bevy_vrm1 は VRM 1.0 専用（0.x は読めない）。VRoid Studio の現行版は 1.0 を書き出せるので許容する。
@@ -52,7 +52,7 @@ bevy_vrm1 は VRM 1.0 専用（0.x は読めない）。VRoid Studio の現行�
 ```
 crates/sapphire-agent-gui/   lib, publish = false（git 依存可）
   ├─ app        起動：runtime、FrameworkClient、フォント・テーマ、repaint
-  ├─ chat/      チャット状態・bridge（今の desktop/src/bridge.rs, state.rs）と egui ビュー
+  ├─ chat/      チャット状態・bridge と egui ビュー（`crates/sapphire-agent-gui/src/chat/` に移した）
   │             （入力欄、吹き出し、履歴パネル、メニュー）
   ├─ avatar/    プラットフォーム非依存の bevy plugin
   │   ├─ model       VRM 読み込み（bevy_vrm1）、未設定・失敗時の仮表示
@@ -352,7 +352,7 @@ framework の indexer は markdown 系（`md` / `markdown` / `txt` / `rst` / `or
 
 ## 作業の順番
 
-1. fork: bevy_egui（egui 0.37）、bevy_vrm1（bevy 0.20）
+1. fork: bevy_egui（egui 0.37）。bevy_vrm1 は上流 0.11 を使うので fork 不要
 2. `crates/sapphire-agent-gui` を作り、今の desktop のチャットを移す（振る舞いは変えない）
 3. framework-gui 0.23 の `Settings` を組み込む
 4. core / cli: `APP_API` 3、`Turn` / `ClientCaps`、`attachments`、`set_expression` /
