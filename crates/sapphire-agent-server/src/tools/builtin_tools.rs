@@ -2231,7 +2231,7 @@ mod refresh_system_prompt_tests {
     /// A real `Agent`, built the way `agent.rs`'s `build_test_agent`
     /// builds one. The tool only ever holds the `Weak` reference, but
     /// constructing a real `Agent` keeps the wiring under test identical
-    /// to the one `main.rs` wires at runtime: `Weak<Agent>` pointing at
+    /// to the one `lib.rs` wires at runtime: `Weak<Agent>` pointing at
     /// a live agent, registered into a `ToolSet` via `register_tool`.
     /// The `TempDir` is leaked on purpose — same test-binary reasoning
     /// as every other fixture in this crate.

@@ -8,7 +8,7 @@
 //! too. See `docs/superpowers/specs/2026-10-13-app-server-sync-acp-stdio-design.md`.
 //!
 //! What the agent adds on top — channels, the HTTP API, the agent loop — is
-//! built in `main` around the workspace this server has open, never around
+//! built in `serve` around the workspace this server has open, never around
 //! one of its own: the cache is a redb database, which only one process may
 //! open.
 
@@ -134,7 +134,7 @@ pub async fn open_workspace(host: &WorkspaceHost) -> Result<(PathBuf, Arc<Worksp
 /// Everything the agent holds — sessions, memory, tools, the bootstrap
 /// files — is rooted in the workspace it was built around, so a switch is a
 /// restart (design decision 2): this cancels `shutdown` and sets
-/// `restart`, and `main` exits with [`RESTART_EXIT_CODE`] once the agent
+/// `restart`, and `serve` exits with [`RESTART_EXIT_CODE`] once the agent
 /// has wound down.
 pub fn watch_for_switch(
     host: Arc<WorkspaceHost>,

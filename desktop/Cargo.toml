@@ -1,8 +1,10 @@
 [package]
 name = "sapphire-agent-desktop"
-version = "0.8.2"
+# Released together with `sapphire-agent-headless`, under its `v{version}`
+# tags (release-plz.toml).
+version = "0.12.0"
 edition.workspace = true
-description = "Desktop GUI client for sapphire-agent (bevy + egui)"
+description = "Desktop GUI client for sapphire-agent (bevy + egui), whose binary also runs the agent's command line"
 license-file = "LICENSE"
 repository.workspace = true
 publish = false
@@ -16,6 +18,13 @@ path = "src/main.rs"
 # connection to the agent running on this host and the egui setup. The
 # desktop adds only the window, the camera and logging.
 sapphire-agent-gui = { path = "../crates/sapphire-agent-gui" }
+
+# Every command but the window — `serve`, `chat`, `acp`, `status`, … — runs
+# the CLI's own code, so this one binary does all the CLI does, the agent
+# server included.
+sapphire-agent-cli = { path = "../crates/sapphire-agent-cli", version = "0.12.0" }
+clap.workspace = true
+anyhow.workspace = true
 
 # Game engine — needed up front for the eventual 3D character work
 # (desktop-mate-style avatar). For the chat-only first cut we use only
@@ -49,20 +58,21 @@ tracing-subscriber.workspace = true
 # `cargo binstall --git https://github.com/sapphire-turtle/sapphire-agent sapphire-agent-desktop`
 # downloads the release file instead of building it (this crate is not on crates.io), following
 # sapphire-turtle/.github's README.md#conventions: the files are bare binaries named
-# `<binary>-<os>-<arch>`, so each release platform names its own. quick-install is a third
+# `<crate>-<os>-<arch>`, so each release platform names its own. The release is the
+# `v{version}` one it shares with `sapphire-agent-headless`. quick-install is a third
 # party's build: only this repository's files, or a build from source, are installed.
 [package.metadata.binstall]
 pkg-fmt = "bin"
 disabled-strategies = ["quick-install"]
 
 [package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
-pkg-url = "{ repo }/releases/download/desktop-v{ version }/{ name }-linux-x86_64"
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-linux-x86_64"
 
 [package.metadata.binstall.overrides.aarch64-unknown-linux-gnu]
-pkg-url = "{ repo }/releases/download/desktop-v{ version }/{ name }-linux-aarch64"
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-linux-aarch64"
 
 [package.metadata.binstall.overrides.aarch64-apple-darwin]
-pkg-url = "{ repo }/releases/download/desktop-v{ version }/{ name }-macos-aarch64"
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-macos-aarch64"
 
 [package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
-pkg-url = "{ repo }/releases/download/desktop-v{ version }/{ name }-windows-x86_64.exe"
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-windows-x86_64.exe"

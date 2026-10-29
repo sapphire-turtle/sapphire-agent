@@ -1,9 +1,11 @@
 [workspace]
 # Tags and GitHub releases follow the sapphire-turtle convention
-# (sapphire-turtle/.github's README.md): `v{version}` for sapphire-agent, the
-# CLI and server binary; `desktop-v{version}` for the desktop app; none for
-# the library crate. Before the CLI and the server became one binary, tags
-# were per package (`sapphire-agent-server-v…`, `sapphire-agent-cli-v…`).
+# (sapphire-turtle/.github's README.md): the two editions — the headless one
+# and the desktop app — share one version and one `v{version}` tag and GitHub
+# release, which the headless one makes; the libraries get none. Before that,
+# the desktop app was tagged `desktop-v{version}`, and before the CLI and the
+# server became one binary, tags were per package (`sapphire-agent-server-v…`,
+# `sapphire-agent-cli-v…`).
 git_tag_enable = false
 git_release_enable = false
 pr_labels = ["release"]
@@ -19,13 +21,28 @@ pr_name = "chore(release): version bump"
 # but it keeps the changelog readable. See cliff.toml for details.
 changelog_config = "./cliff.toml"
 
+# The headless edition: the `sapphire-agent` binary without the GUI. A new
+# crate at 0.12.0; up to 0.11.2 the binary was published as `sapphire-agent`.
 [[package]]
-name = "sapphire-agent"
-changelog_path = "./cli/CHANGELOG.md"
+name = "sapphire-agent-headless"
+version_group = "app"
+changelog_path = "./headless/CHANGELOG.md"
 git_tag_enable = true
 git_release_enable = true
 git_tag_name = "v{{ version }}"
 git_release_name = "v{{ version }}"
+
+# The command line both editions run, and the app server it starts — the
+# agent itself. They move with the editions: nothing outside this workspace
+# builds on them. Both names were published as binaries up to 0.8.0, so they
+# resume at 0.12.0.
+[[package]]
+name = "sapphire-agent-cli"
+version_group = "app"
+
+[[package]]
+name = "sapphire-agent-server"
+version_group = "app"
 
 [[package]]
 name = "sapphire-agent-core"
@@ -43,20 +60,21 @@ release = false
 
 # sapphire-agent-desktop ships as a GitHub-release-only binary (bevy + bundled
 # font + ISC-licensed Lucide SVGs — not intended for crates.io, hence
-# `publish = false` in its Cargo.toml); release-binaries.yml builds the
-# binaries for its tag.
+# `publish = false` in its Cargo.toml), and runs the CLI too.
 #
-# It is versioned from its `desktop-v{version}` tags. `git_only = true` is
-# load-bearing: release-plz silently skips a crate whose Cargo.toml has
-# `publish = false` unless it is set — `release = true` alone, which this file
-# used before, no longer does it, and no desktop tag was made after the
-# package was renamed from sapphire-call-desktop.
+# It is not published, so its versions live in the shared `v{version}` tags
+# the headless edition makes; release-binaries.yml builds both binaries for
+# them. `git_only = true` is load-bearing: release-plz silently skips a crate
+# whose Cargo.toml has `publish = false` unless it is set — `release = true`
+# alone, which this file used before, no longer does it.
 [[package]]
 name = "sapphire-agent-desktop"
+version_group = "app"
 changelog_path = "./desktop/CHANGELOG.md"
 git_only = true
+# Overrides release-plz's default `publish = true`, which `git_only` refuses.
 publish = false
-git_tag_enable = true
-git_release_enable = true
-git_tag_name = "desktop-v{{ version }}"
-git_release_name = "desktop-v{{ version }}"
+# The tag its version is read from; the headless edition makes it.
+git_tag_name = "v{{ version }}"
+git_tag_enable = false
+git_release_enable = false

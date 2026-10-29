@@ -139,7 +139,7 @@ pub fn routes(state: Arc<AmbientState>) -> Router {
 ///
 /// The `enabled` check here is **defence in depth, not the mechanism**:
 /// `ambient::startup::build` returns `None` when `[ambient].enabled` is
-/// false, and `main` then never mounts these routes at all, so a disabled
+/// false, and `serve` then never mounts these routes at all, so a disabled
 /// subsystem 404s by router omission. This guard only matters if some
 /// future caller mounts the routes with a disabled config, and it answers
 /// 404 rather than 401 so that case stays indistinguishable from the

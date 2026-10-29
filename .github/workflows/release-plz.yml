@@ -1,8 +1,9 @@
 name: Release-plz
 
-# sapphire-agent (the CLI and the server) is tagged `v{version}`, the desktop
-# app `desktop-v{version}` (release-plz.toml). Each gets its binaries built once
-# release-plz has made its release.
+# The headless edition (`sapphire-agent-headless`) and the desktop app share
+# one version and its `v{version}` tag, which the headless one makes
+# (release-plz.toml). Both binaries are built once release-plz has made the
+# release.
 on:
   push:
     branches:
@@ -22,22 +23,11 @@ jobs:
     uses: sapphire-turtle/.github/.github/workflows/release-plz.yml@v1
     secrets: inherit
 
-  build-cli:
+  build:
     needs: release-plz
-    if: contains(fromJSON(needs.release-plz.outputs.packages), 'sapphire-agent')
+    if: contains(fromJSON(needs.release-plz.outputs.packages), 'sapphire-agent-headless')
     permissions:
       contents: write
     uses: ./.github/workflows/release-binaries.yml
     with:
-      tag: ${{ fromJSON(needs.release-plz.outputs.tags)['sapphire-agent'] }}
-      target: cli
-
-  build-desktop:
-    needs: release-plz
-    if: contains(fromJSON(needs.release-plz.outputs.packages), 'sapphire-agent-desktop')
-    permissions:
-      contents: write
-    uses: ./.github/workflows/release-binaries.yml
-    with:
-      tag: ${{ fromJSON(needs.release-plz.outputs.tags)['sapphire-agent-desktop'] }}
-      target: desktop
+      tag: ${{ fromJSON(needs.release-plz.outputs.tags)['sapphire-agent-headless'] }}

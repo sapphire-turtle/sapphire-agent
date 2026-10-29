@@ -302,7 +302,7 @@ pub trait TimerDispatch: Send + Sync {
 }
 
 /// The production dispatcher: chat through `Agent::trigger`, voice through
-/// `serve::push_voice_text_to_subscriber`. Both refs are installed by `main`
+/// `serve::push_voice_text_to_subscriber`. Both refs are installed by `serve`
 /// after the agent and `ServeState` exist (weak, to keep the graph acyclic).
 #[derive(Default)]
 pub struct ChannelDispatch {

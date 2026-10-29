@@ -4,7 +4,7 @@
 //! workspace is a synced artefact, and "always allow `file_write` for
 //! this editor" is a statement about *this machine's* trust in *this
 //! client* — the same category as the credentials, bind addresses and
-//! machine paths `main.rs` already keeps host-local.
+//! machine paths `lib.rs` already keeps host-local.
 //!
 //! Grants are per tool name. Argument-level grants ("always, for paths
 //! under this directory") would need a path-normalisation design and

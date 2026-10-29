@@ -397,7 +397,7 @@ impl SessionStore {
     /// Name this store's files by agent-day. See [`FileNaming`].
     ///
     /// A builder rather than a constructor argument because exactly one
-    /// store wants it and every other call site — four in `main.rs`,
+    /// store wants it and every other call site — four in `lib.rs`,
     /// eleven in tests — would otherwise have to name the `Plain`
     /// default explicitly.
     pub fn with_dated_files(mut self, boundary_hour: u8) -> Self {

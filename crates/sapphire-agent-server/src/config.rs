@@ -1680,7 +1680,7 @@ api_key = "test"
     }
 
     /// Validate the `profile:` references of loaded subagent definitions
-    /// against `profiles`. Called by `main` once both the definitions
+    /// against `profiles`. Called by `serve` once both the definitions
     /// (`load_agents_dir`) and this config exist — the loader stays
     /// lenient (one broken definition must not take the others down) and
     /// the strictness lives here instead: an unknown name in a *server*
@@ -1705,7 +1705,7 @@ api_key = "test"
     /// Settings that were removed when device-based auth landed.
     ///
     /// Reported as a hard error at start-up rather than ignored, following the
-    /// `standby_mode` precedent in `main.rs`. Ignoring them would turn a broken
+    /// `standby_mode` precedent in `lib.rs`. Ignoring them would turn a broken
     /// *config* into what looks like a broken *device*: dropping `api_keys`
     /// makes `/acp` 401 every client, and dropping `[device.*]` makes ambient
     /// refuse every segment. Neither symptom sends anyone to the config file.

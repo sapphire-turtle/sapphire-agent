@@ -1,3 +1,13 @@
+//! sapphire-agent's app server: the agent itself — its channels, HTTP API,
+//! tools, memory and the agent loop — around the framework's app server,
+//! which owns the IPC endpoint and the workspace.
+//!
+//! A library, not a binary of its own: `sapphire-agent serve` runs it
+//! ([`serve()`]) in either edition, the headless one
+//! (`sapphire-agent-headless`) and the desktop app, through the command line
+//! both share (`sapphire-agent-cli`). The other commands that need the
+//! agent's own code — `init`, `verify`, `acp` — are here too.
+
 // matrix-sdk's E2EE futures nest deeply enough that proving `Send` on the
 // Matrix channel's `listen` future exceeds the default type-checking recursion
 // limit once the framework's redb/tantivy types are also in the graph.
@@ -12,7 +22,6 @@ mod autonomous;
 mod autonomous_config;
 mod avatar_store;
 mod channel;
-mod chat;
 mod cli_init;
 mod config;
 mod config_layer;
@@ -43,7 +52,6 @@ use agent::Agent;
 use anyhow::{Context, Result};
 use channel::discord::DiscordChannel;
 use channel::matrix::MatrixChannel;
-use clap::{Parser, Subcommand};
 use config::{Config, LoadedConfig};
 use heartbeat::Heartbeat;
 use periodic_log::{
@@ -53,11 +61,16 @@ use periodic_log::{
 use provider::registry::ProviderRegistry;
 use sapphire_framework::workspace::AppContext;
 
-static APP_CTX: AppContext = AppContext::new("sapphire-agent").allow_external_paths();
+/// The app's context: its name, which the IPC endpoint, the service and the
+/// directories are named after, and those directories ([`init_app_ctx`]).
+pub static APP_CTX: AppContext = AppContext::new("sapphire-agent").allow_external_paths();
 
-/// Inject host-platform paths into [`APP_CTX`] before any code touches a
-/// [`SwWorkspace`]. The framework deliberately does not depend on `dirs`, so
-/// each host app resolves its own cache / data directories at startup.
+/// The server's version, which the clients name in their IPC handshake.
+pub use app_server::VERSION;
+/// The server the framework's one-shot verbs (`status`, `workspace`, …)
+/// dispatch against.
+pub use app_server::build;
+
 /// Make ring rustls's process-wide crypto provider.
 ///
 /// rustls picks a default on its own only when exactly one backend is
@@ -65,23 +78,29 @@ static APP_CTX: AppContext = AppContext::new("sapphire-agent").allow_external_pa
 /// reqwest and the rest already use. reqwest names its provider and does not
 /// care, but anything building a `ClientConfig::builder()` would panic with
 /// both present. ring keeps every connection on the provider it used before.
-fn install_crypto_provider() {
+pub fn install_crypto_provider() {
     // Err only when one is already installed, which is what we want anyway.
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
-fn init_app_ctx() {
+/// Inject host-platform paths into [`APP_CTX`] before any code touches a
+/// [`SwWorkspace`]. The framework deliberately does not depend on `dirs`, so
+/// each host app resolves its own cache / data directories at startup.
+///
+/// Named after the app, not this crate: the directories are the ones the
+/// `sapphire-agent` binary has always used.
+pub fn init_app_ctx() {
     let base = directories::BaseDirs::new();
     let cache_dir = base
         .as_ref()
         .map(|b| b.cache_dir().to_path_buf())
         .unwrap_or_else(std::env::temp_dir)
-        .join(env!("CARGO_PKG_NAME"));
+        .join(APP_CTX.app_name);
     let data_dir = base
         .as_ref()
         .map(|b| b.data_dir().to_path_buf())
         .unwrap_or_else(std::env::temp_dir)
-        .join(env!("CARGO_PKG_NAME"));
+        .join(APP_CTX.app_name);
     APP_CTX.set_cache_dir(cache_dir);
     APP_CTX.set_data_dir(data_dir);
     // Where the agent's own `config.toml` has always lived, so the
@@ -99,76 +118,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio_util::sync::CancellationToken;
-use tracing_subscriber::{EnvFilter, fmt};
 use workspace::Workspace;
-
-#[derive(Parser)]
-#[command(
-    name = "sapphire-agent",
-    arg_required_else_help = true,
-    about = "Personal AI assistant — Anthropic + Matrix/Discord",
-    // Without this, `--help` shows the flattened `FrameworkCommand`'s doc
-    // comment as the long description instead of `about`.
-    long_about = None
-)]
-struct Cli {
-    /// Path to config file (default: ~/.config/sapphire-agent/config.toml)
-    #[arg(short, long, value_name = "FILE")]
-    config: Option<PathBuf>,
-
-    /// Listen for HTTP on this address (e.g. 127.0.0.1:3170), overriding
-    /// `[serve]`. Without either, `serve` opens no HTTP port.
-    #[arg(long, value_name = "ADDR")]
-    bind: Option<String>,
-
-    #[command(subcommand)]
-    command: Command,
-}
-
-#[derive(Subcommand)]
-enum Command {
-    /// Seed a workspace with the files the agent reads.
-    Init {
-        /// Directory to seed. Created if missing; defaults to the current one.
-        #[arg(value_name = "PATH")]
-        path: Option<PathBuf>,
-    },
-    /// Validate the config file and exit
-    Verify,
-    /// Speak ACP on stdio, for an editor to start as its agent: relayed to
-    /// the agent running on this host, which runs the conversation. Needs
-    /// `[acp].stdio_room_profile` in the host config.
-    Acp,
-    /// Chat with the agent running on this host: a REPL, or one message
-    /// with `-m`. Needs `[cli].room_profile` in the host config.
-    Chat {
-        /// Grain-id of an existing session to resume (e.g. a3b7k9p).
-        #[arg(long)]
-        session: Option<String>,
-
-        /// List the sessions and exit.
-        #[arg(long)]
-        list: bool,
-
-        /// Send a single message and exit instead of entering the REPL.
-        /// Useful as a CJK-safe fallback or for IDE/editor integration.
-        #[arg(short, long, value_name = "TEXT")]
-        message: Option<String>,
-
-        /// Print the session's history and exit (no message sent, no REPL).
-        #[arg(long)]
-        history: bool,
-
-        /// Emit machine-readable JSON for --list, --history and --message;
-        /// ignored in the REPL.
-        #[arg(long)]
-        json: bool,
-    },
-    /// The framework's verbs: serve, status, service, update, workspace,
-    /// workgroup, device, embedding, external-device, config.
-    #[command(flatten)]
-    Framework(sapphire_framework::server::FrameworkCommand),
-}
 
 /// Whether `meta`'s session counts toward `namespace`'s daily-log
 /// catch-up. Mirrors `Heartbeat::namespace_for_session`
@@ -331,86 +281,43 @@ fn load_config(
     Ok(loaded)
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        // `tracing_subscriber::fmt` defaults to stdout. Every command's
-        // output is `println!` (`external-device add` prints the minted
-        // token there), so sending logs to stderr keeps a stray log line
-        // out of anything piped from a command's output.
-        .with_writer(std::io::stderr)
-        .init();
+/// What [`run`] does once the config is loaded.
+enum Mode {
+    Serve { bind: Option<String> },
+    Verify,
+}
 
-    install_crypto_provider();
-    init_app_ctx();
+/// `serve`: run the app server and the agent around the workspace it
+/// serves, until the server stops. `config` is the host config
+/// (default: ~/.config/sapphire-agent/config.toml); `bind` listens for HTTP
+/// on that address, overriding `[serve]`.
+pub async fn serve(config: Option<PathBuf>, bind: Option<String>) -> Result<()> {
+    run(config, Mode::Serve { bind }).await
+}
 
-    let cli = Cli::parse();
+/// `verify`: validate the config and print what the agent would run with.
+pub async fn verify(config: Option<PathBuf>) -> Result<()> {
+    run(config, Mode::Verify).await
+}
 
-    // Before the config load below: `init` is what an operator runs when there
-    // is no host config yet, so requiring one to reach it would make the
-    // command unusable exactly when it is needed.
-    if let Command::Init { path } = &cli.command {
-        return cli_init::run(path.clone());
-    }
-    // A relay to the running agent, which holds the config: nothing to load
-    // here, and stdout belongs to ACP.
-    if let Command::Acp = &cli.command {
-        return serve::acp_tunnel::run_stdio().await;
-    }
-    // Likewise a client of the running agent.
-    if let Command::Chat {
-        session,
-        list,
-        message,
-        history,
-        json,
-    } = &cli.command
-    {
-        return chat::run(chat::ChatOptions {
-            session: session.clone(),
-            list: *list,
-            message: message.clone(),
-            history: *history,
-            json: *json,
-        })
-        .await;
-    }
+/// `init`: seed a workspace with the files the agent reads. Needs no host
+/// config: it is what an operator runs when there is none yet.
+pub fn init_workspace(path: Option<PathBuf>) -> Result<()> {
+    cli_init::run(path)
+}
 
-    // The framework's verbs other than `serve` talk to the running server
-    // (which relays the bridge's), and need no agent config either.
-    let cli = match cli.command {
-        Command::Framework(command)
-            if !matches!(command, sapphire_framework::server::FrameworkCommand::Serve) =>
-        {
-            // The agent has no keys of its own in the framework's settings
-            // registry (`()`): its `config.toml` tables are its own to read.
-            let code = command
-                .dispatch(
-                    &APP_CTX,
-                    (),
-                    |_: &sapphire_framework::server::Settings| app_server::build(),
-                    app_server::VERSION,
-                )
-                .await?;
-            if code != 0 {
-                std::process::exit(code);
-            }
-            return Ok(());
-        }
-        command => Cli { command, ..cli },
-    };
+/// `acp`: relay ACP on stdio to the agent running on this host, which holds
+/// the config and runs the conversation. stdout belongs to ACP.
+pub async fn acp_stdio() -> Result<()> {
+    serve::acp_tunnel::run_stdio().await
+}
 
-    let config_path = cli.config.unwrap_or_else(Config::default_path);
+async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
+    let config_path = config.unwrap_or_else(Config::default_path);
     // The framework's selected workspace decides which workspace the agent
     // serves; `workspace_dir` is only where a first start migrates it from.
     let selection = app_server::selection()?;
-    let serving = matches!(
-        cli.command,
-        Command::Framework(sapphire_framework::server::FrameworkCommand::Serve)
-    );
+    let serving = matches!(mode, Mode::Serve { .. });
     let loaded = load_config(&config_path, selection.as_ref().map(|s| s.root.as_path()))
         // `serve` refuses to start on what only the registry can see, so a
         // config it would refuse is one it serves without below.
@@ -491,15 +398,8 @@ async fn main() -> Result<()> {
         );
     }
 
-    match cli.command {
-        // Returned above, before the config was loaded.
-        Command::Init { .. } => unreachable!("`init` is dispatched ahead of the config load"),
-        Command::Acp => unreachable!("`acp` is dispatched ahead of the config load"),
-        Command::Chat { .. } => {
-            unreachable!("`chat` is dispatched ahead of the config load")
-        }
-        Command::Framework(sapphire_framework::server::FrameworkCommand::Serve) => {
-            let bind = cli.bind;
+    match mode {
+        Mode::Serve { bind } => {
             let workspace_dir = match &selection {
                 Some(selected) => selected.root.clone(),
                 None => {
@@ -1358,7 +1258,7 @@ async fn main() -> Result<()> {
             }
             server_task.await.context("the app server panicked")??;
         }
-        Command::Verify => {
+        Mode::Verify => {
             let mut profile_errors = config.validate_profiles();
             // `serve` refuses to start on what only the registry can see —
             // a profile naming `anthropic` with no API key, or no key and no
@@ -1491,9 +1391,6 @@ async fn main() -> Result<()> {
                     None => println!("  {label:<28} -"),
                 }
             }
-        }
-        Command::Framework(_) => {
-            unreachable!("the framework's verbs are dispatched ahead of the config load")
         }
     }
 
@@ -1974,83 +1871,6 @@ mod tests {
         let config = config::Config::parse_for_test("[anthropic]\napi_key = \"test\"\n");
         let meta = acp_meta("work");
         assert!(daily_log_catchup_predicate(&meta, &config, "work"));
-    }
-
-    #[test]
-    fn device_add_requires_a_name() {
-        assert!(Cli::try_parse_from(["sapphire-agent", "device", "add"]).is_err());
-    }
-
-    #[test]
-    fn external_device_add_takes_a_name_and_a_description() {
-        use sapphire_framework::server::FrameworkCommand;
-        use sapphire_framework_bridge_api::ExternalDeviceCommand;
-        let cli = Cli::try_parse_from([
-            "sapphire-agent",
-            "external-device",
-            "add",
-            "pendant",
-            "--description",
-            "the one on the lanyard",
-        ])
-        .unwrap();
-        assert!(matches!(
-            cli.command,
-            Command::Framework(FrameworkCommand::ExternalDevice(
-                ExternalDeviceCommand::Add {
-                    ref name,
-                    description: Some(_),
-                    ..
-                }
-            )) if name == "pendant"
-        ));
-    }
-
-    /// The framework's verbs sit beside the agent's own at the top level,
-    /// and a bare invocation prints the help.
-    #[test]
-    fn the_framework_verbs_parse_beside_the_agents() {
-        use sapphire_framework::server::{FrameworkCommand, WorkspaceCommand};
-        let parse = |args: &[&str]| Cli::try_parse_from(args).unwrap().command;
-
-        let err = Cli::try_parse_from(["sapphire-agent"])
-            .err()
-            .expect("a bare invocation does not parse");
-        assert_eq!(
-            err.kind(),
-            clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
-        );
-        assert!(matches!(
-            parse(&["sapphire-agent", "serve"]),
-            Command::Framework(FrameworkCommand::Serve)
-        ));
-        assert!(matches!(
-            parse(&["sapphire-agent", "status"]),
-            Command::Framework(FrameworkCommand::Status)
-        ));
-        assert!(matches!(
-            parse(&["sapphire-agent", "workspace", "show"]),
-            Command::Framework(FrameworkCommand::Workspace(WorkspaceCommand::Show))
-        ));
-        assert!(matches!(
-            parse(&["sapphire-agent", "verify"]),
-            Command::Verify
-        ));
-        assert!(matches!(
-            parse(&["sapphire-agent", "init"]),
-            Command::Init { .. }
-        ));
-        assert!(matches!(parse(&["sapphire-agent", "acp"]), Command::Acp));
-        assert!(matches!(
-            parse(&["sapphire-agent", "chat", "--session", "a3b7k9p", "-m", "hi", "--json"]),
-            Command::Chat {
-                session: Some(ref s),
-                message: Some(ref m),
-                json: true,
-                list: false,
-                history: false,
-            } if s == "a3b7k9p" && m == "hi"
-        ));
     }
 
     /// With ring and aws-lc-rs both compiled in, building a rustls config

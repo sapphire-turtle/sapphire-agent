@@ -1,5 +1,6 @@
 //! `sapphire-agent chat`: the REPL, one-shot and listing client of the agent
-//! running on this host, over IPC (see [`crate::serve::chat_ipc`]).
+//! running on this host, over IPC (served by `sapphire-agent-server`'s
+//! `serve::chat_ipc`).
 
 use std::borrow::Cow;
 use std::io::{Write, stderr, stdout};
@@ -58,7 +59,7 @@ impl Prompt for SimplePrompt {
 }
 
 pub async fn run(options: ChatOptions) -> Result<()> {
-    let client = ChatClient::connect("chat", crate::app_server::VERSION).await?;
+    let client = ChatClient::connect("chat", sapphire_agent_server::VERSION).await?;
 
     if options.list {
         return print_sessions(&client.sessions().await?, options.json);
