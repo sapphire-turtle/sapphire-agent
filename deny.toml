@@ -108,7 +108,7 @@ confidence-threshold = 0.93
 # embeds as its fallback UI font, not the code; blanket-allowing them would
 # also wave through a code dependency that happened to pick one. This crate
 # is `(MIT OR Apache-2.0) AND OFL-1.1 AND Ubuntu-font-1.0` — the code half is
-# already allowed, and we ship an OFL font of our own in `desktop/assets/`.
+# already allowed, and we ship an OFL font of our own in `crates/sapphire-agent-gui/assets/`.
 #
 # Only visible since the workspace root became a virtual manifest: cargo-deny
 # assumes `--workspace` for a virtual manifest, but takes a root *package* as

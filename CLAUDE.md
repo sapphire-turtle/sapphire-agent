@@ -4,11 +4,12 @@ Loaded by Claude Code at session start. Keep it short and operational; deep desi
 
 ## Conventional commit scopes
 
-This workspace ships three crates and uses **conventional-commit scopes** to route changelog entries (and only changelog entries — see "Misattribution" below).
+This workspace ships four crates and uses **conventional-commit scopes** to route changelog entries (and only changelog entries — see "Misattribution" below).
 
 | Scope | Targets |
 |---|---|
 | `(desktop)` | `desktop/` (bevy GUI client) |
+| `(gui)` | `crates/sapphire-agent-gui/` (the bevy + egui GUI shared by the desktop and a future mobile app) |
 | `(rpc)` | `crates/sapphire-agent-core/` (local IPC chat protocol + client, shared by `chat` and the desktop) |
 | `(core)` | retired with `crates/sapphire-agent-client/` (#278); still skipped by `cliff.toml` |
 | unscoped, or `(agent)` / `(messages)` / `(voice)` / `(serve)` / `(channel)` / `(matrix)` / `(discord)` / `(sessions)` / `(chat)` / `(timer)` / `(heartbeat)` / `(memory)` / `(image-cache)` / `(api)` / `(tools)` / `(search)` / `(fts)` / `(mcp)` / `(features)` / `(workspace)` / `(deps)` | the agent binary (`cli/`); `(cli)` / `(call)` too |
@@ -25,6 +26,7 @@ The repo root is a **virtual workspace manifest** (`[workspace]` only, no `[pack
 | `cli/` | `sapphire-agent` | bin (`sapphire-agent`) — the server and its CLI |
 | `desktop/` | `sapphire-agent-desktop` | bin (`sapphire-agent-desktop`) |
 | `crates/sapphire-agent-core/` | `sapphire-agent-core` | lib |
+| `crates/sapphire-agent-gui/` | `sapphire-agent-gui` | lib (`publish = false`) |
 
 **One app, one binary** (#278): the server and its CLI are the single `sapphire-agent` binary in `cli/`, the way `sapphire-ledger` and the other sapphire-framework apps are. The directory is `cli/` because the CLI is what people face; serving is one of its modes. `sapphire-agent-desktop` is a local IPC client the same way, sharing `sapphire-agent-core` with `chat`. `serve` runs the server (a bare invocation prints the help); the client commands (`chat`, `acp`, and the framework's `status`, `workspace`, …) talk to the server already running on the host over the app server's IPC endpoint — never over HTTP, and they start none. The agent's own IPC methods are versioned by `APP_API` in `cli/src/serve/acp_tunnel.rs`; bump it when adding or changing one.
 
@@ -55,7 +57,7 @@ So `cargo build --workspace` links and tests on Linux, macOS and Windows; CI's `
 `cliff.toml` skips commits whose scope is in this list:
 
 ```
-desktop | rpc | core | release | release-plz | fmt | ci | test | deps
+desktop | rpc | core | gui | release | release-plz | fmt | ci | test | deps
 ```
 
 - **Sibling crate scope, new addition**: extend the alternation in `cliff.toml` → `[[git.commit_parsers]] message = '^[a-z]+\\((…)\\):'` at the same time as the first commit using it. Otherwise the first such commit will pollute the agent changelog.

@@ -128,4 +128,4 @@ WARN Ignoring 1 unrecognised key(s) in /home/you/.config/sapphire-agent/config.t
 | `sapphire-agent-core` | MIT OR Apache-2.0 |
 | `sapphire-agent-desktop` | GPL-3.0-or-later、[App Storeマーケットプレイス例外](desktop/LICENSE.App-Store-Exception)付き |
 
-各コンポーネントのディレクトリにある`LICENSE`（または`LICENSE-MIT` / `LICENSE-APACHE`）ファイルに完全なライセンス文書があります。デスクトップアプリは SIL Open Font License のフォント（[desktop/assets/LICENSE-OFL.txt](desktop/assets/LICENSE-OFL.txt)）と ISC License の Lucide アイコン（[desktop/assets/icons/LICENSE-LUCIDE.txt](desktop/assets/icons/LICENSE-LUCIDE.txt)）も同梱しています。
+各コンポーネントのディレクトリにある`LICENSE`（または`LICENSE-MIT` / `LICENSE-APACHE`）ファイルに完全なライセンス文書があります。デスクトップアプリは SIL Open Font License のフォント（[crates/sapphire-agent-gui/assets/LICENSE-OFL.txt](crates/sapphire-agent-gui/assets/LICENSE-OFL.txt)）と ISC License の Lucide アイコン（[crates/sapphire-agent-gui/assets/icons/LICENSE-LUCIDE.txt](crates/sapphire-agent-gui/assets/icons/LICENSE-LUCIDE.txt)）も同梱しています。

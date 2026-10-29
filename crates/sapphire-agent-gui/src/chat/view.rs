@@ -1,11 +1,9 @@
-//! Chat panel: scrolling history + input row.
+//! Chat screen: scrolling history + input row.
 
 use bevy::prelude::*;
 use bevy_egui::{EguiContexts, egui};
 
-use crate::AppState;
-use crate::bridge::RpcBridge;
-use crate::state::{ChatEntry, ChatRole, Session, TurnState};
+use super::{ChatBridge, ChatEntry, ChatRole, ChatState, Session, TurnState};
 
 const ICON_SEND: egui::ImageSource<'_> = egui::include_image!("../../assets/icons/send.svg");
 
@@ -20,11 +18,31 @@ fn icon_image(src: egui::ImageSource<'_>) -> egui::Image<'_> {
         .tint(egui::Color32::from_gray(220))
 }
 
-pub fn ui(mut contexts: EguiContexts, mut state: ResMut<AppState>, bridge: NonSend<RpcBridge>) {
+/// The `Ui` a screen lays its panels out in: the whole window, on the
+/// background layer.
+///
+/// egui 0.36+ shows panels inside a `Ui` rather than straight on the
+/// `Context`, and bevy_egui hands systems only the context, so each frame
+/// starts by making the root one — what egui's own integrations do.
+fn root_ui(ctx: &egui::Context) -> egui::Ui {
+    egui::Ui::new(
+        ctx.clone(),
+        egui::Id::unique("root"),
+        egui::UiBuilder::new()
+            .layer_id(egui::LayerId::background())
+            .max_rect(ctx.content_rect()),
+    )
+}
+
+pub(crate) fn ui(
+    mut contexts: EguiContexts,
+    mut state: ResMut<ChatState>,
+    bridge: Res<ChatBridge>,
+) {
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
     };
-    let root = &mut super::root_ui(ctx);
+    let root = &mut root_ui(ctx);
     egui::Panel::top("chat_topbar").show(root, |ui| {
         ui.horizontal(|ui| {
             ui.heading("sapphire-agent-desktop");
@@ -67,8 +85,12 @@ pub fn ui(mut contexts: EguiContexts, mut state: ResMut<AppState>, bridge: NonSe
 
                 let send_btn = ui.add_enabled(can_send, egui::Button::image(icon_image(ICON_SEND)));
                 let send_clicked = send_btn.on_hover_text("Send").clicked();
-                if (send_clicked || (enter_pressed && can_send)) && !state.draft.trim().is_empty() {
-                    submit_chat(&mut state, &bridge);
+                // `take_submission` holds the rest of the rule: a ready,
+                // idle session and a draft that isn't blank.
+                if (send_clicked || enter_pressed)
+                    && let Some(text) = state.take_submission()
+                {
+                    bridge.submit_chat(text);
                 }
             });
             if let Some(status) = state.last_status.as_deref() {
@@ -102,15 +124,4 @@ fn render_entry(ui: &mut egui::Ui, entry: &ChatEntry) {
         ui.label(egui::RichText::new(prefix).strong().color(color));
         ui.label(&entry.text);
     });
-}
-
-fn submit_chat(state: &mut AppState, bridge: &RpcBridge) {
-    let content = std::mem::take(&mut state.draft);
-    state.history.push(ChatEntry {
-        role: ChatRole::User,
-        text: content.clone(),
-    });
-    state.turn = TurnState::Sending;
-    state.last_status = None;
-    bridge.submit_chat(content);
 }

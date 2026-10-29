@@ -1,0 +1,62 @@
+[package]
+name = "sapphire-agent-gui"
+version = "0.1.0"
+edition.workspace = true
+description = "The GUI of sapphire-agent shared by its desktop and mobile apps (bevy + egui)"
+license-file = "LICENSE"
+repository.workspace = true
+# Ships inside the desktop (and later mobile) binaries only, with a bundled
+# OFL font and ISC-licensed Lucide SVGs; not intended for crates.io.
+publish = false
+
+[dependencies]
+# The local chat protocol and its client: the GUI talks to the agent
+# running on this host over its IPC endpoint, like `sapphire-agent chat`.
+sapphire-agent-core = { path = "../sapphire-agent-core", version = "0.10.0" }
+
+# Only for `AppIdentity`, which the app passes to `AgentGuiPlugin`. No
+# eframe: the GUI runs inside bevy, not framework-gui's own shell.
+sapphire-framework-gui = { version = "0.23.0", default-features = false }
+
+# The engine the GUI lives in. The app adds `DefaultPlugins` and picks the
+# rest (window backends, fonts for bevy's own text, …); this crate asks only
+# for what the egui render path and the event-loop waker need. Default
+# features are avoided for the reason the desktop gives.
+bevy = { version = "0.20", default-features = false, features = [
+    "bevy_winit",
+    "bevy_window",
+    "bevy_render",
+    "bevy_core_pipeline",
+    # bevy_egui enables its `picking` feature by default and emits
+    # a warning at startup if bevy's matching `bevy_picking` isn't on;
+    # without it, the picking plugin isn't installed and bevy_egui's
+    # input + render path doesn't wire up correctly (window paints
+    # black, no UI visible).
+    "bevy_picking",
+] }
+
+# Immediate-mode UI inside the bevy app — drives every panel until /
+# unless we eventually replace specific panels with native bevy_ui.
+#
+# bevy_egui is taken from the sapphire-turtle fork until upstream releases
+# egui 0.37 support (upstream PR #508); sapphire-framework-gui 0.23 is on
+# egui 0.37, and two eguis cannot share an app. The same spec as the
+# desktop's, so Cargo resolves both to one copy.
+bevy_egui = { git = "https://github.com/sapphire-turtle/bevy_egui", branch = "egui-0.37" }
+
+# egui_extras supplies the image loader plumbing we use to render the
+# bundled Lucide SVG icons (send). The `svg` feature pulls in resvg, which
+# turns each SVG into a texture at the requested DPI on first use. Pinned
+# to 0.37 so it matches the egui 0.37.x that the bevy_egui fork re-exports.
+egui_extras = { version = "0.37", features = ["svg"] }
+
+# The agent client is async but bevy's scheduler is sync, so the GUI keeps
+# its own runtime. Multi-threaded so an in-flight turn doesn't hold up a
+# reconnect.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
+
+# Error handling
+anyhow.workspace = true
+
+# Logging
+tracing = "0.1"
