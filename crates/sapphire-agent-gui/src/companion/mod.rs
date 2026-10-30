@@ -417,8 +417,10 @@ mod tests {
         assert_eq!(o, Overlay::default());
     }
 
+    /// The input box stays open by construction: `Speech::follow` has no
+    /// way to the `Overlay`, so only the draft is worth checking.
     #[test]
-    fn a_reply_while_typing_keeps_the_draft_and_the_input_open() {
+    fn a_reply_while_typing_keeps_the_draft() {
         let mut chat = ChatState::new();
         chat.session = Session::Ready {
             display_id: "a".into(),
@@ -426,11 +428,6 @@ mod tests {
         chat.draft = "first".into();
         chat.take_submission().unwrap();
         let mut speech = Speech::default();
-        // Nothing a reply does takes the overlay: it stays as the user left it.
-        let overlay = Overlay {
-            input: true,
-            ..Default::default()
-        };
         let now = Duration::from_secs(100);
         assert_eq!(
             speech.follow(&chat.history, now),
@@ -446,7 +443,6 @@ mod tests {
         let shown_for = speech.follow(&chat.history, now);
 
         assert_eq!(chat.draft, "abc");
-        assert!(overlay.input);
         assert_eq!(shown_for, Some(bubble_duration("hello")));
         let bubble = speech.bubble.as_ref().unwrap();
         assert_eq!(bubble.text, "hello");
