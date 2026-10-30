@@ -48,6 +48,17 @@ bevy = { version = "0.20", default-features = false, features = [
     "bevy_pbr",
     "bevy_gltf",
     "bevy_animation",
+    # Sprite drawing, without relying on bevy_egui's feature unification.
+    "bevy_sprite_render",
+    # VRM files commonly embed JPEG textures.
+    "jpeg",
+    # Camera3d's default tonemapping needs its lookup tables.
+    "tonemapping_luts",
+    # tonemapping_luts stores the tables as KTX2 ...
+    "ktx2",
+    # ... compressed with zstd; `zstd` alone is a marker, and the pure-Rust
+    # decoder keeps a C toolchain out of the build.
+    "zstd_rust",
 ] }
 
 # VRM 1.0 models and VRMA animations for the 3D renderer (plan 4-3D).
