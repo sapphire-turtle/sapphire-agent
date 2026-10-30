@@ -31,6 +31,13 @@ pub struct AgentGuiPlugin {
     /// The app the GUI runs in. Its version is the one the chat reports
     /// to the agent.
     pub app: AppIdentity,
+    /// How often bevy updates, when the app knows better than the GUI.
+    /// `None`: [`bevy::winit::WinitSettings::desktop_app`], which idles
+    /// while nothing happens (input, egui's own repaint requests and the
+    /// [`Waker`] bring the next frame). A window that has to watch the
+    /// pointer while it gets no events of its own (the desktop companion,
+    /// click-through) polls instead.
+    pub update_mode: Option<bevy::winit::WinitSettings>,
 }
 
 impl Plugin for AgentGuiPlugin {
@@ -40,9 +47,11 @@ impl Plugin for AgentGuiPlugin {
             avatar::AvatarPlugin,
             companion::CompanionPlugin,
         ))
-        // Idle while nothing happens: input, egui's own repaint
-        // requests and the `Waker` are what bring the next frame.
-        .insert_resource(bevy::winit::WinitSettings::desktop_app())
+        .insert_resource(
+            self.update_mode
+                .clone()
+                .unwrap_or_else(bevy::winit::WinitSettings::desktop_app),
+        )
         .add_systems(
             Update,
             (
