@@ -7818,8 +7818,74 @@ dependencies = [
 ]
 
 [[package]]
-name = "sapphire-agent"
-version = "0.11.2"
+name = "sapphire-agent-cli"
+version = "0.12.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "reedline",
+ "sapphire-agent-core",
+ "sapphire-agent-server",
+ "sapphire-framework",
+ "sapphire-framework-bridge-api",
+ "serde_json",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "sapphire-agent-core"
+version = "0.10.0"
+dependencies = [
+ "anyhow",
+ "base64 0.23.1",
+ "sapphire-framework",
+ "sapphire-framework-server-api",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tokio",
+]
+
+[[package]]
+name = "sapphire-agent-desktop"
+version = "0.12.0"
+dependencies = [
+ "anyhow",
+ "bevy",
+ "clap",
+ "sapphire-agent-cli",
+ "sapphire-agent-gui",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "sapphire-agent-gui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bevy",
+ "bevy_egui",
+ "corundum-framework-gui",
+ "egui_extras",
+ "sapphire-agent-core",
+ "sapphire-framework-gui",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "sapphire-agent-headless"
+version = "0.12.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "sapphire-agent-cli",
+]
+
+[[package]]
+name = "sapphire-agent-server"
+version = "0.12.0"
 dependencies = [
  "a2a-lf",
  "agent-client-protocol",
@@ -7829,7 +7895,6 @@ dependencies = [
  "base64 0.23.1",
  "bzip2 0.6.1",
  "chrono",
- "clap",
  "cron",
  "directories",
  "dirs 7.0.0",
@@ -7838,7 +7903,6 @@ dependencies = [
  "grain-id",
  "hound",
  "matrix-sdk",
- "reedline",
  "reqwest 0.12.28",
  "rmcp",
  "rustls 0.23.46",
@@ -7866,46 +7930,7 @@ dependencies = [
  "tower",
  "tower-http 0.7.1",
  "tracing",
- "tracing-subscriber",
  "uuid",
-]
-
-[[package]]
-name = "sapphire-agent-core"
-version = "0.10.0"
-dependencies = [
- "anyhow",
- "base64 0.23.1",
- "sapphire-framework",
- "sapphire-framework-server-api",
- "serde",
- "serde_json",
- "sha2 0.11.1",
- "tokio",
-]
-
-[[package]]
-name = "sapphire-agent-desktop"
-version = "0.8.2"
-dependencies = [
- "bevy",
- "sapphire-agent-gui",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "sapphire-agent-gui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bevy",
- "bevy_egui",
- "corundum-framework-gui",
- "egui_extras",
- "sapphire-agent-core",
- "sapphire-framework-gui",
- "tokio",
- "tracing",
 ]
 
 [[package]]

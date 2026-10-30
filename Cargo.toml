@@ -4,17 +4,19 @@
 # (→ resolver "3"), so pin "3" to preserve the prior feature-resolution behavior.
 resolver = "3"
 members = [
-    "cli",
+    "headless",
     "desktop",
+    "crates/sapphire-agent-cli",
     "crates/sapphire-agent-core",
     "crates/sapphire-agent-gui",
+    "crates/sapphire-agent-server",
 ]
-# Keep the bare `cargo build` / `cargo test` at the repo root scoped to the
-# `sapphire-agent` binary, as it was when it was the root package. Without
-# this a virtual workspace defaults to all members, dragging in the desktop
-# (bevy) build. CI targets the full set explicitly via
-# `--workspace` / `--package`, so it is unaffected.
-default-members = ["cli"]
+# Keep the bare `cargo build` at the repo root scoped to the `sapphire-agent`
+# binary (the headless edition), as it was when it was the root package.
+# Without this a virtual workspace defaults to all members, dragging in the
+# desktop (bevy) build. CI targets the full set explicitly via `--workspace` /
+# `--package`, so it is unaffected.
+default-members = ["headless"]
 
 [workspace.dependencies]
 anyhow = "1.0"

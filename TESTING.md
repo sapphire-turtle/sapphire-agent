@@ -6,7 +6,10 @@
 > (`voice/*` on `/rpc`, the STT/TTS providers) is unchanged, for networked
 > voice clients; `sapphire-agent-desktop` no longer uses it. To follow the satellite steps as written, use
 > the `sapphire-agent-cli-v0.8.0` tag; read `sapphire-agent-server` there as
-> `sapphire-agent serve` against a current server.
+> `sapphire-agent serve` against a current server. The `crates/sapphire-agent-cli/…`
+> paths below are that tag's: today's `sapphire-agent-cli` is the command-line
+> library both editions (`sapphire-agent-headless` and the desktop app) run, and
+> the server's voice code is in `crates/sapphire-agent-server/src/voice/`.
 
 Two paths for trying the voice pipeline end-to-end:
 

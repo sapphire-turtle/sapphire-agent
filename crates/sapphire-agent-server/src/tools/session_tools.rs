@@ -89,7 +89,7 @@ impl Tool for CurrentTimeTool {
 /// Every store the two session tools read, plus the config that maps a
 /// session to a memory namespace.
 ///
-/// Assembled in `main.rs` once the stores exist — which is after
+/// Assembled in `lib.rs` once the stores exist — which is after
 /// `default_tool_set` runs, hence the late `register_tool` rather than a
 /// constructor argument.
 pub struct SessionSources {
@@ -563,7 +563,7 @@ provider = "anthropic"
         )
     }
 
-    /// A `SessionSources` over one tempdir, laid out the way `main.rs`
+    /// A `SessionSources` over one tempdir, laid out the way `lib.rs`
     /// lays the real one out: every store shares `sessions/`, each in
     /// its own `kind` subtree.
     fn sources(dir: &tempfile::TempDir) -> Arc<SessionSources> {

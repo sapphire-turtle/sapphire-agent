@@ -36,6 +36,19 @@
 
 ## インストール
 
+2つの版の**どちらか1つ**を入れてください。どちらも PATH に同じコマンド `sapphire-agent` を置きます。
+デスクトップ版のバイナリはヘッドレス版のコマンド（`serve`・`chat`・`acp`・`status` など）もすべて実行できるので、ヘッドレス版の上位互換です。
+
+| 版 | 用途 | 入れ方 |
+|---|---|---|
+| デスクトップ版（`sapphire-agent-desktop`） | GUI チャットクライアントを使うふだんの利用 | Windows・macOS・Linux のインストーラー（準備中） |
+| ヘッドレス版（`sapphire-agent-headless`） | GUI のないホストやサーバー | インストールスクリプト、cargo-binstall、cargo |
+
+両方を入れると `sapphire-agent` が2つになります。PATH 上のものが実行したものと違うときは、
+`sapphire-agent status` が警告します。
+
+### ヘッドレス版：インストールスクリプト
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/sapphire-turtle/sapphire-framework/main/install/install.sh | sh -s -- agent
 ```
@@ -45,35 +58,33 @@ curl -fsSL https://raw.githubusercontent.com/sapphire-turtle/sapphire-framework/
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/sapphire-turtle/sapphire-framework/main/install/install.ps1))) agent
 ```
 
-`sapphire-agent` と、同期に使う `sapphire-bridge` が一緒に `~/.local/bin` へ入ります。デスクトップクライアントも入れるには `agent-desktop` を足してください。オプションは[インストールスクリプトの README](https://github.com/sapphire-turtle/sapphire-framework/tree/main/install)を参照してください。
+`sapphire-agent` と、同期に使う `sapphire-bridge` が一緒に `~/.local/bin` へ入ります。オプションは[インストールスクリプトの README](https://github.com/sapphire-turtle/sapphire-framework/tree/main/install)を参照してください。
 
-[cargo-binstall](https://github.com/cargo-bins/cargo-binstall) で入れる場合（同じリリースファイルをビルドせずに `~/.cargo/bin` へダウンロードします）：
+### ヘッドレス版：cargo-binstall か cargo
 
-```sh
-cargo binstall sapphire-agent
-# デスクトップクライアントは crates.io にない
-cargo binstall --git https://github.com/sapphire-turtle/sapphire-agent sapphire-agent-desktop
-```
-
-cargo で入れる場合：
+[cargo-binstall](https://github.com/cargo-bins/cargo-binstall) は同じリリースファイルをビルドせずに `~/.cargo/bin` へダウンロードします：
 
 ```sh
-cargo install sapphire-agent
+cargo binstall sapphire-agent-headless
+# またはビルドする
+cargo install sapphire-agent-headless
 ```
 
-またはソースから：
+どちらも `sapphire-agent` バイナリを入れます（0.11 までは `sapphire-agent` という crate 名で公開していました。0.8 までバイナリだった `sapphire-agent-cli` と `sapphire-agent-server` は、今は両方の版が使うライブラリです）。
+
+### ソースから
 
 ```sh
 git clone https://github.com/sapphire-turtle/sapphire-agent
 cd sapphire-agent
-cargo build --release
+cargo build --release   # ヘッドレス版：target/release/sapphire-agent
 ```
 
-リリースバイナリは**Linux**（x86_64、aarch64）、**macOS**（aarch64）、**Windows**（x86_64）向けに公開されています。それぞれ単一の自己完結ファイル — `sherpa-onnx`とそのONNX Runtimeは静的リンクされているため、一緒にインストールするものは何もありません。
+両方の版のリリースバイナリ（`sapphire-agent-headless-<os>-<arch>`、`sapphire-agent-desktop-<os>-<arch>`）は**Linux**（x86_64、aarch64）、**macOS**（aarch64）、**Windows**（x86_64）向けに公開されています。それぞれ単一の自己完結ファイル — `sherpa-onnx`とそのONNX Runtimeは静的リンクされているため、一緒にインストールするものは何もありません。
 
 Windows では `shell` ツールは、呼び出しで別のシェル（`pwsh`、`cmd`、`bash` など）を指定しない限り Windows PowerShell でコマンドを実行します。それ以外の OS では `$SHELL`、未設定なら `/bin/sh` を使います。ACP セッション中のコマンド（ファイル系・スキル系ツールのスクリプトも）はエディタ側のマシンで `bash` を使って実行するため、Windows のエディタでは Git Bash が `PATH` 上に必要です。WSL が有効だとエディタが WSL の `bash.exe` を選ぶことがあります（#303）。
 
-サーバーとその CLI は 1 つのバイナリです（[#278](https://github.com/sapphire-turtle/sapphire-agent/issues/278)）。`sapphire-ledger` など他の sapphire-framework アプリと同じく、クライアント系のコマンド（`chat`、`acp`、`status` など）は同じホストで動いているサーバーにローカル IPC で問い合わせます。GUI チャットクライアントの `sapphire-agent-desktop` も同じで、`chat` と同じく `[cli].room_profile` のルームプロファイルで動きます。
+サーバーとその CLI は 1 つのバイナリです（[#278](https://github.com/sapphire-turtle/sapphire-agent/issues/278)）。`sapphire-ledger` など他の sapphire-framework アプリと同じく、クライアント系のコマンド（`chat`、`acp`、`status` など）は同じホストで動いているサーバーにローカル IPC で問い合わせます。GUI チャットクライアントの `sapphire-agent-desktop` のウィンドウも同じで、`chat` と同じく `[cli].room_profile` のルームプロファイルで動きます。そのバイナリは CLI でもあり、引数なしで実行するとウィンドウを開き、サブコマンドを付けると `sapphire-agent` と同じ処理（`serve` も含む）をします。
 
 ## 設定
 
@@ -124,9 +135,13 @@ WARN Ignoring 1 unrecognised key(s) in /home/you/.config/sapphire-agent/config.t
 
 | コンポーネント | ライセンス |
 |-----------|---------|
-| `sapphire-agent`（`cli/`） | MIT OR Apache-2.0 |
+| `sapphire-agent-cli` | MIT OR Apache-2.0 |
 | `sapphire-agent-core` | MIT OR Apache-2.0 |
+| `sapphire-agent-headless` | MIT OR Apache-2.0 |
+| `sapphire-agent-server` | MIT OR Apache-2.0 |
 | `sapphire-agent-desktop` | GPL-3.0-or-later、[App Storeマーケットプレイス例外](desktop/LICENSE.App-Store-Exception)付き |
 | `sapphire-agent-gui` | GPL-3.0-or-later、[App Storeマーケットプレイス例外](crates/sapphire-agent-gui/LICENSE.App-Store-Exception)付き |
+
+デスクトップ版のバイナリはコマンドラインとサーバーの MIT / Apache-2.0 のコードを含むため、バイナリ全体は GPL-3.0-or-later（同じ例外付き）で配布されます。
 
 各コンポーネントのディレクトリにある`LICENSE`（または`LICENSE-MIT` / `LICENSE-APACHE`）ファイルに完全なライセンス文書があります。デスクトップアプリは `sapphire-agent-gui` ライブラリの上に作られており、同梱のフォントとアイコンはそのライブラリから配布されます。SIL Open Font License のフォント（[crates/sapphire-agent-gui/assets/LICENSE-OFL.txt](crates/sapphire-agent-gui/assets/LICENSE-OFL.txt)）と ISC License の Lucide アイコン（[crates/sapphire-agent-gui/assets/icons/LICENSE-LUCIDE.txt](crates/sapphire-agent-gui/assets/icons/LICENSE-LUCIDE.txt)）も同梱しています。

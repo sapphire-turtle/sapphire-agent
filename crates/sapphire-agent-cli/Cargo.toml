@@ -1,0 +1,38 @@
+[package]
+name = "sapphire-agent-cli"
+# Released together with the two editions that run it, `sapphire-agent-headless`
+# and `sapphire-agent-desktop` (release-plz.toml). Published as the CLI binary
+# up to 0.8.0, so this name resumes at 0.12.0.
+version = "0.12.0"
+edition.workspace = true
+description = "The command line of sapphire-agent's two editions, the headless one and the desktop app: its commands, the framework's and its own, which run the agent or talk to it"
+license.workspace = true
+repository.workspace = true
+homepage = "https://github.com/fluo10/sapphire-agent"
+keywords = ["ai", "agent", "anthropic", "matrix", "discord"]
+categories = ["command-line-utilities"]
+
+[features]
+default = ["redb-store", "voice-sherpa"]
+# The server's features, passed through so an edition built with
+# `--no-default-features` can leave them out (see sapphire-agent-server).
+redb-store = ["sapphire-agent-server/redb-store"]
+voice-sherpa = ["sapphire-agent-server/voice-sherpa"]
+
+[dependencies]
+sapphire-agent-server = { path = "../sapphire-agent-server", version = "0.12.0", default-features = false }
+# The local chat protocol and its client, for `chat`.
+sapphire-agent-core = { path = "../sapphire-agent-core", version = "0.10.0" }
+# The framework's verbs (`serve`, `status`, `workspace`, …), which sit beside
+# the agent's own at the top level.
+sapphire-framework = { version = "0.23.0", default-features = false, features = ["server"] }
+clap.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+anyhow.workspace = true
+serde_json.workspace = true
+tracing-subscriber.workspace = true
+# Line editing for the `chat` REPL (CJK-safe input, history, cursor movement).
+reedline = "0.49"
+
+[dev-dependencies]
+sapphire-framework-bridge-api = { version = "3.0.0", features = ["cli"] }

@@ -1589,7 +1589,7 @@ mod tests {
     // on is exercised directly through the pure helper instead.
 
     /// Build a fresh channel-store + ACP-store pair under one temp dir,
-    /// namespaced under `sessions/{channel,acp}` the way `main.rs` lays
+    /// namespaced under `sessions/{channel,acp}` the way `lib.rs` lays
     /// them out.
     fn merge_test_stores(td: &tempfile::TempDir) -> (SessionStore, AcpSessionStore) {
         let sessions_base = td.path().join("sessions");
