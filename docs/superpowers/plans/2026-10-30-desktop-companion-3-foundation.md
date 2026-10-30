@@ -6,7 +6,7 @@
 
 **Architecture:** Server side, `AvatarConfig` becomes `{vrm?, sprite?}` and a third avatar tool, `set_pose`, joins `set_expression` / `play_action`. GUI side, `crates/sapphire-agent-gui/src/avatar/` gains renderer-independent modules; a renderer is a bevy plugin gated on `ActiveRenderer`, reading `AvatarState` + `AvatarAssets` and writing `DeclaredAvatar`, `AvatarBounds` and load errors. The chat view becomes a companion overlay (bubble, input, history, menu) driven by gestures over `AvatarBounds`; the desktop bin turns the window into a transparent, borderless, always-on-top, click-through companion window.
 
-**Tech Stack:** Rust 2024, bevy 0.20, bevy_egui fork (egui 0.37), sapphire-framework-gui 0.23 (`Settings`, `SettingsSection`), tokio, serde/toml, sha2, dirs.
+**Tech Stack:** Rust 2024, bevy 0.20, bevy_egui fork (egui 0.37), sapphire-framework-gui 0.23 (`Settings`, `SettingsSection`), tokio, serde/toml, sha2, corundum-framework-platform 0.3 (`dirs::AppDirs`).
 
 **Spec:** `docs/superpowers/specs/2026-10-28-desktop-companion-design.md` — this plan is work-order step 6 (§3, §4, §5, §6 `set_pose`, §7, §8, §9, §10, §14; §13 only where the foundation must know it: sprite config shape and validation).
 
@@ -19,6 +19,7 @@
 - Revert timer default **30 s**, shared by expression and pose (spec §8); expression/pose transitions ≈ **0.2 s** (renderer concern).
 - Manifest poll: on connect, after own upload, every **5 min** (spec §7).
 - Nothing in `crates/sapphire-agent-gui` is `cfg(target_os)`; desktop-only window behavior lives in `desktop/` (spec §3).
+- App directories come from corundum: `corundum_framework_platform::dirs::AppDirs::new(sapphire_agent_core::APP)` (`.cache()` / `.config()`), never `dirs` / `directories` directly, and the app name only from core's `APP` (`"sapphire-agent"`, the same one the server and CLI use). GUI files under them: cache `companion-avatar/`, config `companion.toml` — names that cannot collide with the server's own files there (`config.toml`, `keys.toml`, `images/`, …).
 - Pure logic (state, mode choice, gestures, manifest diff, bubble timing, prefs clamping) has no bevy dependency beyond `#[derive(Resource)]` and is unit-tested without starting bevy (spec §3, Tests).
 - Commit scopes: `(rpc)` core, `(chat)` / `(tools)` cli, `(gui)` gui crate, `(desktop)` desktop. Commit messages end with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 - Verification per task: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and the task's tests; full `cargo test --workspace` before the last commit of a task that touches cli or core.
@@ -39,6 +40,7 @@
 - Modify: `crates/sapphire-agent-core/src/lib.rs` (`AvatarConfig` ~L435–446, module doc ~L10–31, `APP_API` doc ~L47–53, tests)
 - Modify: `cli/src/avatar_store.rs` (`set_config` ~L354, `remove` ~L384, module doc L1–15, tests)
 - Modify: `cli/src/serve/avatar_ipc.rs` (tests that build `AvatarConfig` ~L215–250)
+- Modify: `cli/src/main.rs:56` (`APP_CTX` named by `sapphire_agent_core::APP`)
 
 **Interfaces:**
 - Produces (core, all `Clone, Debug, Default, Serialize, Deserialize, PartialEq`; `Option`s and empty maps skipped when serializing):
@@ -112,7 +114,7 @@ fn sprite_rules_are_checked() {
   - `remove_refuses_a_file_any_section_uses`: with `vrm.model = "m.vrm"` and pose base `p.png`, removing either is refused with "in use by avatar.toml"; removing an unreferenced file succeeds.
   - Update the existing tests that build `AvatarConfig { model, idle, actions }` to the new shape.
 - [ ] **Step 6: Run** `cargo test -p sapphire-agent avatar_store` — Expected: FAIL.
-- [ ] **Step 7: Implement:** `set_config` runs `config.check()` (→ `AvatarError::Invalid`), then validates and checks existence of each `config.paths()` entry; `remove` uses `cfg.paths()`. Replace "desktop mate" in the module doc with "desktop companion" and describe the two sections. Update `avatar_ipc.rs` tests to the new shape.
+- [ ] **Step 7: Implement:** `set_config` runs `config.check()` (→ `AvatarError::Invalid`), then validates and checks existence of each `config.paths()` entry; `remove` uses `cfg.paths()`. Replace "desktop mate" in the module doc with "desktop companion" and describe the two sections. Update `avatar_ipc.rs` tests to the new shape. In `cli/src/main.rs:56` name the app by core's constant: `AppContext::new(sapphire_agent_core::APP)` (same string, one definition).
 - [ ] **Step 8: Run** `cargo test --workspace` (cli + core) — Expected: PASS.
 - [ ] **Step 9: Commit** (two commits: `refactor(rpc): split the avatar config into [vrm] and [sprite]` for core, `refactor(chat): check every vrm and sprite path the avatar config names` for cli).
 
@@ -155,13 +157,13 @@ Tool spec text (spec §6): description "Switch your avatar's stance (pose). It h
 - Create: `crates/sapphire-agent-gui/src/avatar/assets.rs`
 - Modify: `crates/sapphire-agent-gui/src/lib.rs` (`pub mod avatar;`, systems, resources in `finish`)
 - Modify: `crates/sapphire-agent-gui/src/chat/bridge.rs` (expose the live client)
-- Modify: `crates/sapphire-agent-gui/Cargo.toml` (`sha2 = "0.10"`, `dirs = "6"`, `async-trait = "0.1"`, dev `tempfile = "3"`)
+- Modify: `crates/sapphire-agent-gui/Cargo.toml` (`sha2 = "0.10"`, `corundum-framework-platform = "0.3"` — the version corundum-framework-gui 0.3 already pulls, `async-trait = "0.1"`, dev `tempfile = "3"`)
 
 **Interfaces:**
 - Consumes: core `ChatClient::{avatar_manifest, avatar_download}`, `AvatarManifest`, `AvatarFile`, `AvatarConfig`.
 - Produces:
   - `#[async_trait] pub trait AvatarSource: Send + Sync { async fn manifest(&self) -> anyhow::Result<AvatarManifest>; async fn fetch(&self, path: &str) -> anyhow::Result<Vec<u8>>; }` — implemented for `ChatClient`. This is the one swap point spec §7 asks for (#340 adds a bundled source).
-  - `pub struct Cache { dir: PathBuf }` with `Cache::new(dir)`, `Cache::default_dir() -> Option<PathBuf>` (`dirs::cache_dir()/sapphire-agent-desktop/avatar`), `fn path_of(&self, sha256: &str) -> PathBuf`, `fn has(&self, sha256: &str) -> bool`, `fn put(&self, expected_sha256: &str, bytes: &[u8]) -> anyhow::Result<PathBuf>` (refuses a hash mismatch; writes via temp + rename).
+  - `pub struct Cache { dir: PathBuf }` with `Cache::new(dir)`, `Cache::default_dir() -> Option<PathBuf>` (`AppDirs::new(APP)?.cache().join("companion-avatar")`), `fn path_of(&self, sha256: &str) -> PathBuf`, `fn has(&self, sha256: &str) -> bool`, `fn put(&self, expected_sha256: &str, bytes: &[u8]) -> anyhow::Result<PathBuf>` (refuses a hash mismatch; writes via temp + rename).
   - `pub fn missing<'a>(manifest: &'a AvatarManifest, cache: &Cache) -> Vec<&'a AvatarFile>` — files the config references whose sha256 the cache lacks (files the config does not reference are not fetched).
   - `pub async fn sync(source: &dyn AvatarSource, cache: &Cache) -> anyhow::Result<LoadedAvatar>`.
   - `#[derive(Clone, Debug, PartialEq)] pub struct LoadedAvatar { pub config: AvatarConfig, pub files: BTreeMap<String, PathBuf> }` — `files` maps each referenced avatar path to its cached file.
@@ -228,7 +230,7 @@ A sync failure keeps `loaded` as it was and sets `error`; a success clears `erro
   - `gesture.rs` (pure): `pub struct PointerSample { pub pos: Vec2, pub over_avatar: bool, pub over_ui: bool }`; `pub enum Press { Primary, Secondary }`; `pub enum Gesture { OpenInput, OpenHistory, OpenMenu, StartDrag, CloseAll }`; `pub struct GestureTracker` with `press(&mut self, Press, PointerSample)`, `moved(&mut self, PointerSample) -> Option<Gesture>` (primary held on the avatar and moved > `DRAG_PX = 4.0` → `StartDrag`, once), `release(&mut self, Press, PointerSample) -> Option<Gesture>` (primary pressed+released on the avatar without dragging → `OpenInput`; secondary on the avatar → `OpenMenu`), `scroll(&mut self, PointerSample, delta: f32) -> Option<Gesture>` (on the avatar, |delta| > 0 → `OpenHistory`), `escape(&mut self) -> Gesture` (`CloseAll`). Presses with `over_ui` are ignored (egui owns them).
   - `pub fn wants_pointer(cursor: Option<Vec2>, bounds: Option<Rect>, egui_wants: bool) -> bool` — true iff egui wants the pointer or the cursor is inside `bounds`; `None` cursor → false.
   - `bubble.rs` (pure): `pub fn bubble_duration(text: &str) -> Duration` = clamp(3 s + 60 ms × chars, 3 s, 20 s); `pub struct Bubble { pub text: String, pub until: Duration }`, `pub enum BubbleContent { Thinking, Reply(String) }`.
-  - `prefs.rs`: `#[derive(Resource, Serialize, Deserialize, Clone, Debug, PartialEq)] pub struct CompanionPrefs { pub display_mode: DisplayMode, pub revert_secs: u32, pub show_buttons: bool, pub window: Option<WindowPlacement> }` with defaults `Auto`, `30`, `false`, `None`; `pub struct WindowPlacement { pub x: i32, pub y: i32, pub width: u32, pub height: u32 }`; `load(path) -> Self` (missing or unreadable → default, logged), `save(&self, path) -> anyhow::Result<()>` (temp + rename), `default_path()` = `dirs::config_dir()/sapphire-agent-desktop/companion.toml`; `revert_secs` clamped to 5..=600 on load. Saved whenever it changes (compare with last saved).
+  - `prefs.rs`: `#[derive(Resource, Serialize, Deserialize, Clone, Debug, PartialEq)] pub struct CompanionPrefs { pub display_mode: DisplayMode, pub revert_secs: u32, pub show_buttons: bool, pub window: Option<WindowPlacement> }` with defaults `Auto`, `30`, `false`, `None`; `pub struct WindowPlacement { pub x: i32, pub y: i32, pub width: u32, pub height: u32 }`; `load(path) -> Self` (missing or unreadable → default, logged), `save(&self, path) -> anyhow::Result<()>` (temp + rename), `default_path()` = `AppDirs::new(APP)?.config().join("companion.toml")`; `revert_secs` clamped to 5..=600 on load. Saved whenever it changes (compare with last saved).
   - `#[derive(Resource, Default)] pub struct Overlay { pub input: bool, pub history: bool, pub menu: bool }` and `#[derive(Message)] pub struct CompanionRequest` enum `{ StartDrag, Quit }` — the presenter (Task 6) handles `StartDrag`; the GUI handles `Quit` by `AppExit`.
   - `#[derive(Resource, Clone, Copy, Default)] pub struct PointerWanted(pub bool)` — written each frame from `wants_pointer`, read by the desktop presenter.
 
