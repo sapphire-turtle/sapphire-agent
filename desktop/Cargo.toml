@@ -58,9 +58,10 @@ bevy = { version = "0.20", default-features = false, features = [
 # The system file dialog (src/file_dialog.rs). `default-features = false`
 # leaves out `wayland`; `xdg-portal` is the only Linux backend that links
 # neither GTK nor X11 (rfd's `gtk3` would link GTK, breaking #182): it talks
-# D-Bus to the desktop's file chooser portal, and where there is none the
-# dialog reports an error rather than blocking. Windows and macOS use their
-# native dialogs whatever the features.
+# D-Bus (through libdbus loaded at run time) to the desktop's file chooser
+# portal, falling back to `zenity`; with neither, rfd only logs and reports
+# "no file picked", which src/file_dialog.rs tells apart from a cancel
+# beforehand. Windows and macOS use their native dialogs whatever the features.
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 
 # Logging
