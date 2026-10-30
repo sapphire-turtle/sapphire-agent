@@ -3,8 +3,9 @@
 //! The desktop companion's avatar files live in the workspace so they sync
 //! like the rest of it: a VRM model with its VRMA gestures, and/or sprite
 //! images. `avatar.toml` names which file plays which part, in a `[vrm]` and
-//! a `[sprite]` section. Clients reach this over IPC (`sapphire-agent.avatar.*`); this
-//! module is only the file I/O behind those methods.
+//! a `[sprite]` section. Clients reach this over IPC
+//! (`sapphire-agent.avatar.*`); this module is only the file I/O behind those
+//! methods.
 //!
 //! Design choices:
 //! - **Uploads are staged outside `avatar/`** and replace the final file only
@@ -692,7 +693,7 @@ mod tests {
         let Err(AvatarError::Invalid(m)) = f.store.set_config(&cfg) else {
             panic!("a default pose outside the poses is refused");
         };
-        assert!(m.contains('x'), "{m}");
+        assert!(m.contains("\"x\""), "{m}");
         assert!(!f.dir.join("avatar.toml").exists());
     }
 
