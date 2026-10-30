@@ -14,6 +14,19 @@ and predate any user-facing release of this binary.
 
 ## [Unreleased]
 
+## [0.8.3](https://github.com/sapphire-turtle/sapphire-agent/compare/desktop-v0.8.2...desktop-v0.8.3) - 2026-10-30
+
+### Documentation
+
+- Add the app icon and show it in the README
+- The filled app icon
+
+### Other
+
+- Call the shared workflows from sapphire-turtle/.github@v1
+
+
+
 ## [0.8.2](https://github.com/sapphire-turtle/sapphire-agent/compare/desktop-v0.8.1...desktop-v0.8.2) - 2026-10-26
 
 ### Changed

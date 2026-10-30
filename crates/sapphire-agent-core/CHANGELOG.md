@@ -10,6 +10,15 @@ version with `sapphire-agent-server`) are recorded in the root `CHANGELOG.md`.
 
 ## [Unreleased]
 
+## [0.10.1](https://github.com/sapphire-turtle/sapphire-agent/compare/sapphire-agent-core-v0.10.0...sapphire-agent-core-v0.10.1) - 2026-10-30
+
+### Added
+
+- *(chat)* Store the avatar's model and gestures in the workspace's avatar/ folder
+- *(chat)* Serve the avatar's files to local clients over IPC
+
+
+
 ## [0.10.0](https://github.com/sapphire-turtle/sapphire-agent/compare/sapphire-agent-core-v0.9.0...sapphire-agent-core-v0.10.0) - 2026-10-26
 
 ### Changed

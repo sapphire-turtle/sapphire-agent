@@ -1,6 +1,6 @@
 [package]
 name = "sapphire-agent-core"
-version = "0.10.0"
+version = "0.10.1"
 edition.workspace = true
 description = "Client library and shared protocol for sapphire-agent's local IPC chat"
 license.workspace = true
