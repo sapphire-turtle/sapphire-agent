@@ -2,8 +2,8 @@
 //!
 //! A thin shell around [`sapphire_agent_gui::AgentGuiPlugin`], which owns
 //! the chat, its connection to the agent running on this host and the egui
-//! setup. What stays here is what only a desktop has: logging, the window
-//! and the camera the GUI draws onto.
+//! setup and the cameras. What stays here is what only a desktop has:
+//! logging and the window.
 
 use bevy::prelude::*;
 use sapphire_agent_gui::{AgentGuiPlugin, AppIdentity};
@@ -31,13 +31,5 @@ fn main() {
                 version: env!("CARGO_PKG_VERSION"),
             },
         })
-        .add_systems(Startup, spawn_camera)
         .run();
-}
-
-/// bevy_egui renders onto a camera-bound surface — without an active
-/// camera the window paints black and no UI shows up. A plain `Camera2d`
-/// is enough until we introduce the 3D avatar (swap for Camera3d then).
-fn spawn_camera(mut commands: Commands) {
-    commands.spawn(Camera2d);
 }
