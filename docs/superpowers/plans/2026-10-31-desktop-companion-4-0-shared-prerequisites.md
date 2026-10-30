@@ -35,11 +35,12 @@
   - add `bevy_vrm1 = "0.11"`
   - add the bevy features `bevy_sprite`, `bevy_image`, `png`, `webp`, `bevy_pbr`, `bevy_gltf`, `bevy_animation`
   - keep `default-features = false`
+  - add `fastrand = "2"`, for 4-3D's blink timing
 - Create: `crates/sapphire-agent-gui/src/avatar/sprite/mod.rs` (`pub struct SpriteRendererPlugin;` whose `build` does nothing yet, plus a module doc stating that plan 4-2D owns this directory)
-- Create: `crates/sapphire-agent-gui/src/avatar/vrm/mod.rs` (`pub struct VrmRendererPlugin;`, the same, owned by plan 4-3D; its `build` adds `bevy_vrm1::prelude::{VrmPlugin, VrmaPlugin}` only once 4-3D fills it in, so keep it empty now)
+- Create: `crates/sapphire-agent-gui/src/avatar/vrm/mod.rs` (`pub struct VrmRendererPlugin;`, the same, owned by plan 4-3D; its `build` adds `bevy_vrm1::prelude::{VrmPlugin, VrmaPlugin}` only when `app.is_plugin_added::<bevy::gltf::GltfPlugin>()`: they panic under `MinimalPlugins`, which the GUI's headless tests use. Test `avatar::vrm::tests::bevy_vrm1_is_skipped_without_gltf`)
 - Modify: `crates/sapphire-agent-gui/src/avatar/mod.rs`:
   - `pub mod sprite; pub mod vrm;`
-  - `AvatarPlugin::build` adds both plugins
+  - `AvatarPlugin::build` adds both plugins, and inits `CursorOverride` (as `CompanionPlugin` does) for renderers in an app without the companion
 - Modify: `desktop/Cargo.toml` bevy features, only if the desktop's own feature list must match. Cargo unifies features, so prefer leaving it.
 
 **Interfaces:**
@@ -59,17 +60,16 @@
 - Modify: `crates/sapphire-agent-gui/src/companion/mod.rs` and `src/lib.rs` (resource wiring)
 - Create: `desktop/src/file_dialog.rs`
 - Modify: `desktop/Cargo.toml`:
-  - `rfd = { version = "0.17", default-features = false, features = ["xdg-portal", "tokio"] }`
-  - check rfd 0.17's real feature names and pick a backend that needs no GTK link on Linux (the portal backend uses D-Bus)
+  - `rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }`: the portal backend talks D-Bus and links neither GTK nor X11; `gtk3` would link GTK
 - Modify: `desktop/src/main.rs` (install it on the window path)
 
 **Interfaces:**
 - Produces, in the GUI crate:
   - `pub struct FileFilter { pub name: &'static str, pub extensions: &'static [&'static str] }`
   - `pub struct PickedFile { pub name: String, pub bytes: Vec<u8> }`
-  - `pub trait FileDialog: Send + Sync { fn pick(&self, title: String, filters: Vec<FileFilter>) -> futures::future::BoxFuture<'static, Result<Option<PickedFile>, String>>; }`
+  - `pub type PickOutcome = Result<Option<PickedFile>, String>;` and `pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;` (the crate has no `futures`)
+  - `pub trait FileDialog: Send + Sync { fn pick(&self, title: String, filters: Vec<FileFilter>) -> BoxFuture<PickOutcome>; }`
     - `Ok(None)` means the user cancelled.
-    - Use `std::pin::Pin<Box<dyn Future<…> + Send>>` if the crate has no `futures`.
   - `#[derive(Resource, Clone)] pub struct FilePicker`, holding `Option<Arc<dyn FileDialog>>`, the runtime `Handle` and the `Waker`. Methods:
     - `pick(&self, title: impl Into<String>, filters: Vec<FileFilter>) -> PickTicket` runs the dialog on the GUI runtime and wakes the GUI when done.
     - `result(&self, ticket: &PickTicket) -> Option<Result<Option<PickedFile>, String>>` takes the outcome once. It is `None` while the dialog is open.

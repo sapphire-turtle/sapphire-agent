@@ -19,6 +19,7 @@ The renderer follows the contract in `avatar/mod.rs` and touches no other module
 ## Global Constraints
 
 - Touch only `crates/sapphire-agent-gui/src/avatar/sprite/**`. If shared code must change, stop and land that change as its own PR first (spec §14).
+- One exception to that scope: add ONE line under `desktop/CHANGELOG.md`'s `[Unreleased]` describing the 2D renderer, in its own `docs(desktop)` commit after the last task. The GUI crate makes no desktop release on its own (CLAUDE.md). Plan 4-3D adds its own line there too; the trivial merge conflict between the two is accepted.
 - Expression keys: `happy`, `angry`, `sad`, `relaxed` and `surprised` only (`sapphire_agent_core::SPRITE_EXPRESSIONS`). `neutral` is the pose's `base` (spec §13).
 - All images of one `[sprite]` must share one pixel size, and are drawn at the same origin. A mismatch is a load error shown on the settings page, with the placeholder standing in (spec §13).
 - Formats: PNG and WebP.
@@ -29,7 +30,7 @@ The renderer follows the contract in `avatar/mod.rs` and touches no other module
   - `expressions`: `neutral`, plus every expression that has a loaded image in at least one pose.
   - `actions`: none.
 - Frame pacing: request frames only while a crossfade runs. An idle companion draws no frames (contract, "Frame pacing").
-- Commits use the `(gui)` scope and end with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
+- Commits use the `(gui)` scope (the changelog line above: `docs(desktop)`) and end with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 - Manual checks that need a running agent use a `serve` built from this branch only if it can run without disturbing the user's own agent (they share the IPC endpoint). Otherwise list the check for the human and say so.
 - Verification: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test -p sapphire-agent-gui`.
 
@@ -98,7 +99,7 @@ The renderer follows the contract in `avatar/mod.rs` and touches no other module
     - Otherwise clear `RendererError`, set `DeclaredAvatar(declared(..))` and `ready = true`.
     - Every write is compare-then-write.
 
-- [ ] **Step 1:** Write the failing tests. Use a minimal headless App: `MinimalPlugins`, `AssetPlugin`, `ImagePlugin`, the cache asset source registered with `avatar::register_asset_source_at`-style test setup (see `assets.rs` test `a_synced_file_loads_through_the_asset_server`), and `SpriteRendererPlugin` with `ActiveRenderer::Sprite`. Write tiny PNGs, e.g. 2×4 and 3×3, with the `image` crate as a dev-dependency or bevy's `Image` encoder, into the cache.
+- [ ] **Step 1:** Write the failing tests. Use a minimal headless App: `MinimalPlugins`, `AssetPlugin`, `ImagePlugin`, the cache asset source registered with `avatar::register_asset_source_at`-style test setup (see the test `a_synced_file_loads_through_the_asset_server` in `avatar/mod.rs`), and `SpriteRendererPlugin` with `ActiveRenderer::Sprite`. Put tiny PNGs, e.g. 2×4 and 3×3, into the cache. Add no `image` dev-dependency: commit the PNGs under `crates/sapphire-agent-gui/src/avatar/sprite/testdata/` and `include_bytes!` them, or encode them in the test from bevy's `Image` (`try_into_dynamic`, then write with `ImageFormat::Png.as_image_crate_format()`).
   - `a_complete_sprite_avatar_declares_its_cues`: after a few updates, `DeclaredAvatar` has the expected poses and expressions, and `RendererError` is `None`.
   - `a_wrong_sized_overlay_is_left_out` (Review Focus 2): the happy overlay is 3×3, so the declaration has no `happy`, and `RendererError` is `None`.
   - `a_missing_default_base_is_a_renderer_error`: the default base file is absent from the cache, so `RendererError` is `Some(..)` naming it, and `DeclaredAvatar` is `None`.
@@ -118,7 +119,7 @@ The renderer follows the contract in `avatar/mod.rs` and touches no other module
 - Consumes: `SpriteImages`, `AvatarState` (`Res`; react to `is_changed()`), `ActiveRenderer`, `AvatarSystems::{Choose, Bounds}`, `UI_CAMERA_ORDER`.
 - Produces:
   - `#[derive(Component)] struct SpriteCamera` (`Camera2d`, `order: 0`, `ClearColorConfig::Custom(Color::NONE)`), spawned when the sprite renderer becomes active and ready.
-  - `fn despawn_sprite_scene` without the renderer gate, `run_if(resource_changed::<ActiveRenderer>)`. It despawns the camera and all sprite entities when Sprite is no longer active, as in the contract's example.
+  - `fn despawn_sprite_scene` without the renderer gate, `run_if(resource_changed::<ActiveRenderer>)`. It despawns the camera and all sprite entities when Sprite is no longer active, as in the contract's example. It also resets `SpriteImages` to its default, `generation: None` included, so Sprite → Placeholder → Sprite with the same generation reloads.
   - Two layers, `Current` and `Previous`, each a base sprite and an optional overlay sprite. When `shown(..)` changes, the old current becomes previous, and a new current fades in over `FADE = Duration::from_millis(200)` as previous fades out. Use `Sprite::color` alpha, with previous drawn below current. After the fade, previous is despawned.
   - Pure `pub(crate) fn fit(canvas: UVec2, window: Vec2) -> Rect`: scale = `window.y / canvas.y`, width = `canvas.x * scale`, centred horizontally, bottom at `window.y`. Logical px, top-left origin.
   - `fn write_bounds` in `AvatarSystems::Bounds`: `AvatarBounds(Some(fit(..)))` while ready, compare-then-write, and also on window resize (Review Focus 4).
@@ -128,7 +129,7 @@ The renderer follows the contract in `avatar/mod.rs` and touches no other module
   - `fit_fills_the_height_and_centres` (pure): canvas 400×800, window 420×640, gives a rect of x 110..310, y 0..640.
   - `fit_follows_a_resize`: window 420×320 gives the rect 160..260 × 0..320.
   - `a_change_crossfades_and_cleans_up` (Review Focus 3): headless App, as in Task 2. After an expression change, both layers exist for under 0.2 s, and only one remains after. Advance `Time<Real>`, or drive the fade by an injected clock, and say which in the report.
-  - `switching_away_despawns_the_scene`: set `ActiveRenderer::Placeholder`, so no `SpriteCamera` and no sprite entities remain.
+  - `switching_away_despawns_the_scene`: set `ActiveRenderer::Placeholder`, so no `SpriteCamera` and no sprite entities remain. Switch back to `ActiveRenderer::Sprite` with the same generation, and the avatar loads and declares again.
 - [ ] **Step 2:** Run the tests and confirm they fail.
 - [ ] **Step 3:** Implement. Request redraws only while a fade runs.
 - [ ] **Step 4:** Run the tests. Then run the desktop on this X11 host with a real `serve` built from this branch, and a 2-pose test sprite set uploaded through Task 4's panel or placed in `<workspace>/avatar/` by hand. Check that the character shows, that `set_expression` and `set_pose` from a chat turn change it with a fade, that it reverts after 30 s, that a window resize follows, and that idle CPU stays near 0 with the cursor away. Record the results.
