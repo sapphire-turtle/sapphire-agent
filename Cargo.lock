@@ -7895,6 +7895,7 @@ dependencies = [
  "raw-window-handle",
  "sapphire-agent-cli",
  "sapphire-agent-gui",
+ "tokio",
  "tracing",
  "tracing-subscriber",
  "x11-dl",

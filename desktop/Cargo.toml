@@ -70,6 +70,10 @@ x11-dl = "2.21"
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
 device_query = "4.0.1"
 
+[dev-dependencies]
+# The GUI's runtime, built in tests that check the window wakes the app.
+tokio = { workspace = true, features = ["time"] }
+
 # `cargo binstall --git https://github.com/sapphire-turtle/sapphire-agent sapphire-agent-desktop`
 # downloads the release file instead of building it (this crate is not on crates.io), following
 # sapphire-turtle/.github's README.md#conventions: the files are bare binaries named

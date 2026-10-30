@@ -30,7 +30,7 @@ use sapphire_agent_gui::companion::{
     CompanionPrefs, CompanionRequest, CursorOverride, OVERLAY_PASS, Overlay, PointerWanted,
     WindowPlacement,
 };
-use sapphire_agent_gui::{GuiSettings, GuiWaker};
+use sapphire_agent_gui::{GuiRuntime, GuiSettings, GuiWaker};
 
 use crate::global_pointer::{GlobalPointer, Status, WindowRect};
 
@@ -256,6 +256,25 @@ impl WindowRequests<'_> {
     }
 }
 
+/// Wakes the GUI once a deadline passes. The app idles between frames, so
+/// a system waiting for time to pass (the window to settle) would
+/// otherwise wait for an unrelated frame: up to a minute with the window
+/// unfocused.
+#[derive(bevy::ecs::system::SystemParam)]
+struct Alarm<'w> {
+    runtime: Option<Res<'w, GuiRuntime>>,
+    waker: Option<Res<'w, GuiWaker>>,
+}
+
+impl Alarm<'_> {
+    /// A frame comes no sooner than `after` from now.
+    fn wake_in(&self, after: Duration) {
+        if let (Some(runtime), Some(waker)) = (&self.runtime, &self.waker) {
+            waker.wake_in(runtime, after);
+        }
+    }
+}
+
 /// Sends last frame's window requests on to the display server.
 ///
 /// winit hands X11 its hit-test and drag requests without flushing the
@@ -380,6 +399,7 @@ fn place_window(
     prefs: Res<CompanionPrefs>,
     dragging: Res<Dragging>,
     mut requests_made: WindowRequests,
+    alarm: Alarm,
 ) {
     match *placement {
         Placement::Pending => {}
@@ -430,6 +450,8 @@ fn place_window(
         target: IVec2::new(at.x, at.y),
         until: Instant::now() + PLACEMENT_SETTLE,
     };
+    // To let go of the window when the settling is over.
+    alarm.wake_in(PLACEMENT_SETTLE);
 }
 
 /// Saves where the window is once it has stayed put for [`SETTLE`].
@@ -439,6 +461,7 @@ fn save_placement(
     mut prefs: ResMut<CompanionPrefs>,
     time: Res<Time<Real>>,
     mut last: Local<Option<(WindowPlacement, Duration)>>,
+    alarm: Alarm,
 ) {
     if !matches!(*placement, Placement::Done) {
         return;
@@ -462,7 +485,11 @@ fn save_placement(
                 prefs.window = Some(now);
             }
         }
-        _ => *last = Some((now, elapsed)),
+        _ => {
+            *last = Some((now, elapsed));
+            // To save it if it stays put, frame or no frame meanwhile.
+            alarm.wake_in(SETTLE);
+        }
     }
 }
 
@@ -556,6 +583,51 @@ mod tests {
                 scale: 1.0,
             },
         ]
+    }
+
+    #[test]
+    fn a_window_that_stops_moving_wakes_the_app_to_save_its_place() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let woken = Arc::new(AtomicUsize::new(0));
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_time()
+            .build()
+            .unwrap();
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(Placement::Done)
+            .init_resource::<CompanionPrefs>()
+            .insert_resource(GuiRuntime(Arc::new(runtime)))
+            .insert_resource(GuiWaker(Arc::new({
+                let woken = Arc::clone(&woken);
+                move || {
+                    woken.fetch_add(1, Ordering::SeqCst);
+                }
+            })))
+            .add_systems(Update, save_placement);
+        app.world_mut().spawn((
+            Window {
+                position: WindowPosition::At(IVec2::new(10, 20)),
+                ..default()
+            },
+            PrimaryWindow,
+        ));
+
+        // The window is seen where it now is; nothing is saved yet.
+        app.update();
+        assert_eq!(app.world().resource::<CompanionPrefs>().window, None);
+        assert_eq!(woken.load(Ordering::SeqCst), 0);
+
+        // With no other frame coming, the app is woken once it has settled,
+        // and that frame saves it.
+        std::thread::sleep(SETTLE + Duration::from_millis(300));
+        assert_eq!(woken.load(Ordering::SeqCst), 1);
+        app.update();
+        let saved = app.world().resource::<CompanionPrefs>().window.unwrap();
+        assert_eq!((saved.x, saved.y), (10, 20));
     }
 
     #[test]
