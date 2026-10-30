@@ -71,11 +71,7 @@ pub(crate) fn drain_bridge_events(
                 avatar.turn_finished(time.elapsed(), revert_after);
                 // An idle window draws no frame on its own, so wake it when
                 // the revert is due.
-                let waker = waker.0.clone();
-                runtime.0.spawn(async move {
-                    tokio::time::sleep(revert_after).await;
-                    waker();
-                });
+                waker.wake_in(&runtime, revert_after);
             }
             _ => {}
         }

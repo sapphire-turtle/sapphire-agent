@@ -235,11 +235,7 @@ fn follow_chat(
         return;
     }
     if let Some(shown_for) = speech.follow(&chat.history, time.elapsed()) {
-        let waker = waker.0.clone();
-        runtime.0.spawn(async move {
-            tokio::time::sleep(shown_for).await;
-            waker();
-        });
+        waker.wake_in(&runtime, shown_for);
     }
 }
 
