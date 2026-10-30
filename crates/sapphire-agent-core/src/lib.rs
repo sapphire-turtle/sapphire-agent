@@ -48,9 +48,9 @@ pub const APP: &str = "sapphire-agent";
 /// agent that would read its calls differently, or lacks them.
 ///
 /// 2: added `sapphire-agent.chat.*`.
-/// 3: `chat.send` takes `attachments` and `client` (the client's declared
-/// capabilities); `chat.progress` carries `expression` and `action`;
-/// added `sapphire-agent.avatar.*`, whose config is `{vrm?, sprite?}`.
+/// 3: `chat.send` takes `attachments` and `client`; `chat.progress` carries
+/// `expression`, `action` and `pose`; added `set_pose` and
+/// `sapphire-agent.avatar.*`.
 pub const APP_API: u32 = 3;
 
 /// Open (resume or reserve) a session.
@@ -498,10 +498,21 @@ impl AvatarConfig {
     /// The structural rules, without looking at any file: the error names the
     /// offending key.
     pub fn check(&self) -> Result<(), String> {
-        if let Some(vrm) = &self.vrm
-            && vrm.actions.keys().any(String::is_empty)
-        {
-            return Err("vrm.actions has an empty action name".into());
+        if let Some(vrm) = &self.vrm {
+            if vrm.model.is_empty() {
+                return Err("vrm.model is empty".into());
+            }
+            if vrm.idle.as_deref() == Some("") {
+                return Err("vrm.idle is empty".into());
+            }
+            for (name, path) in &vrm.actions {
+                if name.is_empty() {
+                    return Err("vrm.actions has an empty action name".into());
+                }
+                if path.is_empty() {
+                    return Err(format!("vrm.actions.{name} is empty"));
+                }
+            }
         }
         let Some(sprite) = &self.sprite else {
             return Ok(());
@@ -519,7 +530,10 @@ impl AvatarConfig {
             if name.is_empty() {
                 return Err("sprite.poses has an empty pose name".into());
             }
-            for key in pose.expressions.keys() {
+            if pose.base.is_empty() {
+                return Err(format!("sprite.poses.{name}.base is empty"));
+            }
+            for (key, path) in &pose.expressions {
                 if key.is_empty() {
                     return Err(format!(
                         "sprite.poses.{name}.expressions has an empty expression name"
@@ -530,6 +544,9 @@ impl AvatarConfig {
                         "sprite.poses.{name}.expressions.{key} is not one of {}",
                         SPRITE_EXPRESSIONS.join(", ")
                     ));
+                }
+                if path.is_empty() {
+                    return Err(format!("sprite.poses.{name}.expressions.{key} is empty"));
                 }
             }
         }
@@ -742,5 +759,62 @@ happy = "sprite/normal-happy.png"
         );
         assert!(sprite("", vec![("", pose("a.png", &[]))]).check().is_err());
         assert_eq!(AvatarConfig::default().check(), Ok(()));
+    }
+
+    #[test]
+    fn empty_paths_are_refused_naming_the_key() {
+        let vrm = |model: &str, idle: Option<&str>, action: &str| AvatarConfig {
+            vrm: Some(VrmConfig {
+                model: model.into(),
+                idle: idle.map(Into::into),
+                actions: [("peace".to_string(), action.to_string())].into(),
+            }),
+            sprite: None,
+        };
+        assert!(
+            vrm("", None, "a")
+                .check()
+                .unwrap_err()
+                .contains("vrm.model")
+        );
+        assert!(
+            vrm("m", Some(""), "a")
+                .check()
+                .unwrap_err()
+                .contains("vrm.idle")
+        );
+        assert!(
+            vrm("m", None, "")
+                .check()
+                .unwrap_err()
+                .contains("vrm.actions.peace")
+        );
+        let sprite = |base: &str, happy: &str| AvatarConfig {
+            vrm: None,
+            sprite: Some(SpriteConfig {
+                default_pose: "normal".into(),
+                poses: [(
+                    "normal".to_string(),
+                    SpritePose {
+                        base: base.into(),
+                        expressions: [("happy".to_string(), happy.to_string())].into(),
+                    },
+                )]
+                .into(),
+            }),
+        };
+        assert!(
+            sprite("", "h")
+                .check()
+                .unwrap_err()
+                .contains("sprite.poses.normal.base")
+        );
+        assert!(
+            sprite("b", "")
+                .check()
+                .unwrap_err()
+                .contains("sprite.poses.normal.expressions.happy")
+        );
+        assert_eq!(sprite("b", "h").check(), Ok(()));
     }
 }
