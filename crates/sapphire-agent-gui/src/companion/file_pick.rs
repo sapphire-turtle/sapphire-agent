@@ -37,7 +37,8 @@ pub struct PickedFile {
 }
 
 /// What [`FileDialog::pick`] resolves to: `Ok(None)` when the user
-/// cancelled, `Err` with a message fit to show when the dialog or the
+/// cancelled (or, on a host whose dialog cannot tell, when no dialog
+/// backend responded), `Err` with a message fit to show when the dialog or the
 /// read failed.
 pub type PickOutcome = Result<Option<PickedFile>, String>;
 
@@ -93,6 +94,17 @@ impl Drop for Finish {
 
 /// Lets renderer panels ask the user for a file. [`PanelContext`] hands
 /// panels one; the host installs the dialog behind it.
+///
+/// For panel authors:
+/// - Ignore further "choose" clicks while a ticket is pending: the dialog
+///   is not modal to the companion window, so the user can click again.
+/// - `Ok(None)` means cancelled, but a host whose dialog backend is
+///   missing may also report that way; show no error for it.
+/// - Hosts may match [`FileFilter`] extensions case-sensitively. The
+///   desktop adds uppercase variants itself; another host may not, so list
+///   both cases where it matters.
+/// - On macOS the desktop's dialog is a sheet on the companion window when
+///   there is one (untested).
 ///
 /// [`PanelContext`]: super::character_page::PanelContext
 #[derive(Resource, Clone)]
