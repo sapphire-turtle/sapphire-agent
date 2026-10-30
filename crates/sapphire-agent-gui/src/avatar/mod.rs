@@ -76,7 +76,9 @@
 pub mod assets;
 pub mod mode;
 pub mod placeholder;
+pub mod sprite;
 pub mod state;
+pub mod vrm;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -202,6 +204,7 @@ impl Plugin for AvatarPlugin {
                     .after(CameraUpdateSystems)
                     .before(bevy_egui::EguiPostUpdateSet::EndPass),
             )
+            .add_plugins((sprite::SpriteRendererPlugin, vrm::VrmRendererPlugin))
             .add_systems(Startup, spawn_ui_camera)
             .add_systems(
                 Update,
@@ -453,6 +456,15 @@ mod tests {
             *app.world().resource::<ActiveRenderer>(),
             ActiveRenderer::Placeholder
         );
+    }
+
+    #[test]
+    fn both_renderer_plugins_are_installed() {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AvatarPlugin));
+        app.update();
+        assert!(app.is_plugin_added::<sprite::SpriteRendererPlugin>());
+        assert!(app.is_plugin_added::<vrm::VrmRendererPlugin>());
     }
 
     #[test]

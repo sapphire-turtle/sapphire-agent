@@ -38,7 +38,20 @@ bevy = { version = "0.20", default-features = false, features = [
     # input + render path doesn't wire up correctly (window paints
     # black, no UI visible).
     "bevy_picking",
+    # The renderers: the sprite renderer's 2D sprites and image formats, and
+    # the VRM renderer's PBR scene, glTF loading and animation. bevy_vrm1
+    # enables the last three itself; listing them keeps this crate honest.
+    "bevy_sprite",
+    "bevy_image",
+    "png",
+    "webp",
+    "bevy_pbr",
+    "bevy_gltf",
+    "bevy_animation",
 ] }
+
+# VRM 1.0 models and VRMA animations for the 3D renderer (plan 4-3D).
+bevy_vrm1 = "0.11"
 
 # Immediate-mode UI inside the bevy app — drives every panel until /
 # unless we eventually replace specific panels with native bevy_ui.
