@@ -23,8 +23,15 @@ use crate::avatar::{
 };
 
 /// A renderer's section of the Character page: the settings for the
-/// avatar files it draws. Renderer plugins register one with
-/// [`RendererPanels::push`] in `build`.
+/// avatar files it draws. A renderer plugin registers one in `build` with
+/// [`RendererPanelApp::add_renderer_panel`], whatever order the plugins
+/// are added in.
+///
+/// Change the avatar only through [`AvatarOps::apply`]: it uploads first,
+/// edits the agent's current config rather than the possibly stale
+/// [`PanelContext::config`], and reports under the panel's `source` name.
+/// The page itself shows the renderer's error and every source's op
+/// errors, so a panel need not repeat them.
 pub trait RendererPanel: Send {
     /// The section's heading.
     fn title(&self) -> &str;
@@ -38,10 +45,8 @@ pub struct PanelContext<'a> {
     /// Each avatar path the config references and the cached file holding
     /// its bytes.
     pub files: Option<&'a BTreeMap<String, PathBuf>>,
-    /// Uploads and config changes to the agent.
+    /// Uploads and config changes to the agent: use [`AvatarOps::apply`].
     pub ops: &'a AvatarOps,
-    /// Why the active renderer cannot draw the avatar.
-    pub error: Option<&'a str>,
 }
 
 /// The renderers' panels, collected before the settings page takes them.
@@ -49,7 +54,7 @@ pub struct PanelContext<'a> {
 pub struct RendererPanels(Mutex<Vec<Box<dyn RendererPanel>>>);
 
 impl RendererPanels {
-    pub fn push(&self, panel: Box<dyn RendererPanel>) {
+    fn push(&self, panel: Box<dyn RendererPanel>) {
         self.0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -58,6 +63,22 @@ impl RendererPanels {
 
     pub(crate) fn take(&self) -> Vec<Box<dyn RendererPanel>> {
         std::mem::take(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+}
+
+/// Registers [`RendererPanel`]s on an [`App`].
+pub trait RendererPanelApp {
+    /// Adds `panel` to the Character page. Safe in any plugin order: the
+    /// collection is created if it is not there yet.
+    fn add_renderer_panel(&mut self, panel: Box<dyn RendererPanel>) -> &mut Self;
+}
+
+impl RendererPanelApp for App {
+    fn add_renderer_panel(&mut self, panel: Box<dyn RendererPanel>) -> &mut Self {
+        self.world_mut()
+            .get_resource_or_init::<RendererPanels>()
+            .push(panel);
+        self
     }
 }
 
@@ -80,6 +101,8 @@ pub(crate) struct CharacterModel {
     generation: Option<u64>,
     error: Option<String>,
     active: ActiveRenderer,
+    /// `None` only in a `Default` model, which has no agent and no panels
+    /// to draw; the page's model always has one.
     ops: Option<AvatarOps>,
     panels: Vec<Box<dyn RendererPanel>>,
 }
@@ -180,16 +203,21 @@ impl CharacterModel {
         if let Some(error) = &self.error {
             ui.colored_label(ui.visuals().error_fg_color, error);
         }
-        let status = self.ops.as_ref().map(AvatarOps::status);
-        if let Some(OpsStatus { busy, last_error }) = status {
+        if let Some(ops) = &self.ops {
+            let OpsStatus { busy, errors } = ops.status();
             if busy {
                 ui.horizontal(|ui| {
                     ui.spinner();
                     ui.label("Working…");
                 });
             }
-            if let Some(error) = last_error {
-                ui.colored_label(ui.visuals().error_fg_color, error);
+            for (source, error) in errors {
+                ui.horizontal(|ui| {
+                    ui.colored_label(ui.visuals().error_fg_color, format!("{source}: {error}"));
+                    if ui.small_button("Dismiss").clicked() {
+                        ops.dismiss(source);
+                    }
+                });
             }
         }
 
@@ -197,7 +225,6 @@ impl CharacterModel {
         let Self {
             config,
             files,
-            error,
             ops,
             panels,
             ..
@@ -214,7 +241,6 @@ impl CharacterModel {
                     config: config.as_ref(),
                     files: files.as_ref(),
                     ops,
-                    error: error.as_deref(),
                 };
                 panel.ui(ui, &mut cx);
             });
@@ -290,6 +316,26 @@ pub(crate) fn request_sync_after_ops(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refresh_keeps_a_pending_edit_and_picks_up_new_prefs_when_idle() {
+        let (assets, active) = (AvatarAssets::default(), ActiveRenderer::Placeholder);
+        let mut model = CharacterModel::default();
+
+        model.edit_prefs(|p| p.revert_secs = 90);
+        let older = CompanionPrefs::default();
+        model.refresh(&older, &assets, None, active);
+        assert_eq!(model.prefs.revert_secs, 90, "the pending edit stays");
+        assert!(model.take_prefs_edit().is_some());
+
+        let newer = CompanionPrefs {
+            show_buttons: true,
+            ..CompanionPrefs::default()
+        };
+        model.refresh(&newer, &assets, None, active);
+        assert_eq!(model.prefs, newer, "idle, the resource's prefs show");
+        assert_eq!(model.take_prefs_edit(), None);
+    }
 
     #[test]
     fn prefs_edited_on_the_page_reach_the_resource() {

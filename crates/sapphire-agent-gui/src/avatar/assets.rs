@@ -185,27 +185,104 @@ impl AvatarAssets {
     }
 }
 
-/// Whether an upload or a config change is running, and how the last one
-/// failed.
+/// What [`AvatarOps`] needs of the agent: [`ChatClient`] in the app, a
+/// fake in tests.
+#[async_trait::async_trait]
+pub trait AvatarEditor: Send + Sync {
+    /// Stores `bytes` at the avatar-relative `path`.
+    async fn upload(&self, path: &str, bytes: &[u8]) -> Result<()>;
+    /// The agent's avatar config as it is now.
+    async fn config(&self) -> Result<AvatarConfig>;
+    /// Replaces the agent's avatar config. The agent refuses one that
+    /// references a file it does not have.
+    async fn set_config(&self, config: &AvatarConfig) -> Result<()>;
+}
+
+#[async_trait::async_trait]
+impl AvatarEditor for ChatClient {
+    async fn upload(&self, path: &str, bytes: &[u8]) -> Result<()> {
+        self.avatar_upload(path, bytes).await
+    }
+    async fn config(&self) -> Result<AvatarConfig> {
+        Ok(self.avatar_manifest().await?.config)
+    }
+    async fn set_config(&self, config: &AvatarConfig) -> Result<()> {
+        self.avatar_set_config(config).await
+    }
+}
+
+/// Looks up the live agent connection, if there is one.
+pub type ClientLookup = Arc<dyn Fn() -> Option<Arc<dyn AvatarEditor>> + Send + Sync>;
+
+/// Names one [`AvatarOps::apply`], to read its outcome with
+/// [`AvatarOps::result`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpTicket(u64);
+
+/// Whether ops are running, and how each source's last one failed.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct OpsStatus {
     pub busy: bool,
-    pub last_error: Option<String>,
+    /// The error of each source's latest op, if it failed. Kept until
+    /// that source starts another op or [`AvatarOps::dismiss`]es it.
+    pub errors: BTreeMap<&'static str, String>,
 }
+
+/// How many finished tickets are remembered.
+const KEPT_RESULTS: usize = 64;
 
 #[derive(Default)]
 struct OpsInner {
     running: usize,
-    last_error: Option<String>,
+    next_ticket: u64,
+    errors: BTreeMap<&'static str, String>,
+    results: BTreeMap<u64, Result<(), String>>,
 }
 
-/// Looks up the live agent connection, if there is one.
-pub type ClientLookup = Arc<dyn Fn() -> Option<Arc<ChatClient>> + Send + Sync>;
+/// Records an op's end however the task ends: a panicking op still stops
+/// being "running" and reports a failure.
+struct Finish {
+    ops: AvatarOps,
+    ticket: OpTicket,
+    source: &'static str,
+    result: Option<Result<(), String>>,
+}
 
-/// Changes to the agent's avatar made from the GUI: an upload and a new
-/// config. They run on the GUI's runtime through the live client, report
-/// into a shared [`OpsStatus`] and, on success, ask for a sync so the
-/// manifest is refetched.
+impl Finish {
+    /// How the op ended; recorded when `self` drops.
+    fn set(&mut self, result: Result<(), String>) {
+        self.result = Some(result);
+    }
+}
+
+impl Drop for Finish {
+    fn drop(&mut self) {
+        let result = self
+            .result
+            .take()
+            .unwrap_or_else(|| Err("the operation stopped unexpectedly".to_owned()));
+        {
+            let mut inner = self.ops.lock();
+            inner.running = inner.running.saturating_sub(1);
+            match &result {
+                Ok(()) => self.ops.sync_request.store(true, Ordering::Release),
+                Err(e) => {
+                    inner.errors.insert(self.source, e.clone());
+                }
+            }
+            inner.results.insert(self.ticket.0, result);
+            while inner.results.len() > KEPT_RESULTS {
+                inner.results.pop_first();
+            }
+        }
+        self.ops.wake();
+    }
+}
+
+/// Changes to the agent's avatar made from the GUI. Renderer panels make
+/// theirs with [`apply`](Self::apply): it runs on the GUI's runtime
+/// through the live client, reports per source, and on success asks for a
+/// sync so the manifest is refetched.
 #[derive(Clone, Resource)]
 pub struct AvatarOps {
     runtime: Handle,
@@ -213,6 +290,8 @@ pub struct AvatarOps {
     sync_request: Arc<AtomicBool>,
     waker: Option<crate::Waker>,
     inner: Arc<Mutex<OpsInner>>,
+    /// Held for a whole op, so ops never interleave.
+    serial: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AvatarOps {
@@ -226,6 +305,7 @@ impl AvatarOps {
             sync_request,
             waker: None,
             inner: Arc::default(),
+            serial: Arc::default(),
         }
     }
 
@@ -240,8 +320,19 @@ impl AvatarOps {
         let inner = self.lock();
         OpsStatus {
             busy: inner.running > 0,
-            last_error: inner.last_error.clone(),
+            errors: inner.errors.clone(),
         }
+    }
+
+    /// How the op `ticket` names ended: `None` while it runs (or once
+    /// forgotten, long after it ended).
+    pub fn result(&self, ticket: &OpTicket) -> Option<Result<(), String>> {
+        self.lock().results.get(&ticket.0).cloned()
+    }
+
+    /// Forgets `source`'s error.
+    pub fn dismiss(&self, source: &'static str) {
+        self.lock().errors.remove(source);
     }
 
     /// Whether an op asked for a sync since this was last called.
@@ -249,50 +340,61 @@ impl AvatarOps {
         self.sync_request.swap(false, Ordering::AcqRel)
     }
 
-    /// Uploads `bytes` to the avatar-relative `path`.
-    pub fn upload(&self, path: String, bytes: Vec<u8>) {
-        self.run(move |client| async move { client.avatar_upload(&path, &bytes).await });
-    }
-
-    /// Replaces the avatar's config. A config with a structural error is
-    /// reported without calling the agent.
-    pub fn set_config(&self, config: AvatarConfig) {
-        if let Err(error) = config.check() {
-            self.lock().last_error = Some(error);
-            self.wake();
-            return;
-        }
-        self.run(move |client| async move { client.avatar_set_config(&config).await });
-    }
-
-    fn run<F, Fut>(&self, op: F)
-    where
-        F: FnOnce(Arc<ChatClient>) -> Fut + Send + 'static,
-        Fut: std::future::Future<Output = Result<()>> + Send + 'static,
-    {
-        let Some(client) = (self.client)() else {
-            self.lock().last_error = Some("not connected to the agent".to_owned());
-            self.wake();
-            return;
-        };
-        {
+    /// The way for a panel to change the avatar. In one task, one op at a
+    /// time (a second `apply` waits for the first), it:
+    ///
+    /// 1. uploads each of `uploads` (avatar path, bytes), in order;
+    /// 2. fetches the agent's config as it is now, so a panel's stale view
+    ///    of it cannot undo another panel's edit;
+    /// 3. runs `edit` on that config;
+    /// 4. checks the result and sets it on the agent.
+    ///
+    /// It stops at the first error. The uploads come first because the
+    /// agent refuses a config that references a file it lacks. `source`
+    /// names the caller (a panel's title) for [`OpsStatus::errors`]; its
+    /// previous error is cleared now. A sync follows success.
+    pub fn apply(
+        &self,
+        source: &'static str,
+        uploads: Vec<(String, Vec<u8>)>,
+        edit: impl FnOnce(&mut AvatarConfig) + Send + 'static,
+    ) -> OpTicket {
+        let ticket = {
             let mut inner = self.lock();
+            let ticket = OpTicket(inner.next_ticket);
+            inner.next_ticket += 1;
             inner.running += 1;
-            inner.last_error = None;
-        }
-        let ops = self.clone();
+            inner.errors.remove(source);
+            ticket
+        };
+        let mut finish = Finish {
+            ops: self.clone(),
+            ticket,
+            source,
+            result: None,
+        };
+        let Some(client) = (self.client)() else {
+            finish.set(Err("not connected to the agent".to_owned()));
+            return ticket;
+        };
+        let serial = Arc::clone(&self.serial);
         self.runtime.spawn(async move {
-            let result = op(client).await;
-            {
-                let mut inner = ops.lock();
-                inner.running -= 1;
-                match &result {
-                    Ok(()) => ops.sync_request.store(true, Ordering::Release),
-                    Err(e) => inner.last_error = Some(format!("{e:#}")),
+            let _one_at_a_time = serial.lock().await;
+            let run = async {
+                for (path, bytes) in &uploads {
+                    client
+                        .upload(path, bytes)
+                        .await
+                        .with_context(|| format!("cannot upload {path}"))?;
                 }
-            }
-            ops.wake();
+                let mut config = client.config().await?;
+                edit(&mut config);
+                config.check().map_err(|e| anyhow!(e))?;
+                client.set_config(&config).await
+            };
+            finish.set(run.await.map_err(|e| format!("{e:#}")));
         });
+        ticket
     }
 
     fn wake(&self) {
@@ -309,6 +411,7 @@ impl AvatarOps {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::time::Duration;
 
     use sapphire_agent_core::{AvatarConfig, AvatarFile, AvatarManifest, SpriteConfig, SpritePose};
 
@@ -433,25 +536,208 @@ mod tests {
         assert!(source.fetches.lock().unwrap().is_empty());
     }
 
-    #[test]
-    fn set_config_with_a_structural_error_reports_without_calling_the_agent() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
+    /// An agent whose avatar is a config and a set of file names, which
+    /// refuses a config naming a file it lacks, like the real one.
+    struct FakeEditor {
+        state: Mutex<(AvatarConfig, Vec<String>)>,
+        log: Mutex<Vec<String>>,
+        fail_upload: Option<&'static str>,
+    }
+
+    impl FakeEditor {
+        fn new(config: AvatarConfig) -> Arc<Self> {
+            Arc::new(Self {
+                state: Mutex::new({
+                    let files = config.paths().into_iter().map(str::to_owned).collect();
+                    (config, files)
+                }),
+                log: Mutex::default(),
+                fail_upload: None,
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AvatarEditor for FakeEditor {
+        async fn upload(&self, path: &str, _: &[u8]) -> anyhow::Result<()> {
+            self.log.lock().unwrap().push(format!("upload {path}"));
+            if self.fail_upload == Some(path) {
+                anyhow::bail!("disk full");
+            }
+            self.state.lock().unwrap().1.push(path.to_owned());
+            Ok(())
+        }
+        async fn config(&self) -> anyhow::Result<AvatarConfig> {
+            self.log.lock().unwrap().push("config".to_owned());
+            Ok(self.state.lock().unwrap().0.clone())
+        }
+        async fn set_config(&self, config: &AvatarConfig) -> anyhow::Result<()> {
+            self.log.lock().unwrap().push("set_config".to_owned());
+            let mut state = self.state.lock().unwrap();
+            if let Some(missing) = config
+                .paths()
+                .into_iter()
+                .find(|p| !state.1.iter().any(|f| f == p))
+            {
+                anyhow::bail!("the agent lacks {missing}");
+            }
+            state.0 = config.clone();
+            Ok(())
+        }
+    }
+
+    fn ops_over(runtime: &tokio::runtime::Runtime, editor: Arc<FakeEditor>) -> AvatarOps {
+        AvatarOps::new(
+            runtime.handle().clone(),
+            Arc::new(move || Some(Arc::clone(&editor) as Arc<dyn AvatarEditor>)),
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    fn wait_for(ops: &AvatarOps, ticket: &OpTicket) -> Result<(), String> {
+        for _ in 0..500 {
+            if let Some(result) = ops.result(ticket) {
+                return result;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the op did not finish");
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
             .build()
-            .unwrap();
+            .unwrap()
+    }
+
+    #[test]
+    fn apply_uploads_before_set_config_and_edits_the_freshest_config() {
+        let runtime = runtime();
+        // The agent's config is "other panel's" by the time apply fetches.
+        let editor = FakeEditor::new(config_of(&["old.png"]));
+        let ops = ops_over(&runtime, Arc::clone(&editor));
+
+        let ticket = ops.apply(
+            "sprite",
+            vec![("new.png".to_owned(), b"N".to_vec())],
+            |config| {
+                let sprite = config.sprite.as_mut().unwrap();
+                sprite
+                    .poses
+                    .get_mut("p")
+                    .unwrap()
+                    .expressions
+                    .insert("happy".into(), "new.png".into());
+            },
+        );
+        assert_eq!(wait_for(&ops, &ticket), Ok(()));
+
+        assert_eq!(
+            *editor.log.lock().unwrap(),
+            ["upload new.png", "config", "set_config"]
+        );
+        let state = editor.state.lock().unwrap();
+        let pose = &state.0.sprite.as_ref().unwrap().poses["p"];
+        assert_eq!(
+            pose.base, "old.png",
+            "the fetched config was edited, not rebuilt"
+        );
+        assert_eq!(pose.expressions["happy"], "new.png");
+        assert!(ops.take_sync_request());
+        assert!(!ops.status().busy);
+    }
+
+    #[test]
+    fn a_structural_error_is_reported_without_set_config() {
+        let runtime = runtime();
+        let editor = FakeEditor::new(config_of(&["a.png"]));
+        let ops = ops_over(&runtime, Arc::clone(&editor));
+
+        let ticket = ops.apply("sprite", vec![], |config| {
+            config.sprite.as_mut().unwrap().default_pose = "missing-pose".to_owned();
+        });
+        let error = wait_for(&ops, &ticket).unwrap_err();
+        assert!(error.contains("missing-pose"), "{error}");
+        assert!(
+            !editor
+                .log
+                .lock()
+                .unwrap()
+                .contains(&"set_config".to_owned())
+        );
+        assert!(ops.status().errors["sprite"].contains("missing-pose"));
+        assert!(!ops.take_sync_request());
+    }
+
+    #[test]
+    fn an_upload_error_stops_the_op_before_the_config() {
+        let runtime = runtime();
+        let mut editor = FakeEditor::new(config_of(&["a.png"]));
+        Arc::get_mut(&mut editor).unwrap().fail_upload = Some("b.png");
+        let ops = ops_over(&runtime, Arc::clone(&editor));
+        let ticket = ops.apply(
+            "sprite",
+            vec![("b.png".to_owned(), vec![]), ("c.png".to_owned(), vec![])],
+            |_| {},
+        );
+        let error = wait_for(&ops, &ticket).unwrap_err();
+        assert!(
+            error.contains("b.png") && error.contains("disk full"),
+            "{error}"
+        );
+        assert_eq!(*editor.log.lock().unwrap(), ["upload b.png"]);
+    }
+
+    #[test]
+    fn one_sources_error_survives_another_sources_op() {
+        let runtime = runtime();
+        let editor = FakeEditor::new(config_of(&["a.png"]));
+        let ops = ops_over(&runtime, editor);
+
+        let bad = ops.apply("vrm", vec![("x.vrm".to_owned(), vec![])], |config| {
+            config.vrm = Some(Default::default()); // empty model: check() fails
+        });
+        assert!(wait_for(&ops, &bad).is_err());
+        let good = ops.apply("sprite", vec![], |_| {});
+        assert_eq!(wait_for(&ops, &good), Ok(()));
+        assert!(ops.status().errors.contains_key("vrm"), "kept");
+        assert!(!ops.status().errors.contains_key("sprite"));
+
+        // Its own next op clears it; so does dismissing.
+        let again = ops.apply("vrm", vec![], |_| {});
+        let _ = wait_for(&ops, &again);
+        assert!(!ops.status().errors.contains_key("vrm"));
+        let bad = ops.apply("vrm", vec![], |c| c.vrm = Some(Default::default()));
+        assert!(wait_for(&ops, &bad).is_err());
+        ops.dismiss("vrm");
+        assert!(ops.status().errors.is_empty());
+    }
+
+    #[test]
+    fn a_panicking_edit_does_not_leave_the_status_busy() {
+        let runtime = runtime();
+        let editor = FakeEditor::new(config_of(&["a.png"]));
+        let ops = ops_over(&runtime, editor);
+        let ticket = ops.apply("sprite", vec![], |_| panic!("boom"));
+        assert!(wait_for(&ops, &ticket).is_err());
+        assert!(!ops.status().busy);
+        assert!(ops.status().errors.contains_key("sprite"));
+    }
+
+    #[test]
+    fn without_a_connection_the_op_fails_at_once() {
+        let runtime = runtime();
         let ops = AvatarOps::new(
             runtime.handle().clone(),
-            Arc::new(|| panic!("the agent must not be asked for a client")),
+            Arc::new(|| None),
             Arc::new(AtomicBool::new(false)),
         );
-        let mut config = config_of(&["a.png"]);
-        config.sprite.as_mut().unwrap().default_pose = "missing-pose".to_owned();
-
-        ops.set_config(config);
-
-        let status = ops.status();
-        assert!(!status.busy);
-        let error = status.last_error.expect("the structural error is reported");
-        assert!(error.contains("missing-pose"), "{error}");
+        let ticket = ops.apply("sprite", vec![], |_| {});
+        assert_eq!(
+            ops.result(&ticket),
+            Some(Err("not connected to the agent".into()))
+        );
     }
 
     #[test]

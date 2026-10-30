@@ -177,7 +177,12 @@ impl RpcBridge {
     /// for work on another thread.
     pub fn client_lookup(&self) -> crate::avatar::assets::ClientLookup {
         let live = Arc::clone(&self.live);
-        Arc::new(move || live.lock().unwrap().as_ref().map(|l| Arc::clone(&l.client)))
+        Arc::new(move || {
+            live.lock()
+                .unwrap()
+                .as_ref()
+                .map(|l| Arc::clone(&l.client) as Arc<dyn crate::avatar::assets::AvatarEditor>)
+        })
     }
 
     /// Send a chat turn in the open session, declaring what this client
