@@ -5,6 +5,8 @@
 
 use std::time::Duration;
 
+use crate::avatar::ActiveRenderer;
+
 const BASE: Duration = Duration::from_secs(3);
 const PER_CHAR: Duration = Duration::from_millis(60);
 const LONGEST: Duration = Duration::from_secs(20);
@@ -44,9 +46,70 @@ pub fn content(sending: bool, bubble: Option<&Bubble>, now: Duration) -> Option<
         .map(|b| BubbleContent::Reply(b.text.clone()))
 }
 
+/// Why no character shows, which the bubble says while nothing else is
+/// in it (spec, error handling). The placeholder stands in for each.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Absence {
+    /// The avatar has nothing for the display mode: none is set up, or not
+    /// the section the mode asks for.
+    NotSetUp,
+    /// No avatar has synced yet, and the latest sync failed so.
+    NotFetched(String),
+    /// The chosen renderer cannot draw the avatar, so.
+    CannotDraw(String),
+}
+
+/// What keeps the character from showing: the renderer's error, else the
+/// placeholder being chosen, and then the sync's error if no avatar has
+/// synced (`loaded`) yet. `None` while a renderer draws it.
+pub fn absence(
+    active: ActiveRenderer,
+    renderer_error: Option<&str>,
+    loaded: bool,
+    sync_error: Option<&str>,
+) -> Option<Absence> {
+    if let Some(error) = renderer_error {
+        return Some(Absence::CannotDraw(error.to_owned()));
+    }
+    if active != ActiveRenderer::Placeholder {
+        return None;
+    }
+    Some(match sync_error {
+        Some(error) if !loaded => Absence::NotFetched(error.to_owned()),
+        _ => Absence::NotSetUp,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_bubble_says_why_no_character_shows() {
+        use ActiveRenderer::{Placeholder, Sprite};
+        // A renderer drawing: nothing to say.
+        assert_eq!(absence(Sprite, None, true, None), None);
+        assert_eq!(absence(Sprite, None, true, Some("offline")), None);
+        // A renderer that cannot draw says why, whatever the sync did.
+        assert_eq!(
+            absence(Sprite, Some("bad png"), true, Some("offline")),
+            Some(Absence::CannotDraw("bad png".into()))
+        );
+        // The placeholder: why there is no avatar.
+        assert_eq!(
+            absence(Placeholder, None, true, None),
+            Some(Absence::NotSetUp)
+        );
+        assert_eq!(
+            absence(Placeholder, None, false, Some("offline")),
+            Some(Absence::NotFetched("offline".into()))
+        );
+        // A sync failing after one succeeded keeps the avatar it had.
+        assert_eq!(
+            absence(Placeholder, None, true, Some("offline")),
+            Some(Absence::NotSetUp)
+        );
+    }
 
     #[test]
     fn duration_grows_with_text_and_is_clamped() {

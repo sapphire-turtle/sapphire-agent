@@ -2,11 +2,25 @@
 //! painted by egui in `Order::Background`, beneath the companion overlay.
 //! It follows the renderer contract like the real renderers, declaring no
 //! cues so the agent offers no avatar tools.
+//!
+//! It draws while it is the chosen renderer, and also while the chosen one
+//! reports a [`RendererError`] ([`stands_in`]): that renderer then draws
+//! nothing and the silhouette's bounds stand for the avatar's.
 
 use bevy::prelude::*;
 use bevy_egui::{EguiContexts, egui};
 
-use super::{AvatarBounds, DeclaredAvatar};
+use super::{ActiveRenderer, AvatarBounds, DeclaredAvatar, RendererError};
+
+/// Run condition: the placeholder draws, being the chosen renderer or
+/// standing in for one that cannot draw.
+pub fn stands_in(active: Res<ActiveRenderer>, error: Res<RendererError>) -> bool {
+    stands_in_for(*active, error.0.is_some())
+}
+
+fn stands_in_for(active: ActiveRenderer, renderer_failed: bool) -> bool {
+    active == ActiveRenderer::Placeholder || renderer_failed
+}
 
 /// Share of the window's height the silhouette stands.
 const HEIGHT: f32 = 0.8;
@@ -85,6 +99,14 @@ pub(crate) fn draw(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_placeholder_stands_in_for_a_renderer_that_cannot_draw() {
+        assert!(stands_in_for(ActiveRenderer::Placeholder, false));
+        assert!(!stands_in_for(ActiveRenderer::Sprite, false));
+        assert!(stands_in_for(ActiveRenderer::Sprite, true));
+        assert!(stands_in_for(ActiveRenderer::Vrm, true));
+    }
 
     #[test]
     fn the_silhouette_stands_centred_on_the_bottom_at_80_percent_height() {

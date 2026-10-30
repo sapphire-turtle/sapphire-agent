@@ -11,9 +11,11 @@ use bevy::prelude::*;
 use bevy_egui::{EguiContexts, egui};
 use sapphire_agent_core::ClientCaps;
 
-use super::bubble::{self, BubbleContent};
+use super::bubble::{self, Absence, BubbleContent};
 use super::{CompanionPrefs, CompanionRequest, Gesture, Overlay, OverlayInput, Speech};
-use crate::avatar::{ActiveRenderer, AvatarBounds, AvatarState, DeclaredAvatar, RendererError};
+use crate::avatar::{
+    ActiveRenderer, AvatarAssets, AvatarBounds, AvatarState, DeclaredAvatar, RendererError,
+};
 use crate::chat::{ChatBridge, ChatEntry, ChatRole, ChatState, Session, TurnState};
 use crate::settings::{GuiSettings, Layout, Screen};
 
@@ -50,6 +52,7 @@ pub(crate) struct Avatar<'w> {
     bounds: Res<'w, AvatarBounds>,
     active: Res<'w, ActiveRenderer>,
     error: Res<'w, RendererError>,
+    assets: Res<'w, AvatarAssets>,
 }
 
 /// The overlay's own state, beyond what [`Overlay`] holds.
@@ -103,10 +106,14 @@ pub(crate) fn ui(
         parts.speech.bubble.as_ref(),
         parts.time.elapsed(),
     );
-    let no_character = *avatar.active == ActiveRenderer::Placeholder
-        && chat.turn == TurnState::Idle
-        && content.is_none();
-    if content.is_some() || no_character || failed.is_some() || layout.banner {
+    let absence = bubble::absence(
+        *avatar.active,
+        avatar.error.0.as_deref(),
+        avatar.assets.loaded.is_some(),
+        avatar.assets.error.as_deref(),
+    )
+    .filter(|_| chat.turn == TurnState::Idle && content.is_none());
+    if content.is_some() || absence.is_some() || failed.is_some() || layout.banner {
         let (at, pivot) = match body {
             Some(body) => (
                 egui::pos2(body.center().x, body.top() - GAP),
@@ -144,25 +151,32 @@ pub(crate) fn ui(
                         Some(BubbleContent::Reply(text)) => {
                             ui.label(text);
                         }
-                        None if no_character => {
-                            ui.label("No character is set up yet");
-                            if let Some(error) = &avatar.error.0 {
-                                ui.label(
-                                    egui::RichText::new(error)
-                                        .small()
-                                        .color(ui.visuals().error_fg_color),
-                                );
-                            }
-                            if let Some(settings) = settings.as_mut()
-                                && ui.button("Character settings").clicked()
-                            {
-                                // Settings can't be told to open on a page (only About), so
-                                // the Character page is one click away.
-                                settings.open = true;
-                                ui.ctx().request_repaint();
-                            }
-                        }
                         None => {}
+                    }
+                    if let Some(absence) = &absence {
+                        let (headline, reason) = match absence {
+                            Absence::NotSetUp => ("No character is set up yet", None),
+                            Absence::NotFetched(e) => {
+                                ("Cannot fetch the character from the agent", Some(e))
+                            }
+                            Absence::CannotDraw(e) => ("Cannot draw the character", Some(e)),
+                        };
+                        ui.label(headline);
+                        if let Some(reason) = reason {
+                            ui.label(
+                                egui::RichText::new(reason)
+                                    .small()
+                                    .color(ui.visuals().error_fg_color),
+                            );
+                        }
+                        if let Some(settings) = settings.as_mut()
+                            && ui.button("Character settings").clicked()
+                        {
+                            // Settings can't be told to open on a page (only About), so
+                            // the Character page is one click away.
+                            settings.open = true;
+                            ui.ctx().request_repaint();
+                        }
                     }
                 });
             });

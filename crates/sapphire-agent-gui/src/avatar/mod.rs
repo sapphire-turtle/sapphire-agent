@@ -54,7 +54,10 @@ pub struct DeclaredAvatar(pub Option<AvatarCaps>);
 pub struct AvatarBounds(pub Option<Rect>);
 
 /// Why the active renderer cannot draw the avatar, for the settings page
-/// and the speech bubble.
+/// and the speech bubble. While it is set the renderer draws nothing,
+/// declares nothing and leaves [`AvatarBounds`] alone: the placeholder
+/// stands in ([`placeholder::stands_in`]). The renderer clears it when a
+/// (re)load succeeds, then declares and bounds what it draws.
 #[derive(Resource, Default)]
 pub struct RendererError(pub Option<String>);
 
@@ -124,7 +127,7 @@ impl Plugin for AvatarPlugin {
             .add_systems(
                 EguiPrimaryContextPass,
                 placeholder::draw
-                    .run_if(renderer_is(ActiveRenderer::Placeholder))
+                    .run_if(placeholder::stands_in)
                     // In the theme the settings just applied, and before the
                     // gestures hit-test against the bounds it reports. Its
                     // area is `Order::Background` and the overlay's above

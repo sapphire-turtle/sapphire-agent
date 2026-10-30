@@ -99,7 +99,10 @@ pub(crate) struct CharacterModel {
     config: Option<AvatarConfig>,
     files: Option<BTreeMap<String, PathBuf>>,
     generation: Option<u64>,
+    /// The renderer's error.
     error: Option<String>,
+    /// Why the latest sync of the avatar failed.
+    sync_error: Option<String>,
     active: ActiveRenderer,
     /// `None` only in a `Default` model, which has no agent and no panels
     /// to draw; the page's model always has one.
@@ -116,6 +119,7 @@ impl Default for CharacterModel {
             files: None,
             generation: None,
             error: None,
+            sync_error: None,
             active: ActiveRenderer::Placeholder,
             ops: None,
             panels: Vec::new(),
@@ -167,6 +171,9 @@ impl CharacterModel {
         if self.error.as_deref() != error {
             self.error = error.map(str::to_owned);
         }
+        if self.sync_error != assets.error {
+            self.sync_error.clone_from(&assets.error);
+        }
         self.active = active;
     }
 
@@ -200,8 +207,17 @@ impl CharacterModel {
             ui.ctx().request_repaint();
         }
 
+        if let Some(error) = &self.sync_error {
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                format!("Cannot fetch the character from the agent: {error}"),
+            );
+        }
         if let Some(error) = &self.error {
-            ui.colored_label(ui.visuals().error_fg_color, error);
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                format!("Cannot draw the character: {error}"),
+            );
         }
         if let Some(ops) = &self.ops {
             let OpsStatus { busy, errors } = ops.status();
@@ -335,6 +351,32 @@ mod tests {
         model.refresh(&newer, &assets, None, active);
         assert_eq!(model.prefs, newer, "idle, the resource's prefs show");
         assert_eq!(model.take_prefs_edit(), None);
+    }
+
+    #[test]
+    fn the_page_shows_why_the_avatar_did_not_sync() {
+        let mut model = CharacterModel::default();
+        let mut assets = AvatarAssets::default();
+        assets.apply(Err(anyhow::anyhow!("offline")));
+        model.refresh(
+            &CompanionPrefs::default(),
+            &assets,
+            None,
+            ActiveRenderer::Placeholder,
+        );
+        assert_eq!(model.sync_error.as_deref(), Some("offline"));
+
+        assets.apply(Ok(crate::avatar::LoadedAvatar {
+            config: Default::default(),
+            files: Default::default(),
+        }));
+        model.refresh(
+            &CompanionPrefs::default(),
+            &assets,
+            None,
+            ActiveRenderer::Placeholder,
+        );
+        assert_eq!(model.sync_error, None, "a sync that succeeds clears it");
     }
 
     #[test]
