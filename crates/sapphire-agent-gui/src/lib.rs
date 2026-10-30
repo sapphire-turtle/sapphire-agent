@@ -130,7 +130,6 @@ impl Plugin for AgentGuiPlugin {
             .insert_resource(GuiRuntime(runtime))
             .insert_resource(GuiWaker(waker))
             .insert_resource(avatar_sync)
-            .insert_resource(avatar::AvatarAssets::default())
             .insert_resource(chat::SyncRequested::default())
             .insert_resource(chat::ChatState::new())
             .insert_resource(chat::ChatBridge(bridge))

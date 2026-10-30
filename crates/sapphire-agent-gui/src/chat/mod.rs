@@ -50,7 +50,7 @@ pub(crate) fn drain_bridge_events(
     mut avatar: ResMut<AvatarState>,
     queue: Res<BridgeEventQueue>,
     mut sync: ResMut<SyncRequested>,
-    prefs: Res<CompanionPrefs>,
+    prefs: Option<Res<CompanionPrefs>>,
     time: Res<Time<Real>>,
     runtime: Res<GuiRuntime>,
     waker: Res<GuiWaker>,
@@ -58,7 +58,9 @@ pub(crate) fn drain_bridge_events(
     let Ok(mut rx) = queue.0.lock() else {
         return;
     };
-    let revert_after = Duration::from_secs(prefs.revert_secs.into());
+    let revert_secs =
+        prefs.map_or_else(|| CompanionPrefs::default().revert_secs, |p| p.revert_secs);
+    let revert_after = Duration::from_secs(revert_secs.into());
     while let Ok(evt) = rx.try_recv() {
         match &evt {
             BridgeEvent::SessionReady { .. } => sync.0 = true,

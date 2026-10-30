@@ -60,7 +60,14 @@ impl AvatarState {
         self.pending_action = Some(name.into());
     }
 
-    /// The action to play, handed out once.
+    /// The action waiting to be played, left in place: for a renderer that
+    /// checks it can play it before taking it. Needs only `Res`.
+    pub fn pending_action(&self) -> Option<&str> {
+        self.pending_action.as_deref()
+    }
+
+    /// The action to play, handed out once. Needs `ResMut`, so take it only
+    /// when playing it: the change it makes is one renderers react to.
     pub fn take_action(&mut self) -> Option<String> {
         self.pending_action.take()
     }
@@ -131,7 +138,10 @@ mod tests {
         let mut state = AvatarState::new();
         assert_eq!(state.take_action(), None);
         state.action("wave");
+        assert_eq!(state.pending_action(), Some("wave"), "a peek leaves it");
+        assert_eq!(state.pending_action(), Some("wave"));
         assert_eq!(state.take_action().as_deref(), Some("wave"));
+        assert_eq!(state.pending_action(), None);
         assert_eq!(state.take_action(), None);
     }
 

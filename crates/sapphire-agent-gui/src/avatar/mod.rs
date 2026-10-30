@@ -5,14 +5,73 @@
 //! # The renderer contract (spec §14)
 //!
 //! Each renderer is one bevy plugin whose systems run only while
-//! [`ActiveRenderer`] names it ([`renderer_is`]). It reads [`AvatarState`],
-//! [`AvatarAssets`] and the cached files, and writes [`DeclaredAvatar`],
-//! [`AvatarBounds`] and [`RendererError`]. A renderer that needs a scene
-//! camera spawns its own, at an `order` below [`UI_CAMERA_ORDER`] and with
+//! [`ActiveRenderer`] names it ([`renderer_is`]), after
+//! [`AvatarSystems::Choose`]. The renderers know nothing of each other, and
+//! nothing outside them knows what they draw. [`placeholder`] follows the
+//! same contract.
+//!
+//! **Reads.** [`AvatarState`]: what to show. Read it with `Res`; react to
+//! `is_changed()`, which the GUI keeps for real changes. Peek at the
+//! action with [`AvatarState::pending_action`] and take
+//! [`AvatarState::take_action`] (`ResMut`) only when playing it.
+//! [`AvatarAssets`]: the synced config, and the cached files, which load
+//! through bevy's `AssetServer` from [`LoadedAvatar::asset_path`] (never the
+//! absolute paths); reload when its `generation` changes.
+//!
+//! **Writes.** [`DeclaredAvatar`]: the cues it loaded and can show.
+//! [`AvatarBounds`]: where the avatar is. [`RendererError`]: why it cannot
+//! draw; while set, it draws, declares and bounds nothing and the
+//! placeholder stands in, and it clears it when a (re)load succeeds. Write
+//! each only when the value differs (`set_if_neq`, or compare first): other
+//! systems react to their change.
+//!
+//! **Bounds timing.** The gestures and click-through hit-test
+//! [`AvatarBounds`] in the egui pass (`PostUpdate`), so a renderer writes
+//! them in the same frame, before it: one measuring its scene writes them
+//! in [`AvatarSystems::Bounds`] (`PostUpdate`, after transforms propagate
+//! and cameras update); one drawing in egui, as the placeholder does,
+//! writes them in `EguiPrimaryContextPass` before
+//! `companion::pointer_input`. There is no frame of lag to allow for.
+//!
+//! **Cameras.** A renderer that needs a scene camera spawns its own, at an
+//! `order` below [`UI_CAMERA_ORDER`] and with
 //! `ClearColorConfig::Custom(Color::NONE)`, and despawns it when it stops
-//! being chosen. The renderers know nothing of each other, and nothing
-//! outside them knows what they draw. [`placeholder`] follows the same
-//! contract.
+//! being chosen. [`ActiveRenderer`] is a resource, not a `State`, so there
+//! is no `OnExit`: the teardown is a system *without* the `renderer_is`
+//! gate, run when the choice changes:
+//!
+//! ```ignore
+//! app.add_systems(
+//!     Update,
+//!     despawn_sprite_camera
+//!         .run_if(resource_changed::<ActiveRenderer>)
+//!         .after(AvatarSystems::Choose),
+//! );
+//!
+//! fn despawn_sprite_camera(
+//!     active: Res<ActiveRenderer>,
+//!     cameras: Query<Entity, With<SpriteCamera>>,
+//!     mut commands: Commands,
+//! ) {
+//!     if *active != ActiveRenderer::Sprite {
+//!         for camera in &cameras {
+//!             commands.entity(camera).despawn();
+//!         }
+//!     }
+//! }
+//! ```
+//!
+//! The UI camera sees no render layer, so the renderer's entities are drawn
+//! by its camera alone, whatever layer they are on.
+//!
+//! **Frame pacing.** The GUI runs under `WinitSettings::desktop_app()`: a
+//! frame comes only on input, a [`crate::Waker`] call or a redraw request.
+//! A renderer asks for frames only while it animates (a transition, an
+//! action, an idle loop): a `RequestRedraw` message each frame for full
+//! rate, or, where fewer frames do, a [`crate::GuiWaker`] call after a
+//! timer on the [`crate::GuiRuntime`] (`tokio::time::sleep`, then the
+//! waker) to cap it. A still avatar asks for none, so an idle companion
+//! draws no frames.
 
 pub mod assets;
 pub mod mode;
@@ -24,8 +83,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bevy::camera::visibility::RenderLayers;
-use bevy::camera::{NormalizedRenderTarget, RenderTarget};
+use bevy::camera::{CameraUpdateSystems, NormalizedRenderTarget, RenderTarget};
 use bevy::prelude::*;
+use bevy::transform::TransformSystems;
 use bevy::window::PrimaryWindow;
 use bevy_egui::{EguiGlobalSettings, EguiPrimaryContextPass, PrimaryEguiContext};
 use sapphire_agent_core::AvatarCaps;
@@ -68,6 +128,19 @@ pub const UI_CAMERA_ORDER: isize = 100;
 /// Marks the GUI's own camera, the one carrying the primary egui context.
 #[derive(Component)]
 pub struct UiCamera;
+
+/// Where the avatar's shared systems run, for renderers to order against.
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AvatarSystems {
+    /// `Update`: the renderer is chosen for the avatar that synced and the
+    /// state reverts when due. A renderer's `Update` systems go `.after`
+    /// it, so they see this frame's choice.
+    Choose,
+    /// `PostUpdate`, after transform propagation and the camera update and
+    /// before the egui pass: where a renderer measuring its scene writes
+    /// [`AvatarBounds`] for the frame's gestures.
+    Bounds,
+}
 
 /// Registers the [`assets::ASSET_SOURCE`] asset source, rooted at the
 /// avatar cache, so renderers can load cached files through bevy's
@@ -117,13 +190,29 @@ impl Plugin for AvatarPlugin {
             .init_resource::<DeclaredAvatar>()
             .init_resource::<AvatarBounds>()
             .init_resource::<RendererError>()
+            .init_resource::<AvatarAssets>()
+            // The defaults until `CompanionPlugin` loads the saved ones, or
+            // for good in an app without it.
+            .init_resource::<CompanionPrefs>()
+            .configure_sets(Update, AvatarSystems::Choose.after(drain_sync))
+            .configure_sets(
+                PostUpdate,
+                AvatarSystems::Bounds
+                    .after(TransformSystems::Propagate)
+                    .after(CameraUpdateSystems)
+                    .before(bevy_egui::EguiPostUpdateSet::EndPass),
+            )
             .add_systems(Startup, spawn_ui_camera)
             .add_systems(
                 Update,
-                (choose_renderer, tick_state, clear_without_scene)
+                (choose_renderer, tick_state)
                     .chain()
-                    .after(drain_sync),
+                    .in_set(AvatarSystems::Choose),
             )
+            // After `Update`'s commands, so a camera a renderer spawned or
+            // despawned this frame counts; before rendering picks up the
+            // clear colour.
+            .add_systems(PostUpdate, clear_without_scene)
             .add_systems(
                 EguiPrimaryContextPass,
                 placeholder::draw
@@ -350,6 +439,20 @@ mod tests {
         async fn fetch(&self, _: &str) -> anyhow::Result<Vec<u8>> {
             unreachable!()
         }
+    }
+
+    #[test]
+    fn the_avatar_plugin_runs_without_the_companion_plugin() {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AvatarPlugin));
+        // Its `Update` systems read the prefs, which only the companion
+        // plugin loaded before; it now starts from the defaults.
+        app.update();
+        assert!(app.world().contains_resource::<CompanionPrefs>());
+        assert_eq!(
+            *app.world().resource::<ActiveRenderer>(),
+            ActiveRenderer::Placeholder
+        );
     }
 
     #[test]
