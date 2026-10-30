@@ -76,6 +76,11 @@ pub enum CompanionRequest {
     Quit,
 }
 
+/// Where in `PostUpdate` the overlay runs: bevy_egui's pass. A system that
+/// acts on this frame's [`PointerWanted`] or [`CompanionRequest`]s goes
+/// `.after` it.
+pub const OVERLAY_PASS: bevy_egui::EguiPostUpdateSet = bevy_egui::EguiPostUpdateSet::EndPass;
+
 /// Whether the window should take the pointer where it is now: on the
 /// avatar or on the overlay's egui. Written every frame (changed only when
 /// it flips) for the desktop presenter, which lets the pointer through to
@@ -83,12 +88,31 @@ pub enum CompanionRequest {
 #[derive(Resource, Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct PointerWanted(pub bool);
 
-/// The pointer in logical window pixels, when the app knows it better than
-/// the window does: a click-through window gets no cursor events, so the
-/// desktop presenter writes the global cursor here. `None`: the primary
-/// window's own cursor position is used.
+/// Where the pointer is, when the app knows it better than the window
+/// does: a click-through window gets no cursor events, so the desktop
+/// presenter writes the global cursor here.
 #[derive(Resource, Clone, Copy, Default, Debug, PartialEq)]
-pub struct CursorOverride(pub Option<Vec2>);
+pub enum CursorOverride {
+    /// No override: the primary window's own cursor position is used.
+    #[default]
+    None,
+    /// Outside the window, whatever the window last saw.
+    Outside,
+    /// At this point, in logical window pixels.
+    At(Vec2),
+}
+
+impl CursorOverride {
+    /// The pointer in logical window pixels, given what the window itself
+    /// reports (`window`); `None` when it is not over the window.
+    pub fn resolve(self, window: impl FnOnce() -> Option<Vec2>) -> Option<Vec2> {
+        match self {
+            Self::None => window(),
+            Self::Outside => None,
+            Self::At(pos) => Some(pos),
+        }
+    }
+}
 
 /// What the latest pointer input meant for the view.
 #[derive(Resource, Default)]
@@ -230,8 +254,7 @@ pub(crate) struct Pointer<'w, 's> {
 impl Pointer<'_, '_> {
     fn cursor(&self) -> Option<Vec2> {
         self.cursor_override
-            .0
-            .or_else(|| self.window.single().ok()?.cursor_position())
+            .resolve(|| self.window.single().ok()?.cursor_position())
     }
 }
 
@@ -346,6 +369,15 @@ mod tests {
 
     use super::*;
     use crate::chat::{BridgeEvent, ChatState, Session};
+
+    #[test]
+    fn a_cursor_outside_never_falls_back_to_the_window() {
+        let stale = || Some(Vec2::new(5.0, 5.0));
+        assert_eq!(CursorOverride::None.resolve(stale), stale());
+        assert_eq!(CursorOverride::Outside.resolve(stale), None);
+        let at = Vec2::new(1.0, 2.0);
+        assert_eq!(CursorOverride::At(at).resolve(stale), Some(at));
+    }
 
     #[test]
     fn gestures_open_and_close_the_overlay() {

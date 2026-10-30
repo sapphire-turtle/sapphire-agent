@@ -34,9 +34,9 @@ pub struct AgentGuiPlugin {
     /// How often bevy updates, when the app knows better than the GUI.
     /// `None`: [`bevy::winit::WinitSettings::desktop_app`], which idles
     /// while nothing happens (input, egui's own repaint requests and the
-    /// [`Waker`] bring the next frame). A window that has to watch the
-    /// pointer while it gets no events of its own (the desktop companion,
-    /// click-through) polls instead.
+    /// [`Waker`] bring the next frame). The desktop companion keeps it: its
+    /// pointer poller wakes the GUI through the [`Waker`] rather than
+    /// polling with frames.
     pub update_mode: Option<bevy::winit::WinitSettings>,
 }
 
