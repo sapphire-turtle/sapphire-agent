@@ -12,6 +12,7 @@
 //! nothing here is `cfg(target_os)`.
 
 mod app;
+pub mod avatar;
 pub mod chat;
 pub mod settings;
 
@@ -35,7 +36,15 @@ impl Plugin for AgentGuiPlugin {
             // Idle while nothing happens: input, egui's own repaint
             // requests and the `Waker` are what bring the next frame.
             .insert_resource(bevy::winit::WinitSettings::desktop_app())
-            .add_systems(Update, chat::drain_bridge_events)
+            .add_systems(
+                Update,
+                (
+                    chat::drain_bridge_events,
+                    avatar::poll_sync,
+                    avatar::drain_sync,
+                )
+                    .chain(),
+            )
             .add_systems(
                 EguiPrimaryContextPass,
                 // The look store and the settings' per-frame work come
@@ -76,8 +85,13 @@ impl Plugin for AgentGuiPlugin {
             app.insert_non_send(settings);
         }
 
+        let avatar_sync = avatar::AvatarSync::new(runtime.handle().clone(), waker.clone());
+
         app.insert_resource(GuiRuntime(runtime))
             .insert_resource(GuiWaker(waker))
+            .insert_resource(avatar_sync)
+            .insert_resource(avatar::AvatarAssets::default())
+            .insert_resource(chat::SyncRequested::default())
             .insert_resource(chat::ChatState::new())
             .insert_resource(chat::ChatBridge(bridge))
             .insert_resource(chat::BridgeEventQueue::new(events));

@@ -30,13 +30,25 @@ impl BridgeEventQueue {
     }
 }
 
+/// Set when a session opens: the avatar should be synced now rather than
+/// at the next poll. Whoever syncs clears it.
+#[derive(Resource, Default)]
+pub struct SyncRequested(pub bool);
+
 /// Drains every event the tokio side has produced this frame and
 /// folds it into `ChatState`. Idempotent if the queue is empty.
-pub(crate) fn drain_bridge_events(mut state: ResMut<ChatState>, queue: Res<BridgeEventQueue>) {
+pub(crate) fn drain_bridge_events(
+    mut state: ResMut<ChatState>,
+    queue: Res<BridgeEventQueue>,
+    mut sync: ResMut<SyncRequested>,
+) {
     let Ok(mut rx) = queue.0.lock() else {
         return;
     };
     while let Ok(evt) = rx.try_recv() {
+        if matches!(evt, BridgeEvent::SessionReady { .. }) {
+            sync.0 = true;
+        }
         state.apply(evt);
     }
 }

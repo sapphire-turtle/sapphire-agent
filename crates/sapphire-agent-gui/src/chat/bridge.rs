@@ -136,6 +136,16 @@ impl RpcBridge {
         });
     }
 
+    /// The live connection, once there is one. Other work on the same
+    /// agent (the avatar sync) shares it.
+    pub fn client(&self) -> Option<Arc<ChatClient>> {
+        self.live
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|l| Arc::clone(&l.client))
+    }
+
     /// Send a chat turn in the open session.
     pub fn submit_chat(&self, content: String) {
         let live = self
