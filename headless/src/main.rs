@@ -4,9 +4,9 @@
 
 use anyhow::Result;
 use clap::Parser as _;
-use sapphire_agent_cli::Cli;
+use sapphire_agent_cli::{Cli, Edition};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    sapphire_agent_cli::run(cli.options, cli.command)
+    sapphire_agent_cli::run(cli.options, cli.command, Edition::Headless)
 }

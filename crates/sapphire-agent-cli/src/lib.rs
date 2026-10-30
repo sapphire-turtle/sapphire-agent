@@ -19,6 +19,8 @@ use clap::{Args, Parser, Subcommand};
 use sapphire_framework::server::FrameworkCommand;
 use tracing_subscriber::{EnvFilter, fmt};
 
+pub use sapphire_agent_server::Edition;
+
 #[derive(Parser)]
 #[command(
     name = "sapphire-agent",
@@ -95,9 +97,9 @@ pub enum Command {
     Framework(FrameworkCommand),
 }
 
-/// Run one command, exiting the process with its code when a framework verb
-/// fails with one.
-pub fn run(options: Options, command: Command) -> Result<()> {
+/// Run one command as `edition`, exiting the process with its code when a
+/// framework verb fails with one.
+pub fn run(options: Options, command: Command, edition: Edition) -> Result<()> {
     fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -120,10 +122,10 @@ pub fn run(options: Options, command: Command) -> Result<()> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(dispatch(options, command))
+        .block_on(dispatch(options, command, edition))
 }
 
-async fn dispatch(options: Options, command: Command) -> Result<()> {
+async fn dispatch(options: Options, command: Command, edition: Edition) -> Result<()> {
     match command {
         Command::Init { .. } => unreachable!("`init` is dispatched ahead of the runtime"),
         // A relay to the running agent, which holds the config: nothing to
@@ -149,7 +151,7 @@ async fn dispatch(options: Options, command: Command) -> Result<()> {
         Command::Verify => sapphire_agent_server::verify(options.config).await,
         // What the service manager starts.
         Command::Framework(FrameworkCommand::Serve) => {
-            sapphire_agent_server::serve(options.config, options.bind).await
+            sapphire_agent_server::serve(options.config, options.bind, edition).await
         }
         // The framework's other verbs talk to the running server (which
         // relays the bridge's), and need no agent config either.
@@ -164,7 +166,9 @@ async fn dispatch(options: Options, command: Command) -> Result<()> {
                 .dispatch(
                     &sapphire_agent_server::APP_CTX,
                     (),
-                    |_: &sapphire_framework::server::Settings| sapphire_agent_server::build(),
+                    |_: &sapphire_framework::server::Settings| {
+                        sapphire_agent_server::build(edition)
+                    },
                     sapphire_agent_server::VERSION,
                 )
                 .await?;

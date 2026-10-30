@@ -76,9 +76,9 @@ fn adopt_into(file: &SelectionFile, dir: &Path) -> Result<PathBuf> {
 /// `workspace`, `external-device` and the rest read only the app name and
 /// the service spec from it and talk to the running server or the bridge
 /// themselves.
-pub fn build() -> AppServer {
+pub fn build(edition: Edition) -> AppServer {
     AppServer::new(&APP_CTX, VERSION)
-        .releases(release_source())
+        .releases(edition.releases())
         .app_api(crate::serve::acp_tunnel::APP_API)
 }
 
@@ -183,6 +183,7 @@ pub async fn serve_without_agent(
     error: anyhow::Error,
     host_config: &Path,
     selected: Option<&Path>,
+    edition: Edition,
 ) -> Result<()> {
     tracing::error!("{error:#}");
     tracing::warn!(
@@ -194,7 +195,7 @@ pub async fn serve_without_agent(
     );
 
     let shutdown = CancellationToken::new();
-    let (server, _sync) = with_sync(build())?;
+    let (server, _sync) = with_sync(build(edition))?;
     let host = Arc::clone(server.host());
     let server_task = {
         let shutdown = shutdown.clone();
@@ -239,12 +240,30 @@ fn config_contents(host_config: &Path, root: Option<&Path>) -> [Option<Vec<u8>>;
     ]
 }
 
-/// Where the app's releases are published: what `update` installs from, and where the
-/// server looks once a day for a newer one.
-fn release_source() -> ReleaseSource {
-    ReleaseSource::github("sapphire-turtle", "sapphire-agent")
-        .asset("sapphire-agent")
-        .cargo_crate("sapphire-agent")
+/// Which edition runs the server: the release file `update` installs is the
+/// edition's own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Edition {
+    /// `sapphire-agent-headless`, the command line alone.
+    Headless,
+    /// `sapphire-agent-desktop`, the desktop app.
+    Desktop,
+}
+
+impl Edition {
+    /// Where the edition's releases are published: what `update` installs
+    /// from, and where the server looks once a day for a newer one. Both are
+    /// in the shared `v{version}` release (release-binaries.yml), as
+    /// `<crate>-<os>-<arch>`; only the headless edition is on crates.io.
+    pub fn releases(self) -> ReleaseSource {
+        let source = ReleaseSource::github("sapphire-turtle", "sapphire-agent");
+        match self {
+            Edition::Headless => source
+                .asset("sapphire-agent-headless")
+                .cargo_crate("sapphire-agent-headless"),
+            Edition::Desktop => source.asset("sapphire-agent-desktop"),
+        }
+    }
 }
 
 #[cfg(test)]

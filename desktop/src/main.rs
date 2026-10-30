@@ -14,7 +14,7 @@
 
 use bevy::prelude::*;
 use clap::Parser;
-use sapphire_agent_cli::{Command, Options};
+use sapphire_agent_cli::{Command, Edition, Options};
 use sapphire_agent_gui::{AgentGuiPlugin, AppIdentity};
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -37,7 +37,7 @@ struct DesktopCli {
 fn main() -> anyhow::Result<()> {
     let cli = DesktopCli::parse();
     match cli.command {
-        Some(command) => sapphire_agent_cli::run(cli.options, command),
+        Some(command) => sapphire_agent_cli::run(cli.options, command, Edition::Desktop),
         None => {
             window();
             Ok(())

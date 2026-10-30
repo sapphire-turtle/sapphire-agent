@@ -25,7 +25,7 @@ sapphire-agent-server = { path = "../sapphire-agent-server", version = "0.12.0",
 sapphire-agent-core = { path = "../sapphire-agent-core", version = "0.10.0" }
 # The framework's verbs (`serve`, `status`, `workspace`, …), which sit beside
 # the agent's own at the top level.
-sapphire-framework = { version = "0.22.0", default-features = false, features = ["server"] }
+sapphire-framework = { version = "0.23.0", default-features = false, features = ["server"] }
 clap.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 anyhow.workspace = true

@@ -69,7 +69,7 @@ pub static APP_CTX: AppContext = AppContext::new("sapphire-agent").allow_externa
 pub use app_server::VERSION;
 /// The server the framework's one-shot verbs (`status`, `workspace`, …)
 /// dispatch against.
-pub use app_server::build;
+pub use app_server::{Edition, build};
 
 /// Make ring rustls's process-wide crypto provider.
 ///
@@ -283,7 +283,10 @@ fn load_config(
 
 /// What [`run`] does once the config is loaded.
 enum Mode {
-    Serve { bind: Option<String> },
+    Serve {
+        bind: Option<String>,
+        edition: Edition,
+    },
     Verify,
 }
 
@@ -291,8 +294,8 @@ enum Mode {
 /// serves, until the server stops. `config` is the host config
 /// (default: ~/.config/sapphire-agent/config.toml); `bind` listens for HTTP
 /// on that address, overriding `[serve]`.
-pub async fn serve(config: Option<PathBuf>, bind: Option<String>) -> Result<()> {
-    run(config, Mode::Serve { bind }).await
+pub async fn serve(config: Option<PathBuf>, bind: Option<String>, edition: Edition) -> Result<()> {
+    run(config, Mode::Serve { bind, edition }).await
 }
 
 /// `verify`: validate the config and print what the agent would run with.
@@ -341,9 +344,9 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
         // server still has to be up: `workspace init --remote-workspace`
         // and the other workspace verbs are how a new host gets the
         // workspace its config lives in.
-        Err(e) if serving => {
+        Err(e) if let Mode::Serve { edition, .. } = mode => {
             let selected = selection.as_ref().map(|s| s.root.as_path());
-            return app_server::serve_without_agent(e, &config_path, selected).await;
+            return app_server::serve_without_agent(e, &config_path, selected, edition).await;
         }
         Err(e) => return Err(e),
     };
@@ -399,7 +402,7 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
     }
 
     match mode {
-        Mode::Serve { bind } => {
+        Mode::Serve { bind, edition } => {
             let workspace_dir = match &selection {
                 Some(selected) => selected.root.clone(),
                 None => {
@@ -460,7 +463,7 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
             // attached once built.
             let acp_tunnel = serve::acp_tunnel::AcpTunnel::default();
             let chat_tunnel = serve::chat_ipc::ChatTunnel::default();
-            let server = app_server::build().extend({
+            let server = app_server::build(edition).extend({
                 let acp = acp_tunnel.clone();
                 let chat = chat_tunnel.clone();
                 move |router| chat.router(acp.router(router))
