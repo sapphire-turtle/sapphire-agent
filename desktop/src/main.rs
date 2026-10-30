@@ -3,7 +3,9 @@
 //! A thin shell around [`sapphire_agent_gui::AgentGuiPlugin`], which owns
 //! the chat, its connection to the agent running on this host and the egui
 //! setup and the cameras. What stays here is what only a desktop has:
-//! logging and the window.
+//! logging and the companion's window ([`companion_window`]).
+
+mod companion_window;
 
 use bevy::prelude::*;
 use sapphire_agent_gui::{AgentGuiPlugin, AppIdentity};
@@ -18,11 +20,7 @@ fn main() {
 
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: "sapphire-agent-desktop".to_string(),
-                resolution: (640u32, 720u32).into(),
-                ..default()
-            }),
+            primary_window: Some(companion_window::window()),
             ..default()
         }))
         .add_plugins(AgentGuiPlugin {
@@ -30,6 +28,8 @@ fn main() {
                 app_name: "sapphire-agent",
                 version: env!("CARGO_PKG_VERSION"),
             },
+            update_mode: Some(companion_window::update_mode()),
         })
+        .add_plugins(companion_window::CompanionWindowPlugin)
         .run();
 }
