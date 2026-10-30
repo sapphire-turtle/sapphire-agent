@@ -1,63 +1,67 @@
 //! The desktop companion's window (spec §4): one transparent, borderless
-//! window that stays on top and out of the taskbar, holding the avatar and
-//! the overlay the GUI draws over it.
+//! window that stays on top, holding the avatar and the overlay the GUI
+//! draws over it.
 //!
 //! The window takes the pointer only where the GUI wants it ([`PointerWanted`]:
-//! on the avatar or on the overlay's egui), while a drag is under way, or
-//! while something of the overlay or the settings is open, so a click
-//! outside them reaches egui and closes them. Elsewhere `hit_test` is off
-//! and clicks reach whatever is beneath. A window that lets the pointer
-//! through gets no cursor events, so the global cursor is polled
-//! ([`device_query`]) and handed to the GUI as [`CursorOverride`]; that
-//! needs frames, which [`update_mode`] provides.
+//! on the avatar or on the overlay's egui, the input box included), while a
+//! drag is under way, or while the history, the menu or the settings are
+//! open, so a click outside them reaches egui and closes them. Elsewhere
+//! `hit_test` is off and clicks reach whatever is beneath. A window that
+//! lets the pointer through gets no cursor events, so [`GlobalPointer`]
+//! follows the pointer off bevy's thread and the window hands it to the GUI
+//! as [`CursorOverride`].
 //!
-//! Where the global cursor cannot be read (Wayland, or macOS without the
-//! accessibility permission) the window keeps taking the pointer: no
-//! click-through, but nothing lost either.
+//! Where the global pointer cannot be read (Wayland, macOS without the
+//! accessibility permission, no libX11) the window keeps taking the
+//! pointer: no click-through, but nothing lost either.
 //!
 //! The window goes where [`CompanionPrefs::window`] says, or to the
 //! primary monitor's bottom-right corner, and its place is saved once it
 //! has stopped moving.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bevy::prelude::*;
 use bevy::window::{
     CompositeAlphaMode, CursorOptions, Monitor, PrimaryMonitor, PrimaryWindow, RawHandleWrapper,
-    WindowLevel,
+    RequestRedraw, WindowLevel,
 };
-use bevy::winit::{UpdateMode, WinitSettings};
-use device_query::{DeviceQuery, DeviceState};
 use raw_window_handle::RawDisplayHandle;
-use sapphire_agent_gui::GuiSettings;
 use sapphire_agent_gui::companion::{
-    CompanionPrefs, CompanionRequest, CursorOverride, Overlay, PointerWanted, WindowPlacement,
+    CompanionPrefs, CompanionRequest, CursorOverride, OVERLAY_PASS, Overlay, PointerWanted,
+    WindowPlacement,
 };
+use sapphire_agent_gui::{GuiSettings, GuiWaker};
+
+use crate::global_pointer::{GlobalPointer, Status, WindowRect};
 
 /// The window's size, in logical pixels, until the user has placed it.
 pub const DEFAULT_SIZE: UVec2 = UVec2::new(420, 640);
 
-/// The gap, in physical pixels, between a newly placed window and the
+/// The gap, in logical pixels, between a newly placed window and the
 /// primary monitor's bottom-right corner.
-pub const MARGIN: i32 = 32;
-
-/// How often the window wakes to look at the global cursor.
-const POLL: Duration = Duration::from_millis(50);
+pub const MARGIN: u32 = 32;
 
 /// How long the window has to stay put before its place is saved.
 const SETTLE: Duration = Duration::from_millis(500);
+
+/// How long the window is held where it was placed while the window
+/// manager takes it on.
+const PLACEMENT_SETTLE: Duration = Duration::from_secs(2);
 
 /// How many frames to wait for winit to report the monitors before the
 /// window is placed without them.
 const MONITOR_WAIT_FRAMES: u32 = 10;
 
-/// A monitor's area on the desktop, in physical pixels.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A monitor's area on the desktop, in physical pixels, and its scale
+/// factor.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MonitorRect {
     pub x: i32,
     pub y: i32,
     pub width: u32,
     pub height: u32,
+    pub scale: f64,
 }
 
 impl MonitorRect {
@@ -66,28 +70,39 @@ impl MonitorRect {
         (left..left + i64::from(self.width)).contains(&x)
             && (top..top + i64::from(self.height)).contains(&y)
     }
+
+    /// `logical` pixels on this monitor, in physical ones.
+    fn physical(&self, logical: u32) -> u32 {
+        (f64::from(logical) * self.scale).round() as u32
+    }
 }
 
-/// Where the window goes: where it was saved if that is still on a
-/// monitor (pulled wholly onto it and no larger than it), else at the
-/// bottom-right of the primary monitor, `monitors[0]`, [`MARGIN`] in from
-/// its corner. `default_size` (physical pixels) is the size when nothing
-/// was saved. Without monitors to check against, the saved or default
-/// placement stands.
+/// Where the window goes, in physical pixels: where it was saved if that
+/// is still on a monitor (pulled wholly onto it and no larger than it),
+/// else at the bottom-right of the primary monitor, `monitors[0]`,
+/// [`MARGIN`] in from its corner. `default_size` (logical pixels, scaled by
+/// the primary monitor's factor) is the size when nothing was saved.
+/// Without monitors to check against, the saved or default placement
+/// stands.
 pub fn place_on_screen(
     saved: Option<WindowPlacement>,
     monitors: &[MonitorRect],
     default_size: UVec2,
 ) -> WindowPlacement {
+    let Some(primary) = monitors.first() else {
+        return saved.unwrap_or(WindowPlacement {
+            x: 0,
+            y: 0,
+            width: default_size.x,
+            height: default_size.y,
+        });
+    };
     let wanted = saved.unwrap_or(WindowPlacement {
         x: 0,
         y: 0,
-        width: default_size.x,
-        height: default_size.y,
+        width: primary.physical(default_size.x),
+        height: primary.physical(default_size.y),
     });
-    let Some(primary) = monitors.first() else {
-        return wanted;
-    };
     let center = |p: &WindowPlacement| {
         (
             i64::from(p.x) + i64::from(p.width / 2),
@@ -103,8 +118,9 @@ pub fn place_on_screen(
         None => {
             let width = wanted.width.min(primary.width);
             let height = wanted.height.min(primary.height);
+            let margin = i64::from(primary.physical(MARGIN));
             let corner = |start: i32, extent: u32, size: u32| {
-                (i64::from(start) + i64::from(extent) - i64::from(size) - i64::from(MARGIN))
+                (i64::from(start) + i64::from(extent) - i64::from(size) - margin)
                     .max(i64::from(start))
             };
             WindowPlacement {
@@ -142,6 +158,7 @@ pub fn window() -> Window {
         decorations: false,
         // Raised to `AlwaysOnTop` once placed: see `place_window`.
         window_level: WindowLevel::Normal,
+        // Honoured on Windows only.
         skip_taskbar: true,
         composite_alpha_mode: composite_alpha_mode(),
         ..default()
@@ -159,16 +176,6 @@ fn composite_alpha_mode() -> CompositeAlphaMode {
     }
 }
 
-/// How often bevy updates, for [`sapphire_agent_gui::AgentGuiPlugin`]:
-/// every [`POLL`] at the least, focused or not, so the global cursor is
-/// read while the window lets the pointer through and gets no events.
-pub fn update_mode() -> WinitSettings {
-    WinitSettings {
-        focused_mode: UpdateMode::reactive_low_power(POLL),
-        unfocused_mode: UpdateMode::reactive_low_power(POLL),
-    }
-}
-
 /// The window's behaviour on the desktop: placement, click-through, drag
 /// and the saving of its place. Add it with the GUI, with the primary
 /// window made by [`window`].
@@ -177,128 +184,218 @@ pub struct CompanionWindowPlugin;
 impl Plugin for CompanionWindowPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(ClearColor(Color::NONE))
-            .insert_non_send(GlobalPointer::Undecided)
-            .init_resource::<Placed>()
+            .init_resource::<Placement>()
             .init_resource::<Dragging>()
+            .init_resource::<Press>()
+            .init_resource::<Unflushed>()
+            .add_systems(First, flush_window_requests)
             .add_systems(
                 PreUpdate,
-                follow_global_cursor.after(bevy::input::InputSystems),
+                (start_global_pointer, follow_global_pointer, settle_press)
+                    .chain()
+                    .after(bevy::input::InputSystems),
             )
             .add_systems(Update, (place_window, save_placement).chain())
-            .add_systems(PostUpdate, (start_drag, take_pointer).chain());
-    }
-}
-
-/// The global cursor, where it can be read.
-enum GlobalPointer {
-    /// The window has no handle yet to tell the display server by.
-    Undecided,
-    /// The pointer cannot be read: the window always takes it.
-    Unavailable,
-    Polling {
-        device: DeviceState,
-        /// The primary button is down now, wherever the pointer is.
-        primary_down: bool,
-    },
-}
-
-impl GlobalPointer {
-    fn decide(display: RawDisplayHandle) -> Self {
-        if matches!(display, RawDisplayHandle::Wayland(_)) {
-            tracing::info!(
-                "Wayland does not tell a window where the pointer is outside it: \
-                 the companion window takes every click (no click-through)"
+            .add_systems(
+                PostUpdate,
+                (start_drag, take_pointer).chain().after(OVERLAY_PASS),
             );
-            return Self::Unavailable;
-        }
-        match DeviceState::checked_new() {
-            Some(device) => Self::Polling {
-                device,
-                primary_down: false,
-            },
-            None => {
-                tracing::warn!(
-                    "cannot read the global pointer: the companion window takes every click \
-                     (no click-through)"
-                );
-                Self::Unavailable
-            }
-        }
-    }
-
-    /// The primary button is down: from the global pointer when there is
-    /// one, which a press the window never saw released cannot fool.
-    fn primary_down(&self, buttons: &ButtonInput<MouseButton>) -> bool {
-        match self {
-            Self::Polling { primary_down, .. } => *primary_down,
-            _ => buttons.pressed(MouseButton::Left),
-        }
     }
 }
 
-/// The window has been put in its place.
+/// Where the window stands in being placed.
 #[derive(Resource, Default)]
-struct Placed(bool);
+enum Placement {
+    /// Waiting for the monitors.
+    #[default]
+    Pending,
+    /// Asked to go to `target`. A window manager that maps the window
+    /// after that may put it where it likes instead, so the request is
+    /// repeated until `until`, unless the user has moved it meanwhile.
+    Settling {
+        target: IVec2,
+        until: Instant,
+    },
+    Done,
+}
 
-/// A drag the window manager is carrying out, until the button comes up.
+/// A drag the window manager is carrying out, since when. Wall-clock
+/// instants, as the global pointer's samples are: bevy's frame time can lag
+/// behind after the app has idled.
 #[derive(Resource, Default)]
-struct Dragging(bool);
+struct Dragging(Option<Instant>);
 
-/// Reads the global cursor and hands it to the GUI in the window's logical
-/// pixels, `None` while it is outside the window.
-///
-/// Also lets go of a primary press the window will never see released:
-/// the window manager keeps the release that ends a drag of the window,
-/// and the press would otherwise stay down, swallowing the next one.
-fn follow_global_cursor(
-    mut pointer: NonSendMut<GlobalPointer>,
-    windows: Query<(&Window, Option<&RawHandleWrapper>), With<PrimaryWindow>>,
-    mut cursor: ResMut<CursorOverride>,
-    mut buttons: ResMut<ButtonInput<MouseButton>>,
-) {
-    let Ok((window, handle)) = windows.single() else {
-        return;
-    };
-    if matches!(*pointer, GlobalPointer::Undecided) {
-        let Some(handle) = handle else {
-            return;
-        };
-        *pointer = GlobalPointer::decide(handle.get_display_handle());
+/// The primary press as the window saw it.
+#[derive(Resource, Default)]
+struct Press {
+    /// When the window saw it go down, while it is down.
+    since: Option<Instant>,
+    /// A drag took it: let it go next frame, as the window will not see it
+    /// come up (the window manager keeps that release).
+    taken: bool,
+}
+
+/// Window requests (hit-test, drag) made last frame that may still sit in
+/// the display connection's buffer.
+#[derive(Resource, Default)]
+struct Unflushed(bool);
+
+/// For a system that changes the window in a way winit sends as a request
+/// to the display server: makes sure it gets there.
+#[derive(bevy::ecs::system::SystemParam)]
+struct WindowRequests<'w> {
+    unflushed: ResMut<'w, Unflushed>,
+    redraw: MessageWriter<'w, RequestRedraw>,
+}
+
+impl WindowRequests<'_> {
+    /// A request was made this frame: flush it at the start of the next,
+    /// which this asks for.
+    fn made(&mut self) {
+        self.unflushed.0 = true;
+        self.redraw.write(RequestRedraw);
     }
-    let GlobalPointer::Polling {
-        device,
-        primary_down,
-    } = &mut *pointer
-    else {
+}
+
+/// Sends last frame's window requests on to the display server.
+///
+/// winit hands X11 its hit-test and drag requests without flushing the
+/// connection, and an app that then idles leaves them in the buffer: the
+/// window keeps letting clicks through (or keeps taking them) until some
+/// later frame happens to flush. The frame that made them asks for this
+/// one ([`RequestRedraw`]), whose `First` flushes.
+fn flush_window_requests(
+    mut unflushed: ResMut<Unflushed>,
+    windows: Query<&RawHandleWrapper, With<PrimaryWindow>>,
+    #[cfg(target_os = "linux")] mut xlib: Local<Option<Option<x11_dl::xlib::Xlib>>>,
+) {
+    if !std::mem::take(&mut unflushed.0) {
+        return;
+    }
+    let Ok(handle) = windows.single() else {
         return;
     };
-    let mouse = device.get_mouse();
-    // 1-based: index 1 is the primary button.
-    *primary_down = mouse.button_pressed.get(1).copied().unwrap_or(false);
-    if !*primary_down && buttons.pressed(MouseButton::Left) {
+    #[cfg(target_os = "linux")]
+    if let RawDisplayHandle::Xlib(display) = handle.get_display_handle()
+        && let Some(display) = display.display
+        && let Some(xlib) = xlib.get_or_insert_with(|| x11_dl::xlib::Xlib::open().ok())
+    {
+        // SAFETY: the window's own, open display; winit has made Xlib
+        // thread-safe (`XInitThreads`) before opening it.
+        unsafe { (xlib.XFlush)(display.as_ptr().cast()) };
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = handle;
+}
+
+/// Starts following the global pointer once the window has a handle to
+/// tell the display server by. Not on Wayland, which does not tell a
+/// window where the pointer is outside it.
+fn start_global_pointer(
+    mut commands: Commands,
+    pointer: Option<Res<GlobalPointer>>,
+    windows: Query<&RawHandleWrapper, With<PrimaryWindow>>,
+    waker: Option<Res<GuiWaker>>,
+) {
+    if pointer.is_some() {
+        return;
+    }
+    let (Ok(handle), Some(waker)) = (windows.single(), waker) else {
+        return;
+    };
+    let pointer = if matches!(handle.get_display_handle(), RawDisplayHandle::Wayland(_)) {
+        tracing::info!(
+            "Wayland does not tell a window where the pointer is outside it: \
+             the companion window takes every click (no click-through)"
+        );
+        GlobalPointer::unavailable()
+    } else {
+        GlobalPointer::start(waker.0.clone())
+    };
+    commands.insert_resource(pointer);
+}
+
+/// Tells the poller where the window is and hands the GUI where the
+/// pointer is: at a point in the window, or outside it.
+fn follow_global_pointer(
+    pointer: Option<Res<GlobalPointer>>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    mut cursor: ResMut<CursorOverride>,
+) {
+    let (Some(pointer), Ok(window)) = (pointer, windows.single()) else {
+        return;
+    };
+    let rect = match window.position {
+        WindowPosition::At(origin) => Some(WindowRect {
+            origin,
+            size: window.physical_size(),
+            scale: window.scale_factor(),
+        }),
+        _ => None,
+    };
+    pointer.set_window(rect);
+    if pointer.status() != Status::Polling {
+        return;
+    }
+    let next = match pointer.sample().at {
+        Some(at) => CursorOverride::At(at),
+        None => CursorOverride::Outside,
+    };
+    cursor.set_if_neq(next);
+}
+
+/// Keeps the primary press honest before the overlay reads it: a press a
+/// drag took is let go, and so is one the global pointer has seen come up
+/// though the window never did.
+fn settle_press(
+    mut press: ResMut<Press>,
+    mut buttons: ResMut<ButtonInput<MouseButton>>,
+    pointer: Option<Res<GlobalPointer>>,
+) {
+    if buttons.just_pressed(MouseButton::Left) {
+        press.since = Some(Instant::now());
+    }
+    let stale = pointer
+        .zip(press.since)
+        .is_some_and(|(p, since)| p.released_since(since));
+    let taken = std::mem::take(&mut press.taken);
+    if (taken || stale) && buttons.pressed(MouseButton::Left) {
+        tracing::debug!(taken, stale, "letting go of the primary press");
         buttons.release(MouseButton::Left);
     }
-    let WindowPosition::At(origin) = window.position else {
-        cursor.set_if_neq(CursorOverride(None));
-        return;
-    };
-    let local =
-        (IVec2::new(mouse.coords.0, mouse.coords.1) - origin).as_vec2() / window.scale_factor();
-    let inside = Rect::new(0.0, 0.0, window.width(), window.height()).contains(local);
-    cursor.set_if_neq(CursorOverride(inside.then_some(local)));
+    if !buttons.pressed(MouseButton::Left) {
+        press.since = None;
+    }
 }
 
 /// Puts the window where it was saved (or at the primary monitor's corner)
-/// once winit has reported the monitors.
+/// once winit has reported the monitors, and keeps it there while the
+/// window manager settles.
+// A bevy system: each argument is a resource it reads or writes.
+#[allow(clippy::too_many_arguments)]
 fn place_window(
-    mut placed: ResMut<Placed>,
+    mut placement: ResMut<Placement>,
     mut frames: Local<u32>,
     mut windows: Query<&mut Window, With<PrimaryWindow>>,
     monitors: Query<(&Monitor, Has<PrimaryMonitor>)>,
     prefs: Res<CompanionPrefs>,
+    dragging: Res<Dragging>,
+    mut requests_made: WindowRequests,
 ) {
-    if placed.0 {
-        return;
+    match *placement {
+        Placement::Pending => {}
+        Placement::Settling { target, until } => {
+            if dragging.0.is_some() || Instant::now() >= until {
+                *placement = Placement::Done;
+            } else if let Ok(mut window) = windows.single_mut()
+                && window.position != WindowPosition::At(target)
+            {
+                window.position = WindowPosition::At(target);
+                requests_made.made();
+            }
+            return;
+        }
+        Placement::Done => return,
     }
     *frames += 1;
     if monitors.is_empty() && *frames < MONITOR_WAIT_FRAMES {
@@ -310,7 +407,6 @@ fn place_window(
     let mut found: Vec<_> = monitors.iter().collect();
     // The primary monitor first, as `place_on_screen` wants it.
     found.sort_by_key(|(_, primary)| !primary);
-    let scale = found.first().map_or(1.0, |(m, _)| m.scale_factor) as f32;
     let rects: Vec<_> = found
         .iter()
         .map(|(m, _)| MonitorRect {
@@ -318,10 +414,10 @@ fn place_window(
             y: m.physical_position.y,
             width: m.physical_width,
             height: m.physical_height,
+            scale: m.scale_factor,
         })
         .collect();
-    let default_size = (DEFAULT_SIZE.as_vec2() * scale).round().as_uvec2();
-    let at = place_on_screen(prefs.window, &rects, default_size);
+    let at = place_on_screen(prefs.window, &rects, DEFAULT_SIZE);
     window.position = WindowPosition::At(IVec2::new(at.x, at.y));
     window
         .resolution
@@ -330,18 +426,22 @@ fn place_window(
     // it maps it, before the window manager has taken it on, and that
     // request is lost; asked now, it holds.
     window.window_level = WindowLevel::AlwaysOnTop;
-    placed.0 = true;
+    requests_made.made();
+    *placement = Placement::Settling {
+        target: IVec2::new(at.x, at.y),
+        until: Instant::now() + PLACEMENT_SETTLE,
+    };
 }
 
 /// Saves where the window is once it has stayed put for [`SETTLE`].
 fn save_placement(
-    placed: Res<Placed>,
+    placement: Res<Placement>,
     windows: Query<&Window, With<PrimaryWindow>>,
     mut prefs: ResMut<CompanionPrefs>,
     time: Res<Time<Real>>,
     mut last: Local<Option<(WindowPlacement, Duration)>>,
 ) {
-    if !placed.0 {
+    if !matches!(*placement, Placement::Done) {
         return;
     }
     let Ok(window) = windows.single() else {
@@ -367,54 +467,70 @@ fn save_placement(
     }
 }
 
-/// Moves the window with the pointer when the GUI asks, and only while
-/// the primary button is really down: a press the window never saw come
-/// up (released outside it) must not drag it when the pointer comes back.
+/// Moves the window with the pointer when the GUI asks, while the primary
+/// press is down (`settle_press` has let go of any the window will not
+/// see come up), and takes that press: the window manager keeps its
+/// release.
 fn start_drag(
     mut requests: MessageReader<CompanionRequest>,
-    pointer: NonSend<GlobalPointer>,
     buttons: Res<ButtonInput<MouseButton>>,
+    mut press: ResMut<Press>,
     mut dragging: ResMut<Dragging>,
+    pointer: Option<Res<GlobalPointer>>,
     mut windows: Query<&mut Window, With<PrimaryWindow>>,
+    mut requests_made: WindowRequests,
 ) {
-    let primary_down = pointer.primary_down(&buttons);
-    if dragging.0 && !primary_down {
-        dragging.0 = false;
+    // Over once the global pointer has seen the button come up; without
+    // it, there is no click-through to keep off.
+    if let Some(since) = dragging.0 {
+        let followed = pointer
+            .as_ref()
+            .is_some_and(|p| p.status() == Status::Polling);
+        if !followed || pointer.as_ref().is_some_and(|p| p.released_since(since)) {
+            dragging.0 = None;
+        }
     }
     if !requests.read().any(|r| *r == CompanionRequest::StartDrag) {
         return;
     }
-    if !primary_down {
+    if !buttons.pressed(MouseButton::Left) {
         tracing::debug!("a drag from a press already released: ignored");
         return;
     }
     if let Ok(mut window) = windows.single_mut() {
         tracing::debug!("moving the window with the pointer");
         window.start_drag_move();
-        dragging.0 = true;
+        press.taken = true;
+        dragging.0 = Some(Instant::now());
+        requests_made.made();
     }
 }
 
 /// Lets the pointer through the window except where, or while, the
-/// companion needs it.
+/// companion needs it. The input box is not among the parts that hold the
+/// pointer while open: it stays open until Esc or a send, and clicks
+/// elsewhere go to the desktop meanwhile.
 fn take_pointer(
-    pointer: NonSend<GlobalPointer>,
+    pointer: Option<Res<GlobalPointer>>,
     wanted: Res<PointerWanted>,
     dragging: Res<Dragging>,
     overlay: Res<Overlay>,
     settings: Option<NonSend<GuiSettings>>,
     mut cursor_options: Query<&mut CursorOptions, With<PrimaryWindow>>,
+    mut requests_made: WindowRequests,
 ) {
-    let polling = matches!(*pointer, GlobalPointer::Polling { .. });
+    let polling = pointer.is_some_and(|p| p.status() == Status::Polling);
     let take = !polling
         || wanted.0
-        || dragging.0
-        || *overlay != Overlay::default()
+        || dragging.0.is_some()
+        || overlay.history
+        || overlay.menu
         || settings.is_some_and(|s| s.open);
     if let Ok(mut options) = cursor_options.single_mut()
         && options.hit_test != take
     {
         options.hit_test = take;
+        requests_made.made();
     }
 }
 
@@ -431,12 +547,14 @@ mod tests {
                 y: 0,
                 width: 1920,
                 height: 1080,
+                scale: 1.0,
             },
             MonitorRect {
                 x: 1920,
                 y: 0,
                 width: 2560,
                 height: 1440,
+                scale: 1.0,
             },
         ]
     }
@@ -493,6 +611,7 @@ mod tests {
             y: 50,
             width: 800,
             height: 600,
+            scale: 1.0,
         }];
         let saved = WindowPlacement {
             x: 200,
@@ -523,6 +642,26 @@ mod tests {
                 y: 400,
                 width: 300,
                 height: 200,
+            }
+        );
+    }
+
+    #[test]
+    fn the_default_size_and_the_margin_follow_the_primary_monitors_scale() {
+        let hidpi = [MonitorRect {
+            x: 0,
+            y: 0,
+            width: 3840,
+            height: 2160,
+            scale: 2.0,
+        }];
+        assert_eq!(
+            place_on_screen(None, &hidpi, DEFAULT),
+            WindowPlacement {
+                x: 3840 - 840 - 64,
+                y: 2160 - 1280 - 64,
+                width: 840,
+                height: 1280,
             }
         );
     }

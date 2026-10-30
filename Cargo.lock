@@ -7931,6 +7931,7 @@ dependencies = [
  "sapphire-agent-gui",
  "tracing",
  "tracing-subscriber",
+ "x11-dl",
 ]
 
 [[package]]

@@ -6,6 +6,7 @@
 //! logging and the companion's window ([`companion_window`]).
 
 mod companion_window;
+mod global_pointer;
 
 use bevy::prelude::*;
 use sapphire_agent_gui::{AgentGuiPlugin, AppIdentity};
@@ -28,7 +29,9 @@ fn main() {
                 app_name: "sapphire-agent",
                 version: env!("CARGO_PKG_VERSION"),
             },
-            update_mode: Some(companion_window::update_mode()),
+            // Idle while nothing happens: the global pointer wakes the
+            // companion window when it matters.
+            update_mode: None,
         })
         .add_plugins(companion_window::CompanionWindowPlugin)
         .run();

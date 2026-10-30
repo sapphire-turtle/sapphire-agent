@@ -47,12 +47,19 @@ bevy = { version = "0.20", default-features = false, features = [
 tracing = "0.1"
 tracing-subscriber.workspace = true
 
-# The companion window (src/companion_window.rs): the global pointer, read
-# while the window lets clicks through and gets no cursor events of its own
-# (libX11 on Linux), and the display handle that tells Wayland, where it
-# cannot be read, apart.
-device_query = "4.0.1"
+# The companion window (src/companion_window.rs): the display handle that
+# tells Wayland, where the global pointer cannot be read, apart.
 raw-window-handle = "0.6"
+
+# The global pointer (src/global_pointer.rs), read while the companion window
+# lets clicks through and gets no cursor events of its own. On Linux through
+# Xlib loaded at run time (x11-dl, as winit does), so libX11 is no hard
+# dependency of the binary; device_query would link it.
+[target.'cfg(target_os = "linux")'.dependencies]
+x11-dl = "2.21"
+
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+device_query = "4.0.1"
 
 # `cargo binstall --git https://github.com/sapphire-turtle/sapphire-agent sapphire-agent-desktop`
 # downloads the release file instead of building it (this crate is not on crates.io), following
