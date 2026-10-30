@@ -45,10 +45,11 @@ impl AvatarSync {
         }
     }
 
-    /// Sync from `source` unless a sync is already running.
-    pub fn submit(&self, source: Arc<dyn AvatarSource>) {
+    /// Sync from `source` unless a sync is already running. Returns whether
+    /// one was started; on `false` the caller keeps its request and retries.
+    pub fn submit(&self, source: Arc<dyn AvatarSource>) -> bool {
         if self.in_flight.swap(true, Ordering::AcqRel) {
-            return;
+            return false;
         }
         let cache_dir = self.cache_dir.clone();
         let in_flight = Arc::clone(&self.in_flight);
@@ -63,6 +64,7 @@ impl AvatarSync {
             let _ = tx.send(result);
             waker();
         });
+        true
     }
 
     fn try_recv(&self) -> Option<anyhow::Result<LoadedAvatar>> {
@@ -70,31 +72,32 @@ impl AvatarSync {
     }
 }
 
-/// Counts down to the next poll of the agent's manifest.
-pub(crate) struct PollTimer(Timer);
-
-impl Default for PollTimer {
-    fn default() -> Self {
-        Self(Timer::new(POLL_INTERVAL, TimerMode::Repeating))
-    }
+/// Whether a sync is wanted: one was requested, or [`POLL_INTERVAL`] of
+/// real time passed since the last one started. Measured on the wall clock
+/// (`Time<Real>`), not frames, because the GUI idles between wakes.
+fn wanted(now: Duration, last_started: Duration, requested: bool) -> bool {
+    requested || now.saturating_sub(last_started) >= POLL_INTERVAL
 }
 
-/// Starts a sync when the poll interval elapsed or a connection was just
-/// made ([`SyncRequested`]); needs the live connection, so it waits for one.
+/// Starts a sync when one is [`wanted`]; needs the live connection, so it
+/// waits for one. A request stays pending until a sync actually starts, so
+/// one made during a running sync is retried on later frames.
 pub(crate) fn poll_sync(
-    time: Res<Time>,
-    mut timer: Local<PollTimer>,
+    time: Res<Time<Real>>,
+    mut last_started: Local<Duration>,
     mut requested: ResMut<SyncRequested>,
     bridge: Res<ChatBridge>,
     sync: Res<AvatarSync>,
 ) {
-    let due = timer.0.tick(time.delta()).just_finished();
-    if !(due || requested.0) {
+    let now = time.elapsed();
+    if !wanted(now, *last_started, requested.0) {
         return;
     }
-    if let Some(client) = bridge.client() {
+    if let Some(client) = bridge.client()
+        && sync.submit(client)
+    {
         requested.0 = false;
-        sync.submit(client);
+        *last_started = now;
     }
 }
 
@@ -105,5 +108,55 @@ pub(crate) fn drain_sync(sync: Res<AvatarSync>, mut assets: ResMut<AvatarAssets>
             tracing::warn!("avatar sync failed: {e:#}");
         }
         assets.apply(result);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Idle;
+
+    #[async_trait::async_trait]
+    impl AvatarSource for Idle {
+        async fn manifest(&self) -> anyhow::Result<sapphire_agent_core::AvatarManifest> {
+            Ok(Default::default())
+        }
+        async fn fetch(&self, _: &str) -> anyhow::Result<Vec<u8>> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn the_poll_is_due_after_300_seconds_of_real_time() {
+        let s = Duration::from_secs;
+        assert!(!wanted(s(299), s(0), false));
+        assert!(wanted(s(300), s(0), false));
+        // Measured from the last start, however few frames ran between.
+        assert!(!wanted(s(500), s(300), false));
+        assert!(wanted(s(600), s(300), false));
+        assert!(wanted(s(1), s(0), true));
+    }
+
+    #[test]
+    fn a_request_made_during_a_sync_survives_and_runs_after_it() {
+        // Not driven: the spawned sync stays in flight until the runtime runs.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let sync = AvatarSync::new(runtime.handle().clone(), Arc::new(|| {}));
+        let source: Arc<dyn AvatarSource> = Arc::new(Idle);
+
+        assert!(sync.submit(Arc::clone(&source)));
+        // A new request arrives while that sync runs: it is refused, so
+        // `poll_sync` leaves `SyncRequested` set and asks again.
+        assert!(!sync.submit(Arc::clone(&source)));
+
+        runtime.block_on(async {
+            while sync.in_flight.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        });
+        assert!(sync.submit(source), "runs once the first sync is done");
     }
 }
