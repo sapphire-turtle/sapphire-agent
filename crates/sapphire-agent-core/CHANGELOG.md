@@ -10,6 +10,16 @@ version with `sapphire-agent-server`) are recorded in the root `CHANGELOG.md`.
 
 ## [Unreleased]
 
+### Changed
+
+- [**breaking**] `AvatarConfig` splits into an optional `[vrm]` section (`VrmConfig`: `model`, `idle`, `actions`) and an optional `[sprite]` section (`SpriteConfig`: `default_pose` and `poses`, each a `SpritePose` with a `base` image and an image per expression); the old top-level `model` / `idle` / `actions` form is no longer read. `AvatarConfig::paths` lists every file it references and `AvatarConfig::check` validates it
+
+### Added
+
+- [**breaking**] `AvatarCaps.poses`: the stances a client's avatar can hold, declared with each turn
+- `ChatEvent::Pose` and `KIND_POSE`, the `pose` cue streamed while a turn runs
+- `SPRITE_EXPRESSIONS`: the expressions a sprite pose may have an image for (happy, angry, sad, relaxed, surprised)
+
 ## [0.10.0](https://github.com/sapphire-turtle/sapphire-agent/compare/sapphire-agent-core-v0.9.0...sapphire-agent-core-v0.10.0) - 2026-10-26
 
 ### Changed
