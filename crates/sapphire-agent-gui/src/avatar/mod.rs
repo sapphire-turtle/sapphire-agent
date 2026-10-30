@@ -66,6 +66,32 @@ pub const UI_CAMERA_ORDER: isize = 100;
 #[derive(Component)]
 pub struct UiCamera;
 
+/// Registers the [`assets::ASSET_SOURCE`] asset source, rooted at the
+/// avatar cache, so renderers can load cached files through bevy's
+/// `AssetServer` ([`LoadedAvatar::asset_path`]). The host calls this on
+/// its `App` before adding `DefaultPlugins`: bevy builds its sources when
+/// `AssetPlugin` is added and takes none after. Where the platform has no
+/// cache directory there is nothing to serve, and nothing is registered.
+pub fn register_asset_source(app: &mut App) {
+    match Cache::default_dir() {
+        Some(dir) => register_asset_source_at(app, dir),
+        None => tracing::warn!("no cache directory; the avatar's files cannot be loaded"),
+    }
+}
+
+fn register_asset_source_at(app: &mut App, dir: std::path::PathBuf) {
+    use bevy::asset::AssetApp as _;
+    use bevy::asset::io::AssetSourceBuilder;
+    use bevy::asset::io::file::FileAssetReader;
+
+    // Read-only, unwatched: the cache changes only by syncs, which bump
+    // `AvatarAssets::generation` for renderers to reload on.
+    app.register_asset_source(
+        assets::ASSET_SOURCE,
+        AssetSourceBuilder::new(move || Box::new(FileAssetReader::new(dir.clone()))),
+    );
+}
+
 /// The avatar and its renderers, and the GUI's camera. Add it after
 /// `bevy_egui::EguiPlugin`; [`crate::AgentGuiPlugin`] does.
 pub struct AvatarPlugin;
@@ -106,6 +132,18 @@ impl Plugin for AvatarPlugin {
                     .after(crate::settings::follow)
                     .before(crate::companion::pointer_input),
             );
+    }
+
+    fn finish(&self, app: &mut App) {
+        if let Some(server) = app.world().get_resource::<AssetServer>()
+            && server.get_source(assets::ASSET_SOURCE).is_err()
+        {
+            tracing::warn!(
+                "no `{}` asset source: the renderers cannot load the avatar's files \
+                 (the host calls `avatar::register_asset_source` before `DefaultPlugins`)",
+                assets::ASSET_SOURCE
+            );
+        }
     }
 }
 
@@ -353,6 +391,94 @@ mod tests {
         // An active one is: the UI draws over it.
         world.get_mut::<Camera>(scene).unwrap().is_active = true;
         assert!(matches!(clear(&mut world), ClearColorConfig::None));
+    }
+
+    /// A text file as an asset: enough to see a cached file load.
+    #[derive(Asset, TypePath)]
+    struct Text(String);
+
+    #[derive(TypePath)]
+    struct TextLoader;
+
+    impl bevy::asset::AssetLoader for TextLoader {
+        type Asset = Text;
+        type Settings = ();
+        type Error = std::io::Error;
+
+        async fn load(
+            &self,
+            reader: &mut dyn bevy::asset::io::Reader,
+            _: &(),
+            _: &mut bevy::asset::LoadContext<'_>,
+        ) -> Result<Text, std::io::Error> {
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes).await?;
+            Ok(Text(String::from_utf8_lossy(&bytes).into_owned()))
+        }
+
+        fn extensions(&self) -> &[&str] {
+            &["txt"]
+        }
+    }
+
+    #[test]
+    fn a_synced_file_loads_through_the_asset_server() {
+        use bevy::asset::{AssetApp as _, AssetPlugin, LoadState};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path().to_path_buf());
+        let manifest = sapphire_agent_core::AvatarManifest {
+            config: sapphire_agent_core::AvatarConfig {
+                vrm: Some(sapphire_agent_core::VrmConfig {
+                    model: "Hello.TXT".into(),
+                    ..Default::default()
+                }),
+                sprite: None,
+            },
+            files: vec![sapphire_agent_core::AvatarFile {
+                path: "Hello.TXT".into(),
+                size: 5,
+                sha256: assets::sha256_hex(b"hello"),
+            }],
+        };
+        struct One(sapphire_agent_core::AvatarManifest);
+        #[async_trait::async_trait]
+        impl AvatarSource for One {
+            async fn manifest(&self) -> anyhow::Result<sapphire_agent_core::AvatarManifest> {
+                Ok(self.0.clone())
+            }
+            async fn fetch(&self, _: &str) -> anyhow::Result<Vec<u8>> {
+                Ok(b"hello".to_vec())
+            }
+        }
+        let loaded = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(assets::sync(&One(manifest), &cache))
+            .unwrap();
+
+        let mut app = App::new();
+        register_asset_source_at(&mut app, dir.path().to_path_buf());
+        app.add_plugins((TaskPoolPlugin::default(), AssetPlugin::default()))
+            .init_asset::<Text>()
+            .register_asset_loader(TextLoader);
+
+        let path = loaded.asset_path("Hello.TXT").unwrap();
+        let handle: bevy::asset::Handle<Text> = app.world().resource::<AssetServer>().load(path);
+        for _ in 0..500 {
+            app.update();
+            match app.world().resource::<AssetServer>().load_state(&handle) {
+                LoadState::Loaded => break,
+                LoadState::Failed(e) => panic!("the cached file failed to load: {e}"),
+                _ => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        let text = app
+            .world()
+            .resource::<Assets<Text>>()
+            .get(&handle)
+            .map(|t| t.0.clone());
+        assert_eq!(text.as_deref(), Some("hello"));
     }
 
     #[test]

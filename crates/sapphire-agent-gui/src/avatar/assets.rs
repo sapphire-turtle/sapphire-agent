@@ -1,9 +1,10 @@
 //! Fetching the avatar's files from the agent and keeping them in a local
-//! cache, named by their sha256.
+//! cache, named by their sha256 and their extension (`<sha256>.<ext>`).
 //!
-//! Pure of bevy except for the [`AvatarAssets`] `Resource` derive. The
-//! files come from an [`AvatarSource`] so the agent is not the only place
-//! an avatar can come from.
+//! Pure of bevy except for the [`AvatarAssets`] `Resource` derive and the
+//! [`AssetPath`] [`LoadedAvatar::asset_path`] hands out. The files come
+//! from an [`AvatarSource`] so the agent is not the only place an avatar
+//! can come from.
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
@@ -12,6 +13,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context as _, Result, anyhow, bail};
+use bevy::asset::AssetPath;
+use bevy::asset::io::AssetSourceId;
 use bevy::prelude::Resource;
 use sapphire_agent_core::{AvatarConfig, AvatarFile, AvatarManifest, ChatClient};
 use sha2::{Digest as _, Sha256};
@@ -51,7 +54,33 @@ fn is_sha256_hex(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// A directory of files each named by the sha256 of its bytes.
+/// The bevy asset source the cache is served under:
+/// `companion-avatar://<cache name>`. The host registers it with
+/// [`super::register_asset_source`].
+pub const ASSET_SOURCE: &str = "companion-avatar";
+
+/// The cache's name for the file at the avatar-relative `path` whose bytes
+/// hash to `sha256`: the hash, then the path's extension in lowercase,
+/// which bevy picks a loader by (`model.VRM` → `<sha256>.vrm`). An
+/// extension other than ASCII letters and digits is left off. `None` when
+/// `sha256` is not one, so a name never leaves the cache directory.
+pub fn cache_name(sha256: &str, path: &str) -> Option<String> {
+    if !is_sha256_hex(sha256) {
+        return None;
+    }
+    let extension = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .filter(|e| !e.is_empty() && e.bytes().all(|b| b.is_ascii_alphanumeric()))
+        .map(str::to_ascii_lowercase);
+    Some(match extension {
+        Some(extension) => format!("{sha256}.{extension}"),
+        None => sha256.to_owned(),
+    })
+}
+
+/// A directory of files each named by the sha256 of its bytes and the
+/// extension of the avatar path they came from ([`cache_name`]).
 pub struct Cache {
     dir: PathBuf,
 }
@@ -71,35 +100,35 @@ impl Cache {
         )
     }
 
-    pub fn path_of(&self, sha256: &str) -> PathBuf {
-        self.dir.join(sha256)
+    /// Where the file at avatar `path` with these bytes is kept; `None`
+    /// when `sha256` is not a sha256.
+    pub fn path_of(&self, sha256: &str, path: &str) -> Option<PathBuf> {
+        cache_name(sha256, path).map(|name| self.dir.join(name))
     }
 
-    pub fn has(&self, sha256: &str) -> bool {
-        is_sha256_hex(sha256) && self.path_of(sha256).is_file()
+    pub fn has(&self, sha256: &str, path: &str) -> bool {
+        self.path_of(sha256, path).is_some_and(|p| p.is_file())
     }
 
-    /// Store `bytes` under `expected_sha256`; refuses bytes that hash to
-    /// something else. Written to a temporary file and renamed, so a
-    /// half-written file never has a hash name.
-    pub fn put(&self, expected_sha256: &str, bytes: &[u8]) -> Result<PathBuf> {
-        if !is_sha256_hex(expected_sha256) {
+    /// Store `bytes`, the file at avatar `path`, under `expected_sha256`;
+    /// refuses bytes that hash to something else. Written to a temporary
+    /// file and renamed, so a half-written file never has a hash name.
+    pub fn put(&self, expected_sha256: &str, path: &str, bytes: &[u8]) -> Result<PathBuf> {
+        let Some(name) = cache_name(expected_sha256, path) else {
             bail!("{expected_sha256:?} is not a sha256");
-        }
+        };
         let actual = sha256_hex(bytes);
         if actual != expected_sha256 {
             bail!("hash is {actual}, expected {expected_sha256}");
         }
         std::fs::create_dir_all(&self.dir)
             .with_context(|| format!("cannot create {}", self.dir.display()))?;
-        let tmp = self
-            .dir
-            .join(format!(".{expected_sha256}.{}.tmp", std::process::id()));
+        let tmp = self.dir.join(format!(".{name}.{}.tmp", std::process::id()));
         let written = std::fs::File::create(&tmp).and_then(|mut f| {
             f.write_all(bytes)?;
             f.sync_all()
         });
-        let dest = self.path_of(expected_sha256);
+        let dest = self.dir.join(name);
         let done = written.and_then(|()| std::fs::rename(&tmp, &dest));
         if let Err(e) = done {
             let _ = std::fs::remove_file(&tmp);
@@ -110,7 +139,8 @@ impl Cache {
 }
 
 /// The files the config references whose bytes the cache lacks, once per
-/// distinct hash. Files the config does not reference are not wanted.
+/// distinct cache name. Files the config does not reference are not
+/// wanted.
 pub fn missing<'a>(manifest: &'a AvatarManifest, cache: &Cache) -> Vec<&'a AvatarFile> {
     let wanted = manifest.config.paths();
     let mut seen = std::collections::BTreeSet::new();
@@ -118,8 +148,8 @@ pub fn missing<'a>(manifest: &'a AvatarManifest, cache: &Cache) -> Vec<&'a Avata
         .files
         .iter()
         .filter(|f| wanted.contains(&f.path.as_str()))
-        .filter(|f| !cache.has(&f.sha256))
-        .filter(|f| seen.insert(f.sha256.as_str()))
+        .filter(|f| !cache.has(&f.sha256, &f.path))
+        .filter(|f| seen.insert(cache_name(&f.sha256, &f.path).unwrap_or_else(|| f.sha256.clone())))
         .collect()
 }
 
@@ -129,6 +159,22 @@ pub struct LoadedAvatar {
     pub config: AvatarConfig,
     /// Each referenced avatar path and the cached file holding its bytes.
     pub files: BTreeMap<String, PathBuf>,
+}
+
+impl LoadedAvatar {
+    /// Where bevy's `AssetServer` loads the file at the avatar-relative
+    /// `path` from: `companion-avatar://<sha256>.<ext>`, the cached copy
+    /// under [`ASSET_SOURCE`]. `None` when the config does not reference
+    /// `path`. Load through this, not the absolute [`Self::files`] path:
+    /// bevy refuses paths outside its approved sources.
+    pub fn asset_path(&self, path: &str) -> Option<AssetPath<'static>> {
+        let name = self.files.get(path)?.file_name()?.to_str()?;
+        Some(
+            AssetPath::from_path_buf(PathBuf::from(name))
+                .with_source(AssetSourceId::from(ASSET_SOURCE))
+                .into_owned(),
+        )
+    }
 }
 
 /// Bring the cache up to date with `source` and describe the avatar it now
@@ -142,7 +188,7 @@ pub async fn sync(source: &dyn AvatarSource, cache: &Cache) -> Result<LoadedAvat
             .await
             .with_context(|| format!("cannot fetch {}", file.path))?;
         cache
-            .put(&file.sha256, &bytes)
+            .put(&file.sha256, &file.path, &bytes)
             .with_context(|| format!("cannot cache {}", file.path))?;
     }
     let mut files = BTreeMap::new();
@@ -152,7 +198,10 @@ pub async fn sync(source: &dyn AvatarSource, cache: &Cache) -> Result<LoadedAvat
             .iter()
             .find(|f| f.path == path)
             .ok_or_else(|| anyhow!("the avatar config names {path}, which the agent lacks"))?;
-        files.insert(path.to_owned(), cache.path_of(&file.sha256));
+        let cached = cache
+            .path_of(&file.sha256, &file.path)
+            .ok_or_else(|| anyhow!("the agent's hash of {path} is not a sha256"))?;
+        files.insert(path.to_owned(), cached);
     }
     Ok(LoadedAvatar {
         config: manifest.config,
@@ -472,7 +521,7 @@ mod tests {
     async fn sync_fetches_only_referenced_files_missing_from_the_cache() {
         let dir = tempfile::tempdir().unwrap();
         let cache = Cache::new(dir.path().to_path_buf());
-        cache.put(&sha(b"B"), b"B").unwrap();
+        cache.put(&sha(b"B"), "b.png", b"B").unwrap();
         let source = FakeSource {
             manifest: AvatarManifest {
                 config: config_of(&["a.png", "b.png"]),
@@ -498,6 +547,53 @@ mod tests {
         assert_eq!(std::fs::read(&loaded.files["a.png"]).unwrap(), b"A");
     }
 
+    #[test]
+    fn a_cache_name_is_the_hash_and_the_lowercase_extension() {
+        let h = sha(b"x");
+        assert_eq!(cache_name(&h, "body/model.VRM"), Some(format!("{h}.vrm")));
+        assert_eq!(
+            cache_name(&h, "pose.dir/base.png"),
+            Some(format!("{h}.png"))
+        );
+        // No extension, or one bevy could not pick a loader by: the hash alone.
+        assert_eq!(cache_name(&h, "pose.dir/base"), Some(h.clone()));
+        assert_eq!(cache_name(&h, "base."), Some(h.clone()));
+        assert_eq!(cache_name(&h, "base.p g"), Some(h.clone()));
+        // Never a name outside the cache.
+        assert_eq!(cache_name("../../etc/passwd", "a.png"), None);
+        assert_eq!(cache_name(&h.to_uppercase(), "a.png"), None);
+    }
+
+    #[tokio::test]
+    async fn cached_files_keep_their_extension_and_load_from_the_asset_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path().to_path_buf());
+        let source = FakeSource {
+            manifest: AvatarManifest {
+                config: config_of(&["poses/Base.PNG", "happy"]),
+                files: vec![file("poses/Base.PNG", b"A"), file("happy", b"H")],
+            },
+            files: HashMap::from([
+                ("poses/Base.PNG".to_owned(), b"A".to_vec()),
+                ("happy".to_owned(), b"H".to_vec()),
+            ]),
+            fetches: Mutex::new(Vec::new()),
+        };
+        let loaded = sync(&source, &cache).await.unwrap();
+        let base = format!("{}.png", sha(b"A"));
+        assert_eq!(loaded.files["poses/Base.PNG"], dir.path().join(&base));
+        assert!(cache.has(&sha(b"A"), "poses/Base.PNG"));
+
+        let asset = loaded.asset_path("poses/Base.PNG").unwrap();
+        assert_eq!(asset.to_string(), format!("companion-avatar://{base}"));
+        assert_eq!(asset.get_full_extension(), Some("png"));
+        assert_eq!(
+            loaded.asset_path("happy").unwrap().to_string(),
+            format!("companion-avatar://{}", sha(b"H"))
+        );
+        assert_eq!(loaded.asset_path("unreferenced.png"), None);
+    }
+
     #[tokio::test]
     async fn a_download_whose_hash_differs_is_not_cached() {
         let dir = tempfile::tempdir().unwrap();
@@ -512,8 +608,8 @@ mod tests {
         };
         let err = sync(&source, &cache).await.unwrap_err();
         assert!(format!("{err:#}").contains("a.png"), "{err:#}");
-        assert!(!cache.has(&sha(b"A")));
-        assert!(!cache.has(&sha(b"tampered")));
+        assert!(!cache.has(&sha(b"A"), "a.png"));
+        assert!(!cache.has(&sha(b"tampered"), "a.png"));
     }
 
     #[tokio::test]
