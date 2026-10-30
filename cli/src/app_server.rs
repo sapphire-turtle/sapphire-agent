@@ -20,7 +20,7 @@ use std::time::Duration;
 use anyhow::{Context as _, Result};
 use sapphire_framework::ipc::ManagedBy;
 use sapphire_framework::server::{
-    AppServer, BridgeConnector, Selection, SelectionFile, SyncRuntime, WorkspaceHost,
+    AppServer, BridgeConnector, ReleaseSource, Selection, SelectionFile, SyncRuntime, WorkspaceHost,
 };
 use sapphire_framework::workspace::WorkspaceState;
 use tokio_util::sync::CancellationToken;
@@ -77,7 +77,9 @@ fn adopt_into(file: &SelectionFile, dir: &Path) -> Result<PathBuf> {
 /// the service spec from it and talk to the running server or the bridge
 /// themselves.
 pub fn build() -> AppServer {
-    AppServer::new(&APP_CTX, VERSION).app_api(crate::serve::acp_tunnel::APP_API)
+    AppServer::new(&APP_CTX, VERSION)
+        .releases(release_source())
+        .app_api(crate::serve::acp_tunnel::APP_API)
 }
 
 /// Attach sync, through the host's `sapphire-bridge`.
@@ -235,6 +237,14 @@ fn config_contents(host_config: &Path, root: Option<&Path>) -> [Option<Vec<u8>>;
         std::fs::read(host_config).ok(),
         root.and_then(|root| std::fs::read(crate::config::workspace_config_path(root)).ok()),
     ]
+}
+
+/// Where the app's releases are published: what `update` installs from, and where the
+/// server looks once a day for a newer one.
+fn release_source() -> ReleaseSource {
+    ReleaseSource::github("sapphire-turtle", "sapphire-agent")
+        .asset("sapphire-agent")
+        .cargo_crate("sapphire-agent")
 }
 
 #[cfg(test)]
