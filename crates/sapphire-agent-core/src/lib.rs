@@ -17,7 +17,7 @@
 //!   `{session_id, kind, ..}` notifies each tool call starting
 //!   (`kind: "tool_start"`, `"tool_end"`, with `id` and `name`), and the
 //!   avatar cues the reply carries (`"expression"` with `expression` and
-//!   `intensity?`, `"action"` with `action`); see [`parse_progress`].
+//!   `intensity?`, `"action"` with `action`, `"pose"` with `pose`); see [`parse_progress`].
 //! - [`HISTORY`] `{session_id}` answers `{messages}`.
 //! - [`SESSIONS`] answers `{sessions}`.
 //! - The avatar's files, kept in the workspace's `avatar/` folder, move in
@@ -86,6 +86,8 @@ pub const KIND_TOOL_END: &str = "tool_end";
 pub const KIND_EXPRESSION: &str = "expression";
 /// [`PROGRESS`] `kind`: the reply makes the avatar perform an action.
 pub const KIND_ACTION: &str = "action";
+/// [`PROGRESS`] `kind`: the reply switches the avatar's stance.
+pub const KIND_POSE: &str = "pose";
 
 /// What a client can do, declared on each [`SEND`] turn.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -101,6 +103,9 @@ pub struct AvatarCaps {
     pub expressions: Vec<String>,
     #[serde(default)]
     pub actions: Vec<String>,
+    /// The stances the avatar can hold until told otherwise.
+    #[serde(default)]
+    pub poses: Vec<String>,
 }
 
 /// A file sent with a message. `data` is base64, as on the wire.
@@ -159,6 +164,7 @@ pub enum ChatEvent {
     Tool(ToolEvent),
     Expression { name: String, intensity: f32 },
     Action { name: String },
+    Pose { name: String },
 }
 
 /// Read a [`PROGRESS`] notification's `params`. `None` for another
@@ -183,6 +189,9 @@ pub fn parse_progress(session_id: &str, params: &Value) -> Option<ChatEvent> {
         }),
         KIND_ACTION => Some(ChatEvent::Action {
             name: params["action"].as_str()?.to_owned(),
+        }),
+        KIND_POSE => Some(ChatEvent::Pose {
+            name: params["pose"].as_str()?.to_owned(),
         }),
         _ => None,
     }
@@ -609,6 +618,15 @@ mod tests {
                 name: "peace".into()
             })
         );
+        assert_eq!(
+            parse_progress(
+                s,
+                &json!({"session_id":"s1","kind":"pose","pose":"arms_crossed"})
+            ),
+            Some(ChatEvent::Pose {
+                name: "arms_crossed".into()
+            })
+        );
     }
 
     #[test]
@@ -655,6 +673,7 @@ mod tests {
             avatar: Some(AvatarCaps {
                 expressions: vec!["happy".into()],
                 actions: vec![],
+                poses: vec![],
             }),
         };
         let turn = Turn {
@@ -668,7 +687,7 @@ mod tests {
                 "session_id": "s1",
                 "content": "hi",
                 "attachments": [{"mime": "image/png", "data": "YWJj"}],
-                "client": {"avatar": {"expressions": ["happy"], "actions": []}},
+                "client": {"avatar": {"expressions": ["happy"], "actions": [], "poses": []}},
             })
         );
     }
