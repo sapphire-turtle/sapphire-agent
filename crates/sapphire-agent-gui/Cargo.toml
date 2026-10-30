@@ -63,8 +63,9 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "ti
 # Error handling
 anyhow.workspace = true
 
-# The display mode is a setting the GUI stores.
+# The companion's preferences on this device (`companion.toml`).
 serde = { version = "1.0", features = ["derive"] }
+toml = "1"
 
 # Logging
 tracing = "0.1"

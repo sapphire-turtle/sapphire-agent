@@ -5,7 +5,7 @@
 //! [`FrameworkClient`] on the GUI's runtime. Every frame, whether or not
 //! the settings are open, [`follow`] registers the framework's strings,
 //! polls the client and applies the theme and language the settings hold,
-//! so a change made on another device restyles the chat too.
+//! so a change made on another device restyles the companion too.
 //!
 //! The look last applied is kept on the device by corundum's store
 //! ([`attach_look_store`]), so the window opens in it before the bridge
@@ -24,20 +24,20 @@ use crate::app::Waker;
 /// doesn't share a file with the agent CLI.
 const LOOK_STORE_APP: &str = "sapphire-agent-desktop";
 
-/// The framework's settings and whether they are shown in place of the
-/// chat. A non-`Send` resource: `Settings` holds the app's sections as
+/// The framework's settings and whether they fill the window over the
+/// companion. A non-`Send` resource: `Settings` holds the app's sections as
 /// plain trait objects.
 pub struct GuiSettings {
     pub settings: Settings,
-    /// Shows the settings in place of the chat. The top bar's button
-    /// toggles it.
+    /// Shows the settings over the companion. The overlay's menu opens
+    /// them; their own close button shuts them.
     pub open: bool,
 }
 
 impl GuiSettings {
     /// Settings over a client for `app`, refreshing on `runtime` and waking
     /// the GUI with `waker`. `None`, logged, when the client cannot be
-    /// configured: the chat works without the settings.
+    /// configured: the companion works without the settings.
     pub(crate) fn spawn(
         app: AppIdentity,
         runtime: &tokio::runtime::Handle,
@@ -58,27 +58,18 @@ impl GuiSettings {
     }
 }
 
-/// Which screen fills the window below the top bar.
+/// What fills the window: the companion overlay or the settings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Screen {
-    Chat,
+    Companion,
     Settings,
-}
-
-/// The button at the top bar's end that switches screens.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Toggle {
-    OpenSettings,
-    BackToChat,
 }
 
 /// What the frame shows, decided from the settings' state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Layout {
     pub(crate) screen: Screen,
-    /// `None` without settings.
-    pub(crate) toggle: Option<Toggle>,
-    /// The services' status banner under the session line.
+    /// The services' status banner, above the speech bubble.
     pub(crate) banner: bool,
 }
 
@@ -88,19 +79,16 @@ impl Layout {
     pub(crate) fn of(settings: Option<(bool, Health)>) -> Layout {
         match settings {
             None => Layout {
-                screen: Screen::Chat,
-                toggle: None,
+                screen: Screen::Companion,
                 banner: false,
             },
             Some((true, _)) => Layout {
                 screen: Screen::Settings,
-                toggle: Some(Toggle::BackToChat),
                 // Settings on its own draws the banner above its pages.
                 banner: false,
             },
             Some((false, health)) => Layout {
-                screen: Screen::Chat,
-                toggle: Some(Toggle::OpenSettings),
+                screen: Screen::Companion,
                 banner: health == Health::Problem,
             },
         }
@@ -149,43 +137,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn without_settings_only_the_chat_shows() {
+    fn without_settings_only_the_companion_shows() {
         assert_eq!(
             Layout::of(None),
             Layout {
-                screen: Screen::Chat,
-                toggle: None,
+                screen: Screen::Companion,
                 banner: false,
             }
         );
     }
 
     #[test]
-    fn closed_settings_offer_to_open_them() {
+    fn closed_settings_leave_the_companion() {
         assert_eq!(
             Layout::of(Some((false, Health::Healthy))),
             Layout {
-                screen: Screen::Chat,
-                toggle: Some(Toggle::OpenSettings),
+                screen: Screen::Companion,
                 banner: false,
             }
         );
     }
 
     #[test]
-    fn open_settings_replace_the_chat_and_offer_the_way_back() {
+    fn open_settings_fill_the_window() {
         assert_eq!(
             Layout::of(Some((true, Health::Healthy))),
             Layout {
                 screen: Screen::Settings,
-                toggle: Some(Toggle::BackToChat),
                 banner: false,
             }
         );
     }
 
     #[test]
-    fn a_problem_shows_the_banner_on_the_chat() {
+    fn a_problem_shows_the_banner_on_the_companion() {
         assert!(Layout::of(Some((false, Health::Problem))).banner);
     }
 

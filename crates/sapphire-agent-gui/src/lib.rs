@@ -6,8 +6,9 @@
 //! ([`bevy_egui::EguiPlugin`]) and the camera it draws with, a tokio
 //! runtime for the agent client ([`GuiRuntime`]), a [`Waker`] that lets
 //! that runtime wake bevy's event loop, the chat ([`chat`]), the avatar and
-//! its renderers ([`avatar`]) and the framework's settings ([`settings`]),
-//! whose theme and language apply to the whole GUI.
+//! its renderers ([`avatar`]), the companion overlay over it
+//! ([`companion`]) and the framework's settings ([`settings`]), whose
+//! theme and language apply to the whole GUI.
 //!
 //! Window concerns (size, decorations, platform quirks) stay in the app;
 //! nothing here is `cfg(target_os)`.
@@ -15,6 +16,7 @@
 mod app;
 pub mod avatar;
 pub mod chat;
+pub mod companion;
 pub mod settings;
 
 use bevy::prelude::*;
@@ -33,37 +35,41 @@ pub struct AgentGuiPlugin {
 
 impl Plugin for AgentGuiPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins((EguiPlugin::default(), avatar::AvatarPlugin))
-            // Idle while nothing happens: input, egui's own repaint
-            // requests and the `Waker` are what bring the next frame.
-            .insert_resource(bevy::winit::WinitSettings::desktop_app())
-            .add_systems(
-                Update,
-                (
-                    chat::drain_bridge_events,
-                    avatar::poll_sync,
-                    avatar::drain_sync,
-                )
-                    .chain(),
+        app.add_plugins((
+            EguiPlugin::default(),
+            avatar::AvatarPlugin,
+            companion::CompanionPlugin,
+        ))
+        // Idle while nothing happens: input, egui's own repaint
+        // requests and the `Waker` are what bring the next frame.
+        .insert_resource(bevy::winit::WinitSettings::desktop_app())
+        .add_systems(
+            Update,
+            (
+                chat::drain_bridge_events,
+                avatar::poll_sync,
+                avatar::drain_sync,
             )
-            .add_systems(
-                EguiPrimaryContextPass,
-                // The look store and the settings' per-frame work come
-                // before the chat so a theme change restyles the frame it
-                // arrives in.
-                (
-                    app::setup_fonts,
-                    app::setup_image_loaders,
-                    settings::attach_look_store,
-                    settings::follow,
-                    chat::view::ui,
-                )
-                    .chain(),
+                .chain(),
+        )
+        .add_systems(
+            EguiPrimaryContextPass,
+            // The look store and the settings' per-frame work come
+            // before the overlay (which `CompanionPlugin` adds after
+            // `settings::follow`) so a theme change restyles the frame
+            // it arrives in.
+            (
+                app::setup_fonts,
+                app::setup_image_loaders,
+                settings::attach_look_store,
+                settings::follow,
             )
-            .add_systems(
-                Last,
-                app::shutdown_runtime.in_set(bevy::app::OnAppExitSystems),
-            );
+                .chain(),
+        )
+        .add_systems(
+            Last,
+            app::shutdown_runtime.in_set(bevy::app::OnAppExitSystems),
+        );
     }
 
     /// The runtime, the waker, the bridge and the settings are made here

@@ -31,6 +31,7 @@ use tokio::sync::mpsc;
 
 use crate::Waker;
 use crate::chat::{ChatBridge, SyncRequested};
+use crate::companion::CompanionPrefs;
 pub use assets::{AvatarAssets, AvatarSource, Cache, LoadedAvatar};
 pub use mode::{ActiveRenderer, DisplayMode, choose, renderer_is};
 pub use state::AvatarState;
@@ -93,11 +94,12 @@ impl Plugin for AvatarPlugin {
                 EguiPrimaryContextPass,
                 placeholder::draw
                     .run_if(renderer_is(ActiveRenderer::Placeholder))
-                    // In the theme the settings just applied. Its area is
-                    // `Order::Background` and the chat's `Order::Middle`, so
-                    // the chat paints over it whichever system runs first.
+                    // In the theme the settings just applied, and before the
+                    // gestures hit-test against the bounds it reports. Its
+                    // area is `Order::Background` and the overlay's above
+                    // it, so the overlay paints over it either way.
                     .after(crate::settings::follow)
-                    .before(crate::chat::view::ui),
+                    .before(crate::companion::pointer_input),
             );
     }
 }
@@ -137,18 +139,22 @@ fn clear_without_scene(
     }
 }
 
-/// Picks the renderer for the avatar that synced. When it changes, the new
+/// Picks the renderer for the avatar that synced, in the display mode the
+/// companion's prefs hold. When it changes, the new
 /// one starts from nothing: neutral, nothing declared, no bounds or error.
 fn choose_renderer(
     assets: Res<AvatarAssets>,
+    prefs: Res<CompanionPrefs>,
     mut active: ResMut<ActiveRenderer>,
     mut state: ResMut<AvatarState>,
     mut declared: ResMut<DeclaredAvatar>,
     mut bounds: ResMut<AvatarBounds>,
     mut error: ResMut<RendererError>,
 ) {
-    // `Auto` until the GUI's own settings hold the mode.
-    let chosen = choose(DisplayMode::Auto, assets.loaded.as_ref().map(|l| &l.config));
+    let chosen = choose(
+        prefs.display_mode,
+        assets.loaded.as_ref().map(|l| &l.config),
+    );
     if chosen == *active {
         return;
     }

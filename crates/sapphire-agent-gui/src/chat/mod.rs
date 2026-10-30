@@ -1,10 +1,9 @@
 //! The chat with the agent running on this host: its state
-//! ([`ChatState`]), the async bridge to the agent ([`RpcBridge`]) and the
-//! egui screen (`view`).
+//! ([`ChatState`]) and the async bridge to the agent ([`RpcBridge`]). The
+//! companion overlay ([`crate::companion`]) draws it.
 
 mod bridge;
 mod state;
-pub(crate) mod view;
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -13,6 +12,7 @@ use bevy::prelude::*;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::avatar::AvatarState;
+use crate::companion::CompanionPrefs;
 use crate::{GuiRuntime, GuiWaker};
 
 pub use bridge::{BridgeEvent, RpcBridge};
@@ -39,18 +39,18 @@ impl BridgeEventQueue {
 #[derive(Resource, Default)]
 pub struct SyncRequested(pub bool);
 
-/// How long after a turn's reply the avatar goes back to neutral and its
-/// default pose.
-const REVERT_AFTER: Duration = Duration::from_secs(30);
-
 /// Drains every event the tokio side has produced this frame and
 /// folds it into `ChatState`; the avatar's cues and the end of a turn go
-/// to `AvatarState`. Idempotent if the queue is empty.
+/// to `AvatarState`, which reverts [`CompanionPrefs::revert_secs`] after a
+/// turn. Idempotent if the queue is empty.
+// A bevy system: each argument is a resource it reads or writes.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn drain_bridge_events(
     mut state: ResMut<ChatState>,
     mut avatar: ResMut<AvatarState>,
     queue: Res<BridgeEventQueue>,
     mut sync: ResMut<SyncRequested>,
+    prefs: Res<CompanionPrefs>,
     time: Res<Time<Real>>,
     runtime: Res<GuiRuntime>,
     waker: Res<GuiWaker>,
@@ -58,6 +58,7 @@ pub(crate) fn drain_bridge_events(
     let Ok(mut rx) = queue.0.lock() else {
         return;
     };
+    let revert_after = Duration::from_secs(prefs.revert_secs.into());
     while let Ok(evt) = rx.try_recv() {
         match &evt {
             BridgeEvent::SessionReady { .. } => sync.0 = true,
@@ -65,12 +66,12 @@ pub(crate) fn drain_bridge_events(
             BridgeEvent::Action { name } => avatar.action(name),
             BridgeEvent::Pose { name } => avatar.pose(name),
             BridgeEvent::ChatText { .. } | BridgeEvent::ChatError { .. } => {
-                avatar.turn_finished(time.elapsed(), REVERT_AFTER);
+                avatar.turn_finished(time.elapsed(), revert_after);
                 // An idle window draws no frame on its own, so wake it when
                 // the revert is due.
                 let waker = waker.0.clone();
                 runtime.0.spawn(async move {
-                    tokio::time::sleep(REVERT_AFTER).await;
+                    tokio::time::sleep(revert_after).await;
                     waker();
                 });
             }
