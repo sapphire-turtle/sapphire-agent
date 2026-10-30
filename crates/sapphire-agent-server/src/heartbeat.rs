@@ -125,7 +125,7 @@ impl Heartbeat {
     /// during the LLM call) without waiting for the next process restart.
     async fn run_catchup(self: Arc<Self>) {
         let mut tick = tokio::time::interval(CATCHUP_INTERVAL);
-        tick.tick().await; // skip immediate fire — startup catchup already ran in main
+        tick.tick().await; // skip immediate fire — startup catchup already ran in `serve`
         loop {
             tick.tick().await;
             if !self.placement.runs_background().await {

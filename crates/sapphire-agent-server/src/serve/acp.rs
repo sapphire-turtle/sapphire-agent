@@ -3920,7 +3920,7 @@ mod tests {
     }
 
     /// A header line that fails to parse cannot say whose it is — the same
-    /// property `main`'s `SessionStore` protects with an optional
+    /// property `serve`'s `SessionStore` protects with an optional
     /// `namespace`, but `AcpSessionStore`'s `SessionHeader.namespace` is a
     /// required field, so the equivalent of "written before namespace
     /// existed" is a header the type cannot even deserialize. An unknown

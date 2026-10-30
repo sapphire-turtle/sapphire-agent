@@ -9,7 +9,7 @@ Thank you for helping with sapphire-agent. A couple of conventions keep the repo
 
 ## Repository layout
 
-- **Binary crates** live in a directory named after the short name (`cli/`, `desktop/`) directly under the repo root.
+- **Binary crates** live in a directory named after the short name (`headless/`, `desktop/`) directly under the repo root.
 - **Library crates** live under `crates/`, in a directory named after the full crate name.
 - Non-crate directories (docs, editor extensions, etc.) stay at the repo root.
 
@@ -25,6 +25,6 @@ Thank you for helping with sapphire-agent. A couple of conventions keep the repo
 
 ## リポジトリ構成
 
-- **バイナリ用クレート**は、短い名前（`cli/`, `desktop/`）のディレクトリをリポジトリ直下に置きます。
+- **バイナリ用クレート**は、短い名前（`headless/`, `desktop/`）のディレクトリをリポジトリ直下に置きます。
 - **ライブラリ用クレート**は `crates/` 直下に、正式なクレート名のディレクトリで置きます。
 - クレートではないディレクトリ（docs やエディタ拡張など）はリポジトリ直下のままにします。

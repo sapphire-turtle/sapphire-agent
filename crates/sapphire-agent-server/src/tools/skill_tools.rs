@@ -78,7 +78,7 @@ pub struct SkillTool {
     /// The resolved index, cached per session id.
     ///
     /// `SkillTool` is registered once into the `ToolSet` shared by
-    /// every connection through `ServeState` (`src/main.rs`), and
+    /// every connection through `ServeState` (`src/lib.rs`), and
     /// `/acp` accepts many concurrent editor connections against that
     /// one state. A single cache slot on the tool — what an earlier
     /// version of this code did, reasoning that "a session belongs to

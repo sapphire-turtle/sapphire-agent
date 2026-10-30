@@ -1,0 +1,51 @@
+[package]
+# The edition without the GUI, for headless hosts. Its binary is `sapphire-agent`,
+# the one command both editions put on PATH; the desktop app is
+# `sapphire-agent-desktop`, and runs the same commands.
+name = "sapphire-agent-headless"
+version = "0.12.0"
+edition.workspace = true
+description = "A personal AI assistant agent that works on file-based, local-first sapphire-framework workspaces together with you"
+license.workspace = true
+repository.workspace = true
+homepage = "https://github.com/fluo10/sapphire-agent"
+keywords = ["ai", "agent", "anthropic", "matrix", "discord"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "sapphire-agent"
+path = "src/main.rs"
+
+[features]
+default = ["redb-store", "voice-sherpa"]
+# The server's features (see sapphire-agent-server): `voice-sherpa` is the slow
+# sherpa-onnx C++ build, which `--no-default-features` leaves out.
+redb-store = ["sapphire-agent-cli/redb-store"]
+voice-sherpa = ["sapphire-agent-cli/voice-sherpa"]
+
+[dependencies]
+sapphire-agent-cli = { path = "../crates/sapphire-agent-cli", version = "0.12.0", default-features = false }
+clap.workspace = true
+anyhow.workspace = true
+
+# `cargo binstall sapphire-agent-headless` downloads the release file instead of building
+# it, following sapphire-turtle/.github's README.md#conventions: the files are bare binaries
+# named `<crate>-<os>-<arch>` — `sapphire-agent-headless-…`, beside the desktop app's
+# `sapphire-agent-desktop-…` — so each release platform names its own; binstall installs
+# it as the `sapphire-agent` binary. quick-install is a third party's build: only this
+# repository's files, or a build from source, are installed.
+[package.metadata.binstall]
+pkg-fmt = "bin"
+disabled-strategies = ["quick-install"]
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-linux-x86_64"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-linux-aarch64"
+
+[package.metadata.binstall.overrides.aarch64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-macos-aarch64"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-windows-x86_64.exe"

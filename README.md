@@ -36,6 +36,20 @@ A personal AI assistant agent that works on file-based, local-first [`sapphire-f
 
 ## Install
 
+Install **one** of the two editions. Both put the same command, `sapphire-agent`, on
+PATH: the desktop app's binary also runs every command of the headless one (`serve`,
+`chat`, `acp`, `status`, …), so it is a superset of it.
+
+| Edition | For | How |
+|---|---|---|
+| Desktop app (`sapphire-agent-desktop`) | Everyday use, with the GUI chat client | Installer for Windows, macOS and Linux (in preparation) |
+| Headless (`sapphire-agent-headless`) | Hosts and servers without a GUI | Install script, cargo-binstall or cargo |
+
+Installing both leaves two `sapphire-agent` commands; `sapphire-agent status` warns
+when the one on PATH is not the one you ran.
+
+### Headless: install script
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/sapphire-turtle/sapphire-framework/main/install/install.sh | sh -s -- agent
 ```
@@ -45,35 +59,35 @@ curl -fsSL https://raw.githubusercontent.com/sapphire-turtle/sapphire-framework/
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/sapphire-turtle/sapphire-framework/main/install/install.ps1))) agent
 ```
 
-This installs `sapphire-agent` into `~/.local/bin` together with `sapphire-bridge`, which it syncs through. Add `agent-desktop` for the desktop client. See the [install script's README](https://github.com/sapphire-turtle/sapphire-framework/tree/main/install) for the options.
+This installs `sapphire-agent` into `~/.local/bin` together with `sapphire-bridge`, which it syncs through. See the [install script's README](https://github.com/sapphire-turtle/sapphire-framework/tree/main/install) for the options.
 
-Or with [cargo-binstall](https://github.com/cargo-bins/cargo-binstall), which downloads the same release files into `~/.cargo/bin` rather than building them:
+### Headless: cargo-binstall or cargo
 
-```sh
-cargo binstall sapphire-agent
-# The desktop client is not on crates.io
-cargo binstall --git https://github.com/sapphire-turtle/sapphire-agent sapphire-agent-desktop
-```
-
-Or with cargo:
+[cargo-binstall](https://github.com/cargo-bins/cargo-binstall) downloads the same release files into `~/.cargo/bin` rather than building them:
 
 ```sh
-cargo install sapphire-agent
+cargo binstall sapphire-agent-headless
+# or build it
+cargo install sapphire-agent-headless
 ```
 
-Or from source:
+Either installs the `sapphire-agent` binary. (Up to 0.11 it was published as the
+`sapphire-agent` crate. `sapphire-agent-cli` and `sapphire-agent-server`, binaries up to
+0.8, are now the libraries both editions share.)
+
+### From source
 
 ```sh
 git clone https://github.com/sapphire-turtle/sapphire-agent
 cd sapphire-agent
-cargo build --release
+cargo build --release   # the headless edition: target/release/sapphire-agent
 ```
 
-Release binaries are published for **Linux** (x86_64, aarch64), **macOS** (aarch64) and **Windows** (x86_64). Each is a single self-contained file — `sherpa-onnx` and its ONNX Runtime are linked statically, so there is nothing to install alongside it.
+Release binaries of both editions (`sapphire-agent-headless-<os>-<arch>`, `sapphire-agent-desktop-<os>-<arch>`) are published for **Linux** (x86_64, aarch64), **macOS** (aarch64) and **Windows** (x86_64). Each is a single self-contained file — `sherpa-onnx` and its ONNX Runtime are linked statically, so there is nothing to install alongside it.
 
 On Windows the `shell` tool runs commands under Windows PowerShell unless a call names another shell (`pwsh`, `cmd`, `bash`, …); elsewhere it uses `$SHELL`, falling back to `/bin/sh`. Inside an ACP session, commands (and the file and skill tools' scripts) run on the editor's machine under `bash`, so a Windows editor needs Git Bash on `PATH`; with WSL enabled the editor may pick WSL's `bash.exe` instead (#303).
 
-The server and its CLI are one binary ([#278](https://github.com/sapphire-turtle/sapphire-agent/issues/278)), the way `sapphire-ledger` and the other sapphire-framework apps are: the client commands (`chat`, `acp`, `status`, …) talk to the server already running on the same host over its local IPC endpoint. So does `sapphire-agent-desktop`, the GUI chat client; like `chat` it runs under `[cli].room_profile`.
+The server and its CLI are one binary ([#278](https://github.com/sapphire-turtle/sapphire-agent/issues/278)), the way `sapphire-ledger` and the other sapphire-framework apps are: the client commands (`chat`, `acp`, `status`, …) talk to the server already running on the same host over its local IPC endpoint. So does the window of `sapphire-agent-desktop`, the GUI chat client; like `chat` it runs under `[cli].room_profile`. Its binary is the CLI too: run bare it opens the window, and with a subcommand it does what `sapphire-agent` does — `serve` included.
 
 ## Configure
 
@@ -1224,9 +1238,15 @@ This repository contains components under different licenses:
 
 | Component | License |
 |-----------|---------|
-| `sapphire-agent` (`cli/`) | MIT OR Apache-2.0 |
+| `sapphire-agent-cli` | MIT OR Apache-2.0 |
 | `sapphire-agent-core` | MIT OR Apache-2.0 |
+| `sapphire-agent-headless` | MIT OR Apache-2.0 |
+| `sapphire-agent-server` | MIT OR Apache-2.0 |
 | `sapphire-agent-desktop` | GPL-3.0-or-later, with [App Store marketplace exception](desktop/LICENSE.App-Store-Exception) |
 | `sapphire-agent-gui` | GPL-3.0-or-later, with [App Store marketplace exception](crates/sapphire-agent-gui/LICENSE.App-Store-Exception) |
+
+The desktop app's binary includes the MIT/Apache-2.0 code of the command line and the
+server, so the binary as a whole is distributed under GPL-3.0-or-later (with the same
+exception).
 
 See the `LICENSE` (or `LICENSE-MIT` / `LICENSE-APACHE`) file in each component's directory for the full license text. The desktop app is built on the `sapphire-agent-gui` library, which now ships the bundled font and icons: a font under the SIL Open Font License ([crates/sapphire-agent-gui/assets/LICENSE-OFL.txt](crates/sapphire-agent-gui/assets/LICENSE-OFL.txt)) and Lucide icons under the ISC License ([crates/sapphire-agent-gui/assets/icons/LICENSE-LUCIDE.txt](crates/sapphire-agent-gui/assets/icons/LICENSE-LUCIDE.txt)).

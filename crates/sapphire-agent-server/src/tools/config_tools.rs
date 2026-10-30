@@ -317,7 +317,7 @@ impl ConfigTool {
     ///
     /// The path is built from a fixed directory name and a validated stem,
     /// so it is inside the workspace — *assuming no symlink is pre-placed
-    /// in the definition directory*. `main` builds the `AppContext` with
+    /// in the definition directory*. `serve` builds the `AppContext` with
     /// `.allow_external_paths()`, so a pre-placed symlink resolving out of
     /// the tree is followed rather than refused: the write lands at the
     /// symlink's target. That is accepted defense-in-depth, not the
@@ -474,7 +474,7 @@ impl ConfigTool {
     /// Each arm is the loader's own parse (`parse_definition`), plus the
     /// checks that loader applies elsewhere — a heartbeat `schedule:` the
     /// cron parser cannot read, and the subagent profile references
-    /// `main` validates at startup.
+    /// `serve` validates at startup.
     fn validate(&self, name: &str, content: &str) -> Result<()> {
         match self.dir {
             ConfigDir::Heartbeat => {
@@ -501,7 +501,7 @@ impl ConfigTool {
             ConfigDir::Agents => {
                 let def = crate::agents::parse_definition(name, content)
                     .map_err(|e| anyhow!("refusing to write {name}.md: {e}"))?;
-                // The same check `main` runs at startup. Now that a
+                // The same check `serve` runs at startup. Now that a
                 // definition can be written while the agent is running,
                 // leaving it out here would be a way around the startup
                 // check — and the failure would be an agent quietly
@@ -932,8 +932,8 @@ impl Tool for TaskTestTool {
 
 /// Register the four admin tools when the deployment has named a room profile.
 ///
-/// Extracted from `main.rs` so the condition is testable, because the
-/// condition *is* the grant: with `[tools.admin].room_profiles` empty, `main`
+/// Extracted from `lib.rs` so the condition is testable, because the
+/// condition *is* the grant: with `[tools.admin].room_profiles` empty, `serve`
 /// must register nothing at all — four tools that always refuse would
 /// still tell the model they exist, and "exists but never works" is a
 /// worse answer than "does not exist". The run-time gate in
@@ -1647,7 +1647,7 @@ mod tests {
     /// definition written while the agent runs is immediately
     /// advertised and callable, not one of the two. Asserted end to end:
     /// one `ToolSet`, one `Arc<SubagentTool>` in it, one `ConfigTool`
-    /// wired to both by `Weak` exactly as `main` wires them.
+    /// wired to both by `Weak` exactly as `serve` wires them.
     #[tokio::test]
     async fn a_written_agent_definition_is_offered_and_callable() {
         let (_dir, root, ws) = test_workspace();
