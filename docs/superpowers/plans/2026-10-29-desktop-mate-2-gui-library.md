@@ -19,7 +19,7 @@
 - corundum-framework-gui 0.3
 - bevy_vrm1: upstream 0.11 from crates.io (the fork in Task 5 is superseded; it is kept only for future bevy bumps that run ahead of upstream)
 
-**Spec:** `docs/superpowers/specs/2026-10-28-desktop-mate-design.md`. This plan covers work-order steps 1–3 and §1, §2, §3 and §11.
+**Spec:** `docs/superpowers/specs/2026-10-28-desktop-companion-design.md` (formerly `desktop-mate-design.md`). This plan covers work-order steps 1–3 and §1, §2, §3 and §11.
 
 ## Global Constraints
 

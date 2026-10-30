@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust 2024、tokio、serde / serde_json、toml、base64 0.23、sha2 0.11、sapphire-framework ipc 0.22。
 
-**Spec:** `docs/superpowers/specs/2026-10-28-desktop-mate-design.md`（§6、§7、§10、§12 の形）
+**Spec:** `docs/superpowers/specs/2026-10-28-desktop-companion-design.md`（旧名 desktop-mate-design.md）（§6、§7、§10、§12 の形）
 
 **後続の計画:** 2/3 GUI ライブラリ化（fork、`sapphire-agent-gui`、`Settings`）、3/3 アバター表示とメイトウィンドウ。この計画の完了時点で、CLI の `chat` と既存の desktop は新しい API で今までどおり動く。
 
