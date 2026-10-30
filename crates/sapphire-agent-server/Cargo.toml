@@ -126,7 +126,7 @@ sapphire-framework-server-api = "5.0.0"
 # Human-readable ids: session ids, and external device ids. Must match the
 # version sapphire-framework uses — `keys::Authenticated::id` is a `GrainId`, and two semver-incompatible grain-id versions in one graph are
 # two different types.
-grain-id = { version = "0.16", features = ["serde"] }
+grain-id = { version = "0.17", features = ["serde"] }
 
 # HTTP server (control API + Matrix/Discord channels)
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "ws"] }
