@@ -11,9 +11,8 @@
 //! follows the pointer off bevy's thread and the window hands it to the GUI
 //! as [`CursorOverride`].
 //!
-//! Where the global pointer cannot be read (Wayland, macOS without the
-//! accessibility permission, no libX11) the window keeps taking the
-//! pointer: no click-through, but nothing lost either.
+//! Where the global pointer cannot be read (Wayland, no libX11) the window
+//! keeps taking the pointer: no click-through, but nothing lost either.
 //!
 //! The window goes where [`CompanionPrefs::window`] says, or to the
 //! primary monitor's bottom-right corner, and its place is saved once it

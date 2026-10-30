@@ -10,7 +10,11 @@
 //!
 //! - Linux: Xlib through `x11-dl`, loaded at run time, so a desktop without
 //!   libX11 still starts (and goes without click-through).
-//! - Windows and macOS: `device_query`.
+//! - Windows and macOS: `device_query`'s mouse query. On macOS that reads
+//!   the pointer through `CGEventCreate` / `CGEventSourceButtonState`,
+//!   which need no Accessibility permission (only its keyboard query
+//!   does), so the state is made without the permission check. Untested
+//!   on a Mac.
 //! - Elsewhere, or when the backend cannot start: unavailable.
 
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
@@ -271,9 +275,13 @@ mod backend {
     pub struct Backend(DeviceState);
 
     impl Backend {
-        /// `None` on macOS without the accessibility permission.
+        /// Always opens. Not `DeviceState::checked_new`: on macOS that
+        /// requires (and prompts for) the Accessibility permission, which
+        /// only the keyboard query needs; without it the window would never
+        /// let a click through. `DeviceState` is a unit struct on both
+        /// platforms, holding nothing to set up.
         pub fn open() -> Option<Self> {
-            DeviceState::checked_new().map(Self)
+            Some(Self(DeviceState))
         }
 
         /// The pointer in the backend's desktop units, and whether the
