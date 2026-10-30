@@ -14,11 +14,13 @@
 //! transparent companion).
 
 mod companion_window;
+mod file_dialog;
 mod global_pointer;
 
 use bevy::prelude::*;
 use clap::Parser;
 use sapphire_agent_cli::{Command, Edition, Options};
+use sapphire_agent_gui::companion::FilePickerApp;
 use sapphire_agent_gui::{AgentGuiPlugin, AppIdentity};
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -73,5 +75,6 @@ fn window() {
         update_mode: None,
     })
     .add_plugins(companion_window::CompanionWindowPlugin)
+    .set_file_dialog(std::sync::Arc::new(file_dialog::RfdDialog))
     .run();
 }
