@@ -1,8 +1,9 @@
 //! File layer for the agent workspace's `avatar/` folder.
 //!
-//! The desktop mate's VRM model and VRMA gestures live in the workspace so
-//! they sync like the rest of it, and `avatar.toml` names which file plays
-//! which part. Clients reach this over IPC (`sapphire-agent.avatar.*`); this
+//! The desktop companion's avatar files live in the workspace so they sync
+//! like the rest of it: a VRM model with its VRMA gestures, and/or sprite
+//! images. `avatar.toml` names which file plays which part, in a `[vrm]` and
+//! a `[sprite]` section. Clients reach this over IPC (`sapphire-agent.avatar.*`); this
 //! module is only the file I/O behind those methods.
 //!
 //! Design choices:
@@ -353,12 +354,8 @@ impl AvatarStore {
 
     pub(crate) fn set_config(&self, config: &AvatarConfig) -> Result<(), AvatarError> {
         let _guard = self.config_lock.lock().unwrap();
-        let refs = config
-            .model
-            .iter()
-            .chain(config.idle.iter())
-            .chain(config.actions.values());
-        for p in refs {
+        config.check().map_err(AvatarError::Invalid)?;
+        for p in config.paths() {
             validate_path(p)?;
             if !self.dir.join(p).is_file() {
                 return invalid(format!("{p} does not exist in avatar/"));
@@ -385,13 +382,7 @@ impl AvatarStore {
         validate_path(path)?;
         let _guard = self.config_lock.lock().unwrap();
         let cfg = self.read_config()?;
-        let used = cfg
-            .model
-            .iter()
-            .chain(cfg.idle.iter())
-            .chain(cfg.actions.values())
-            .any(|p| p == path);
-        if used {
+        if cfg.paths().contains(&path) {
             return invalid(format!("{path} is in use by {CONFIG_FILE}"));
         }
         let full = self.dir.join(path);
@@ -406,6 +397,7 @@ impl AvatarStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sapphire_agent_core::{SpriteConfig, SpritePose, VrmConfig};
     use std::time::{Duration, Instant};
 
     fn sha(b: &[u8]) -> String {
@@ -607,13 +599,40 @@ mod tests {
         assert!(f.store.read("missing", 0, 1).is_err());
     }
 
+    fn vrm(model: &str) -> VrmConfig {
+        VrmConfig {
+            model: model.into(),
+            ..Default::default()
+        }
+    }
+
+    fn sprite(default: &str, poses: &[(&str, SpritePose)]) -> SpriteConfig {
+        SpriteConfig {
+            default_pose: default.into(),
+            poses: poses
+                .iter()
+                .map(|(k, p)| (k.to_string(), p.clone()))
+                .collect(),
+        }
+    }
+
+    fn pose(base: &str, expressions: &[(&str, &str)]) -> SpritePose {
+        SpritePose {
+            base: base.into(),
+            expressions: expressions
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
     #[test]
     fn set_config_needs_existing_files_and_round_trips() {
         let f = fx();
         put(&f, "model.vrm", b"m");
         put(&f, "actions/peace.vrma", b"p");
         let bad = AvatarConfig {
-            model: Some("nope.vrm".into()),
+            vrm: Some(vrm("nope.vrm")),
             ..Default::default()
         };
         assert!(matches!(
@@ -621,16 +640,19 @@ mod tests {
             Err(AvatarError::Invalid(_))
         ));
         let cfg = AvatarConfig {
-            model: Some("model.vrm".into()),
-            idle: None,
-            actions: [("peace".to_string(), "actions/peace.vrma".to_string())].into(),
+            vrm: Some(VrmConfig {
+                model: "model.vrm".into(),
+                idle: None,
+                actions: [("peace".to_string(), "actions/peace.vrma".to_string())].into(),
+            }),
+            sprite: None,
         };
         f.store.set_config(&cfg).unwrap();
         let m = f.store.manifest().unwrap();
         assert_eq!(m.config, cfg);
         assert!(m.files.iter().all(|x| x.path != "avatar.toml"));
         assert_eq!(m.files.len(), 2);
-        std::fs::write(f.dir.join("avatar.toml"), "model = [").unwrap();
+        std::fs::write(f.dir.join("avatar.toml"), "vrm = [").unwrap();
         assert!(matches!(
             f.store.manifest(),
             Err(AvatarError::Invalid(m)) if m.starts_with("avatar.toml")
@@ -638,22 +660,62 @@ mod tests {
     }
 
     #[test]
-    fn a_file_in_use_cannot_be_removed() {
+    fn set_config_checks_every_sprite_and_vrm_path() {
         let f = fx();
-        put(&f, "model.vrm", b"m");
-        put(&f, "spare.vrma", b"s");
+        put(&f, "sprite/normal.png", b"n");
+        let cfg = AvatarConfig {
+            vrm: None,
+            sprite: Some(sprite(
+                "normal",
+                &[(
+                    "normal",
+                    pose("sprite/normal.png", &[("happy", "sprite/h.png")]),
+                )],
+            )),
+        };
+        let Err(AvatarError::Invalid(m)) = f.store.set_config(&cfg) else {
+            panic!("a missing expression image is refused");
+        };
+        assert!(m.contains("sprite/h.png"), "{m}");
+        put(&f, "sprite/h.png", b"h");
+        f.store.set_config(&cfg).unwrap();
+        assert_eq!(f.store.manifest().unwrap().config, cfg);
+    }
+
+    #[test]
+    fn set_config_refuses_structural_errors_before_touching_disk() {
+        let f = fx();
+        let cfg = AvatarConfig {
+            vrm: None,
+            sprite: Some(sprite("x", &[("normal", pose("n.png", &[]))])),
+        };
+        let Err(AvatarError::Invalid(m)) = f.store.set_config(&cfg) else {
+            panic!("a default pose outside the poses is refused");
+        };
+        assert!(m.contains('x'), "{m}");
+        assert!(!f.dir.join("avatar.toml").exists());
+    }
+
+    #[test]
+    fn remove_refuses_a_file_any_section_uses() {
+        let f = fx();
+        put(&f, "m.vrm", b"m");
+        put(&f, "p.png", b"p");
+        put(&f, "spare.png", b"s");
         f.store
             .set_config(&AvatarConfig {
-                model: Some("model.vrm".into()),
-                ..Default::default()
+                vrm: Some(vrm("m.vrm")),
+                sprite: Some(sprite("normal", &[("normal", pose("p.png", &[]))])),
             })
             .unwrap();
-        assert!(matches!(
-            f.store.remove("model.vrm"),
-            Err(AvatarError::Invalid(m)) if m.contains("in use by avatar.toml")
-        ));
-        f.store.remove("spare.vrma").unwrap();
-        assert!(!f.dir.join("spare.vrma").exists());
-        assert!(f.store.remove("spare.vrma").is_err());
+        for used in ["m.vrm", "p.png"] {
+            assert!(matches!(
+                f.store.remove(used),
+                Err(AvatarError::Invalid(m)) if m.contains("in use by avatar.toml")
+            ));
+        }
+        f.store.remove("spare.png").unwrap();
+        assert!(!f.dir.join("spare.png").exists());
+        assert!(f.store.remove("spare.png").is_err());
     }
 }

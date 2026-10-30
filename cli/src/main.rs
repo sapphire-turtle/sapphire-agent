@@ -53,7 +53,7 @@ use periodic_log::{
 use provider::registry::ProviderRegistry;
 use sapphire_framework::workspace::AppContext;
 
-static APP_CTX: AppContext = AppContext::new("sapphire-agent").allow_external_paths();
+static APP_CTX: AppContext = AppContext::new(sapphire_agent_core::APP).allow_external_paths();
 
 /// Inject host-platform paths into [`APP_CTX`] before any code touches a
 /// [`SwWorkspace`]. The framework deliberately does not depend on `dirs`, so
