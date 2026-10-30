@@ -93,9 +93,9 @@ impl Plugin for AvatarPlugin {
                 EguiPrimaryContextPass,
                 placeholder::draw
                     .run_if(renderer_is(ActiveRenderer::Placeholder))
-                    // In the theme the settings just applied; drawn behind
-                    // the chat either way, since its area is a layer of
-                    // its own.
+                    // In the theme the settings just applied. Its area is
+                    // `Order::Background` and the chat's `Order::Middle`, so
+                    // the chat paints over it whichever system runs first.
                     .after(crate::settings::follow)
                     .before(crate::chat::view::ui),
             );

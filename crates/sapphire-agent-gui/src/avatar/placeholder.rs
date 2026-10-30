@@ -1,7 +1,8 @@
 //! The stand-in when there is no avatar to draw: a neutral silhouette,
-//! painted by egui behind the chat. It follows the renderer contract like
-//! the real renderers, declaring no cues so the agent offers no avatar
-//! tools.
+//! painted by egui in `Order::Background`, beneath the chat's area (whose
+//! opaque panels cover it where they reach). It follows the renderer
+//! contract like the real renderers, declaring no cues so the agent offers
+//! no avatar tools.
 
 use bevy::prelude::*;
 use bevy_egui::{EguiContexts, egui};

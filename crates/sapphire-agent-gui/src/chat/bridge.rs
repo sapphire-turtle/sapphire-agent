@@ -222,6 +222,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn progress_maps_cues_and_keeps_tools_apart() {
+        use sapphire_agent_core::ToolEvent;
+
+        assert!(matches!(
+            BridgeEvent::from_progress(ChatEvent::Expression {
+                name: "happy".into(),
+                intensity: 0.5,
+            }),
+            Some(BridgeEvent::Expression { name, intensity }) if name == "happy" && intensity == 0.5
+        ));
+        assert!(matches!(
+            BridgeEvent::from_progress(ChatEvent::Action { name: "wave".into() }),
+            Some(BridgeEvent::Action { name }) if name == "wave"
+        ));
+        assert!(matches!(
+            BridgeEvent::from_progress(ChatEvent::Pose { name: "arms".into() }),
+            Some(BridgeEvent::Pose { name }) if name == "arms"
+        ));
+        let tool = |started| {
+            ChatEvent::Tool(ToolEvent {
+                started,
+                id: "1".into(),
+                name: "set_pose".into(),
+            })
+        };
+        assert!(matches!(
+            BridgeEvent::from_progress(tool(true)),
+            Some(BridgeEvent::ToolStart { name }) if name == "set_pose"
+        ));
+        assert!(matches!(
+            BridgeEvent::from_progress(tool(false)),
+            Some(BridgeEvent::ToolEnd { name }) if name == "set_pose"
+        ));
+    }
+
+    #[test]
     fn submit_chat_without_connection_reports_and_wakes() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()

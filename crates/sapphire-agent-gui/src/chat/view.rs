@@ -23,10 +23,11 @@ fn icon_image<'a>(ui: &egui::Ui, src: egui::ImageSource<'a>) -> egui::Image<'a> 
 }
 
 /// The avatar as the chat sees it: what to declare with a turn, and the
-/// state a new turn holds.
+/// state a new turn holds. `state` stays a `Mut` so the frame marks it
+/// changed only when a turn actually starts.
 struct Avatar<'a> {
     declared: &'a DeclaredAvatar,
-    state: &'a mut AvatarState,
+    state: Mut<'a, AvatarState>,
 }
 
 pub(crate) fn ui(
@@ -43,18 +44,31 @@ pub(crate) fn ui(
     let settings = settings.as_deref_mut();
     let avatar = Avatar {
         declared: &declared,
-        state: &mut avatar,
+        state: avatar.reborrow(),
     };
-    // egui 0.37 keeps one root `Ui` per viewport, so every system that
-    // shows panels stacks them on the same one.
-    ctx.root_ui(|root| show(root, &mut state, &bridge, avatar, settings));
+    // The chat gets a full-window area of its own rather than the root
+    // `Ui`: bevy_egui runs this pass inside `Context::run_ui`, which holds
+    // the root `Ui` for the whole pass. `Order::Middle` keeps it above the
+    // avatar's placeholder, which paints in `Order::Background`.
+    let screen = ctx.content_rect();
+    egui::Area::new(egui::Id::unique("chat"))
+        .order(egui::Order::Middle)
+        .fixed_pos(screen.min)
+        .movable(false)
+        .show(ctx, |ui| {
+            // The area's own size is last frame's; the panels follow the
+            // window as it is now.
+            ui.scope_builder(egui::UiBuilder::new().max_rect(screen), |ui| {
+                show(ui, &mut state, &bridge, avatar, settings);
+            });
+        });
 }
 
 fn show(
     root: &mut egui::Ui,
     state: &mut ChatState,
     bridge: &ChatBridge,
-    avatar: Avatar<'_>,
+    mut avatar: Avatar<'_>,
     mut settings: Option<&mut GuiSettings>,
 ) {
     let layout = Layout::of(settings.as_ref().map(|s| (s.open, s.settings.health())));
