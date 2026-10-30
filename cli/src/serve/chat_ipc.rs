@@ -22,8 +22,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use base64::Engine as _;
 use sapphire_agent_core::{
-    Attachment, ClientCaps, HISTORY, KIND_ACTION, KIND_EXPRESSION, KIND_TOOL_END, KIND_TOOL_START,
-    OPEN, PROGRESS, SEND, SESSIONS,
+    Attachment, ClientCaps, HISTORY, KIND_ACTION, KIND_EXPRESSION, KIND_POSE, KIND_TOOL_END,
+    KIND_TOOL_START, OPEN, PROGRESS, SEND, SESSIONS,
 };
 use sapphire_framework::ipc::{PeerHandle, RequestCtx, Router, RpcError, codes};
 use serde::Deserialize;
@@ -347,6 +347,16 @@ impl AvatarSink for IpcAvatarSink {
             )
             .await;
     }
+
+    async fn pose(&self, name: &str) {
+        let _ = self
+            .peer
+            .notify(
+                PROGRESS,
+                json!({ "session_id": self.session_id, "kind": KIND_POSE, "pose": name }),
+            )
+            .await;
+    }
 }
 
 impl IpcProgress {
@@ -594,6 +604,7 @@ pub(super) mod tests {
             avatar: Some(sapphire_agent_core::AvatarCaps {
                 expressions: vec!["neutral".into(), "happy".into()],
                 actions: vec![],
+                poses: vec![],
             }),
         };
         let turn = Turn {
@@ -614,6 +625,44 @@ pub(super) mod tests {
         assert_eq!(expressions, [("happy".to_owned(), 1.0)]);
         // No actions declared, so no `play_action` to offer.
         assert_eq!(avatar_tools_offered(&log), ["set_expression"]);
+    }
+
+    /// A declared stance is what makes `set_pose` offered.
+    #[tokio::test]
+    async fn a_declared_pose_offers_set_pose() {
+        let (state, log) =
+            ServeState::for_test_scripted_with_log(false, vec![reply_text("hello back")]);
+        state
+            .tools
+            .register_tool(Box::new(crate::tools::avatar_tools::SetExpressionTool))
+            .await;
+        state
+            .tools
+            .register_tool(Box::new(crate::tools::avatar_tools::PlayActionTool))
+            .await;
+        state
+            .tools
+            .register_tool(Box::new(crate::tools::avatar_tools::SetPoseTool))
+            .await;
+        let tunnel = ChatTunnel::default();
+        tunnel.attach(state);
+        let chat = connected(&tunnel).await;
+
+        let opened = chat.open(None).await.unwrap();
+        let client = ClientCaps {
+            avatar: Some(sapphire_agent_core::AvatarCaps {
+                expressions: vec!["neutral".into()],
+                actions: vec![],
+                poses: vec!["normal".into()],
+            }),
+        };
+        let turn = Turn {
+            content: "hi",
+            attachments: &[],
+            client: &client,
+        };
+        chat.send(&opened.session_id, turn, |_| {}).await.unwrap();
+        assert_eq!(avatar_tools_offered(&log), ["set_expression", "set_pose"]);
     }
 
     /// A client that declared nothing is offered neither avatar tool.

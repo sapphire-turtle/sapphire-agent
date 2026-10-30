@@ -1974,9 +1974,9 @@ pub(crate) trait TurnHost: Send + Sync {
 
     /// The avatar this turn's client declared, when it shows one.
     ///
-    /// `None` by default: only the desktop mate over IPC draws a
-    /// character. `run_llm_turn` offers `set_expression`/`play_action`
-    /// only when this answers, and the tools read it through a task-local,
+    /// `None` by default: only the desktop companion over IPC draws a
+    /// character. `run_llm_turn` offers `set_expression`/`play_action`/
+    /// `set_pose` only when this answers, and the tools read it through a task-local,
     /// so a host that does not override it keeps both out of its turns.
     /// A host must return the same `AvatarTurn` for the whole turn — it
     /// carries the turn's one gesture.
@@ -6297,6 +6297,8 @@ mod tests {
             .await;
         set.register_tool(Box::new(crate::tools::avatar_tools::PlayActionTool))
             .await;
+        set.register_tool(Box::new(crate::tools::avatar_tools::SetPoseTool))
+            .await;
         for predicate in [
             visible_tool_predicate(false, false, false, false, false),
             visible_tool_predicate(true, true, true, true, true),
@@ -6309,6 +6311,7 @@ mod tests {
                 .collect();
             assert!(!names.contains(&"set_expression".to_string()), "{names:?}");
             assert!(!names.contains(&"play_action".to_string()), "{names:?}");
+            assert!(!names.contains(&"set_pose".to_string()), "{names:?}");
         }
     }
 

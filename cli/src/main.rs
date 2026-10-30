@@ -963,6 +963,9 @@ async fn main() -> Result<()> {
             tool_set
                 .register_tool(Box::new(tools::avatar_tools::PlayActionTool))
                 .await;
+            tool_set
+                .register_tool(Box::new(tools::avatar_tools::SetPoseTool))
+                .await;
 
             // ── ACP session store (sessions/<namespace>/acp/) ───────────────
             // Separate from `cross_device_session_store`: ACP is an

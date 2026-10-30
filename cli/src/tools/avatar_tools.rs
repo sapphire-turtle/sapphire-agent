@@ -1,5 +1,6 @@
-//! The tools that give the agent a body: `set_expression` and
-//! `play_action`, for a client that shows an avatar (the desktop mate).
+//! The tools that give the agent a body: `set_expression`, `play_action`
+//! and `set_pose`, for a client that shows an avatar (the desktop
+//! companion).
 //!
 //! Which cues exist is the client's to say — a VRM model ships its own
 //! expressions and gestures — so the client declares them on each turn
@@ -30,11 +31,12 @@ use crate::tools::{Tool, ToolKind};
 
 pub(crate) const SET_EXPRESSION: &str = "set_expression";
 pub(crate) const PLAY_ACTION: &str = "play_action";
+pub(crate) const SET_POSE: &str = "set_pose";
 
 /// Whether `name` is one of this module's tools — the ones only a turn
 /// with a declared avatar may see.
 pub(crate) fn is_avatar_tool(name: &str) -> bool {
-    matches!(name, SET_EXPRESSION | PLAY_ACTION)
+    matches!(name, SET_EXPRESSION | PLAY_ACTION | SET_POSE)
 }
 
 /// Where a cue goes: the client that declared the avatar.
@@ -42,6 +44,7 @@ pub(crate) fn is_avatar_tool(name: &str) -> bool {
 pub(crate) trait AvatarSink: Send + Sync {
     async fn expression(&self, name: &str, intensity: f32);
     async fn action(&self, name: &str);
+    async fn pose(&self, name: &str);
 }
 
 /// One turn's avatar: what the client declared, where cues go, and
@@ -87,15 +90,17 @@ pub(crate) fn current_avatar_turn() -> Option<Arc<AvatarTurn>> {
 }
 
 /// Fit this turn's tool list to what its client declared: with no avatar
-/// both tools go, with no actions `play_action` goes, and whatever stays
+/// all three tools go, with no actions `play_action` goes (likewise
+/// `set_pose` with no poses), and whatever stays
 /// has its `enum` replaced by the declared names. An empty `enum` is a
 /// schema no name can satisfy — and some providers reject outright — so a
 /// declaration with no expressions drops `set_expression` the same way.
 pub(crate) fn specialize_specs(specs: &mut Vec<ToolSpec>, caps: Option<&AvatarCaps>) {
     specs.retain(|s| match (s.name.as_ref(), caps) {
-        (SET_EXPRESSION | PLAY_ACTION, None) => false,
+        (SET_EXPRESSION | PLAY_ACTION | SET_POSE, None) => false,
         (SET_EXPRESSION, Some(c)) => !c.expressions.is_empty(),
         (PLAY_ACTION, Some(c)) => !c.actions.is_empty(),
+        (SET_POSE, Some(c)) => !c.poses.is_empty(),
         _ => true,
     });
     let Some(caps) = caps else { return };
@@ -103,6 +108,7 @@ pub(crate) fn specialize_specs(specs: &mut Vec<ToolSpec>, caps: Option<&AvatarCa
         let (field, names) = match spec.name.as_ref() {
             SET_EXPRESSION => ("expression", &caps.expressions),
             PLAY_ACTION => ("action", &caps.actions),
+            SET_POSE => ("pose", &caps.poses),
             _ => continue,
         };
         let mut unique: Vec<&String> = Vec::new();
@@ -226,6 +232,44 @@ impl Tool for PlayActionTool {
     }
 }
 
+// -- set_pose ----------------------------------------------------------------
+
+static SET_POSE_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| ToolSpec {
+    name: SET_POSE.into(),
+    description: "Switch your avatar's stance (pose). It holds until you change it again, \
+                  independent of the expression. Call it as often as you like within one turn."
+        .into(),
+    // The `enum` is filled per turn by `specialize_specs`.
+    input_schema: json!({
+        "type": "object",
+        "properties": {
+            "pose": { "type": "string", "enum": [] }
+        },
+        "required": ["pose"]
+    }),
+});
+
+pub(crate) struct SetPoseTool;
+
+#[async_trait]
+impl Tool for SetPoseTool {
+    fn spec(&self) -> &ToolSpec {
+        &SET_POSE_SPEC
+    }
+
+    /// `Think`, as for `set_expression`.
+    fn kind(&self) -> ToolKind {
+        ToolKind::Think
+    }
+
+    async fn execute(&self, input: &Value) -> Result<String> {
+        let turn = avatar_turn()?;
+        let name = declared_name(input, "pose", &turn.caps.poses)?;
+        turn.sink.pose(name).await;
+        Ok("ok".into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,12 +298,24 @@ mod tests {
         async fn action(&self, name: &str) {
             self.0.lock().unwrap().push(format!("action {name}"));
         }
+
+        async fn pose(&self, name: &str) {
+            self.0.lock().unwrap().push(format!("pose {name}"));
+        }
     }
 
     fn caps(expressions: &[&str], actions: &[&str]) -> AvatarCaps {
         AvatarCaps {
             expressions: expressions.iter().map(|s| s.to_string()).collect(),
             actions: actions.iter().map(|s| s.to_string()).collect(),
+            poses: vec![],
+        }
+    }
+
+    fn caps_with_poses(poses: &[&str]) -> AvatarCaps {
+        AvatarCaps {
+            poses: poses.iter().map(|s| s.to_string()).collect(),
+            ..caps(&["neutral"], &[])
         }
     }
 
@@ -356,6 +412,76 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(sink.events(), ["action peace"]);
+    }
+
+    fn pose_turn(poses: &[&str]) -> (Arc<AvatarTurn>, Arc<RecordingSink>) {
+        let sink = Arc::new(RecordingSink::default());
+        let turn = AvatarTurn::new(caps_with_poses(poses), sink.clone());
+        (turn, sink)
+    }
+
+    #[tokio::test]
+    async fn a_declared_pose_is_sent_and_answers_ok() {
+        let (turn, sink) = pose_turn(&["normal", "arms"]);
+        let out = scope_avatar_turn(Some(turn), SetPoseTool.execute(&json!({"pose":"arms"})))
+            .await
+            .unwrap();
+        assert_eq!(out, "ok");
+        assert_eq!(sink.events(), ["pose arms"]);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_pose_is_refused_with_the_declared_list() {
+        let (turn, sink) = pose_turn(&["normal", "arms"]);
+        let err = scope_avatar_turn(Some(turn), SetPoseTool.execute(&json!({"pose":"dab"})))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("normal, arms"), "{err}");
+        assert!(sink.events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn set_pose_has_no_per_turn_limit() {
+        let (turn, sink) = pose_turn(&["normal", "arms"]);
+        for pose in ["arms", "normal"] {
+            let out = scope_avatar_turn(
+                Some(turn.clone()),
+                SetPoseTool.execute(&json!({ "pose": pose })),
+            )
+            .await
+            .unwrap();
+            assert_eq!(out, "ok");
+        }
+        assert_eq!(sink.events(), ["pose arms", "pose normal"]);
+    }
+
+    #[test]
+    fn set_pose_follows_the_declared_poses() {
+        let all = || {
+            vec![
+                SetExpressionTool.spec().clone(),
+                PlayActionTool.spec().clone(),
+                SetPoseTool.spec().clone(),
+            ]
+        };
+        let mut none = all();
+        specialize_specs(&mut none, Some(&caps_with_poses(&[])));
+        assert_eq!(names(&none), ["set_expression"]);
+
+        let mut declared = all();
+        specialize_specs(
+            &mut declared,
+            Some(&caps_with_poses(&["normal", "normal", "arms"])),
+        );
+        assert_eq!(names(&declared), ["set_expression", "set_pose"]);
+        assert_eq!(
+            declared[1].input_schema["properties"]["pose"]["enum"],
+            json!(["normal", "arms"])
+        );
+
+        let mut no_caps = all();
+        specialize_specs(&mut no_caps, None);
+        assert!(no_caps.is_empty());
     }
 
     #[tokio::test]
