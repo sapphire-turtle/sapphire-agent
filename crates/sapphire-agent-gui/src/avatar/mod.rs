@@ -96,7 +96,7 @@ use tokio::sync::mpsc;
 
 use crate::Waker;
 use crate::chat::{ChatBridge, SyncRequested};
-use crate::companion::CompanionPrefs;
+use crate::companion::{CompanionPrefs, CursorOverride};
 pub use assets::{
     AvatarAssets, AvatarEditor, AvatarOps, AvatarSource, Cache, LoadedAvatar, OpTicket, OpsStatus,
 };
@@ -196,6 +196,9 @@ impl Plugin for AvatarPlugin {
             // The defaults until `CompanionPlugin` loads the saved ones, or
             // for good in an app without it.
             .init_resource::<CompanionPrefs>()
+            // Where the pointer is, for a renderer to read in an app
+            // without `CompanionPlugin`, which inits it too.
+            .init_resource::<CursorOverride>()
             .configure_sets(Update, AvatarSystems::Choose.after(drain_sync))
             .configure_sets(
                 PostUpdate,
@@ -452,6 +455,7 @@ mod tests {
         // plugin loaded before; it now starts from the defaults.
         app.update();
         assert!(app.world().contains_resource::<CompanionPrefs>());
+        assert!(app.world().contains_resource::<CursorOverride>());
         assert_eq!(
             *app.world().resource::<ActiveRenderer>(),
             ActiveRenderer::Placeholder

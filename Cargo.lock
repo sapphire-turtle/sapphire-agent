@@ -8229,6 +8229,7 @@ dependencies = [
  "corundum-framework-gui",
  "corundum-framework-platform",
  "egui_extras",
+ "fastrand",
  "sapphire-agent-core",
  "sapphire-framework-gui",
  "serde",

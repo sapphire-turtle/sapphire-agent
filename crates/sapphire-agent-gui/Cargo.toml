@@ -99,6 +99,9 @@ tracing = "0.1"
 sha2 = "0.10"
 async-trait = "0.1"
 
+# The VRM renderer's blink timing (plan 4-3D).
+fastrand = "2"
+
 # Per-app cache directory, from the same place the framework's apps use.
 corundum-framework-platform = "0.3"
 
