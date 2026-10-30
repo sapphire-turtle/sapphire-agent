@@ -8,6 +8,14 @@ use bevy::prelude::Resource;
 
 use super::bridge::BridgeEvent;
 
+/// The agent's tools that move the avatar. They are how the avatar shows
+/// itself, not work to wait on, so they never show as a status.
+const AVATAR_TOOLS: [&str; 3] = ["set_expression", "play_action", "set_pose"];
+
+fn is_avatar_tool(name: &str) -> bool {
+    AVATAR_TOOLS.contains(&name)
+}
+
 /// All of the chat screen's state in one resource.
 #[derive(Debug, Resource)]
 pub struct ChatState {
@@ -61,12 +69,18 @@ impl ChatState {
                 self.turn = TurnState::Idle;
                 self.last_status = None;
             }
+            BridgeEvent::ToolStart { name } | BridgeEvent::ToolEnd { name }
+                if is_avatar_tool(&name) => {}
             BridgeEvent::ToolStart { name } => {
                 self.last_status = Some(format!("tool: {name}…"));
             }
             BridgeEvent::ToolEnd { name } => {
                 self.last_status = Some(format!("tool: {name} done"));
             }
+            // The avatar's cues; `drain_bridge_events` hands them to it.
+            BridgeEvent::Expression { .. }
+            | BridgeEvent::Action { .. }
+            | BridgeEvent::Pose { .. } => {}
         }
     }
 
@@ -167,6 +181,17 @@ mod tests {
             name: "search".into(),
         });
         assert_eq!(s.last_status.as_deref(), Some("tool: search done"));
+    }
+
+    #[test]
+    fn avatar_tool_calls_do_not_show_as_thinking() {
+        let mut s = ChatState::new();
+        for name in ["set_expression", "play_action", "set_pose"] {
+            s.apply(BridgeEvent::ToolStart { name: name.into() });
+            assert_eq!(s.last_status, None, "{name} started");
+            s.apply(BridgeEvent::ToolEnd { name: name.into() });
+            assert_eq!(s.last_status, None, "{name} ended");
+        }
     }
 
     #[test]

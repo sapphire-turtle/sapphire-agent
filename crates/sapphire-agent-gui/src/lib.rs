@@ -2,10 +2,11 @@
 //! mobile one.
 //!
 //! [`AgentGuiPlugin`] is the whole of it: the app adds bevy's
-//! `DefaultPlugins`, its window and a camera, then this plugin. It brings
-//! egui ([`bevy_egui::EguiPlugin`]), a tokio runtime for the agent client
-//! ([`GuiRuntime`]), a [`Waker`] that lets that runtime wake bevy's event
-//! loop, the chat ([`chat`]) and the framework's settings ([`settings`]),
+//! `DefaultPlugins` and its window, then this plugin. It brings egui
+//! ([`bevy_egui::EguiPlugin`]) and the camera it draws with, a tokio
+//! runtime for the agent client ([`GuiRuntime`]), a [`Waker`] that lets
+//! that runtime wake bevy's event loop, the chat ([`chat`]), the avatar and
+//! its renderers ([`avatar`]) and the framework's settings ([`settings`]),
 //! whose theme and language apply to the whole GUI.
 //!
 //! Window concerns (size, decorations, platform quirks) stay in the app;
@@ -32,7 +33,7 @@ pub struct AgentGuiPlugin {
 
 impl Plugin for AgentGuiPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins(EguiPlugin::default())
+        app.add_plugins((EguiPlugin::default(), avatar::AvatarPlugin))
             // Idle while nothing happens: input, egui's own repaint
             // requests and the `Waker` are what bring the next frame.
             .insert_resource(bevy::winit::WinitSettings::desktop_app())

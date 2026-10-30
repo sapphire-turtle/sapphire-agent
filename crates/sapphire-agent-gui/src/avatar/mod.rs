@@ -1,19 +1,173 @@
 //! The companion's avatar: its files, synced from the agent into a local
-//! cache ([`assets`]), and the bevy side that keeps them current.
+//! cache ([`assets`]), and the bevy side that keeps them current; what it
+//! shows ([`state`]); and which renderer draws it ([`mode`]).
+//!
+//! # The renderer contract (spec §14)
+//!
+//! Each renderer is one bevy plugin whose systems run only while
+//! [`ActiveRenderer`] names it ([`renderer_is`]). It reads [`AvatarState`],
+//! [`AvatarAssets`] and the cached files, and writes [`DeclaredAvatar`],
+//! [`AvatarBounds`] and [`RendererError`]. A renderer that needs a scene
+//! camera spawns its own, at an `order` below [`UI_CAMERA_ORDER`] and with
+//! `ClearColorConfig::Custom(Color::NONE)`, and despawns it when it stops
+//! being chosen. The renderers know nothing of each other, and nothing
+//! outside them knows what they draw. [`placeholder`] follows the same
+//! contract.
 
 pub mod assets;
+pub mod mode;
+pub mod placeholder;
+pub mod state;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bevy::prelude::*;
+use bevy_egui::{EguiGlobalSettings, EguiPrimaryContextPass, PrimaryEguiContext};
+use sapphire_agent_core::AvatarCaps;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 
 use crate::Waker;
 use crate::chat::{ChatBridge, SyncRequested};
 pub use assets::{AvatarAssets, AvatarSource, Cache, LoadedAvatar};
+pub use mode::{ActiveRenderer, DisplayMode, choose, renderer_is};
+pub use state::AvatarState;
+
+/// The cues the active renderer can show, as the chat declares them to the
+/// agent with each turn. `None`: no avatar, so the agent offers no avatar
+/// tools.
+#[derive(Resource, Default)]
+pub struct DeclaredAvatar(pub Option<AvatarCaps>);
+
+/// Where the avatar is on screen, in logical window pixels with the origin
+/// at the top left: the space egui's points are in. Gestures and click
+/// pass-through hit-test against it. `None` until a renderer draws.
+#[derive(Resource, Default, Clone, Copy)]
+pub struct AvatarBounds(pub Option<Rect>);
+
+/// Why the active renderer cannot draw the avatar, for the settings page
+/// and the speech bubble.
+#[derive(Resource, Default)]
+pub struct RendererError(pub Option<String>);
+
+/// The camera the GUI's egui draws with. It sits above every renderer's
+/// scene camera.
+pub const UI_CAMERA_ORDER: isize = 100;
+
+/// Marks the GUI's own camera, the one carrying the primary egui context.
+#[derive(Component)]
+pub struct UiCamera;
+
+/// The avatar and its renderers, and the GUI's camera. Add it after
+/// `bevy_egui::EguiPlugin`; [`crate::AgentGuiPlugin`] does.
+pub struct AvatarPlugin;
+
+impl Plugin for AvatarPlugin {
+    fn build(&self, app: &mut App) {
+        // The GUI's camera carries the primary egui context, not whichever
+        // camera a renderer happens to spawn first.
+        match app.world_mut().get_resource_mut::<EguiGlobalSettings>() {
+            Some(mut settings) => settings.auto_create_primary_context = false,
+            None => {
+                app.insert_resource(EguiGlobalSettings {
+                    auto_create_primary_context: false,
+                    ..default()
+                });
+            }
+        }
+        app.insert_resource(ActiveRenderer::Placeholder)
+            .init_resource::<AvatarState>()
+            .init_resource::<DeclaredAvatar>()
+            .init_resource::<AvatarBounds>()
+            .init_resource::<RendererError>()
+            .add_systems(Startup, spawn_ui_camera)
+            .add_systems(
+                Update,
+                (choose_renderer, tick_state, clear_without_scene)
+                    .chain()
+                    .after(drain_sync),
+            )
+            .add_systems(
+                EguiPrimaryContextPass,
+                placeholder::draw
+                    .run_if(renderer_is(ActiveRenderer::Placeholder))
+                    // In the theme the settings just applied; drawn behind
+                    // the chat either way, since its area is a layer of
+                    // its own.
+                    .after(crate::settings::follow)
+                    .before(crate::chat::view::ui),
+            );
+    }
+}
+
+/// The GUI's camera: it draws egui over whatever the renderers drew and
+/// clears nothing itself, unless [`clear_without_scene`] finds nothing to
+/// draw over.
+fn spawn_ui_camera(mut commands: Commands) {
+    commands.spawn((
+        Camera2d,
+        Camera {
+            order: UI_CAMERA_ORDER,
+            clear_color: ClearColorConfig::None,
+            ..default()
+        },
+        PrimaryEguiContext,
+        UiCamera,
+    ));
+}
+
+/// With no active scene camera (the placeholder draws in egui, and a
+/// renderer swap can leave a frame between one camera and the next),
+/// nothing else clears the window, so the UI camera clears it with the
+/// app's `ClearColor`; otherwise it draws over the scene.
+fn clear_without_scene(
+    mut ui: Single<&mut Camera, With<UiCamera>>,
+    scene: Query<&Camera, Without<UiCamera>>,
+) {
+    let has_scene = scene.iter().any(|camera| camera.is_active);
+    let clears = !matches!(ui.clear_color, ClearColorConfig::None);
+    if has_scene == clears {
+        ui.clear_color = if has_scene {
+            ClearColorConfig::None
+        } else {
+            ClearColorConfig::Default
+        };
+    }
+}
+
+/// Picks the renderer for the avatar that synced. When it changes, the new
+/// one starts from nothing: neutral, nothing declared, no bounds or error.
+fn choose_renderer(
+    assets: Res<AvatarAssets>,
+    mut active: ResMut<ActiveRenderer>,
+    mut state: ResMut<AvatarState>,
+    mut declared: ResMut<DeclaredAvatar>,
+    mut bounds: ResMut<AvatarBounds>,
+    mut error: ResMut<RendererError>,
+) {
+    // `Auto` until the GUI's own settings hold the mode.
+    let chosen = choose(DisplayMode::Auto, assets.loaded.as_ref().map(|l| &l.config));
+    if chosen == *active {
+        return;
+    }
+    *active = chosen;
+    state.reset();
+    declared.0 = None;
+    bounds.0 = None;
+    error.0 = None;
+}
+
+/// Reverts the avatar once a finished turn's revert time comes. On the
+/// wall clock (`Time<Real>`): virtual time barely moves while the GUI
+/// idles between wakes.
+fn tick_state(time: Res<Time<Real>>, mut state: ResMut<AvatarState>) {
+    let mut next = state.clone();
+    next.tick(time.elapsed());
+    // Renderers react to a change, so most frames must not make one.
+    state.set_if_neq(next);
+}
 
 /// How often the agent is asked whether the avatar changed.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(300);

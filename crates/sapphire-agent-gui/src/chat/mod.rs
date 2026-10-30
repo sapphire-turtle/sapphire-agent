@@ -7,9 +7,13 @@ mod state;
 pub(crate) mod view;
 
 use std::sync::Mutex;
+use std::time::Duration;
 
 use bevy::prelude::*;
 use tokio::sync::mpsc::UnboundedReceiver;
+
+use crate::avatar::AvatarState;
+use crate::{GuiRuntime, GuiWaker};
 
 pub use bridge::{BridgeEvent, RpcBridge};
 pub use state::{ChatEntry, ChatRole, ChatState, Session, TurnState};
@@ -35,19 +39,42 @@ impl BridgeEventQueue {
 #[derive(Resource, Default)]
 pub struct SyncRequested(pub bool);
 
+/// How long after a turn's reply the avatar goes back to neutral and its
+/// default pose.
+const REVERT_AFTER: Duration = Duration::from_secs(30);
+
 /// Drains every event the tokio side has produced this frame and
-/// folds it into `ChatState`. Idempotent if the queue is empty.
+/// folds it into `ChatState`; the avatar's cues and the end of a turn go
+/// to `AvatarState`. Idempotent if the queue is empty.
 pub(crate) fn drain_bridge_events(
     mut state: ResMut<ChatState>,
+    mut avatar: ResMut<AvatarState>,
     queue: Res<BridgeEventQueue>,
     mut sync: ResMut<SyncRequested>,
+    time: Res<Time<Real>>,
+    runtime: Res<GuiRuntime>,
+    waker: Res<GuiWaker>,
 ) {
     let Ok(mut rx) = queue.0.lock() else {
         return;
     };
     while let Ok(evt) = rx.try_recv() {
-        if matches!(evt, BridgeEvent::SessionReady { .. }) {
-            sync.0 = true;
+        match &evt {
+            BridgeEvent::SessionReady { .. } => sync.0 = true,
+            BridgeEvent::Expression { name, intensity } => avatar.expression(name, *intensity),
+            BridgeEvent::Action { name } => avatar.action(name),
+            BridgeEvent::Pose { name } => avatar.pose(name),
+            BridgeEvent::ChatText { .. } | BridgeEvent::ChatError { .. } => {
+                avatar.turn_finished(time.elapsed(), REVERT_AFTER);
+                // An idle window draws no frame on its own, so wake it when
+                // the revert is due.
+                let waker = waker.0.clone();
+                runtime.0.spawn(async move {
+                    tokio::time::sleep(REVERT_AFTER).await;
+                    waker();
+                });
+            }
+            _ => {}
         }
         state.apply(evt);
     }

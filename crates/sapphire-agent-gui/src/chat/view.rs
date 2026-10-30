@@ -3,8 +3,10 @@
 
 use bevy::prelude::*;
 use bevy_egui::{EguiContexts, egui};
+use sapphire_agent_core::ClientCaps;
 
 use super::{ChatBridge, ChatEntry, ChatRole, ChatState, Session, TurnState};
+use crate::avatar::{AvatarState, DeclaredAvatar};
 use crate::settings::{GuiSettings, Layout, Screen, Toggle};
 
 const ICON_SEND: egui::ImageSource<'_> = egui::include_image!("../../assets/icons/send.svg");
@@ -20,25 +22,39 @@ fn icon_image<'a>(ui: &egui::Ui, src: egui::ImageSource<'a>) -> egui::Image<'a> 
         .tint(ui.visuals().text_color())
 }
 
+/// The avatar as the chat sees it: what to declare with a turn, and the
+/// state a new turn holds.
+struct Avatar<'a> {
+    declared: &'a DeclaredAvatar,
+    state: &'a mut AvatarState,
+}
+
 pub(crate) fn ui(
     mut contexts: EguiContexts,
     mut state: ResMut<ChatState>,
     bridge: Res<ChatBridge>,
+    declared: Res<DeclaredAvatar>,
+    mut avatar: ResMut<AvatarState>,
     mut settings: Option<NonSendMut<GuiSettings>>,
 ) {
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
     };
     let settings = settings.as_deref_mut();
+    let avatar = Avatar {
+        declared: &declared,
+        state: &mut avatar,
+    };
     // egui 0.37 keeps one root `Ui` per viewport, so every system that
     // shows panels stacks them on the same one.
-    ctx.root_ui(|root| show(root, &mut state, &bridge, settings));
+    ctx.root_ui(|root| show(root, &mut state, &bridge, avatar, settings));
 }
 
 fn show(
     root: &mut egui::Ui,
     state: &mut ChatState,
     bridge: &ChatBridge,
+    avatar: Avatar<'_>,
     mut settings: Option<&mut GuiSettings>,
 ) {
     let layout = Layout::of(settings.as_ref().map(|s| (s.open, s.settings.health())));
@@ -114,7 +130,11 @@ fn show(
                 if (send_clicked || enter_pressed)
                     && let Some(text) = state.take_submission()
                 {
-                    bridge.submit_chat(text);
+                    avatar.state.turn_started();
+                    let caps = ClientCaps {
+                        avatar: avatar.declared.0.clone(),
+                    };
+                    bridge.submit_chat(text, caps);
                 }
             });
             if let Some(status) = state.last_status.as_deref() {

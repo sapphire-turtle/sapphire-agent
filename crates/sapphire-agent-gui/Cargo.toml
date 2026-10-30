@@ -63,6 +63,9 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "ti
 # Error handling
 anyhow.workspace = true
 
+# The display mode is a setting the GUI stores.
+serde = { version = "1.0", features = ["derive"] }
+
 # Logging
 tracing = "0.1"
 
