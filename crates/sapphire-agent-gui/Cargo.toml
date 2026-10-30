@@ -12,7 +12,7 @@ publish = false
 [dependencies]
 # The local chat protocol and its client: the GUI talks to the agent
 # running on this host over its IPC endpoint, like `sapphire-agent chat`.
-sapphire-agent-core = { path = "../sapphire-agent-core", version = "0.10.0" }
+sapphire-agent-core = { path = "../sapphire-agent-core", version = "0.10.1" }
 
 # The framework's Settings screen (workspace, devices, appearance, about…)
 # and its client, plus `AppIdentity`. No eframe: the GUI runs inside bevy,

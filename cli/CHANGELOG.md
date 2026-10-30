@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.3](https://github.com/sapphire-turtle/sapphire-agent/compare/v0.11.2...v0.11.3) - 2026-10-30
+
+### Added
+
+- *(chat)* Accept image attachments and client capabilities over IPC
+- *(tools)* Let the agent set its avatar's expression and play a gesture on clients that show one
+- *(chat)* Store the avatar's model and gestures in the workspace's avatar/ folder
+- *(chat)* Serve the avatar's files to local clients over IPC
+
+### Fixed
+
+- Name where the app's releases are, so update installs them
+- *(tools)* Keep the avatar tools out of a subagent's tool list
+- *(chat)* Copy a cross-filesystem avatar upload via a hidden unique sibling
+- *(tools)* Dedupe declared avatar names in the tool enums
+- *(chat)* Refuse hidden and case-variant avatar paths, serialize config mutations
+
+### Other
+
+- Call the shared workflows from sapphire-turtle/.github@v1
+
+
+
 ## [0.11.2](https://github.com/sapphire-turtle/sapphire-agent/compare/v0.11.1...v0.11.2) - 2026-10-27
 
 ### Fixed

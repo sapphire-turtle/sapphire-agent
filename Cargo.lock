@@ -7819,7 +7819,7 @@ dependencies = [
 
 [[package]]
 name = "sapphire-agent"
-version = "0.11.2"
+version = "0.11.3"
 dependencies = [
  "a2a-lf",
  "agent-client-protocol",
@@ -7872,7 +7872,7 @@ dependencies = [
 
 [[package]]
 name = "sapphire-agent-core"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -7886,7 +7886,7 @@ dependencies = [
 
 [[package]]
 name = "sapphire-agent-desktop"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "bevy",
  "sapphire-agent-gui",
