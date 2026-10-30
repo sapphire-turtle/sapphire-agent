@@ -8,11 +8,14 @@
 use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use bevy::prelude::Resource;
 use sapphire_agent_core::{AvatarConfig, AvatarFile, AvatarManifest, ChatClient};
 use sha2::{Digest as _, Sha256};
+use tokio::runtime::Handle;
 
 /// Where an avatar and its files come from. The agent is the source today;
 /// this is the one place another (a bundled avatar) plugs in.
@@ -182,10 +185,130 @@ impl AvatarAssets {
     }
 }
 
+/// Whether an upload or a config change is running, and how the last one
+/// failed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OpsStatus {
+    pub busy: bool,
+    pub last_error: Option<String>,
+}
+
+#[derive(Default)]
+struct OpsInner {
+    running: usize,
+    last_error: Option<String>,
+}
+
+/// Looks up the live agent connection, if there is one.
+pub type ClientLookup = Arc<dyn Fn() -> Option<Arc<ChatClient>> + Send + Sync>;
+
+/// Changes to the agent's avatar made from the GUI: an upload and a new
+/// config. They run on the GUI's runtime through the live client, report
+/// into a shared [`OpsStatus`] and, on success, ask for a sync so the
+/// manifest is refetched.
+#[derive(Clone, Resource)]
+pub struct AvatarOps {
+    runtime: Handle,
+    client: ClientLookup,
+    sync_request: Arc<AtomicBool>,
+    waker: Option<crate::Waker>,
+    inner: Arc<Mutex<OpsInner>>,
+}
+
+impl AvatarOps {
+    /// Ops on `runtime` using whatever connection `client` finds. On
+    /// success `sync_request` is set; the GUI turns that into a
+    /// [`crate::chat::SyncRequested`].
+    pub fn new(runtime: Handle, client: ClientLookup, sync_request: Arc<AtomicBool>) -> Self {
+        Self {
+            runtime,
+            client,
+            sync_request,
+            waker: None,
+            inner: Arc::default(),
+        }
+    }
+
+    /// Wakes the GUI when an op finishes, so an idle window repaints its
+    /// status.
+    pub fn with_waker(mut self, waker: crate::Waker) -> Self {
+        self.waker = Some(waker);
+        self
+    }
+
+    pub fn status(&self) -> OpsStatus {
+        let inner = self.lock();
+        OpsStatus {
+            busy: inner.running > 0,
+            last_error: inner.last_error.clone(),
+        }
+    }
+
+    /// Whether an op asked for a sync since this was last called.
+    pub fn take_sync_request(&self) -> bool {
+        self.sync_request.swap(false, Ordering::AcqRel)
+    }
+
+    /// Uploads `bytes` to the avatar-relative `path`.
+    pub fn upload(&self, path: String, bytes: Vec<u8>) {
+        self.run(move |client| async move { client.avatar_upload(&path, &bytes).await });
+    }
+
+    /// Replaces the avatar's config. A config with a structural error is
+    /// reported without calling the agent.
+    pub fn set_config(&self, config: AvatarConfig) {
+        if let Err(error) = config.check() {
+            self.lock().last_error = Some(error);
+            self.wake();
+            return;
+        }
+        self.run(move |client| async move { client.avatar_set_config(&config).await });
+    }
+
+    fn run<F, Fut>(&self, op: F)
+    where
+        F: FnOnce(Arc<ChatClient>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+    {
+        let Some(client) = (self.client)() else {
+            self.lock().last_error = Some("not connected to the agent".to_owned());
+            self.wake();
+            return;
+        };
+        {
+            let mut inner = self.lock();
+            inner.running += 1;
+            inner.last_error = None;
+        }
+        let ops = self.clone();
+        self.runtime.spawn(async move {
+            let result = op(client).await;
+            {
+                let mut inner = ops.lock();
+                inner.running -= 1;
+                match &result {
+                    Ok(()) => ops.sync_request.store(true, Ordering::Release),
+                    Err(e) => inner.last_error = Some(format!("{e:#}")),
+                }
+            }
+            ops.wake();
+        });
+    }
+
+    fn wake(&self) {
+        if let Some(waker) = &self.waker {
+            waker();
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, OpsInner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::Mutex;
 
     use sapphire_agent_core::{AvatarConfig, AvatarFile, AvatarManifest, SpriteConfig, SpritePose};
 
@@ -308,6 +431,27 @@ mod tests {
             }
         );
         assert!(source.fetches.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn set_config_with_a_structural_error_reports_without_calling_the_agent() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let ops = AvatarOps::new(
+            runtime.handle().clone(),
+            Arc::new(|| panic!("the agent must not be asked for a client")),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let mut config = config_of(&["a.png"]);
+        config.sprite.as_mut().unwrap().default_pose = "missing-pose".to_owned();
+
+        ops.set_config(config);
+
+        let status = ops.status();
+        assert!(!status.busy);
+        let error = status.last_error.expect("the structural error is reported");
+        assert!(error.contains("missing-pose"), "{error}");
     }
 
     #[test]

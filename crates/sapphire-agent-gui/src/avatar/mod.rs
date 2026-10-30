@@ -32,7 +32,7 @@ use tokio::sync::mpsc;
 use crate::Waker;
 use crate::chat::{ChatBridge, SyncRequested};
 use crate::companion::CompanionPrefs;
-pub use assets::{AvatarAssets, AvatarSource, Cache, LoadedAvatar};
+pub use assets::{AvatarAssets, AvatarOps, AvatarSource, Cache, LoadedAvatar, OpsStatus};
 pub use mode::{ActiveRenderer, DisplayMode, choose, renderer_is};
 pub use state::AvatarState;
 

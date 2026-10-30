@@ -56,6 +56,8 @@ impl Plugin for AgentGuiPlugin {
             Update,
             (
                 chat::drain_bridge_events,
+                companion::character_page::refresh,
+                companion::character_page::request_sync_after_ops,
                 avatar::poll_sync,
                 avatar::drain_sync,
             )
@@ -94,16 +96,38 @@ impl Plugin for AgentGuiPlugin {
         // the window paints.
         bridge.submit_connect();
 
+        // The Character page edits the avatar through these ops; a sync
+        // follows each success.
+        let ops = avatar::AvatarOps::new(
+            runtime.handle().clone(),
+            bridge.client_lookup(),
+            Default::default(),
+        )
+        .with_waker(waker.clone());
+        let panels = app
+            .world()
+            .get_resource::<companion::character_page::RendererPanels>()
+            .map(|p| p.take())
+            .unwrap_or_default();
+        let shared = companion::character_page::CharacterShared::new(
+            companion::character_page::CharacterModel::new(ops.clone(), panels),
+        );
+
         // Without settings (no client config) the chat still works.
-        if let Some(settings) =
-            settings::GuiSettings::spawn(self.app, runtime.handle(), waker.clone())
-        {
+        if let Some(settings) = settings::GuiSettings::spawn(
+            self.app,
+            runtime.handle(),
+            waker.clone(),
+            vec![Box::new(shared.page())],
+        ) {
             app.insert_non_send(settings);
         }
 
         let avatar_sync = avatar::AvatarSync::new(runtime.handle().clone(), waker.clone());
 
-        app.insert_resource(GuiRuntime(runtime))
+        app.insert_resource(shared)
+            .insert_resource(ops)
+            .insert_resource(GuiRuntime(runtime))
             .insert_resource(GuiWaker(waker))
             .insert_resource(avatar_sync)
             .insert_resource(avatar::AvatarAssets::default())

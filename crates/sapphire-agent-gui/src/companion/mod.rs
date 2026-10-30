@@ -18,6 +18,7 @@
 //! and the GUI exits on `Quit`.
 
 pub mod bubble;
+pub mod character_page;
 pub mod gesture;
 pub mod prefs;
 pub(crate) mod view;
@@ -161,6 +162,7 @@ impl Plugin for CompanionPlugin {
             .init_resource::<PointerWanted>()
             .init_resource::<CursorOverride>()
             .init_resource::<Speech>()
+            .init_resource::<character_page::RendererPanels>()
             .add_systems(
                 Update,
                 (

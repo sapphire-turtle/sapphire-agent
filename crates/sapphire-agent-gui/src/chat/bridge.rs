@@ -173,6 +173,13 @@ impl RpcBridge {
             .map(|l| Arc::clone(&l.client))
     }
 
+    /// [`Self::client`] as a function that can outlive the bridge's borrow,
+    /// for work on another thread.
+    pub fn client_lookup(&self) -> crate::avatar::assets::ClientLookup {
+        let live = Arc::clone(&self.live);
+        Arc::new(move || live.lock().unwrap().as_ref().map(|l| Arc::clone(&l.client)))
+    }
+
     /// Send a chat turn in the open session, declaring what this client
     /// can show for it (`caps`).
     pub fn submit_chat(&self, content: String, caps: ClientCaps) {

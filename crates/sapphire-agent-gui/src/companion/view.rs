@@ -156,7 +156,8 @@ pub(crate) fn ui(
                             if let Some(settings) = settings.as_mut()
                                 && ui.button("Character settings").clicked()
                             {
-                                // Task 7 opens the Character page itself.
+                                // Settings can't be told to open on a page (only About), so
+                                // the Character page is one click away.
                                 settings.open = true;
                                 ui.ctx().request_repaint();
                             }

@@ -15,7 +15,7 @@ use bevy::prelude::*;
 use bevy_egui::EguiContexts;
 use corundum_framework_gui::store;
 use sapphire_framework_gui::client::{AppIdentity, ClientConfig, FrameworkClient};
-use sapphire_framework_gui::{Health, Settings};
+use sapphire_framework_gui::{Health, Settings, SettingsSection};
 use tracing::{info, warn};
 
 use crate::app::Waker;
@@ -37,11 +37,13 @@ pub struct GuiSettings {
 impl GuiSettings {
     /// Settings over a client for `app`, refreshing on `runtime` and waking
     /// the GUI with `waker`. `None`, logged, when the client cannot be
-    /// configured: the companion works without the settings.
+    /// configured: the companion works without the settings. `sections`
+    /// are the app's own pages (the Character page).
     pub(crate) fn spawn(
         app: AppIdentity,
         runtime: &tokio::runtime::Handle,
         waker: Waker,
+        sections: Vec<Box<dyn SettingsSection>>,
     ) -> Option<GuiSettings> {
         let config = match ClientConfig::new(app) {
             Ok(config) => config,
@@ -52,7 +54,7 @@ impl GuiSettings {
         };
         let client = FrameworkClient::spawn(runtime, config, waker);
         Some(GuiSettings {
-            settings: Settings::new(client),
+            settings: Settings::new(client).with_app_sections("sapphire-agent", sections),
             open: false,
         })
     }
