@@ -23,7 +23,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use bevy::camera::visibility::RenderLayers;
+use bevy::camera::{NormalizedRenderTarget, RenderTarget};
 use bevy::prelude::*;
+use bevy::window::PrimaryWindow;
 use bevy_egui::{EguiGlobalSettings, EguiPrimaryContextPass, PrimaryEguiContext};
 use sapphire_agent_core::AvatarCaps;
 use tokio::runtime::Handle;
@@ -109,6 +112,11 @@ impl Plugin for AvatarPlugin {
 /// The GUI's camera: it draws egui over whatever the renderers drew and
 /// clears nothing itself, unless [`clear_without_scene`] finds nothing to
 /// draw over.
+///
+/// It sees no render layer ([`RenderLayers::none`]): a `Camera2d` on the
+/// default layer 0 would draw every sprite on that layer a second time,
+/// over the renderer's own camera. egui is not drawn as entities, so it
+/// does not depend on the layers.
 fn spawn_ui_camera(mut commands: Commands) {
     commands.spawn((
         Camera2d,
@@ -117,20 +125,26 @@ fn spawn_ui_camera(mut commands: Commands) {
             clear_color: ClearColorConfig::None,
             ..default()
         },
+        RenderLayers::none(),
         PrimaryEguiContext,
         UiCamera,
     ));
 }
 
-/// With no active scene camera (the placeholder draws in egui, and a
-/// renderer swap can leave a frame between one camera and the next),
-/// nothing else clears the window, so the UI camera clears it with the
-/// app's `ClearColor`; otherwise it draws over the scene.
+/// With no active scene camera drawing to the window (the placeholder
+/// draws in egui, and a renderer swap can leave a frame between one camera
+/// and the next), nothing else clears the window, so the UI camera clears
+/// it with the app's `ClearColor`; otherwise it draws over the scene. A
+/// camera rendering to an image or another window is no scene here.
 fn clear_without_scene(
     mut ui: Single<&mut Camera, With<UiCamera>>,
-    scene: Query<&Camera, Without<UiCamera>>,
+    scene: Query<(&Camera, &RenderTarget), Without<UiCamera>>,
+    primary: Query<Entity, With<PrimaryWindow>>,
 ) {
-    let has_scene = scene.iter().any(|camera| camera.is_active);
+    let primary = primary.single().ok();
+    let has_scene = scene
+        .iter()
+        .any(|(camera, target)| camera.is_active && draws_to(target, primary));
     let clears = !matches!(ui.clear_color, ClearColorConfig::None);
     if has_scene == clears {
         ui.clear_color = if has_scene {
@@ -139,6 +153,14 @@ fn clear_without_scene(
             ClearColorConfig::Default
         };
     }
+}
+
+/// Whether `target` is the primary window, `primary`.
+fn draws_to(target: &RenderTarget, primary: Option<Entity>) -> bool {
+    matches!(
+        target.normalize(primary),
+        Some(NormalizedRenderTarget::Window(window)) if Some(window.entity()) == primary
+    )
 }
 
 /// Picks the renderer for the avatar that synced, in the display mode the
@@ -287,6 +309,50 @@ mod tests {
         async fn fetch(&self, _: &str) -> anyhow::Result<Vec<u8>> {
             unreachable!()
         }
+    }
+
+    #[test]
+    fn only_a_camera_drawing_to_the_window_counts_as_a_scene() {
+        use bevy::ecs::system::RunSystemOnce as _;
+
+        let mut world = World::new();
+        world.spawn((Window::default(), PrimaryWindow));
+        let ui = world
+            .spawn((
+                Camera {
+                    clear_color: ClearColorConfig::None,
+                    ..default()
+                },
+                UiCamera,
+            ))
+            .id();
+        let clear = |world: &mut World| {
+            world.run_system_once(clear_without_scene).unwrap();
+            world.get::<Camera>(ui).unwrap().clear_color
+        };
+
+        // An off-screen camera draws nothing beneath the UI: it clears.
+        world.spawn((
+            Camera::default(),
+            RenderTarget::Image(bevy::asset::Handle::<Image>::default().into()),
+        ));
+        assert!(matches!(clear(&mut world), ClearColorConfig::Default));
+
+        // An inactive camera on the window is no scene either.
+        let scene = world
+            .spawn((
+                Camera {
+                    is_active: false,
+                    ..default()
+                },
+                RenderTarget::default(),
+            ))
+            .id();
+        assert!(matches!(clear(&mut world), ClearColorConfig::Default));
+
+        // An active one is: the UI draws over it.
+        world.get_mut::<Camera>(scene).unwrap().is_active = true;
+        assert!(matches!(clear(&mut world), ClearColorConfig::None));
     }
 
     #[test]
