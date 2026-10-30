@@ -191,7 +191,7 @@ pub fn register(router: Router, cell: Cell) -> Router {
 
 #[cfg(test)]
 mod tests {
-    use sapphire_agent_core::{AVATAR_CHUNK, AvatarConfig, ChatClient};
+    use sapphire_agent_core::{AVATAR_CHUNK, AvatarConfig, ChatClient, VrmConfig};
 
     use super::*;
     use crate::serve::chat_ipc::ChatTunnel;
@@ -218,13 +218,16 @@ mod tests {
         let model = vec![7u8; AVATAR_CHUNK + 10];
         chat.avatar_upload("model.vrm", &model).await.unwrap();
         chat.avatar_set_config(&AvatarConfig {
-            model: Some("model.vrm".into()),
+            vrm: Some(VrmConfig {
+                model: "model.vrm".into(),
+                ..Default::default()
+            }),
             ..Default::default()
         })
         .await
         .unwrap();
         let manifest = chat.avatar_manifest().await.unwrap();
-        assert_eq!(manifest.config.model.as_deref(), Some("model.vrm"));
+        assert_eq!(manifest.config.vrm.unwrap().model, "model.vrm");
         assert_eq!(manifest.files[0].size, model.len() as u64);
         assert_eq!(chat.avatar_download("model.vrm").await.unwrap(), model);
     }
@@ -241,7 +244,10 @@ mod tests {
         let Fx { chat, .. } = fx().await;
         chat.avatar_upload("a.vrm", b"abc").await.unwrap();
         chat.avatar_set_config(&AvatarConfig {
-            model: Some("a.vrm".into()),
+            vrm: Some(VrmConfig {
+                model: "a.vrm".into(),
+                ..Default::default()
+            }),
             ..Default::default()
         })
         .await

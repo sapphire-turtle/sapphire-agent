@@ -27,3 +27,6 @@ anyhow.workspace = true
 
 # `select!` over a call and its notifications.
 tokio = { workspace = true, features = ["sync", "macros"] }
+
+[dev-dependencies]
+toml = "1.0"

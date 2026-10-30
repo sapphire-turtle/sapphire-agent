@@ -42,3 +42,13 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/sapphire-turtle/sapphire-agent"
+
+# The test binaries link the agent, bevy and the GUI together, and with full
+# debug info that link outgrows the CI's Linux aarch64 runner (it was
+# killed mid-link on #347). Line tables keep file:line in backtraces and
+# panics; dependencies keep none.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false

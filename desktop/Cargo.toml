@@ -27,7 +27,7 @@ clap.workspace = true
 anyhow.workspace = true
 
 # Game engine — needed up front for the eventual 3D character work
-# (desktop-mate-style avatar). For the chat-only first cut we use only
+# (the desktop companion's avatar). For the chat-only first cut we use only
 # the windowing + render essentials, but pinning bevy now keeps us from
 # rewriting the runtime later. Default features are deliberately
 # avoided: bevy ships ~70 of them, including audio and asset loaders we
@@ -53,7 +53,26 @@ bevy = { version = "0.20", default-features = false, features = [
 ] }
 
 # Logging
+tracing = "0.1"
 tracing-subscriber.workspace = true
+
+# The companion window (src/companion_window.rs): the display handle that
+# tells Wayland, where the global pointer cannot be read, apart.
+raw-window-handle = "0.6"
+
+# The global pointer (src/global_pointer.rs), read while the companion window
+# lets clicks through and gets no cursor events of its own. On Linux through
+# Xlib loaded at run time (x11-dl, as winit does), so libX11 is no hard
+# dependency of the binary; device_query would link it.
+[target.'cfg(target_os = "linux")'.dependencies]
+x11-dl = "2.21"
+
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+device_query = "4.0.1"
+
+[dev-dependencies]
+# The GUI's runtime, built in tests that check the window wakes the app.
+tokio = { workspace = true, features = ["time"] }
 
 # `cargo binstall --git https://github.com/sapphire-turtle/sapphire-agent sapphire-agent-desktop`
 # downloads the release file instead of building it (this crate is not on crates.io), following

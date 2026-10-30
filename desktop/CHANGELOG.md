@@ -14,6 +14,17 @@ and predate any user-facing release of this binary.
 
 ## [Unreleased]
 
+### Added
+
+- The desktop companion: the window is now a transparent, borderless, always-on-top companion holding the character, with replies in a speech bubble that fades after a time fitting their length. Clicks outside the character and its panels go through to the desktop (X11, Windows and macOS; not on Wayland). Drag the character to move it; its place is remembered
+- Gestures on the character: click for the input box, scroll for the history, right-click for the menu (settings, reconnecting, quitting), Esc to close them. Enter opens the input box (Ctrl+Enter while a panel is open), and a setting shows a button for each
+- The Character settings page: the display mode (Auto, 3D or 2D), how long an expression or pose holds after a reply, the gesture buttons, and a section per renderer for the avatar's files
+- The avatar's files are synced from the agent into a local cache: on connecting, after an upload from this device, and every five minutes. Until a renderer can draw it, a silhouette stands in and the bubble says why
+
+### Fixed
+
+- No longer panics on the first frame (the chat borrowed egui's root `Ui`, which the egui pass already holds)
+
 ## [0.8.2](https://github.com/sapphire-turtle/sapphire-agent/compare/desktop-v0.8.1...desktop-v0.8.2) - 2026-10-26
 
 ### Changed

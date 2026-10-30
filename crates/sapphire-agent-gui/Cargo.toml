@@ -63,5 +63,20 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "ti
 # Error handling
 anyhow.workspace = true
 
+# The companion's preferences on this device (`companion.toml`).
+serde = { version = "1.0", features = ["derive"] }
+toml = "1"
+
 # Logging
 tracing = "0.1"
+
+# The avatar cache: files are named by their sha256, and the source of the
+# files is a trait object (the agent today, a bundled set later).
+sha2 = "0.10"
+async-trait = "0.1"
+
+# Per-app cache directory, from the same place the framework's apps use.
+corundum-framework-platform = "0.3"
+
+[dev-dependencies]
+tempfile = "3"

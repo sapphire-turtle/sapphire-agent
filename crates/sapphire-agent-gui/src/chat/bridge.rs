@@ -17,7 +17,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use sapphire_agent_core::{ChatClient, ChatEvent, Turn};
+use sapphire_agent_core::{ChatClient, ChatEvent, ClientCaps, Turn};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 
@@ -50,6 +50,33 @@ pub enum BridgeEvent {
     ChatError {
         message: String,
     },
+    /// The agent set the avatar's expression.
+    Expression {
+        name: String,
+        intensity: f32,
+    },
+    /// The agent asked the avatar to play an action once.
+    Action {
+        name: String,
+    },
+    /// The agent set the pose the avatar holds.
+    Pose {
+        name: String,
+    },
+}
+
+impl BridgeEvent {
+    /// The bridge event for a turn's progress event, if it has one.
+    fn from_progress(event: ChatEvent) -> Option<Self> {
+        Some(match event {
+            ChatEvent::Tool(tool) if tool.started => Self::ToolStart { name: tool.name },
+            ChatEvent::Tool(tool) => Self::ToolEnd { name: tool.name },
+            ChatEvent::Expression { name, intensity } => Self::Expression { name, intensity },
+            ChatEvent::Action { name } => Self::Action { name },
+            ChatEvent::Pose { name } => Self::Pose { name },
+            _ => return None,
+        })
+    }
 }
 
 /// The connection and the session it opened, once there are both.
@@ -136,8 +163,31 @@ impl RpcBridge {
         });
     }
 
-    /// Send a chat turn in the open session.
-    pub fn submit_chat(&self, content: String) {
+    /// The live connection, once there is one. Other work on the same
+    /// agent (the avatar sync) shares it.
+    pub fn client(&self) -> Option<Arc<ChatClient>> {
+        self.live
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|l| Arc::clone(&l.client))
+    }
+
+    /// [`Self::client`] as a function that can outlive the bridge's borrow,
+    /// for work on another thread.
+    pub fn client_lookup(&self) -> crate::avatar::assets::ClientLookup {
+        let live = Arc::clone(&self.live);
+        Arc::new(move || {
+            live.lock()
+                .unwrap()
+                .as_ref()
+                .map(|l| Arc::clone(&l.client) as Arc<dyn crate::avatar::assets::AvatarEditor>)
+        })
+    }
+
+    /// Send a chat turn in the open session, declaring what this client
+    /// can show for it (`caps`).
+    pub fn submit_chat(&self, content: String, caps: ClientCaps) {
         let live = self
             .live
             .lock()
@@ -152,15 +202,16 @@ impl RpcBridge {
             return;
         };
         self.runtime.spawn(async move {
-            let tool_events = events.clone();
+            let progress = events.clone();
+            let turn = Turn {
+                content: &content,
+                attachments: &[],
+                client: &caps,
+            };
             let reply = client
-                .send(&session_id, Turn::text(&content), |event| {
-                    if let ChatEvent::Tool(event) = event {
-                        tool_events.send(if event.started {
-                            BridgeEvent::ToolStart { name: event.name }
-                        } else {
-                            BridgeEvent::ToolEnd { name: event.name }
-                        });
+                .send(&session_id, turn, |event| {
+                    if let Some(event) = BridgeEvent::from_progress(event) {
+                        progress.send(event);
                     }
                 })
                 .await;
@@ -178,7 +229,45 @@ impl RpcBridge {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use sapphire_agent_core::ClientCaps;
+
     use super::*;
+
+    #[test]
+    fn progress_maps_cues_and_keeps_tools_apart() {
+        use sapphire_agent_core::ToolEvent;
+
+        assert!(matches!(
+            BridgeEvent::from_progress(ChatEvent::Expression {
+                name: "happy".into(),
+                intensity: 0.5,
+            }),
+            Some(BridgeEvent::Expression { name, intensity }) if name == "happy" && intensity == 0.5
+        ));
+        assert!(matches!(
+            BridgeEvent::from_progress(ChatEvent::Action { name: "wave".into() }),
+            Some(BridgeEvent::Action { name }) if name == "wave"
+        ));
+        assert!(matches!(
+            BridgeEvent::from_progress(ChatEvent::Pose { name: "arms".into() }),
+            Some(BridgeEvent::Pose { name }) if name == "arms"
+        ));
+        let tool = |started| {
+            ChatEvent::Tool(ToolEvent {
+                started,
+                id: "1".into(),
+                name: "set_pose".into(),
+            })
+        };
+        assert!(matches!(
+            BridgeEvent::from_progress(tool(true)),
+            Some(BridgeEvent::ToolStart { name }) if name == "set_pose"
+        ));
+        assert!(matches!(
+            BridgeEvent::from_progress(tool(false)),
+            Some(BridgeEvent::ToolEnd { name }) if name == "set_pose"
+        ));
+    }
 
     #[test]
     fn submit_chat_without_connection_reports_and_wakes() {
@@ -191,7 +280,7 @@ mod tests {
             counter.fetch_add(1, Ordering::SeqCst);
         });
         let (bridge, mut rx) = RpcBridge::new(runtime.handle().clone(), waker);
-        bridge.submit_chat("x".to_owned());
+        bridge.submit_chat("x".to_owned(), ClientCaps::default());
         match rx.try_recv() {
             Ok(BridgeEvent::ChatError { message }) => assert_eq!(message, "not connected"),
             other => panic!("expected ChatError, got {other:?}"),

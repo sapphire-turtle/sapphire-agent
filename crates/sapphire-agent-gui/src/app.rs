@@ -21,6 +21,18 @@ pub type Waker = Arc<dyn Fn() + Send + Sync>;
 #[derive(Resource, Clone)]
 pub struct GuiWaker(pub Waker);
 
+impl GuiWaker {
+    /// Wakes the GUI once `after` has passed, timed on `runtime`: an idle
+    /// window draws no frame on its own to notice a deadline.
+    pub fn wake_in(&self, runtime: &GuiRuntime, after: std::time::Duration) {
+        let waker = self.0.clone();
+        runtime.0.spawn(async move {
+            tokio::time::sleep(after).await;
+            waker();
+        });
+    }
+}
+
 /// The tokio runtime the agent client runs on. Bevy's scheduler is sync and
 /// the client is async, so the GUI keeps its own. On `AppExit` it is shut
 /// down with `shutdown_background`: a blocking drop could hold the window

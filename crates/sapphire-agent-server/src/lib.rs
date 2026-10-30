@@ -63,7 +63,7 @@ use sapphire_framework::workspace::AppContext;
 
 /// The app's context: its name, which the IPC endpoint, the service and the
 /// directories are named after, and those directories ([`init_app_ctx`]).
-pub static APP_CTX: AppContext = AppContext::new("sapphire-agent").allow_external_paths();
+pub static APP_CTX: AppContext = AppContext::new(sapphire_agent_core::APP).allow_external_paths();
 
 /// The server's version, which the clients name in their IPC handshake.
 pub use app_server::VERSION;
@@ -865,6 +865,9 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
                 .await;
             tool_set
                 .register_tool(Box::new(tools::avatar_tools::PlayActionTool))
+                .await;
+            tool_set
+                .register_tool(Box::new(tools::avatar_tools::SetPoseTool))
                 .await;
 
             // ── ACP session store (sessions/<namespace>/acp/) ───────────────

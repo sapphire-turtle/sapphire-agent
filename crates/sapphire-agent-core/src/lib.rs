@@ -17,7 +17,7 @@
 //!   `{session_id, kind, ..}` notifies each tool call starting
 //!   (`kind: "tool_start"`, `"tool_end"`, with `id` and `name`), and the
 //!   avatar cues the reply carries (`"expression"` with `expression` and
-//!   `intensity?`, `"action"` with `action`); see [`parse_progress`].
+//!   `intensity?`, `"action"` with `action`, `"pose"` with `pose`); see [`parse_progress`].
 //! - [`HISTORY`] `{session_id}` answers `{messages}`.
 //! - [`SESSIONS`] answers `{sessions}`.
 //! - The avatar's files, kept in the workspace's `avatar/` folder, move in
@@ -27,7 +27,8 @@
 //!   answers `{upload_id}`, then [`AVATAR_WRITE_CHUNK`]
 //!   `{upload_id, offset, data}` per piece and [`AVATAR_WRITE_COMMIT`]
 //!   `{upload_id}` to put the file in place; [`AVATAR_SET_MANIFEST`] takes an
-//!   [`AvatarConfig`]; [`AVATAR_REMOVE`] `{path}` deletes a file.
+//!   [`AvatarConfig`] (`{vrm?, sprite?}`); [`AVATAR_REMOVE`] `{path}` deletes
+//!   a file.
 //!
 //! There is no token: the IPC endpoint admits only the OS user that runs
 //! the server, and the agent's `[cli].room_profile` names the room profile.
@@ -47,9 +48,9 @@ pub const APP: &str = "sapphire-agent";
 /// agent that would read its calls differently, or lacks them.
 ///
 /// 2: added `sapphire-agent.chat.*`.
-/// 3: `chat.send` takes `attachments` and `client` (the client's declared
-/// capabilities); `chat.progress` carries `expression` and `action`;
-/// added `sapphire-agent.avatar.*`.
+/// 3: `chat.send` takes `attachments` and `client`; `chat.progress` carries
+/// `expression`, `action` and `pose`; added `set_pose` and
+/// `sapphire-agent.avatar.*`.
 pub const APP_API: u32 = 3;
 
 /// Open (resume or reserve) a session.
@@ -85,6 +86,8 @@ pub const KIND_TOOL_END: &str = "tool_end";
 pub const KIND_EXPRESSION: &str = "expression";
 /// [`PROGRESS`] `kind`: the reply makes the avatar perform an action.
 pub const KIND_ACTION: &str = "action";
+/// [`PROGRESS`] `kind`: the reply switches the avatar's stance.
+pub const KIND_POSE: &str = "pose";
 
 /// What a client can do, declared on each [`SEND`] turn.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -100,6 +103,9 @@ pub struct AvatarCaps {
     pub expressions: Vec<String>,
     #[serde(default)]
     pub actions: Vec<String>,
+    /// The stances the avatar can hold until told otherwise.
+    #[serde(default)]
+    pub poses: Vec<String>,
 }
 
 /// A file sent with a message. `data` is base64, as on the wire.
@@ -158,6 +164,7 @@ pub enum ChatEvent {
     Tool(ToolEvent),
     Expression { name: String, intensity: f32 },
     Action { name: String },
+    Pose { name: String },
 }
 
 /// Read a [`PROGRESS`] notification's `params`. `None` for another
@@ -182,6 +189,9 @@ pub fn parse_progress(session_id: &str, params: &Value) -> Option<ChatEvent> {
         }),
         KIND_ACTION => Some(ChatEvent::Action {
             name: params["action"].as_str()?.to_owned(),
+        }),
+        KIND_POSE => Some(ChatEvent::Pose {
+            name: params["pose"].as_str()?.to_owned(),
         }),
         _ => None,
     }
@@ -432,17 +442,125 @@ pub const AVATAR_MAX_FILE: u64 = 256 * 1024 * 1024;
 /// The most one `avatar.read` / `avatar.write_chunk` carries, in bytes.
 pub const AVATAR_CHUNK: usize = 1024 * 1024;
 
-/// What `<workspace>/avatar/avatar.toml` says: which file is the model, which
-/// is the idle loop, and which file plays each named action. Every value is a
-/// `/`-separated path relative to `avatar/`.
+/// The expressions a sprite pose may name an image for, besides its `base`
+/// (the neutral face). They are the VRM preset expressions an avatar cue can
+/// carry.
+pub const SPRITE_EXPRESSIONS: [&str; 5] = ["happy", "angry", "sad", "relaxed", "surprised"];
+
+/// What `<workspace>/avatar/avatar.toml` says. `[vrm]` names a 3D model and
+/// its gestures, `[sprite]` a set of still images; either may be absent, and
+/// a companion shows whichever it can. Every path is `/`-separated and
+/// relative to `avatar/`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct AvatarConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
+    pub vrm: Option<VrmConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sprite: Option<SpriteConfig>,
+}
+
+/// The `[vrm]` section: the model, its idle loop, and the file that plays
+/// each named action.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct VrmConfig {
+    pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub actions: std::collections::BTreeMap<String, String>,
+}
+
+/// The `[sprite]` section: named poses, one of which shows by default.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct SpriteConfig {
+    pub default_pose: String,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub poses: std::collections::BTreeMap<String, SpritePose>,
+}
+
+/// One sprite pose: the neutral image and an image per expression.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct SpritePose {
+    pub base: String,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub expressions: std::collections::BTreeMap<String, String>,
+}
+
+impl AvatarConfig {
+    /// Every file the config references.
+    pub fn paths(&self) -> Vec<&str> {
+        let mut out = Vec::new();
+        if let Some(vrm) = &self.vrm {
+            out.push(vrm.model.as_str());
+            out.extend(vrm.idle.as_deref());
+            out.extend(vrm.actions.values().map(String::as_str));
+        }
+        if let Some(sprite) = &self.sprite {
+            for pose in sprite.poses.values() {
+                out.push(pose.base.as_str());
+                out.extend(pose.expressions.values().map(String::as_str));
+            }
+        }
+        out
+    }
+
+    /// The structural rules, without looking at any file: the error names the
+    /// offending key.
+    pub fn check(&self) -> Result<(), String> {
+        if let Some(vrm) = &self.vrm {
+            if vrm.model.is_empty() {
+                return Err("vrm.model is empty".into());
+            }
+            if vrm.idle.as_deref() == Some("") {
+                return Err("vrm.idle is empty".into());
+            }
+            for (name, path) in &vrm.actions {
+                if name.is_empty() {
+                    return Err("vrm.actions has an empty action name".into());
+                }
+                if path.is_empty() {
+                    return Err(format!("vrm.actions.{name} is empty"));
+                }
+            }
+        }
+        let Some(sprite) = &self.sprite else {
+            return Ok(());
+        };
+        if sprite.poses.is_empty() {
+            return Err("sprite.poses is empty".into());
+        }
+        if !sprite.poses.contains_key(&sprite.default_pose) {
+            return Err(format!(
+                "sprite.default_pose {:?} is not one of sprite.poses",
+                sprite.default_pose
+            ));
+        }
+        for (name, pose) in &sprite.poses {
+            if name.is_empty() {
+                return Err("sprite.poses has an empty pose name".into());
+            }
+            if pose.base.is_empty() {
+                return Err(format!("sprite.poses.{name}.base is empty"));
+            }
+            for (key, path) in &pose.expressions {
+                if key.is_empty() {
+                    return Err(format!(
+                        "sprite.poses.{name}.expressions has an empty expression name"
+                    ));
+                }
+                if !SPRITE_EXPRESSIONS.contains(&key.as_str()) {
+                    return Err(format!(
+                        "sprite.poses.{name}.expressions.{key} is not one of {}",
+                        SPRITE_EXPRESSIONS.join(", ")
+                    ));
+                }
+                if path.is_empty() {
+                    return Err(format!("sprite.poses.{name}.expressions.{key} is empty"));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// One file under `avatar/`, with the hash a client compares to decide
@@ -500,6 +618,15 @@ mod tests {
                 name: "peace".into()
             })
         );
+        assert_eq!(
+            parse_progress(
+                s,
+                &json!({"session_id":"s1","kind":"pose","pose":"arms_crossed"})
+            ),
+            Some(ChatEvent::Pose {
+                name: "arms_crossed".into()
+            })
+        );
     }
 
     #[test]
@@ -546,6 +673,7 @@ mod tests {
             avatar: Some(AvatarCaps {
                 expressions: vec!["happy".into()],
                 actions: vec![],
+                poses: vec![],
             }),
         };
         let turn = Turn {
@@ -559,8 +687,153 @@ mod tests {
                 "session_id": "s1",
                 "content": "hi",
                 "attachments": [{"mime": "image/png", "data": "YWJj"}],
-                "client": {"avatar": {"expressions": ["happy"], "actions": []}},
+                "client": {"avatar": {"expressions": ["happy"], "actions": [], "poses": []}},
             })
         );
+    }
+
+    #[test]
+    fn avatar_toml_round_trips_both_sections() {
+        let text = r#"
+[vrm]
+model = "vrm/model.vrm"
+[vrm.actions]
+peace = "vrm/peace.vrma"
+[sprite]
+default_pose = "normal"
+[sprite.poses.normal]
+base = "sprite/normal.png"
+[sprite.poses.normal.expressions]
+happy = "sprite/normal-happy.png"
+"#;
+        let cfg: AvatarConfig = toml::from_str(text).unwrap();
+        assert_eq!(cfg.vrm.as_ref().unwrap().model, "vrm/model.vrm");
+        assert_eq!(
+            cfg.sprite.as_ref().unwrap().poses["normal"].expressions["happy"],
+            "sprite/normal-happy.png"
+        );
+        let mut paths = cfg.paths();
+        paths.sort();
+        assert_eq!(
+            paths,
+            [
+                "sprite/normal-happy.png",
+                "sprite/normal.png",
+                "vrm/model.vrm",
+                "vrm/peace.vrma"
+            ]
+        );
+        assert_eq!(
+            toml::from_str::<AvatarConfig>(&toml::to_string(&cfg).unwrap()).unwrap(),
+            cfg
+        );
+        assert_eq!(cfg.check(), Ok(()));
+    }
+
+    #[test]
+    fn sprite_rules_are_checked() {
+        let pose = |base: &str, ex: &[(&str, &str)]| SpritePose {
+            base: base.into(),
+            expressions: ex
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        };
+        let sprite = |default: &str, poses: Vec<(&str, SpritePose)>| AvatarConfig {
+            vrm: None,
+            sprite: Some(SpriteConfig {
+                default_pose: default.into(),
+                poses: poses.into_iter().map(|(k, p)| (k.to_string(), p)).collect(),
+            }),
+        };
+        assert!(
+            sprite("normal", vec![])
+                .check()
+                .unwrap_err()
+                .contains("poses")
+        );
+        assert!(
+            sprite("missing", vec![("normal", pose("a.png", &[]))])
+                .check()
+                .unwrap_err()
+                .contains("missing")
+        );
+        assert!(
+            sprite(
+                "normal",
+                vec![("normal", pose("a.png", &[("neutral", "b.png")]))]
+            )
+            .check()
+            .unwrap_err()
+            .contains("neutral")
+        );
+        assert!(
+            sprite(
+                "normal",
+                vec![("normal", pose("a.png", &[("smug", "b.png")]))]
+            )
+            .check()
+            .unwrap_err()
+            .contains("smug")
+        );
+        assert!(sprite("", vec![("", pose("a.png", &[]))]).check().is_err());
+        assert_eq!(AvatarConfig::default().check(), Ok(()));
+    }
+
+    #[test]
+    fn empty_paths_are_refused_naming_the_key() {
+        let vrm = |model: &str, idle: Option<&str>, action: &str| AvatarConfig {
+            vrm: Some(VrmConfig {
+                model: model.into(),
+                idle: idle.map(Into::into),
+                actions: [("peace".to_string(), action.to_string())].into(),
+            }),
+            sprite: None,
+        };
+        assert!(
+            vrm("", None, "a")
+                .check()
+                .unwrap_err()
+                .contains("vrm.model")
+        );
+        assert!(
+            vrm("m", Some(""), "a")
+                .check()
+                .unwrap_err()
+                .contains("vrm.idle")
+        );
+        assert!(
+            vrm("m", None, "")
+                .check()
+                .unwrap_err()
+                .contains("vrm.actions.peace")
+        );
+        let sprite = |base: &str, happy: &str| AvatarConfig {
+            vrm: None,
+            sprite: Some(SpriteConfig {
+                default_pose: "normal".into(),
+                poses: [(
+                    "normal".to_string(),
+                    SpritePose {
+                        base: base.into(),
+                        expressions: [("happy".to_string(), happy.to_string())].into(),
+                    },
+                )]
+                .into(),
+            }),
+        };
+        assert!(
+            sprite("", "h")
+                .check()
+                .unwrap_err()
+                .contains("sprite.poses.normal.base")
+        );
+        assert!(
+            sprite("b", "")
+                .check()
+                .unwrap_err()
+                .contains("sprite.poses.normal.expressions.happy")
+        );
+        assert_eq!(sprite("b", "h").check(), Ok(()));
     }
 }
