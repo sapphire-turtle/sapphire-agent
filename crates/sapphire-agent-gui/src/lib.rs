@@ -104,13 +104,24 @@ impl Plugin for AgentGuiPlugin {
             Default::default(),
         )
         .with_waker(waker.clone());
+        // The host's dialog, if it installed one before now.
+        let dialog = app
+            .world()
+            .get_resource::<companion::file_pick::InstalledDialog>()
+            .and_then(|d| d.take());
+        let file_picker =
+            companion::FilePicker::new(dialog, runtime.handle().clone(), waker.clone());
         let panels = app
             .world()
             .get_resource::<companion::character_page::RendererPanels>()
             .map(|p| p.take())
             .unwrap_or_default();
         let shared = companion::character_page::CharacterShared::new(
-            companion::character_page::CharacterModel::new(ops.clone(), panels),
+            companion::character_page::CharacterModel::new(
+                ops.clone(),
+                file_picker.clone(),
+                panels,
+            ),
         );
 
         // Without settings (no client config) the chat still works.
@@ -127,6 +138,7 @@ impl Plugin for AgentGuiPlugin {
 
         app.insert_resource(shared)
             .insert_resource(ops)
+            .insert_resource(file_picker)
             .insert_resource(GuiRuntime(runtime))
             .insert_resource(GuiWaker(waker))
             .insert_resource(avatar_sync)

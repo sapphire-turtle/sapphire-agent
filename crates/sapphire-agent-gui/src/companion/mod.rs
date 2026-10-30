@@ -9,6 +9,7 @@
 //! - [`gesture`]: what the pointer means (pure).
 //! - [`bubble`]: what the bubble says and for how long (pure).
 //! - [`prefs`]: the companion's preferences on this device.
+//! - [`file_pick`]: the host's file dialog, for renderer panels.
 //! - `view`: the egui of it all.
 //!
 //! Each frame, [`pointer_input`] turns the mouse and keyboard into
@@ -19,6 +20,7 @@
 
 pub mod bubble;
 pub mod character_page;
+pub mod file_pick;
 pub mod gesture;
 pub mod prefs;
 pub(crate) mod view;
@@ -35,6 +37,9 @@ use crate::chat::{ChatEntry, ChatRole, ChatState};
 use crate::settings::GuiSettings;
 use crate::{GuiRuntime, GuiWaker};
 pub use bubble::{Bubble, BubbleContent, bubble_duration};
+pub use file_pick::{
+    FileDialog, FileFilter, FilePicker, FilePickerApp, PickOutcome, PickTicket, PickedFile,
+};
 pub use gesture::{Gesture, GestureTracker, PointerSample, Press, wants_pointer};
 pub use prefs::{CompanionPrefs, WindowPlacement};
 
