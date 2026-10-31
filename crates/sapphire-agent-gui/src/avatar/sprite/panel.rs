@@ -85,6 +85,22 @@ pub(crate) fn upload_path(pose: &str, slot: Slot, bytes: &[u8], ext: &str) -> St
     format!("sprite/{pose}/{}-{}.{ext}", slot.key(), &hash[..8])
 }
 
+/// Removes the image of expression `key` from `pose`; the file stays.
+pub(crate) fn clear_expression(
+    config: &mut AvatarConfig,
+    pose: &str,
+    key: &str,
+) -> Result<(), String> {
+    config
+        .sprite
+        .as_mut()
+        .and_then(|s| s.poses.get_mut(pose))
+        .ok_or_else(|| format!("there is no pose named {pose}"))?
+        .expressions
+        .remove(key);
+    Ok(())
+}
+
 /// Why `name` cannot name a pose: it becomes a directory of the upload
 /// path, which the agent checks (`validate_path`) as one path component.
 fn name_error(name: &str) -> Option<&'static str> {
@@ -199,8 +215,12 @@ struct PickTarget {
 #[derive(Default)]
 pub(crate) struct SpritePanel {
     pick: Option<(PickTicket, PickTarget)>,
+    /// The op this panel sent last, until it ends; the edit buttons wait
+    /// for it.
     op: Option<OpTicket>,
     new_pose: String,
+    /// The user typed in the new-pose field, so it is not prefilled again.
+    new_pose_edited: bool,
     /// The pose being renamed and the name typed so far.
     renaming: Option<(String, String)>,
     /// What this panel refused itself; the page shows the ops' errors.
@@ -241,6 +261,11 @@ impl SpritePanel {
                 }
             }
         }
+    }
+
+    /// Whether a file pick or an op is under way, so edits wait.
+    fn busy(&self) -> bool {
+        self.pick.is_some() || self.op.is_some()
     }
 
     fn upload(
@@ -316,7 +341,7 @@ impl RendererPanel for SpritePanel {
 
     fn ui(&mut self, ui: &mut egui::Ui, cx: &mut PanelContext<'_>) {
         self.poll(cx);
-        let picking = self.pick.is_some();
+        let busy = self.busy();
         if let Some(error) = &self.error {
             ui.colored_label(ui.visuals().error_fg_color, error);
         }
@@ -324,33 +349,39 @@ impl RendererPanel for SpritePanel {
             ui.colored_label(ui.visuals().warn_fg_color, note);
         }
         let sprite = cx.config.and_then(|c| c.sprite.as_ref());
+        let no_poses = sprite.is_none_or(|s| s.poses.is_empty());
         match sprite {
-            Some(sprite) if !sprite.poses.is_empty() => {
+            Some(sprite) if !no_poses => {
                 for (name, pose) in &sprite.poses {
-                    self.pose_ui(ui, cx, sprite, name, pose, picking);
+                    self.pose_ui(ui, cx, sprite, name, pose, busy);
                 }
             }
             _ => {
                 ui.weak("No poses yet. Add one with a base image to draw a 2D avatar.");
             }
         }
+        // The first pose is usually the default one: offer its usual name.
+        if no_poses && !self.new_pose_edited && self.new_pose.is_empty() {
+            self.new_pose = "normal".to_owned();
+        }
 
         ui.separator();
         ui.horizontal(|ui| {
             ui.label("New pose");
-            ui.add(egui::TextEdit::singleline(&mut self.new_pose).desired_width(120.0));
+            let field = ui.add(egui::TextEdit::singleline(&mut self.new_pose).desired_width(120.0));
+            if field.changed() {
+                self.new_pose_edited = true;
+            }
             let name = self.new_pose.trim().to_owned();
             let taken = sprite.is_some_and(|s| s.poses.contains_key(&name));
             let problem = name_error(&name)
                 .map(str::to_owned)
                 .or_else(|| taken.then(|| format!("there is already a pose named {name}")));
-            let add = ui.add_enabled(
-                !picking && problem.is_none(),
-                egui::Button::new("Base image…"),
-            );
+            let add = ui.add_enabled(!busy && problem.is_none(), egui::Button::new("Base image…"));
             if add.clicked() {
                 self.choose(cx, &name, Slot::Base);
                 self.new_pose.clear();
+                self.new_pose_edited = false;
             }
             if !name.is_empty()
                 && let Some(problem) = problem
@@ -358,8 +389,10 @@ impl RendererPanel for SpritePanel {
                 ui.weak(problem);
             }
         });
-        if picking {
+        if self.pick.is_some() {
             ui.weak("Waiting for the file dialog…");
+        } else if self.op.is_some() {
+            ui.weak("Saving…");
         }
     }
 }
@@ -384,13 +417,13 @@ impl SpritePanel {
         sprite: &SpriteConfig,
         name: &str,
         pose: &SpritePose,
-        picking: bool,
+        busy: bool,
     ) {
         let is_default = sprite.default_pose == name;
         ui.group(|ui| {
             ui.horizontal(|ui| {
                 if ui
-                    .radio(is_default, "")
+                    .add_enabled(!busy, egui::RadioButton::new(is_default, ""))
                     .on_hover_text("Default pose")
                     .clicked()
                     && !is_default
@@ -400,12 +433,18 @@ impl SpritePanel {
                 }
                 match &mut self.renaming {
                     Some((from, to)) if from == name => {
-                        ui.add(egui::TextEdit::singleline(to).desired_width(120.0));
+                        let field = ui.add(egui::TextEdit::singleline(to).desired_width(120.0));
+                        let entered =
+                            field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                         let to = to.trim().to_owned();
                         let from = from.clone();
-                        if ui.button("Rename").clicked() {
+                        let rename = ui.add_enabled(!busy, egui::Button::new("Rename"));
+                        if !busy && (rename.clicked() || entered) {
                             self.renaming = None;
-                            self.edit(cx, move |c| rename_pose(c, &from, &to));
+                            // The same name changes nothing: no op.
+                            if to != from {
+                                self.edit(cx, move |c| rename_pose(c, &from, &to));
+                            }
                         } else if ui.button("Cancel").clicked() {
                             self.renaming = None;
                         }
@@ -415,14 +454,17 @@ impl SpritePanel {
                         if is_default {
                             ui.weak("(default)");
                         }
-                        if ui.small_button("Rename").clicked() {
+                        let rename = ui.add_enabled(!busy, egui::Button::new("Rename").small());
+                        if rename.clicked() {
                             self.renaming = Some((name.to_owned(), name.to_owned()));
                         }
                         let delete = ui
-                            .add_enabled(!is_default, egui::Button::new("Delete").small())
-                            .on_disabled_hover_text(
-                                "Choose another default pose before deleting this one",
-                            );
+                            .add_enabled(!busy && !is_default, egui::Button::new("Delete").small())
+                            .on_disabled_hover_text(if is_default {
+                                "Choose another default pose before deleting this one"
+                            } else {
+                                "Waiting for the last change"
+                            });
                         if delete.clicked() {
                             let pose = name.to_owned();
                             self.edit(cx, move |c| remove_pose(c, &pose));
@@ -435,10 +477,20 @@ impl SpritePanel {
                     ui.label(slot.key());
                     ui.weak(path.unwrap_or("none"));
                     if ui
-                        .add_enabled(!picking, egui::Button::new("Set image…").small())
+                        .add_enabled(!busy, egui::Button::new("Set image…").small())
                         .clicked()
                     {
                         self.choose(cx, name, slot);
+                    }
+                    // A base cannot go: a pose needs one.
+                    if let Slot::Expression(key) = slot
+                        && path.is_some()
+                        && ui
+                            .add_enabled(!busy, egui::Button::new("Clear").small())
+                            .clicked()
+                    {
+                        let pose = name.to_owned();
+                        self.edit(cx, move |c| clear_expression(c, &pose, key));
                     }
                     ui.end_row();
                 };
@@ -560,19 +612,6 @@ mod tests {
     }
 
     #[test]
-    fn the_left_out_note_names_each_image_and_why() {
-        assert_eq!(left_out_note(&BTreeMap::new()), None);
-        let left_out = BTreeMap::from([
-            ("a.png".to_string(), "3×3, not 2×4".to_string()),
-            ("b.png".to_string(), "did not load".to_string()),
-        ]);
-        assert_eq!(
-            left_out_note(&left_out).unwrap(),
-            "Left out: a.png (3×3, not 2×4); b.png (did not load)"
-        );
-    }
-
-    #[test]
     fn an_upload_never_overwrites_a_renamed_poses_image() {
         let (old, new) = (b"old art".as_slice(), b"new art".as_slice());
         let mut config = AvatarConfig::default();
@@ -597,6 +636,40 @@ mod tests {
             "{happy}"
         );
         assert_eq!(happy.len(), "sprite/normal/happy-12345678.webp".len());
+    }
+
+    #[test]
+    fn an_expression_image_can_be_cleared() {
+        let mut config = two_poses();
+        with_image(
+            &mut config,
+            "arms",
+            Slot::Expression("happy"),
+            "h.png".into(),
+        )
+        .unwrap();
+        clear_expression(&mut config, "arms", "happy").unwrap();
+        assert!(
+            config.sprite.as_ref().unwrap().poses["arms"]
+                .expressions
+                .is_empty()
+        );
+        // Already clear: nothing to do, no error.
+        clear_expression(&mut config, "arms", "happy").unwrap();
+        assert!(clear_expression(&mut config, "gone", "happy").is_err());
+    }
+
+    #[test]
+    fn the_left_out_note_names_each_image_and_why() {
+        assert_eq!(left_out_note(&BTreeMap::new()), None);
+        let left_out = BTreeMap::from([
+            ("a.png".to_string(), "3×3, not 2×4".to_string()),
+            ("b.png".to_string(), "did not load".to_string()),
+        ]);
+        assert_eq!(
+            left_out_note(&left_out).unwrap(),
+            "Left out: a.png (3×3, not 2×4); b.png (did not load)"
+        );
     }
 
     #[test]
