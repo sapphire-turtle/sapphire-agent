@@ -8,6 +8,8 @@
 
 use bevy::prelude::*;
 
+mod resolve;
+
 /// Draws the avatar from its sprite sheet while `ActiveRenderer` names the
 /// sprite renderer. Empty until plan 4-2D.
 pub struct SpriteRendererPlugin;
