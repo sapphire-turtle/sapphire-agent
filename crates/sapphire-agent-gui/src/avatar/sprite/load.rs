@@ -38,7 +38,7 @@ impl SpriteImages {
 }
 
 /// The `[sprite]` section of the avatar that synced, if any.
-fn sprite_config(assets: &AvatarAssets) -> Option<&SpriteConfig> {
+pub(super) fn sprite_config(assets: &AvatarAssets) -> Option<&SpriteConfig> {
     assets.loaded.as_ref()?.config.sprite.as_ref()
 }
 
@@ -175,7 +175,7 @@ fn fail(error: &mut ResMut<RendererError>, declared: &mut ResMut<DeclaredAvatar>
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::collections::BTreeMap;
     use std::time::Duration;
 
@@ -190,12 +190,12 @@ mod tests {
     use crate::avatar::assets::{Cache, sha256_hex};
     use crate::avatar::sprite::SpriteRendererPlugin;
     use crate::avatar::{
-        ActiveRenderer, AvatarAssets, DeclaredAvatar, LoadedAvatar, RendererError,
-        register_asset_source_at,
+        ActiveRenderer, AvatarAssets, AvatarBounds, AvatarState, DeclaredAvatar, LoadedAvatar,
+        RendererError, register_asset_source_at,
     };
 
     /// A `w`×`h` PNG, encoded through bevy's own image conversion.
-    fn png(w: u32, h: u32) -> Vec<u8> {
+    pub(in crate::avatar::sprite) fn png(w: u32, h: u32) -> Vec<u8> {
         let image = Image::new_fill(
             Extent3d {
                 width: w,
@@ -222,10 +222,10 @@ mod tests {
     }
 
     /// A pose: its name, its base, and its `(expression, path)` overlays.
-    type Pose<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)]);
+    pub(in crate::avatar::sprite) type Pose<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)]);
 
     /// A sprite avatar with these poses; the first is the default.
-    fn sprite(poses: &[Pose]) -> AvatarConfig {
+    pub(in crate::avatar::sprite) fn sprite(poses: &[Pose]) -> AvatarConfig {
         AvatarConfig {
             vrm: None,
             sprite: Some(SpriteConfig {
@@ -249,7 +249,7 @@ mod tests {
 
     /// Caches `files` (avatar path, bytes) and describes the avatar holding
     /// them. A file with `None` bytes is referenced but absent from the cache.
-    fn cached(
+    pub(in crate::avatar::sprite) fn cached(
         dir: &std::path::Path,
         config: AvatarConfig,
         files: &[(&str, Option<Vec<u8>>)],
@@ -268,7 +268,7 @@ mod tests {
         LoadedAvatar { config, files }
     }
 
-    fn app(dir: &std::path::Path, avatar: LoadedAvatar) -> App {
+    pub(in crate::avatar::sprite) fn app(dir: &std::path::Path, avatar: LoadedAvatar) -> App {
         let mut app = App::new();
         register_asset_source_at(&mut app, dir.to_path_buf());
         app.add_plugins((
@@ -282,6 +282,9 @@ mod tests {
         .init_resource::<DeclaredAvatar>()
         .init_resource::<RendererError>()
         .init_resource::<AvatarAssets>()
+        // What `AvatarPlugin` provides the renderer's drawing side.
+        .init_resource::<AvatarState>()
+        .init_resource::<AvatarBounds>()
         .add_plugins(SpriteRendererPlugin);
         app.world_mut()
             .resource_mut::<AvatarAssets>()
@@ -290,7 +293,7 @@ mod tests {
     }
 
     /// Runs frames until `done`, or fails after a while.
-    fn until(app: &mut App, done: impl Fn(&World) -> bool) {
+    pub(in crate::avatar::sprite) fn until(app: &mut App, done: impl Fn(&World) -> bool) {
         for _ in 0..500 {
             app.update();
             if done(app.world()) {
@@ -301,7 +304,7 @@ mod tests {
         panic!("the sprites never settled");
     }
 
-    fn declared(app: &App) -> Option<(Vec<String>, Vec<String>)> {
+    pub(in crate::avatar::sprite) fn declared(app: &App) -> Option<(Vec<String>, Vec<String>)> {
         let caps = app.world().resource::<DeclaredAvatar>().0.as_ref()?;
         Some((caps.poses.clone(), caps.expressions.clone()))
     }
@@ -310,7 +313,7 @@ mod tests {
         app.world().resource::<RendererError>().0.clone()
     }
 
-    fn settled(world: &World) -> bool {
+    pub(in crate::avatar::sprite) fn settled(world: &World) -> bool {
         world.resource::<DeclaredAvatar>().0.is_some()
             || world.resource::<RendererError>().0.is_some()
     }

@@ -8,8 +8,6 @@ use sapphire_agent_core::{AvatarCaps, SpriteConfig};
 
 /// What to draw: a pose's base image and, optionally, an expression overlay.
 /// `base` and `overlay` are avatar paths, as written in the config.
-// The renderer (plan 4-2D, Task 3) consumes this; until then only the tests do.
-#[allow(dead_code)]
 #[derive(Debug, PartialEq)]
 pub(crate) struct Shown<'a> {
     pub pose: &'a str,
@@ -19,7 +17,6 @@ pub(crate) struct Shown<'a> {
 
 /// The pose to draw (the requested one, else the default) and the overlay for
 /// `expression`. `None` when neither pose has a loaded base.
-#[allow(dead_code)] // See `Shown`.
 pub(crate) fn shown<'a>(
     config: &'a SpriteConfig,
     loaded: &impl Fn(&str) -> bool,

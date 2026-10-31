@@ -11,6 +11,7 @@ use bevy::window::RequestRedraw;
 
 use super::{ActiveRenderer, AvatarSystems, renderer_is};
 
+mod draw;
 mod load;
 mod resolve;
 
@@ -21,13 +22,31 @@ pub struct SpriteRendererPlugin;
 impl Plugin for SpriteRendererPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<load::SpriteImages>()
+            .init_resource::<draw::SpriteScene>()
             // `WindowPlugin` adds it too; an app without one still runs.
             .add_message::<RequestRedraw>()
             .add_systems(
                 Update,
-                (load::load_sprites, load::settle_sprites)
+                (
+                    // Ungated: it runs on the switch away.
+                    draw::despawn_sprite_scene.run_if(resource_changed::<ActiveRenderer>),
+                    (
+                        load::load_sprites,
+                        load::settle_sprites,
+                        draw::show_sprites,
+                        draw::fade_sprites,
+                        draw::place_sprites,
+                    )
+                        .chain()
+                        .run_if(renderer_is(ActiveRenderer::Sprite)),
+                )
                     .chain()
-                    .after(AvatarSystems::Choose)
+                    .after(AvatarSystems::Choose),
+            )
+            .add_systems(
+                PostUpdate,
+                draw::write_bounds
+                    .in_set(AvatarSystems::Bounds)
                     .run_if(renderer_is(ActiveRenderer::Sprite)),
             );
     }
