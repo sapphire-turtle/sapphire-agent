@@ -15,6 +15,7 @@ use super::header::{file_size, image_info};
 use super::load::LeftOut;
 use super::resolve::same_canvas;
 use crate::avatar::OpTicket;
+use crate::avatar::assets::sha256_hex;
 use crate::companion::character_page::{PanelContext, RendererPanel};
 use crate::companion::file_pick::{FileFilter, PickTicket};
 
@@ -72,6 +73,16 @@ pub(crate) fn with_image(
         }
     }
     Ok(())
+}
+
+/// Where an upload of `bytes` into `slot` of `pose` is stored:
+/// `sprite/<pose>/<slot>-<sha8>.<ext>`. The content hash keeps it from
+/// overwriting a file another pose still uses (a renamed pose keeps its
+/// old paths, and a case-insensitive filesystem folds names together);
+/// the same bytes land on the same path, which is harmless.
+pub(crate) fn upload_path(pose: &str, slot: Slot, bytes: &[u8], ext: &str) -> String {
+    let hash = sha256_hex(bytes);
+    format!("sprite/{pose}/{}-{}.{ext}", slot.key(), &hash[..8])
 }
 
 /// Why `name` cannot name a pose: it becomes a directory of the upload
@@ -239,7 +250,7 @@ impl SpritePanel {
         bytes: Vec<u8>,
     ) -> Result<(), String> {
         let (size, ext) = image_info(&bytes)?;
-        let path = format!("sprite/{}/{}.{ext}", target.pose, target.slot.key());
+        let path = upload_path(&target.pose, target.slot, &bytes, ext);
         let reference = canvas_reference(cx.config, cx.files, &path);
         check_canvas(
             reference.as_ref().map(|(p, s)| (p.as_str(), *s)),
@@ -559,6 +570,33 @@ mod tests {
             left_out_note(&left_out).unwrap(),
             "Left out: a.png (3×3, not 2×4); b.png (did not load)"
         );
+    }
+
+    #[test]
+    fn an_upload_never_overwrites_a_renamed_poses_image() {
+        let (old, new) = (b"old art".as_slice(), b"new art".as_slice());
+        let mut config = AvatarConfig::default();
+        let first = upload_path("normal", Slot::Base, old, "png");
+        with_image(&mut config, "normal", Slot::Base, first.clone()).unwrap();
+        rename_pose(&mut config, "normal", "calm").unwrap();
+        // The old name again, with new art: a path of its own.
+        let second = upload_path("normal", Slot::Base, new, "png");
+        assert_ne!(second, config.sprite.as_ref().unwrap().poses["calm"].base);
+        with_image(&mut config, "normal", Slot::Base, second).unwrap();
+        assert_eq!(config.sprite.unwrap().poses["calm"].base, first);
+        // Case only: the hash still tells them apart.
+        assert_ne!(
+            upload_path("Normal", Slot::Base, new, "png").to_lowercase(),
+            first.to_lowercase()
+        );
+        // The same bytes land on the same path, which is the same file.
+        assert_eq!(upload_path("normal", Slot::Base, old, "png"), first);
+        let happy = upload_path("normal", Slot::Expression("happy"), old, "webp");
+        assert!(
+            happy.starts_with("sprite/normal/happy-") && happy.ends_with(".webp"),
+            "{happy}"
+        );
+        assert_eq!(happy.len(), "sprite/normal/happy-12345678.webp".len());
     }
 
     #[test]
