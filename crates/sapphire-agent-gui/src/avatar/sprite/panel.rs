@@ -42,28 +42,48 @@ impl Slot {
     }
 }
 
-/// Points `slot` of `pose` at `path`, creating `[sprite]` (with `pose` as
-/// the default) and the pose as needed. `vrm` is left alone.
-pub(crate) fn with_image(config: &mut AvatarConfig, pose: &str, slot: Slot, path: String) {
-    let sprite = config.sprite.get_or_insert_with(|| SpriteConfig {
-        default_pose: pose.to_owned(),
-        poses: BTreeMap::new(),
-    });
-    let pose = sprite.poses.entry(pose.to_owned()).or_default();
+/// Points `slot` of `pose` at `path`. A base creates `[sprite]` (with
+/// `pose` as the default) and the pose as needed; if the pose was removed
+/// on another device meanwhile, uploading its base brings it back, which is
+/// acceptable. An expression on a pose that is not there is an error: a
+/// pose without a base is not a valid config. `vrm` is left alone.
+pub(crate) fn with_image(
+    config: &mut AvatarConfig,
+    pose: &str,
+    slot: Slot,
+    path: String,
+) -> Result<(), String> {
     match slot {
-        Slot::Base => pose.base = path,
+        Slot::Base => {
+            let sprite = config.sprite.get_or_insert_with(|| SpriteConfig {
+                default_pose: pose.to_owned(),
+                poses: BTreeMap::new(),
+            });
+            sprite.poses.entry(pose.to_owned()).or_default().base = path;
+        }
         Slot::Expression(key) => {
-            pose.expressions.insert(key.to_owned(), path);
+            let target = config
+                .sprite
+                .as_mut()
+                .and_then(|s| s.poses.get_mut(pose))
+                .ok_or_else(|| format!("there is no pose named {pose}"))?;
+            target.expressions.insert(key.to_owned(), path);
         }
     }
+    Ok(())
 }
 
-/// Why `name` cannot name a pose: it becomes a directory of the upload path.
+/// Why `name` cannot name a pose: it becomes a directory of the upload
+/// path, which the agent checks (`validate_path`) as one path component.
 fn name_error(name: &str) -> Option<&'static str> {
     if name.is_empty() {
         Some("a pose needs a name")
-    } else if name == "." || name == ".." || name.contains(['/', '\\']) {
-        Some("a pose name cannot contain slashes or be . or ..")
+    } else if name.contains(['/', '\\', ':']) {
+        Some("a pose name cannot contain / \\ or :")
+    } else if name.starts_with('.') || name.ends_with(".uploading") {
+        // The agent refuses hidden and in-flight names (`is_transient`),
+        // and `.`/`..` start with a dot.
+        Some("a pose name cannot start with . or end in .uploading")
     } else {
         None
     }
@@ -119,34 +139,54 @@ pub(crate) fn image_info(bytes: &[u8]) -> Result<(UVec2, &'static str), String> 
     const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
     let short = || "the image file is truncated".to_owned();
     let le24 = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], 0]);
-    if bytes.starts_with(PNG) {
+    let (size, ext) = if bytes.starts_with(PNG) {
         let ihdr = bytes.get(8..24).ok_or_else(short)?;
         if &ihdr[4..8] != b"IHDR" {
             return Err("the PNG has no header".to_owned());
         }
         let be = |b: &[u8]| u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
-        return Ok((UVec2::new(be(&ihdr[8..12]), be(&ihdr[12..16])), "png"));
-    }
-    if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
-        let chunk = bytes.get(12..30).ok_or_else(short)?;
+        (UVec2::new(be(&ihdr[8..12]), be(&ihdr[12..16])), "png")
+    } else if bytes.len() >= 16 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        // Each variant needs only its own header bytes, counted from the
+        // chunk's start at 12.
+        let chunk = &bytes[12..];
+        let need = |n: usize| chunk.get(..n).ok_or_else(short);
         let size = match &chunk[..4] {
             // Lossy: frame tag, start code, then 14-bit width and height.
-            b"VP8 " if chunk[11..14] == [0x9d, 0x01, 0x2a] => UVec2::new(
-                u32::from(u16::from_le_bytes([chunk[14], chunk[15]]) & 0x3fff),
-                u32::from(u16::from_le_bytes([chunk[16], chunk[17]]) & 0x3fff),
-            ),
+            b"VP8 " => {
+                let c = need(18)?;
+                if c[11..14] != [0x9d, 0x01, 0x2a] {
+                    return Err("the WebP has no VP8 start code".to_owned());
+                }
+                UVec2::new(
+                    u32::from(u16::from_le_bytes([c[14], c[15]]) & 0x3fff),
+                    u32::from(u16::from_le_bytes([c[16], c[17]]) & 0x3fff),
+                )
+            }
             // Lossless: signature byte, then 14-bit width-1 and height-1.
-            b"VP8L" if chunk[8] == 0x2f => {
-                let bits = u32::from_le_bytes([chunk[9], chunk[10], chunk[11], chunk[12]]);
+            b"VP8L" => {
+                let c = need(13)?;
+                if c[8] != 0x2f {
+                    return Err("the WebP has no VP8L signature".to_owned());
+                }
+                let bits = u32::from_le_bytes([c[9], c[10], c[11], c[12]]);
                 UVec2::new((bits & 0x3fff) + 1, ((bits >> 14) & 0x3fff) + 1)
             }
             // Extended: 24-bit width-1 and height-1 after the flags.
-            b"VP8X" => UVec2::new(le24(&chunk[12..15]) + 1, le24(&chunk[15..18]) + 1),
+            b"VP8X" => {
+                let c = need(18)?;
+                UVec2::new(le24(&c[12..15]) + 1, le24(&c[15..18]) + 1)
+            }
             _ => return Err("this WebP is not one the header can be read from".to_owned()),
         };
-        return Ok((size, "webp"));
+        (size, "webp")
+    } else {
+        return Err("the file is not a PNG or WebP image".to_owned());
+    };
+    if size.x == 0 || size.y == 0 {
+        return Err(format!("the image is {}×{}", size.x, size.y));
     }
-    Err("the file is not a PNG or WebP image".to_owned())
+    Ok((size, ext))
 }
 
 /// Refuses an image of `size` that is not the canvas size of `reference`
@@ -176,12 +216,12 @@ fn canvas_reference(
         .poses
         .get(&sprite.default_pose)
         .map(|p| p.base.as_str());
-    let paths = default_base.into_iter().chain(
-        config
-            .paths()
-            .into_iter()
-            .filter(|p| p.ends_with(".png") || p.ends_with(".webp")),
-    );
+    let paths = default_base
+        .into_iter()
+        .chain(config.paths().into_iter().filter(|p| {
+            let p = p.to_ascii_lowercase();
+            p.ends_with(".png") || p.ends_with(".webp")
+        }));
     for path in paths {
         if path == except {
             continue;
@@ -263,7 +303,12 @@ impl SpritePanel {
         let PickTarget { pose, slot } = target;
         let stored = path.clone();
         self.op = Some(cx.ops.apply(SOURCE, vec![(path, bytes)], move |config| {
-            with_image(config, &pose, slot, stored);
+            // `apply`'s edit cannot fail, so a refusal (the pose is gone on
+            // the agent's newer config) leaves the config unchanged and the
+            // op still reports success. Only the log tells.
+            if let Err(why) = with_image(config, &pose, slot, stored) {
+                tracing::warn!("2D: image for pose {pose} not set: {why}");
+            }
         }));
         Ok(())
     }
@@ -297,8 +342,12 @@ impl SpritePanel {
             return;
         }
         self.op = Some(cx.ops.apply(SOURCE, Vec::new(), move |config| {
-            // Refused on the agent's newer config: nothing changes.
-            let _ = edit(config);
+            // Refused on the agent's newer config: nothing changes, and
+            // `apply` (whose edit cannot fail) still reports success. Only
+            // the log tells.
+            if let Err(why) = edit(config) {
+                tracing::warn!("2D: pose edit not applied: {why}");
+            }
         }));
     }
 }
@@ -455,13 +504,15 @@ mod tests {
             "normal",
             Slot::Base,
             "sprite/normal/base.png".into(),
-        );
+        )
+        .unwrap();
         with_image(
             &mut config,
             "arms",
             Slot::Base,
             "sprite/arms/base.png".into(),
-        );
+        )
+        .unwrap();
         config
     }
 
@@ -474,7 +525,8 @@ mod tests {
             "normal",
             Slot::Base,
             "sprite/normal/base.png".into(),
-        );
+        )
+        .unwrap();
         let sprite = config.sprite.unwrap();
         assert_eq!(sprite.default_pose, "normal");
         assert_eq!(sprite.poses["normal"].base, "sprite/normal/base.png");
@@ -489,13 +541,50 @@ mod tests {
             "arms",
             Slot::Expression("happy"),
             "sprite/arms/happy.webp".into(),
-        );
+        )
+        .unwrap();
         let sprite = config.sprite.unwrap();
         assert_eq!(sprite.default_pose, "normal");
         assert_eq!(
             sprite.poses["arms"].expressions["happy"],
             "sprite/arms/happy.webp"
         );
+    }
+
+    #[test]
+    fn an_expression_needs_its_pose() {
+        let mut config = only_vrm();
+        let before = config.clone();
+        assert!(with_image(&mut config, "gone", Slot::Expression("sad"), "x.png".into()).is_err());
+        let mut config = two_poses();
+        let before_poses = config.clone();
+        assert!(with_image(&mut config, "gone", Slot::Expression("sad"), "x.png".into()).is_err());
+        assert_eq!(config, before_poses);
+        assert!(before.sprite.is_none());
+        // A base brings a removed pose back.
+        with_image(&mut config, "gone", Slot::Base, "b.png".into()).unwrap();
+        assert!(config.sprite.unwrap().poses.contains_key("gone"));
+    }
+
+    #[test]
+    fn pose_names_follow_the_agents_path_rules() {
+        for bad in [
+            "",
+            ".",
+            "..",
+            ".hidden",
+            "a:b",
+            "x.uploading",
+            "a/b",
+            "a\\b",
+        ] {
+            assert!(name_error(bad).is_some(), "{bad:?}");
+        }
+        for good in ["normal", "arms up", "日本語", "a.b"] {
+            assert!(name_error(good).is_none(), "{good:?}");
+        }
+        let mut config = two_poses();
+        assert!(rename_pose(&mut config, "normal", ".hidden").is_err());
     }
 
     #[test]
@@ -567,7 +656,33 @@ mod tests {
         ]);
         assert_eq!(image_info(&vp8), Ok((UVec2::new(30, 40), "webp")));
 
+        // Only what each variant needs: the shortest VP8L header.
+        let short_l = [
+            &b"RIFF\0\0\0\0WEBPVP8L\x05\0\0\0\x2f"[..],
+            &packed.to_le_bytes(),
+        ]
+        .concat();
+        assert_eq!(short_l.len(), 25);
+        assert_eq!(image_info(&short_l), Ok((UVec2::new(50, 80), "webp")));
+        // Truncated variants are errors, not panics.
+        for full in [&vp8x, &riff(&l), &vp8] {
+            let end = if std::ptr::eq(full, &vp8x) { 29 } else { 24 };
+            assert!(image_info(&full[..end]).is_err(), "{end}");
+        }
+        assert!(image_info(&short_l[..24]).is_err());
+        assert!(image_info(b"RIFF\0\0\0\0WEBPVP8").is_err());
+
         assert!(image_info(b"GIF89a....").is_err());
         assert!(image_info(&png[..10]).is_err());
+    }
+
+    #[test]
+    fn zero_sized_images_are_refused() {
+        let mut png = crate::avatar::sprite::load::tests::png(3, 5);
+        png[16..20].copy_from_slice(&0u32.to_be_bytes());
+        assert!(image_info(&png).is_err());
+        let mut png = crate::avatar::sprite::load::tests::png(3, 5);
+        png[20..24].copy_from_slice(&0u32.to_be_bytes());
+        assert!(image_info(&png).is_err());
     }
 }
