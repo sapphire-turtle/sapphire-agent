@@ -399,14 +399,17 @@ impl AvatarOps {
     /// 4. checks the result and sets it on the agent.
     ///
     /// It stops at the first error. The uploads come first because the
-    /// agent refuses a config that references a file it lacks. `source`
-    /// names the caller (a panel's title) for [`OpsStatus::errors`]; its
-    /// previous error is cleared now. A sync follows success.
+    /// agent refuses a config that references a file it lacks. `edit`
+    /// refuses with `Err(why)` when the change no longer fits the config it
+    /// is given (another device renamed or removed what it edits): nothing
+    /// is set, and `why` is the op's error. `source` names the caller (a
+    /// panel's title) for [`OpsStatus::errors`]; its previous error is
+    /// cleared now. A sync follows success.
     pub fn apply(
         &self,
         source: &'static str,
         uploads: Vec<(String, Vec<u8>)>,
-        edit: impl FnOnce(&mut AvatarConfig) + Send + 'static,
+        edit: impl FnOnce(&mut AvatarConfig) -> Result<(), String> + Send + 'static,
     ) -> OpTicket {
         let ticket = {
             let mut inner = self.lock();
@@ -437,7 +440,7 @@ impl AvatarOps {
                         .with_context(|| format!("cannot upload {path}"))?;
                 }
                 let mut config = client.config().await?;
-                edit(&mut config);
+                edit(&mut config).map_err(|e| anyhow!(e))?;
                 config.check().map_err(|e| anyhow!(e))?;
                 client.set_config(&config).await
             };
@@ -725,6 +728,7 @@ mod tests {
                     .unwrap()
                     .expressions
                     .insert("happy".into(), "new.png".into());
+                Ok(())
             },
         );
         assert_eq!(wait_for(&ops, &ticket), Ok(()));
@@ -752,6 +756,7 @@ mod tests {
 
         let ticket = ops.apply("sprite", vec![], |config| {
             config.sprite.as_mut().unwrap().default_pose = "missing-pose".to_owned();
+            Ok(())
         });
         let error = wait_for(&ops, &ticket).unwrap_err();
         assert!(error.contains("missing-pose"), "{error}");
@@ -767,6 +772,23 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_edit_is_reported_without_set_config() {
+        let runtime = runtime();
+        let editor = FakeEditor::new(config_of(&["a.png"]));
+        let ops = ops_over(&runtime, Arc::clone(&editor));
+
+        // The pose the panel saw is gone from the agent's newer config.
+        let ticket = ops.apply("sprite", vec![], |_| {
+            Err("pose gone was removed elsewhere".to_owned())
+        });
+        let error = wait_for(&ops, &ticket).unwrap_err();
+        assert!(error.contains("pose gone"), "{error}");
+        assert_eq!(*editor.log.lock().unwrap(), ["config"]);
+        assert!(ops.status().errors["sprite"].contains("pose gone"));
+        assert!(!ops.take_sync_request());
+    }
+
+    #[test]
     fn an_upload_error_stops_the_op_before_the_config() {
         let runtime = runtime();
         let mut editor = FakeEditor::new(config_of(&["a.png"]));
@@ -775,7 +797,7 @@ mod tests {
         let ticket = ops.apply(
             "sprite",
             vec![("b.png".to_owned(), vec![]), ("c.png".to_owned(), vec![])],
-            |_| {},
+            |_| Ok(()),
         );
         let error = wait_for(&ops, &ticket).unwrap_err();
         assert!(
@@ -793,18 +815,22 @@ mod tests {
 
         let bad = ops.apply("vrm", vec![("x.vrm".to_owned(), vec![])], |config| {
             config.vrm = Some(Default::default()); // empty model: check() fails
+            Ok(())
         });
         assert!(wait_for(&ops, &bad).is_err());
-        let good = ops.apply("sprite", vec![], |_| {});
+        let good = ops.apply("sprite", vec![], |_| Ok(()));
         assert_eq!(wait_for(&ops, &good), Ok(()));
         assert!(ops.status().errors.contains_key("vrm"), "kept");
         assert!(!ops.status().errors.contains_key("sprite"));
 
         // Its own next op clears it; so does dismissing.
-        let again = ops.apply("vrm", vec![], |_| {});
+        let again = ops.apply("vrm", vec![], |_| Ok(()));
         let _ = wait_for(&ops, &again);
         assert!(!ops.status().errors.contains_key("vrm"));
-        let bad = ops.apply("vrm", vec![], |c| c.vrm = Some(Default::default()));
+        let bad = ops.apply("vrm", vec![], |c| {
+            c.vrm = Some(Default::default());
+            Ok(())
+        });
         assert!(wait_for(&ops, &bad).is_err());
         ops.dismiss("vrm");
         assert!(ops.status().errors.is_empty());
@@ -815,7 +841,9 @@ mod tests {
         let runtime = runtime();
         let editor = FakeEditor::new(config_of(&["a.png"]));
         let ops = ops_over(&runtime, editor);
-        let ticket = ops.apply("sprite", vec![], |_| panic!("boom"));
+        let ticket = ops.apply("sprite", vec![], |_| -> Result<(), String> {
+            panic!("boom")
+        });
         assert!(wait_for(&ops, &ticket).is_err());
         assert!(!ops.status().busy);
         assert!(ops.status().errors.contains_key("sprite"));
@@ -829,7 +857,7 @@ mod tests {
             Arc::new(|| None),
             Arc::new(AtomicBool::new(false)),
         );
-        let ticket = ops.apply("sprite", vec![], |_| {});
+        let ticket = ops.apply("sprite", vec![], |_| Ok(()));
         assert_eq!(
             ops.result(&ticket),
             Some(Err("not connected to the agent".into()))

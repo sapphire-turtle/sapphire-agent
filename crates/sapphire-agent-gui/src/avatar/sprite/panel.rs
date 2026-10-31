@@ -284,13 +284,10 @@ impl SpritePanel {
         )?;
         let PickTarget { pose, slot } = target;
         let stored = path.clone();
+        // A refusal on the agent's newer config (the pose is gone) is the
+        // op's error, which the page shows under this panel's name.
         self.op = Some(cx.ops.apply(SOURCE, vec![(path, bytes)], move |config| {
-            // `apply`'s edit cannot fail, so a refusal (the pose is gone on
-            // the agent's newer config) leaves the config unchanged and the
-            // op still reports success. Only the log tells.
-            if let Err(why) = with_image(config, &pose, slot, stored) {
-                tracing::warn!("2D: image for pose {pose} not set: {why}");
-            }
+            with_image(config, &pose, slot, stored)
         }));
         Ok(())
     }
@@ -323,14 +320,8 @@ impl SpritePanel {
             self.error = Some(e);
             return;
         }
-        self.op = Some(cx.ops.apply(SOURCE, Vec::new(), move |config| {
-            // Refused on the agent's newer config: nothing changes, and
-            // `apply` (whose edit cannot fail) still reports success. Only
-            // the log tells.
-            if let Err(why) = edit(config) {
-                tracing::warn!("2D: pose edit not applied: {why}");
-            }
-        }));
+        // Refused on the agent's newer config, it is the op's error.
+        self.op = Some(cx.ops.apply(SOURCE, Vec::new(), edit));
     }
 }
 
