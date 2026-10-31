@@ -30,6 +30,8 @@ use crate::avatar::{
 /// Change the avatar only through [`AvatarOps::apply`]: it uploads first,
 /// edits the agent's current config rather than the possibly stale
 /// [`PanelContext::config`], and reports under the panel's `source` name.
+/// The edit returns `Err(why)` when the change no longer fits that config
+/// (another device renamed or removed what it edits), and nothing is set.
 /// The page itself shows the renderer's error and every source's op
 /// errors, so a panel need not repeat them.
 pub trait RendererPanel: Send {
