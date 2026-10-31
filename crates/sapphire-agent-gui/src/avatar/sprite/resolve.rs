@@ -70,6 +70,7 @@ pub(crate) fn declared(
     let expressions: BTreeSet<&str> = config
         .poses
         .values()
+        .filter(|p| loaded(&p.base))
         .flat_map(|p| &p.expressions)
         .filter(|(_, path)| loaded(path))
         .map(|(key, _)| key.as_str())
@@ -181,6 +182,15 @@ mod tests {
         assert_eq!(caps.poses, ["arms", "normal"]);
         assert_eq!(caps.expressions, ["neutral", "happy"]);
         assert!(caps.actions.is_empty());
+    }
+
+    #[test]
+    fn declared_skips_expressions_of_poses_that_did_not_load() {
+        let c = config();
+        let loaded = |p: &str| p != "a.png";
+        let caps = declared(&c, &loaded).unwrap();
+        assert_eq!(caps.poses, ["normal"]);
+        assert_eq!(caps.expressions, ["neutral", "happy"]);
     }
 
     #[test]
