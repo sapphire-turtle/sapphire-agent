@@ -1,9 +1,18 @@
 //! Drawing the 2D avatar: its camera, the sprites of what [`shown`] picks,
 //! the crossfade between them, and the bounds they cover.
 //!
-//! Two layers: `Current`, what [`shown`] picks now, and while a crossfade
-//! runs `Previous`, what it picked before, drawn below and fading out as
-//! `Current` fades in. Each layer is a base sprite and an optional overlay.
+//! The `Current` sprites are what [`shown`] picks now: a base and an
+//! optional overlay. A change fades without letting the desktop show
+//! through the avatar:
+//!
+//! - **Expression only** (same base): the base stays, opaque. The old
+//!   overlay fades out and the new one fades in above it.
+//! - **Pose**: everything shown becomes `Previous`, drawn underneath and held
+//!   at its opacity for the first half of the fade before fading out, while
+//!   the new base and overlay fade in on top.
+//!
+//! Each sprite fades on its own from the opacity it has, so a change in the
+//! middle of a fade carries on from what is on screen.
 //!
 //! Only a ready [`SpriteImages`] is drawn. When the avatar reloads (a new
 //! generation) or fails, the sprites go at once rather than staying until
@@ -25,46 +34,78 @@ pub(crate) const FADE: Duration = Duration::from_millis(200);
 #[derive(Component)]
 pub(crate) struct SpriteCamera;
 
-/// Which layer a sprite belongs to.
+/// Whether a sprite is part of what shows now, or on its way out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Layer {
     Current,
     Previous,
 }
 
-/// One sprite of the avatar: a layer's base or its overlay.
+/// The current base's depth; its overlay is drawn one above it.
+const BASE_Z: f32 = 0.0;
+/// An overlay fading out over the base that stays: above the base, below
+/// the overlay fading in.
+const OUTGOING_OVERLAY_Z: f32 = BASE_Z + 0.5;
+/// How far a pose change pushes what showed below the new pose.
+const POSE_STEP_Z: f32 = 10.0;
+
+/// One sprite of the avatar: a base or an overlay.
 #[derive(Component)]
 pub(crate) struct SpritePart {
     layer: Layer,
     overlay: bool,
+    z: f32,
+    fade: Option<PartFade>,
 }
 
-impl SpritePart {
-    /// Previous below current, each overlay above its base.
-    fn z(&self) -> f32 {
-        let layer = match self.layer {
-            Layer::Previous => 0.0,
-            Layer::Current => 2.0,
-        };
-        layer + if self.overlay { 1.0 } else { 0.0 }
-    }
-}
-
-/// What the sprites show, and the crossfade under way.
-#[derive(Resource, Default)]
-pub(crate) struct SpriteScene {
-    /// The current layer's base and overlay, as avatar paths.
-    shown: Option<(String, Option<String>)>,
-    fade: Option<Fade>,
+/// How a sprite's opacity changes, from `from` at `started`.
+#[derive(Clone, Copy)]
+struct PartFade {
+    /// On the wall clock (`Time<Real>`), as the state's revert is.
+    started: Duration,
+    from: f32,
+    curve: Curve,
 }
 
 #[derive(Clone, Copy)]
-struct Fade {
-    /// On the wall clock (`Time<Real>`), as the state's revert is.
-    started: Duration,
-    /// The previous layer's opacity when it started fading out: below one
-    /// when it was itself still fading in.
-    from: f32,
+enum Curve {
+    /// Up to opaque.
+    In,
+    /// Down to nothing.
+    Out,
+    /// Held for the first half, then down to nothing: what the new pose
+    /// fades in over stays covered until the new pose mostly is.
+    HoldThenOut,
+}
+
+impl PartFade {
+    fn new(started: Duration, from: f32, curve: Curve) -> Self {
+        Self {
+            started,
+            from,
+            curve,
+        }
+    }
+
+    /// The share of [`FADE`] gone by at `now`, up to one.
+    fn progress(&self, now: Duration) -> f32 {
+        (now.saturating_sub(self.started).as_secs_f32() / FADE.as_secs_f32()).min(1.0)
+    }
+
+    fn alpha(&self, t: f32) -> f32 {
+        match self.curve {
+            Curve::In => self.from + (1.0 - self.from) * t,
+            Curve::Out => self.from * (1.0 - t),
+            Curve::HoldThenOut => self.from * (2.0 * (1.0 - t)).min(1.0),
+        }
+    }
+}
+
+/// What the current sprites show.
+#[derive(Resource, Default)]
+pub(crate) struct SpriteScene {
+    /// The current base and overlay, as avatar paths.
+    shown: Option<(String, Option<String>)>,
 }
 
 /// Where the canvas is drawn in a `window` of logical size: as tall as the
@@ -102,8 +143,8 @@ pub(crate) fn despawn_sprite_scene(
 }
 
 /// Spawns the sprites of what [`shown`] picks when the state or the images
-/// change, starting a crossfade from what showed before. Clears them while
-/// the images are not ready.
+/// change, and starts their crossfade from what showed before (see the
+/// module docs). Clears them while the images are not ready.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn show_sprites(
     assets: Res<AvatarAssets>,
@@ -153,27 +194,10 @@ pub(crate) fn show_sprites(
         ));
     }
 
-    // The first picture appears at once; a later one fades in over it.
-    let fades = scene.shown.is_some();
-    if fades {
-        let mut from = 1.0;
-        for (entity, mut part, sprite) in &mut parts {
-            match part.layer {
-                Layer::Previous => commands.entity(entity).despawn(),
-                Layer::Current => {
-                    from = sprite.color.alpha();
-                    part.layer = Layer::Previous;
-                }
-            }
-        }
-        scene.fade = Some(Fade {
-            started: time.elapsed(),
-            from,
-        });
-    }
-    let alpha = if fades { 0.0 } else { 1.0 };
-    let layers = std::iter::once((&next.0, false)).chain(next.1.as_ref().map(|o| (o, true)));
-    for (path, overlay) in layers {
+    let now = time.elapsed();
+    let mut spawn = |path: &str, overlay: bool, fade: Option<PartFade>| {
+        let z = BASE_Z + if overlay { 1.0 } else { 0.0 };
+        let alpha = fade.map_or(1.0, |f| f.alpha(0.0));
         commands.spawn((
             Sprite {
                 image: images.handles[path].clone(),
@@ -183,36 +207,75 @@ pub(crate) fn show_sprites(
             SpritePart {
                 layer: Layer::Current,
                 overlay,
+                z,
+                fade,
             },
         ));
+    };
+    let fade_in = Some(PartFade::new(now, 0.0, Curve::In));
+    match &scene.shown {
+        // The first picture appears at once.
+        None => {
+            spawn(&next.0, false, None);
+            if let Some(overlay) = &next.1 {
+                spawn(overlay, true, None);
+            }
+        }
+        // The base stays: only the overlays change.
+        Some((base, _)) if *base == next.0 => {
+            for (_, mut part, sprite) in &mut parts {
+                if part.layer == Layer::Current && part.overlay {
+                    part.layer = Layer::Previous;
+                    part.z = OUTGOING_OVERLAY_Z;
+                    part.fade = Some(PartFade::new(now, sprite.color.alpha(), Curve::Out));
+                }
+            }
+            if let Some(overlay) = &next.1 {
+                spawn(overlay, true, fade_in);
+            }
+        }
+        // A new pose fades in over everything that showed.
+        Some(_) => {
+            for (_, mut part, sprite) in &mut parts {
+                part.layer = Layer::Previous;
+                part.z -= POSE_STEP_Z;
+                part.fade = Some(PartFade::new(now, sprite.color.alpha(), Curve::HoldThenOut));
+            }
+            spawn(&next.0, false, fade_in);
+            if let Some(overlay) = &next.1 {
+                spawn(overlay, true, fade_in);
+            }
+        }
     }
     scene.shown = Some(next);
 }
 
-/// Runs the crossfade: current fades in, previous fades out, and is
-/// despawned at the end. Asks for the next frame until it ends.
+/// Runs the crossfades: sets each fading sprite's opacity, despawns what
+/// faded out, and asks for the next frame until every fade ends.
 pub(crate) fn fade_sprites(
     time: Res<Time<Real>>,
-    mut scene: ResMut<SpriteScene>,
-    mut parts: Query<(Entity, &SpritePart, &mut Sprite)>,
+    mut parts: Query<(Entity, &mut SpritePart, &mut Sprite)>,
     mut redraw: MessageWriter<RequestRedraw>,
     mut commands: Commands,
 ) {
-    let Some(fade) = scene.fade else {
-        return;
-    };
-    let t =
-        (time.elapsed().saturating_sub(fade.started).as_secs_f32() / FADE.as_secs_f32()).min(1.0);
-    for (entity, part, mut sprite) in &mut parts {
-        match part.layer {
-            Layer::Current => sprite.color.set_alpha(t),
-            Layer::Previous if t >= 1.0 => commands.entity(entity).despawn(),
-            Layer::Previous => sprite.color.set_alpha(fade.from * (1.0 - t)),
+    let now = time.elapsed();
+    let mut fading = false;
+    for (entity, mut part, mut sprite) in &mut parts {
+        let Some(fade) = part.fade else {
+            continue;
+        };
+        let t = fade.progress(now);
+        if t < 1.0 {
+            sprite.color.set_alpha(fade.alpha(t));
+            fading = true;
+        } else if part.layer == Layer::Previous {
+            commands.entity(entity).despawn();
+        } else {
+            sprite.color.set_alpha(1.0);
+            part.fade = None;
         }
     }
-    if t >= 1.0 {
-        scene.fade = None;
-    } else {
+    if fading {
         redraw.write(RequestRedraw);
     }
 }
@@ -238,7 +301,7 @@ pub(crate) fn place_sprites(
         if sprite.custom_size != Some(size) {
             sprite.custom_size = Some(size);
         }
-        let translation = centre.extend(part.z());
+        let translation = centre.extend(part.z);
         if transform.translation != translation {
             transform.translation = translation;
         }
@@ -290,14 +353,14 @@ mod tests {
         assert_eq!(rect, Rect::new(130.0, 0.0, 290.0, 320.0));
     }
 
-    /// A settled sprite avatar with a happy overlay, in a 420×640 window,
+    /// A settled sprite avatar with happy and sad overlays and a second pose, in a 420×640 window,
     /// whose clock advances 50 ms a frame.
     fn drawn(dir: &std::path::Path) -> App {
         let config = sprite(&[
-            ("normal", "n.png", &[("happy", "nh.png")]),
+            ("normal", "n.png", &[("happy", "nh.png"), ("sad", "ns.png")]),
             ("arms", "a.png", &[]),
         ]);
-        let files = ["n.png", "nh.png", "a.png"].map(|p| (p, Some(png(2, 4))));
+        let files = ["n.png", "nh.png", "ns.png", "a.png"].map(|p| (p, Some(png(2, 4))));
         let mut app = app(dir, cached(dir, config, &files));
         app.world_mut().spawn((
             Window {
@@ -386,51 +449,190 @@ mod tests {
         assert_eq!(transform.translation.truncate(), Vec2::ZERO);
     }
 
+    /// Every sprite: its entity, layer, whether it is an overlay, its
+    /// opacity and its depth.
+    fn parts(app: &mut App) -> Vec<(Entity, Layer, bool, f32, f32)> {
+        let mut parts = app
+            .world_mut()
+            .query::<(Entity, &SpritePart, &Sprite, &Transform)>();
+        parts
+            .iter(app.world())
+            .map(|(e, p, s, t)| (e, p.layer, p.overlay, s.color.alpha(), t.translation.z))
+            .collect()
+    }
+
+    fn close(a: f32, b: f32) -> bool {
+        (a - b).abs() < 1e-3
+    }
+
+    /// The one current base: its entity and opacity.
+    fn base(app: &mut App) -> (Entity, f32) {
+        let bases: Vec<_> = parts(app)
+            .into_iter()
+            .filter(|(_, layer, overlay, ..)| *layer == Layer::Current && !overlay)
+            .map(|(e, _, _, alpha, _)| (e, alpha))
+            .collect();
+        assert_eq!(bases.len(), 1, "{bases:?}");
+        bases[0]
+    }
+
     #[test]
-    fn a_change_crossfades_and_cleans_up() {
+    fn an_expression_change_fades_only_the_overlays() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = drawn(dir.path());
+        let (still, _) = base(&mut app);
 
+        // neutral → happy: the one overlay fades in over the base, which
+        // stays as it is. Each frame is 50 ms; at 200 ms it ends.
         app.world_mut()
             .resource_mut::<AvatarState>()
             .expression("happy", 1.0);
-        // The frame of the change starts the fade: the base and its overlay
-        // fade in over the old base. Each frame is 50 ms; at 200 ms it ends.
         for frame in 0..4 {
             assert_eq!(redraws(&mut app), 1, "frame {frame} asks for the next");
-            assert_eq!(layers(&mut app), (2, 1), "frame {frame}");
+            assert_eq!(layers(&mut app), (2, 0), "frame {frame}");
+            assert_eq!(base(&mut app), (still, 1.0), "frame {frame}");
         }
         app.update();
         assert_eq!(layers(&mut app), (2, 0));
-        let mut sprites = app.world_mut().query::<&Sprite>();
-        assert!(sprites.iter(app.world()).all(|s| s.color.alpha() == 1.0));
-        // Still again, it asks for no more frames.
+        assert!(parts(&mut app).iter().all(|p| p.3 == 1.0));
+        assert_eq!(redraws(&mut app), 0, "still again, it asks for no frames");
+
+        // happy → sad: the old overlay fades out between the base and the
+        // new overlay, the base untouched.
+        app.world_mut()
+            .resource_mut::<AvatarState>()
+            .expression("sad", 1.0);
+        for frame in 0..4 {
+            app.update();
+            assert_eq!(layers(&mut app), (2, 1), "frame {frame}");
+            assert_eq!(base(&mut app), (still, 1.0), "frame {frame}");
+            let parts = parts(&mut app);
+            let z = |layer, overlay| {
+                parts
+                    .iter()
+                    .find(|p| p.1 == layer && p.2 == overlay)
+                    .unwrap()
+                    .4
+            };
+            let base_z = z(Layer::Current, false);
+            let (outgoing, incoming) = (z(Layer::Previous, true), z(Layer::Current, true));
+            assert!(base_z < outgoing && outgoing < incoming, "{parts:?}");
+        }
+        app.update();
+        assert_eq!(layers(&mut app), (2, 0));
+        assert_eq!(base(&mut app), (still, 1.0));
         assert_eq!(redraws(&mut app), 0);
     }
 
     #[test]
-    fn previous_fades_out_below_current() {
+    fn a_pose_change_holds_the_old_pose_underneath() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = drawn(dir.path());
 
         app.world_mut().resource_mut::<AvatarState>().pose("arms");
+        app.update(); // t = 0
+        app.update(); // t = 0.25
+        app.update(); // t = 0.5
+        let alphas = |app: &mut App| {
+            let parts = parts(app);
+            assert_eq!(parts.len(), 2, "{parts:?}");
+            let of = |layer| parts.iter().find(|p| p.1 == layer).unwrap();
+            let (previous, current) = (of(Layer::Previous), of(Layer::Current));
+            assert!(previous.4 < current.4, "previous is drawn below: {parts:?}");
+            (previous.3, current.3)
+        };
+        let (previous, current) = alphas(&mut app);
+        assert!(close(previous, 1.0), "held at `from` halfway: {previous}");
+        assert!(close(current, 0.5), "{current}");
+
+        app.update(); // t = 0.75
+        let (previous, current) = alphas(&mut app);
+        assert!(close(previous, 0.5), "{previous}");
+        assert!(close(current, 0.75), "{current}");
+
+        app.update(); // t = 1
+        assert_eq!(layers(&mut app), (1, 0));
+        assert_eq!(base(&mut app).1, 1.0);
+        assert_eq!(redraws(&mut app), 0);
+    }
+
+    #[test]
+    fn a_change_mid_fade_carries_the_opacity() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = drawn(dir.path());
+
+        app.world_mut().resource_mut::<AvatarState>().pose("arms");
+        app.update(); // t = 0
+        app.update(); // t = 0.25: arms a quarter in, normal held opaque
+        let before = parts(&mut app);
+
+        app.world_mut().resource_mut::<AvatarState>().pose("normal");
+        app.update();
+        let after = parts(&mut app);
+        for (entity, _, _, alpha, _) in &before {
+            let (.., now, _) = after.iter().find(|p| p.0 == *entity).unwrap();
+            assert!(close(*now, *alpha), "{alpha} became {now}");
+            assert!(
+                after
+                    .iter()
+                    .any(|p| p.0 == *entity && p.1 == Layer::Previous)
+            );
+        }
+        assert_eq!(layers(&mut app), (1, 2));
+
+        // Everything ends with the one base, opaque.
+        for _ in 0..4 {
+            app.update();
+        }
+        assert_eq!(layers(&mut app), (1, 0));
+        assert_eq!(base(&mut app).1, 1.0);
+    }
+
+    #[test]
+    fn a_failed_reload_clears_the_sprites_and_leaves_the_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = drawn(dir.path());
+        assert_eq!(layers(&mut app), (1, 0));
+
+        // A new generation whose default base is missing.
+        let config = sprite(&[("normal", "gone.png", &[])]);
+        let avatar = cached(dir.path(), config, &[("gone.png", None)]);
+        app.world_mut()
+            .resource_mut::<AvatarAssets>()
+            .apply(Ok(avatar));
+        until(&mut app, |world| {
+            world.resource::<RendererError>().0.is_some()
+        });
+        assert_eq!(layers(&mut app), (0, 0));
+
+        // The placeholder now owns the bounds; the renderer leaves them.
+        let theirs = Some(Rect::new(1.0, 2.0, 3.0, 4.0));
+        app.world_mut().resource_mut::<AvatarBounds>().0 = theirs;
         app.update();
         app.update();
-        let mut parts = app
-            .world_mut()
-            .query::<(&SpritePart, &Sprite, &Transform)>();
-        let (mut current, mut previous) = (None, None);
-        for (part, sprite, transform) in parts.iter(app.world()) {
-            let seen = (sprite.color.alpha(), transform.translation.z);
-            match part.layer {
-                Layer::Current => current = Some(seen),
-                Layer::Previous => previous = Some(seen),
+        assert_eq!(app.world().resource::<AvatarBounds>().0, theirs);
+        assert_eq!(layers(&mut app), (0, 0));
+    }
+
+    #[test]
+    fn idle_frames_leave_the_images_unchanged() {
+        #[derive(Resource, Default)]
+        struct Changes(usize);
+        fn count(images: Res<SpriteImages>, mut changes: ResMut<Changes>) {
+            if images.is_changed() {
+                changes.0 += 1;
             }
         }
-        let (current, previous) = (current.unwrap(), previous.unwrap());
-        assert!(0.0 < current.0 && current.0 < 1.0, "{current:?}");
-        assert!(0.0 < previous.0 && previous.0 < 1.0, "{previous:?}");
-        assert!(previous.1 < current.1, "{previous:?} below {current:?}");
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = drawn(dir.path());
+        app.init_resource::<Changes>()
+            .add_systems(PostUpdate, count);
+        app.update(); // the first run sees the resource as new
+        app.world_mut().resource_mut::<Changes>().0 = 0;
+        for _ in 0..5 {
+            app.update();
+        }
+        assert_eq!(app.world().resource::<Changes>().0, 0);
     }
 
     #[test]
