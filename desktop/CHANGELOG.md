@@ -20,6 +20,7 @@ and predate any user-facing release of this binary.
 - Gestures on the character: click for the input box, scroll for the history, right-click for the menu (settings, reconnecting, quitting), Esc to close them. Enter opens the input box (Ctrl+Enter while a panel is open), and a setting shows a button for each
 - The Character settings page: the display mode (Auto, 3D or 2D), how long an expression or pose holds after a reply, the gesture buttons, and a section per renderer for the avatar's files
 - The avatar's files are synced from the agent into a local cache: on connecting, after an upload from this device, and every five minutes. Until a renderer can draw it, a silhouette stands in and the bubble says why
+- The 2D avatar: the character can be drawn from still images (PNG or WebP) in named poses, each with a neutral image and one per expression, crossfading between them. The Character page's 2D section adds, renames and deletes poses and uploads their images, which must all share one size
 
 ### Fixed
 
