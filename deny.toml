@@ -25,7 +25,9 @@ ignore = [
     # are gone: both reached us through lance, which left the graph when
     # sapphire-framework dropped its LanceDB backend. `cargo tree -i` finds
     # neither package now, even under --all-features. paste (RUSTSEC-2024-0436)
-    # went the same way when the desktop moved to bevy 0.20.
+    # went the same way when the desktop moved to bevy 0.20, and came back
+    # with bevy_vrm1 (the companion's VRM renderer), which uses it for macros.
+    { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained (author-declared, no vulnerability); a compile-time macro crate reached only via bevy_vrm1 0.11. No safe upgrade; drop once bevy_vrm1 moves to pastey or similar." },
 
     # --- unmaintained, reached only through the bevy/egui text stack ---
     # ttf-parser is unmaintained upstream (author-declared). It reaches us via
