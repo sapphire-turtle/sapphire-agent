@@ -7,13 +7,28 @@
 //! renderer's branch.
 
 use bevy::prelude::*;
+use bevy::window::RequestRedraw;
 
+use super::{ActiveRenderer, AvatarSystems, renderer_is};
+
+mod load;
 mod resolve;
 
 /// Draws the avatar from its sprite sheet while `ActiveRenderer` names the
-/// sprite renderer. Empty until plan 4-2D.
+/// sprite renderer.
 pub struct SpriteRendererPlugin;
 
 impl Plugin for SpriteRendererPlugin {
-    fn build(&self, _app: &mut App) {}
+    fn build(&self, app: &mut App) {
+        app.init_resource::<load::SpriteImages>()
+            // `WindowPlugin` adds it too; an app without one still runs.
+            .add_message::<RequestRedraw>()
+            .add_systems(
+                Update,
+                (load::load_sprites, load::settle_sprites)
+                    .chain()
+                    .after(AvatarSystems::Choose)
+                    .run_if(renderer_is(ActiveRenderer::Sprite)),
+            );
+    }
 }
