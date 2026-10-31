@@ -195,7 +195,7 @@ The renderer follows the contract in `avatar/mod.rs` and touches no other module
   - "Choose model…": `.vrm` uploads to `vrm/model.vrm` and sets `vrm.model`. Before uploading, check it with `vrm_version`. Refuse VRM 0.x (`VRM` extension) with a clear message.
   - "Idle…": `.vrma` uploads to `vrm/idle.vrma` and sets `vrm.idle`. Add a "None" option.
   - **Actions:** a list of name → file. Add a name plus a `.vrma` file (uploaded to `vrm/actions/<name>.vrma`), rename, and delete.
-  - Every change goes through one `apply` that edits only `config.vrm` and leaves `sprite` untouched.
+  - Every change goes through one `apply` that edits only `config.vrm` and leaves `sprite` untouched. The edit closure returns `Result<(), String>` (#356): return `Err` when the change no longer fits the agent's current config (e.g. renaming an action that another device removed), so the op reports it.
 - **Pure helpers:**
   - `fn with_model(..)`
   - `fn with_idle(..)`
