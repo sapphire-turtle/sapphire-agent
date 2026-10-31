@@ -38,7 +38,31 @@ bevy = { version = "0.20", default-features = false, features = [
     # input + render path doesn't wire up correctly (window paints
     # black, no UI visible).
     "bevy_picking",
+    # The renderers: the sprite renderer's 2D sprites and image formats, and
+    # the VRM renderer's PBR scene, glTF loading and animation. bevy_vrm1
+    # enables the last three itself; listing them keeps this crate honest.
+    "bevy_sprite",
+    "bevy_image",
+    "png",
+    "webp",
+    "bevy_pbr",
+    "bevy_gltf",
+    "bevy_animation",
+    # Sprite drawing, without relying on bevy_egui's feature unification.
+    "bevy_sprite_render",
+    # VRM files commonly embed JPEG textures.
+    "jpeg",
+    # Camera3d's default tonemapping needs its lookup tables.
+    "tonemapping_luts",
+    # tonemapping_luts stores the tables as KTX2 ...
+    "ktx2",
+    # ... compressed with zstd; `zstd` alone is a marker, and the pure-Rust
+    # decoder keeps a C toolchain out of the build.
+    "zstd_rust",
 ] }
+
+# VRM 1.0 models and VRMA animations for the 3D renderer (plan 4-3D).
+bevy_vrm1 = "0.11"
 
 # Immediate-mode UI inside the bevy app — drives every panel until /
 # unless we eventually replace specific panels with native bevy_ui.
@@ -74,6 +98,9 @@ tracing = "0.1"
 # files is a trait object (the agent today, a bundled set later).
 sha2 = "0.10"
 async-trait = "0.1"
+
+# The VRM renderer's blink timing (plan 4-3D).
+fastrand = "2"
 
 # Per-app cache directory, from the same place the framework's apps use.
 corundum-framework-platform = "0.3"

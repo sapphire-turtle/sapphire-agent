@@ -76,7 +76,9 @@
 pub mod assets;
 pub mod mode;
 pub mod placeholder;
+pub mod sprite;
 pub mod state;
+pub mod vrm;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -94,7 +96,7 @@ use tokio::sync::mpsc;
 
 use crate::Waker;
 use crate::chat::{ChatBridge, SyncRequested};
-use crate::companion::CompanionPrefs;
+use crate::companion::{CompanionPrefs, CursorOverride};
 pub use assets::{
     AvatarAssets, AvatarEditor, AvatarOps, AvatarSource, Cache, LoadedAvatar, OpTicket, OpsStatus,
 };
@@ -194,6 +196,9 @@ impl Plugin for AvatarPlugin {
             // The defaults until `CompanionPlugin` loads the saved ones, or
             // for good in an app without it.
             .init_resource::<CompanionPrefs>()
+            // Where the pointer is, for a renderer to read in an app
+            // without `CompanionPlugin`, which inits it too.
+            .init_resource::<CursorOverride>()
             .configure_sets(Update, AvatarSystems::Choose.after(drain_sync))
             .configure_sets(
                 PostUpdate,
@@ -202,6 +207,7 @@ impl Plugin for AvatarPlugin {
                     .after(CameraUpdateSystems)
                     .before(bevy_egui::EguiPostUpdateSet::EndPass),
             )
+            .add_plugins((sprite::SpriteRendererPlugin, vrm::VrmRendererPlugin))
             .add_systems(Startup, spawn_ui_camera)
             .add_systems(
                 Update,
@@ -449,10 +455,20 @@ mod tests {
         // plugin loaded before; it now starts from the defaults.
         app.update();
         assert!(app.world().contains_resource::<CompanionPrefs>());
+        assert!(app.world().contains_resource::<CursorOverride>());
         assert_eq!(
             *app.world().resource::<ActiveRenderer>(),
             ActiveRenderer::Placeholder
         );
+    }
+
+    #[test]
+    fn both_renderer_plugins_are_installed() {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AvatarPlugin));
+        app.update();
+        assert!(app.is_plugin_added::<sprite::SpriteRendererPlugin>());
+        assert!(app.is_plugin_added::<vrm::VrmRendererPlugin>());
     }
 
     #[test]

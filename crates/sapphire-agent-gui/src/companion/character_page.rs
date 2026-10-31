@@ -17,7 +17,7 @@ use bevy_egui::egui;
 use sapphire_agent_core::AvatarConfig;
 use sapphire_framework_gui::SettingsSection;
 
-use super::CompanionPrefs;
+use super::{CompanionPrefs, FilePicker};
 use crate::avatar::{
     ActiveRenderer, AvatarAssets, AvatarOps, DisplayMode, OpsStatus, RendererError,
 };
@@ -47,6 +47,8 @@ pub struct PanelContext<'a> {
     pub files: Option<&'a BTreeMap<String, PathBuf>>,
     /// Uploads and config changes to the agent: use [`AvatarOps::apply`].
     pub ops: &'a AvatarOps,
+    /// Asks the user for a file through the host's dialog.
+    pub file_picker: &'a FilePicker,
 }
 
 /// The renderers' panels, collected before the settings page takes them.
@@ -107,6 +109,8 @@ pub(crate) struct CharacterModel {
     /// `None` only in a `Default` model, which has no agent and no panels
     /// to draw; the page's model always has one.
     ops: Option<AvatarOps>,
+    /// Likewise.
+    file_picker: Option<FilePicker>,
     panels: Vec<Box<dyn RendererPanel>>,
 }
 
@@ -122,15 +126,21 @@ impl Default for CharacterModel {
             sync_error: None,
             active: ActiveRenderer::Placeholder,
             ops: None,
+            file_picker: None,
             panels: Vec::new(),
         }
     }
 }
 
 impl CharacterModel {
-    pub(crate) fn new(ops: AvatarOps, panels: Vec<Box<dyn RendererPanel>>) -> Self {
+    pub(crate) fn new(
+        ops: AvatarOps,
+        file_picker: FilePicker,
+        panels: Vec<Box<dyn RendererPanel>>,
+    ) -> Self {
         Self {
             ops: Some(ops),
+            file_picker: Some(file_picker),
             panels,
             ..Self::default()
         }
@@ -242,13 +252,14 @@ impl CharacterModel {
             config,
             files,
             ops,
+            file_picker,
             panels,
             ..
         } = self;
         if panels.is_empty() {
             ui.weak("No renderer sections yet");
         }
-        let Some(ops) = ops.as_ref() else {
+        let (Some(ops), Some(file_picker)) = (ops.as_ref(), file_picker.as_ref()) else {
             return;
         };
         for panel in panels {
@@ -257,6 +268,7 @@ impl CharacterModel {
                     config: config.as_ref(),
                     files: files.as_ref(),
                     ops,
+                    file_picker,
                 };
                 panel.ui(ui, &mut cx);
             });

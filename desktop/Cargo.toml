@@ -19,6 +19,9 @@ path = "src/main.rs"
 # desktop adds only the window, the camera and logging.
 sapphire-agent-gui = { path = "../crates/sapphire-agent-gui" }
 
+# The avatar's file size limit, which the file dialog checks before reading.
+sapphire-agent-core = { path = "../crates/sapphire-agent-core", version = "0.10.0" }
+
 # Every command but the window — `serve`, `chat`, `acp`, `status`, … — runs
 # the CLI's own code, so this one binary does all the CLI does, the agent
 # server included.
@@ -51,6 +54,15 @@ bevy = { version = "0.20", default-features = false, features = [
     "wayland",
     "multi_threaded",
 ] }
+
+# The system file dialog (src/file_dialog.rs). `default-features = false`
+# leaves out `wayland`; `xdg-portal` is the only Linux backend that links
+# neither GTK nor X11 (rfd's `gtk3` would link GTK, breaking #182): it talks
+# D-Bus (through libdbus loaded at run time) to the desktop's file chooser
+# portal, falling back to `zenity`; with neither, rfd only logs and reports
+# "no file picked", which src/file_dialog.rs tells apart from a cancel
+# beforehand. Windows and macOS use their native dialogs whatever the features.
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 
 # Logging
 tracing = "0.1"
