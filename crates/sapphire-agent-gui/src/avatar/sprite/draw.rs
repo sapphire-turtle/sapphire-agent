@@ -15,15 +15,17 @@
 //! middle of a fade carries on from what is on screen.
 //!
 //! Only a ready [`SpriteImages`] is drawn. When the avatar reloads (a new
-//! generation) or fails, the sprites go at once rather than staying until
-//! the new images are ready, so two generations never show together.
+//! generation, as every upload from the panel makes), what shows stays,
+//! bounds included, until the new images are ready, then the new picture
+//! replaces it in one frame, so two generations never show together. A
+//! [`RendererError`] clears the sprites at once: the placeholder takes over.
 
 use std::time::Duration;
 
 use bevy::prelude::*;
 use bevy::window::{PrimaryWindow, RequestRedraw};
 
-use super::load::{SpriteImages, sprite_config};
+use super::load::{LeftOut, SpriteImages, sprite_config};
 use super::resolve::shown;
 use crate::avatar::{ActiveRenderer, AvatarAssets, AvatarBounds, AvatarState, RendererError};
 
@@ -108,6 +110,11 @@ impl PartFade {
 pub(crate) struct SpriteScene {
     /// The current base and overlay, as avatar paths.
     shown: Option<(String, Option<String>)>,
+    /// The [`SpriteImages::generation`] the sprites were drawn from.
+    generation: Option<u64>,
+    /// Their canvas size, which places them and makes the bounds; kept
+    /// while the next generation loads.
+    canvas: Option<UVec2>,
 }
 
 /// Where the canvas is drawn in a `window` of logical size: as tall as the
@@ -130,6 +137,7 @@ type InScene = Or<(With<SpriteCamera>, With<SpritePart>)>;
 pub(crate) fn despawn_sprite_scene(
     active: Res<ActiveRenderer>,
     entities: Query<Entity, InScene>,
+    left_out: Res<LeftOut>,
     mut images: ResMut<SpriteImages>,
     mut scene: ResMut<SpriteScene>,
     mut commands: Commands,
@@ -142,11 +150,13 @@ pub(crate) fn despawn_sprite_scene(
     }
     *images = SpriteImages::default();
     *scene = SpriteScene::default();
+    left_out.set(Default::default());
 }
 
 /// Spawns the sprites of what [`shown`] picks when the state or the images
 /// change, and starts their crossfade from what showed before (see the
-/// module docs). Clears them while the images are not ready.
+/// module docs). Keeps them while a new generation loads; clears them on a
+/// [`RendererError`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn show_sprites(
     assets: Res<AvatarAssets>,
@@ -159,7 +169,8 @@ pub(crate) fn show_sprites(
     cameras: Query<(), With<SpriteCamera>>,
     mut commands: Commands,
 ) {
-    if !images.ready || error.0.is_some() {
+    let config = sprite_config(&assets).filter(|_| error.0.is_none());
+    let Some(config) = config else {
         if scene.shown.is_some() || !parts.is_empty() {
             for (entity, ..) in &parts {
                 commands.entity(entity).despawn();
@@ -167,21 +178,34 @@ pub(crate) fn show_sprites(
             *scene = SpriteScene::default();
         }
         return;
-    }
-    if scene.shown.is_some() && !state.is_changed() && !images.is_changed() {
-        return;
-    }
-    let Some(config) = sprite_config(&assets) else {
-        return;
     };
+    // Loading: what shows stays until the new images are ready.
+    if !images.ready {
+        return;
+    }
+    let reloaded = scene.generation != images.generation;
+    if !reloaded && scene.shown.is_some() && !state.is_changed() {
+        return;
+    }
     let loaded =
         |path: &str| images.handles.contains_key(path) && !images.failed.contains_key(path);
     let Some(picked) = shown(config, &loaded, state.pose.as_deref(), &state.expression) else {
         return;
     };
     let next = (picked.base.to_owned(), picked.overlay.map(str::to_owned));
-    if scene.shown.as_ref() == Some(&next) {
+    if !reloaded && scene.shown.as_ref() == Some(&next) {
         return;
+    }
+    if reloaded {
+        // The new generation replaces the old in one frame.
+        for (entity, ..) in &parts {
+            commands.entity(entity).despawn();
+        }
+        *scene = SpriteScene {
+            shown: None,
+            generation: images.generation,
+            canvas: images.canvas,
+        };
     }
 
     if cameras.is_empty() {
@@ -217,7 +241,7 @@ pub(crate) fn show_sprites(
     };
     let fade_in = Some(PartFade::new(now, 0.0, Curve::In));
     match &scene.shown {
-        // The first picture appears at once.
+        // The first picture, or a reloaded one, appears at once.
         None => {
             spawn(&next.0, false, None);
             if let Some(overlay) = &next.1 {
@@ -294,11 +318,11 @@ pub(crate) fn fade_sprites(
 /// The camera's default projection puts world (0, 0) at the window's
 /// centre, y up, one world unit to a logical pixel.
 pub(crate) fn place_sprites(
-    images: Res<SpriteImages>,
+    scene: Res<SpriteScene>,
     windows: Query<&Window, With<PrimaryWindow>>,
     mut parts: Query<(&SpritePart, &mut Sprite, &mut Transform)>,
 ) {
-    let (Some(canvas), Ok(window)) = (images.canvas, windows.single()) else {
+    let (Some(canvas), Ok(window)) = (scene.canvas, windows.single()) else {
         return;
     };
     let rect = fit(canvas, window.size());
@@ -321,7 +345,7 @@ pub(crate) fn place_sprites(
 /// Reports the drawn rect as [`AvatarBounds`], `None` while nothing is
 /// drawn. Leaves them to the placeholder while a [`RendererError`] is set.
 pub(crate) fn write_bounds(
-    images: Res<SpriteImages>,
+    scene: Res<SpriteScene>,
     error: Res<RendererError>,
     windows: Query<&Window, With<PrimaryWindow>>,
     mut bounds: ResMut<AvatarBounds>,
@@ -329,8 +353,8 @@ pub(crate) fn write_bounds(
     if error.0.is_some() {
         return;
     }
-    let next = match (images.ready, images.canvas, windows.single()) {
-        (true, Some(canvas), Ok(window)) => Some(fit(canvas, window.size())),
+    let next = match (scene.canvas, windows.single()) {
+        (Some(canvas), Ok(window)) => Some(fit(canvas, window.size())),
         _ => None,
     };
     if bounds.0 != next {
@@ -348,7 +372,8 @@ mod tests {
     use super::*;
     use crate::avatar::sprite::load::tests::{app, cached, declared, png, settled, sprite, until};
     use crate::avatar::{
-        ActiveRenderer, AvatarBounds, AvatarState, DeclaredAvatar, UI_CAMERA_ORDER,
+        ActiveRenderer, AvatarAssets, AvatarBounds, AvatarState, DeclaredAvatar, RendererError,
+        UI_CAMERA_ORDER,
     };
 
     #[test]
@@ -641,6 +666,43 @@ mod tests {
             BASE_Z < then_out && then_out < first_out && first_out < incoming,
             "{then_out} {first_out} {incoming}"
         );
+    }
+
+    #[test]
+    fn a_reload_keeps_the_old_scene_until_the_new_one_is_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = drawn(dir.path());
+        let old_parts: Vec<Entity> = parts(&mut app).iter().map(|p| p.0).collect();
+        let old_bounds = app.world().resource::<AvatarBounds>().0;
+        assert!(old_bounds.is_some());
+
+        // New art, of another size: what an upload from the panel makes.
+        let config = sprite(&[("normal", "n2.png", &[])]);
+        let avatar = cached(dir.path(), config, &[("n2.png", Some(png(4, 4)))]);
+        app.world_mut()
+            .resource_mut::<AvatarAssets>()
+            .apply(Ok(avatar));
+        app.update();
+        assert!(
+            !app.world().resource::<SpriteImages>().ready,
+            "still loading"
+        );
+        let now: Vec<Entity> = parts(&mut app).iter().map(|p| p.0).collect();
+        assert_eq!(now, old_parts, "the old picture stays while loading");
+        assert_eq!(app.world().resource::<AvatarBounds>().0, old_bounds);
+
+        until(&mut app, |world| world.resource::<SpriteImages>().ready);
+        app.update();
+        // Swapped in one frame: one opaque base, none of the old sprites.
+        assert_eq!(layers(&mut app), (1, 0));
+        let (entity, alpha) = base(&mut app);
+        assert!(!old_parts.contains(&entity));
+        assert_eq!(alpha, 1.0);
+        assert_eq!(
+            app.world().resource::<AvatarBounds>().0,
+            Some(fit(UVec2::new(4, 4), Vec2::new(420.0, 640.0)))
+        );
+        assert_eq!(redraws(&mut app), 0);
     }
 
     #[test]
