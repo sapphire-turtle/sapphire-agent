@@ -44,8 +44,10 @@ pub(crate) enum Layer {
 /// The current base's depth; its overlay is drawn one above it.
 const BASE_Z: f32 = 0.0;
 /// An overlay fading out over the base that stays: above the base, below
-/// the overlay fading in.
+/// the overlay fading in. Each later one goes [`OUTGOING_STEP_Z`] lower,
+/// so overlapping fades draw in a fixed order.
 const OUTGOING_OVERLAY_Z: f32 = BASE_Z + 0.5;
+const OUTGOING_STEP_Z: f32 = 1.0 / 64.0;
 /// How far a pose change pushes what showed below the new pose.
 const POSE_STEP_Z: f32 = 10.0;
 
@@ -224,10 +226,17 @@ pub(crate) fn show_sprites(
         }
         // The base stays: only the overlays change.
         Some((base, _)) if *base == next.0 => {
+            // Below the overlays already fading out over this base.
+            let z = parts
+                .iter()
+                .filter(|(_, p, _)| p.layer == Layer::Previous && p.overlay && p.z > BASE_Z)
+                .map(|(_, p, _)| p.z - OUTGOING_STEP_Z)
+                .fold(OUTGOING_OVERLAY_Z, f32::min)
+                .max(BASE_Z + OUTGOING_STEP_Z);
             for (_, mut part, sprite) in &mut parts {
                 if part.layer == Layer::Current && part.overlay {
                     part.layer = Layer::Previous;
-                    part.z = OUTGOING_OVERLAY_Z;
+                    part.z = z;
                     part.fade = Some(PartFade::new(now, sprite.color.alpha(), Curve::Out));
                 }
             }
@@ -587,6 +596,51 @@ mod tests {
         }
         assert_eq!(layers(&mut app), (1, 0));
         assert_eq!(base(&mut app).1, 1.0);
+    }
+
+    #[test]
+    fn overlapping_outgoing_overlays_draw_in_a_fixed_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = drawn(dir.path());
+        app.world_mut()
+            .resource_mut::<AvatarState>()
+            .expression("happy", 1.0);
+        for _ in 0..5 {
+            app.update();
+        }
+        assert_eq!(layers(&mut app), (2, 0));
+
+        // happy → sad, and back before the fade ends: two overlays fade out
+        // over the base at once.
+        app.world_mut()
+            .resource_mut::<AvatarState>()
+            .expression("sad", 1.0);
+        app.update();
+        app.world_mut()
+            .resource_mut::<AvatarState>()
+            .expression("happy", 1.0);
+        app.update();
+        assert_eq!(layers(&mut app), (2, 2));
+
+        // Told apart by when each began to fade: the files share their
+        // bytes, so their handles are the same.
+        let mut query = app.world_mut().query::<&SpritePart>();
+        let mut outgoing: Vec<_> = query
+            .iter(app.world())
+            .filter(|p| p.layer == Layer::Previous && p.overlay)
+            .map(|p| (p.fade.unwrap().started, p.z))
+            .collect();
+        outgoing.sort_by_key(|(started, _)| *started);
+        let (first_out, then_out) = (outgoing[0].1, outgoing[1].1);
+        let incoming = query
+            .iter(app.world())
+            .find(|p| p.layer == Layer::Current && p.overlay)
+            .unwrap()
+            .z;
+        assert!(
+            BASE_Z < then_out && then_out < first_out && first_out < incoming,
+            "{then_out} {first_out} {incoming}"
+        );
     }
 
     #[test]
