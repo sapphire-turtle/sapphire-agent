@@ -5,13 +5,14 @@
 //! egui; the panel only wires them to buttons and to the file picker.
 
 use std::collections::BTreeMap;
-use std::io::Read;
 use std::path::PathBuf;
 
 use bevy::math::UVec2;
 use bevy_egui::egui;
 use sapphire_agent_core::{AvatarConfig, SPRITE_EXPRESSIONS, SpriteConfig, SpritePose};
 
+use super::header::{file_size, image_info};
+use super::load::LeftOut;
 use super::resolve::same_canvas;
 use crate::avatar::OpTicket;
 use crate::companion::character_page::{PanelContext, RendererPanel};
@@ -133,62 +134,6 @@ pub(crate) fn set_default(config: &mut AvatarConfig, pose: &str) -> Result<(), S
     Ok(())
 }
 
-/// The pixel size and file extension of a PNG or WebP, read from its
-/// header only.
-pub(crate) fn image_info(bytes: &[u8]) -> Result<(UVec2, &'static str), String> {
-    const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
-    let short = || "the image file is truncated".to_owned();
-    let le24 = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], 0]);
-    let (size, ext) = if bytes.starts_with(PNG) {
-        let ihdr = bytes.get(8..24).ok_or_else(short)?;
-        if &ihdr[4..8] != b"IHDR" {
-            return Err("the PNG has no header".to_owned());
-        }
-        let be = |b: &[u8]| u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
-        (UVec2::new(be(&ihdr[8..12]), be(&ihdr[12..16])), "png")
-    } else if bytes.len() >= 16 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
-        // Each variant needs only its own header bytes, counted from the
-        // chunk's start at 12.
-        let chunk = &bytes[12..];
-        let need = |n: usize| chunk.get(..n).ok_or_else(short);
-        let size = match &chunk[..4] {
-            // Lossy: frame tag, start code, then 14-bit width and height.
-            b"VP8 " => {
-                let c = need(18)?;
-                if c[11..14] != [0x9d, 0x01, 0x2a] {
-                    return Err("the WebP has no VP8 start code".to_owned());
-                }
-                UVec2::new(
-                    u32::from(u16::from_le_bytes([c[14], c[15]]) & 0x3fff),
-                    u32::from(u16::from_le_bytes([c[16], c[17]]) & 0x3fff),
-                )
-            }
-            // Lossless: signature byte, then 14-bit width-1 and height-1.
-            b"VP8L" => {
-                let c = need(13)?;
-                if c[8] != 0x2f {
-                    return Err("the WebP has no VP8L signature".to_owned());
-                }
-                let bits = u32::from_le_bytes([c[9], c[10], c[11], c[12]]);
-                UVec2::new((bits & 0x3fff) + 1, ((bits >> 14) & 0x3fff) + 1)
-            }
-            // Extended: 24-bit width-1 and height-1 after the flags.
-            b"VP8X" => {
-                let c = need(18)?;
-                UVec2::new(le24(&c[12..15]) + 1, le24(&c[15..18]) + 1)
-            }
-            _ => return Err("this WebP is not one the header can be read from".to_owned()),
-        };
-        (size, "webp")
-    } else {
-        return Err("the file is not a PNG or WebP image".to_owned());
-    };
-    if size.x == 0 || size.y == 0 {
-        return Err(format!("the image is {}×{}", size.x, size.y));
-    }
-    Ok((size, ext))
-}
-
 /// Refuses an image of `size` that is not the canvas size of `reference`
 /// (the path and size of an image already in the avatar). With no
 /// reference, the image sets the canvas.
@@ -226,15 +171,7 @@ fn canvas_reference(
         if path == except {
             continue;
         }
-        let Some(file) = files.get(path) else {
-            continue;
-        };
-        // Only the header: 32 bytes of a possibly large file.
-        let mut head = Vec::new();
-        let read = std::fs::File::open(file).and_then(|f| f.take(32).read_to_end(&mut head));
-        if read.is_ok()
-            && let Ok((size, _)) = image_info(&head)
-        {
+        if let Some(Ok(size)) = files.get(path).map(|file| file_size(file)) {
             return Some((path.to_owned(), size));
         }
     }
@@ -257,9 +194,18 @@ pub(crate) struct SpritePanel {
     renaming: Option<(String, String)>,
     /// What this panel refused itself; the page shows the ops' errors.
     error: Option<String>,
+    /// The images the renderer left out, as it last loaded them.
+    left_out: LeftOut,
 }
 
 impl SpritePanel {
+    pub(crate) fn new(left_out: LeftOut) -> Self {
+        Self {
+            left_out,
+            ..Self::default()
+        }
+    }
+
     fn poll(&mut self, cx: &PanelContext<'_>) {
         if let Some(ticket) = &self.op
             && cx.ops.result(ticket).is_some()
@@ -363,6 +309,9 @@ impl RendererPanel for SpritePanel {
         if let Some(error) = &self.error {
             ui.colored_label(ui.visuals().error_fg_color, error);
         }
+        if let Some(note) = left_out_note(&self.left_out.snapshot()) {
+            ui.colored_label(ui.visuals().warn_fg_color, note);
+        }
         let sprite = cx.config.and_then(|c| c.sprite.as_ref());
         match sprite {
             Some(sprite) if !sprite.poses.is_empty() => {
@@ -402,6 +351,18 @@ impl RendererPanel for SpritePanel {
             ui.weak("Waiting for the file dialog…");
         }
     }
+}
+
+/// The note on the images the renderer left out, `None` when none were.
+fn left_out_note(left_out: &BTreeMap<String, String>) -> Option<String> {
+    if left_out.is_empty() {
+        return None;
+    }
+    let each: Vec<String> = left_out
+        .iter()
+        .map(|(path, why)| format!("{path} ({why})"))
+        .collect();
+    Some(format!("Left out: {}", each.join("; ")))
 }
 
 impl SpritePanel {
@@ -588,6 +549,19 @@ mod tests {
     }
 
     #[test]
+    fn the_left_out_note_names_each_image_and_why() {
+        assert_eq!(left_out_note(&BTreeMap::new()), None);
+        let left_out = BTreeMap::from([
+            ("a.png".to_string(), "3×3, not 2×4".to_string()),
+            ("b.png".to_string(), "did not load".to_string()),
+        ]);
+        assert_eq!(
+            left_out_note(&left_out).unwrap(),
+            "Left out: a.png (3×3, not 2×4); b.png (did not load)"
+        );
+    }
+
+    #[test]
     fn rename_follows_the_default() {
         let mut config = two_poses();
         rename_pose(&mut config, "normal", "calm").unwrap();
@@ -627,62 +601,5 @@ mod tests {
         );
         // The first base sets the canvas.
         assert_eq!(check_canvas(None, "x.png", UVec2::new(7, 9)), Ok(()));
-    }
-
-    #[test]
-    fn image_info_reads_png_and_webp_headers() {
-        let png = crate::avatar::sprite::load::tests::png(3, 5);
-        assert_eq!(image_info(&png), Ok((UVec2::new(3, 5), "png")));
-
-        let riff = |chunk: &[u8]| {
-            let mut b = b"RIFF\0\0\0\0WEBP".to_vec();
-            b.extend_from_slice(chunk);
-            b.resize(40, 0);
-            b
-        };
-        // VP8X: flags, then 24-bit width-1 and height-1.
-        let vp8x = riff(&[
-            b'V', b'P', b'8', b'X', 10, 0, 0, 0, 0, 0, 0, 0, 99, 0, 0, 199, 0, 0,
-        ]);
-        assert_eq!(image_info(&vp8x), Ok((UVec2::new(100, 200), "webp")));
-        // VP8L: signature 0x2f, then 14-bit width-1 and height-1.
-        let packed: u32 = 49 | (79 << 14);
-        let mut l = vec![b'V', b'P', b'8', b'L', 5, 0, 0, 0, 0x2f];
-        l.extend_from_slice(&packed.to_le_bytes());
-        assert_eq!(image_info(&riff(&l)), Ok((UVec2::new(50, 80), "webp")));
-        // VP8: frame tag, start code, 14-bit width and height.
-        let vp8 = riff(&[
-            b'V', b'P', b'8', b' ', 10, 0, 0, 0, 0, 0, 0, 0x9d, 0x01, 0x2a, 30, 0, 40, 0,
-        ]);
-        assert_eq!(image_info(&vp8), Ok((UVec2::new(30, 40), "webp")));
-
-        // Only what each variant needs: the shortest VP8L header.
-        let short_l = [
-            &b"RIFF\0\0\0\0WEBPVP8L\x05\0\0\0\x2f"[..],
-            &packed.to_le_bytes(),
-        ]
-        .concat();
-        assert_eq!(short_l.len(), 25);
-        assert_eq!(image_info(&short_l), Ok((UVec2::new(50, 80), "webp")));
-        // Truncated variants are errors, not panics.
-        for full in [&vp8x, &riff(&l), &vp8] {
-            let end = if std::ptr::eq(full, &vp8x) { 29 } else { 24 };
-            assert!(image_info(&full[..end]).is_err(), "{end}");
-        }
-        assert!(image_info(&short_l[..24]).is_err());
-        assert!(image_info(b"RIFF\0\0\0\0WEBPVP8").is_err());
-
-        assert!(image_info(b"GIF89a....").is_err());
-        assert!(image_info(&png[..10]).is_err());
-    }
-
-    #[test]
-    fn zero_sized_images_are_refused() {
-        let mut png = crate::avatar::sprite::load::tests::png(3, 5);
-        png[16..20].copy_from_slice(&0u32.to_be_bytes());
-        assert!(image_info(&png).is_err());
-        let mut png = crate::avatar::sprite::load::tests::png(3, 5);
-        png[20..24].copy_from_slice(&0u32.to_be_bytes());
-        assert!(image_info(&png).is_err());
     }
 }

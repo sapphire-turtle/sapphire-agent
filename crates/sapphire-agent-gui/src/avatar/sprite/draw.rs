@@ -172,7 +172,8 @@ pub(crate) fn show_sprites(
     let Some(config) = sprite_config(&assets) else {
         return;
     };
-    let loaded = |path: &str| images.handles.contains_key(path) && !images.failed.contains(path);
+    let loaded =
+        |path: &str| images.handles.contains_key(path) && !images.failed.contains_key(path);
     let Some(picked) = shown(config, &loaded, state.pose.as_deref(), &state.expression) else {
         return;
     };

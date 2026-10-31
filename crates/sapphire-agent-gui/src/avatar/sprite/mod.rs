@@ -13,6 +13,7 @@ use super::{ActiveRenderer, AvatarSystems, renderer_is};
 use crate::companion::character_page::RendererPanelApp;
 
 mod draw;
+mod header;
 mod load;
 mod panel;
 mod resolve;
@@ -23,7 +24,9 @@ pub struct SpriteRendererPlugin;
 
 impl Plugin for SpriteRendererPlugin {
     fn build(&self, app: &mut App) {
-        app.add_renderer_panel(Box::new(panel::SpritePanel::default()))
+        let left_out = load::LeftOut::default();
+        app.add_renderer_panel(Box::new(panel::SpritePanel::new(left_out.clone())))
+            .insert_resource(left_out)
             .init_resource::<load::SpriteImages>()
             .init_resource::<draw::SpriteScene>()
             // `WindowPlugin` adds it too; an app without one still runs.
