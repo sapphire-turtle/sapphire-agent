@@ -10,9 +10,11 @@ use bevy::prelude::*;
 use bevy::window::RequestRedraw;
 
 use super::{ActiveRenderer, AvatarSystems, renderer_is};
+use crate::companion::character_page::RendererPanelApp;
 
 mod draw;
 mod load;
+mod panel;
 mod resolve;
 
 /// Draws the avatar from its sprite sheet while `ActiveRenderer` names the
@@ -21,7 +23,8 @@ pub struct SpriteRendererPlugin;
 
 impl Plugin for SpriteRendererPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<load::SpriteImages>()
+        app.add_renderer_panel(Box::new(panel::SpritePanel::default()))
+            .init_resource::<load::SpriteImages>()
             .init_resource::<draw::SpriteScene>()
             // `WindowPlugin` adds it too; an app without one still runs.
             .add_message::<RequestRedraw>()
