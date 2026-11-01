@@ -132,10 +132,9 @@ pub fn routes(state: Arc<AmbientState>) -> Router {
 /// Resolve the bearer to a device name, or the error response to return.
 ///
 /// Every refusal `DeviceAuth::resolve` can give (unknown token, retired
-/// device, device not allowed to use the agent, device unrouted) collapses
-/// to the same 401 — the distinction is logged, not returned. A bridge that
-/// cannot be asked is 503, so the device retries rather than concluding its
-/// key is wrong.
+/// key, key from before profiles that no room profile lists) collapses to
+/// the same 401 — the distinction is logged, not returned. A key whose
+/// profile is no room profile of this agent is 403.
 ///
 /// The `enabled` check here is **defence in depth, not the mechanism**:
 /// `ambient::startup::build` returns `None` when `[ambient].enabled` is
@@ -152,11 +151,9 @@ async fn authenticate(state: &AmbientState, headers: &HeaderMap) -> Result<Strin
     let token = crate::serve::extract_bearer(headers).ok_or(StatusCode::UNAUTHORIZED)?;
     match state.devices.resolve(&token).await {
         Ok(r) => Ok(r.device.name),
-        Err(crate::device_auth::AuthError::Unavailable) => Err(StatusCode::SERVICE_UNAVAILABLE),
+        Err(crate::device_auth::AuthError::Forbidden) => Err(StatusCode::FORBIDDEN),
         Err(crate::device_auth::AuthError::Refused) => {
-            debug!(
-                "ambient: rejected bearer (unknown, retired, not allowed, or bound to no room profile)"
-            );
+            debug!("ambient: rejected bearer (unknown, retired, or bound to no room profile)");
             Err(StatusCode::UNAUTHORIZED)
         }
     }
@@ -331,7 +328,7 @@ mod tests {
 
     /// Build a `DeviceAuth` binding one device ("pendant") to a token
     /// ("sa-dev-good"), routed to room_profile "home". A static verifier
-    /// stands in for the bridge, so the fixed bearer literal used
+    /// stands in for the workspace's API keys, so the fixed bearer literal used
     /// throughout these tests keeps resolving.
     fn device_auth_fixture() -> Arc<crate::device_auth::DeviceAuth> {
         let mut room_profiles = std::collections::HashMap::new();

@@ -45,13 +45,13 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Some(command) => sapphire_agent_cli::run(cli.options, command, Edition::Desktop),
         None => {
-            window();
+            window(cli.options.config);
             Ok(())
         }
     }
 }
 
-fn window() {
+fn window(config: Option<std::path::PathBuf>) {
     fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
             EnvFilter::new("warn,sapphire_agent_desktop=info,sapphire_agent_gui=info")
@@ -73,6 +73,12 @@ fn window() {
         // Idle while nothing happens: the global pointer wakes the
         // companion window when it matters.
         update_mode: None,
+        // A new API key takes one of the agent's room profiles, read from
+        // its config (and the selected workspace's) as the API keys page asks.
+        key_profiles: Some({
+            sapphire_agent_cli::init_app_ctx();
+            sapphire_agent_cli::configured_key_profiles(config)
+        }),
     })
     .add_plugins(companion_window::CompanionWindowPlugin)
     .set_file_dialog(std::sync::Arc::new(file_dialog::RfdDialog))

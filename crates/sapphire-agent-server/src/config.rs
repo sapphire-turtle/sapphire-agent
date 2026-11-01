@@ -225,11 +225,14 @@ pub struct RoomProfileConfig {
     /// `Config::migration_errors`.
     #[serde(default)]
     pub api_keys: Vec<String>,
-    /// External devices (by name or id, from `sapphire-agent external-device`)
-    /// that run under this room profile. A device appears in exactly one room
-    /// profile; the binding is
-    /// what gives an authenticated device its LLM profile and memory namespace.
-    /// Replaces `api_keys`, which held raw tokens in this file.
+    /// API keys from before key profiles (by name or id) that run under this
+    /// room profile. A key made with `api-key add --profile <room profile>`
+    /// needs no entry: its profile is its room profile. Only keys with the
+    /// framework's migrated `read-only` profile — the workgroup's former
+    /// external devices — are routed by this list, so they keep working
+    /// until re-issued. A key appears in exactly one room profile; the
+    /// binding is what gives it its LLM profile and memory namespace.
+    /// Replaced `api_keys`, which held raw tokens in this file.
     #[serde(default)]
     pub devices: Vec<String>,
 }
@@ -1727,11 +1730,10 @@ api_key = "test"
         if self.keys.file.is_some() {
             errors.push(
                 "[keys].file is gone: the agent no longer reads a key file. Tokens now belong \
-                 to the workgroup's external devices, which the sapphire bridge checks. Delete \
-                 the [keys] block, then re-create each device with `sapphire-agent \
-                 external-device add <name>` (the old tokens cannot be carried over), put the \
-                 printed token on the device, and keep its name or id in a \
-                 `[room_profile.<name>].devices` array."
+                 to the workspace's API keys. Delete the [keys] block, then re-create each \
+                 device with `sapphire-agent api-key add <name> --profile <room profile>` \
+                 (the old tokens cannot be carried over) and put the printed token on the \
+                 device."
                     .to_string(),
             );
         }
@@ -1742,11 +1744,10 @@ api_key = "test"
             errors.push(format!(
                 "[device.{name}] no longer lives in this file. Delete this block from \
                  config.toml first — startup refuses to run any command, including \
-                 `sapphire-agent external-device add`, while it is still present. Devices moved to the \
-                 workgroup's external devices. Once the block is gone, run `sapphire-agent \
-                 external-device add {name}`, put the printed token on the device, and add \
-                 {name:?} to a `[room_profile.<name>].devices` array. The old token cannot be \
-                 carried over."
+                 `sapphire-agent api-key add`, while it is still present. Devices moved to the \
+                 workspace's API keys. Once the block is gone, run `sapphire-agent api-key add \
+                 {name} --profile <room profile>` and put the printed token on the device. The \
+                 old token cannot be carried over."
             ));
         }
 
@@ -1759,11 +1760,11 @@ api_key = "test"
         rp_names.sort();
         for name in rp_names {
             errors.push(format!(
-                "[room_profile.{name}].api_keys was replaced by `devices`. Delete this \
+                "[room_profile.{name}].api_keys is gone. Delete this \
                  `api_keys` line from config.toml first — startup refuses to run any command, \
-                 including `sapphire-agent external-device add`, while it is still present. Raw tokens \
-                 no longer live in this file; run `sapphire-agent external-device add <device>` \
-                 for each client and list the names in `[room_profile.{name}].devices`."
+                 including `sapphire-agent api-key add`, while it is still present. Raw tokens \
+                 no longer live in this file; run `sapphire-agent api-key add <device> --profile \
+                 {name}` for each client."
             ));
         }
 
@@ -2706,7 +2707,10 @@ key_id = "550e8400-e29b-41d4-a716-446655440000"
         assert!(errors[0].contains("pendant"), "{errors:?}");
         // The message has to say what to run, not just what is wrong: the
         // token cannot be carried over, so the operator must re-issue it.
-        assert!(errors[0].contains("device add"), "{errors:?}");
+        assert!(
+            errors[0].contains("api-key add pendant --profile"),
+            "{errors:?}"
+        );
     }
 
     #[test]
@@ -2725,7 +2729,7 @@ file = "/etc/sapphire/keys.toml"
         let errors = cfg.migration_errors();
 
         assert_eq!(errors.len(), 1, "{errors:?}");
-        assert!(errors[0].contains("external-device add"), "{errors:?}");
+        assert!(errors[0].contains("api-key add"), "{errors:?}");
     }
 
     #[test]
@@ -2749,7 +2753,7 @@ api_keys = ["sa-acp-token"]
 
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert!(errors[0].contains("work"), "{errors:?}");
-        assert!(errors[0].contains("devices"), "{errors:?}");
+        assert!(errors[0].contains("--profile work"), "{errors:?}");
     }
 
     #[test]

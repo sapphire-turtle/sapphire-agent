@@ -185,10 +185,10 @@ pub async fn handle_a2a_post(
     };
     let profile_name = match state.device_auth.resolve(&bearer).await {
         Ok(r) => r.room_profile,
-        Err(crate::device_auth::AuthError::Unavailable) => {
+        Err(crate::device_auth::AuthError::Forbidden) => {
             return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "cannot check the bearer token now",
+                StatusCode::FORBIDDEN,
+                "this API key's profile is no room profile of this agent",
             )
                 .into_response();
         }
