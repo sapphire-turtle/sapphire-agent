@@ -38,6 +38,10 @@ pub struct AgentGuiPlugin {
     /// pointer poller wakes the GUI through the [`Waker`] rather than
     /// polling with frames.
     pub update_mode: Option<bevy::winit::WinitSettings>,
+    /// The profiles Settings › API keys offers a new key: the agent's room
+    /// profiles, which only an app that reads the agent's config knows.
+    /// `None`: the framework's `read-only`, `read-write` and `admin`.
+    pub key_profiles: Option<sapphire_framework_keys::KeyProfiles>,
 }
 
 impl Plugin for AgentGuiPlugin {
@@ -130,6 +134,7 @@ impl Plugin for AgentGuiPlugin {
             runtime.handle(),
             waker.clone(),
             vec![Box::new(shared.page())],
+            self.key_profiles.clone(),
         ) {
             app.insert_non_send(settings);
         }

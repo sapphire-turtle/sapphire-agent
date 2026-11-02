@@ -30,8 +30,8 @@
 - **コマンド**：
   - `sapphire-agent` — チャネルリスナー＋JSON-RPC HTTP制御API（`/rpc`、`/a2a`、`/acp`）を開始
   - `sapphire-agent init [PATH]` — エージェントが読むファイル（`AGENTS.md`、`SOUL.md`など）でワークスペースをシードし、貼り付けるホストローカル設定を出力。既存ファイルを決して上書きしない
-  - `sapphire-agent verify` — 設定を検証し、device -> room_profileのバインディングを含む読み込まれたワークスペースファイルを報告
-  - sapphire-framework の動詞（稼働中のサーバーまたは bridge と話す）: `status`、`service install|uninstall|status`、`workspace init|select|show|…`（エージェントは選択されたワークスペースを扱う。`config.toml` の `workspace_dir` は初回起動時にだけ取り込まれ、切り替えるとエージェントは新しいワークスペースで再起動する）、`workgroup`、`device`、`embedding`、`external-device add|list|rotate|retire|restore|apps`（ベアラートークンでエージェントにアクセスするクライアント。`add` と `rotate` はトークンを一度だけ表示）
+  - `sapphire-agent verify` — 設定を検証し、各 API キーがどの room_profile で動くかを含む読み込まれたワークスペースファイルを報告
+  - sapphire-framework の動詞（稼働中のサーバーまたは bridge と話す）: `status`、`service install|uninstall|status`、`workspace init|select|show|…`（エージェントは選択されたワークスペースを扱う。`config.toml` の `workspace_dir` は初回起動時にだけ取り込まれ、切り替えるとエージェントは新しいワークスペースで再起動する）、`api-key add|list|rotate|retire|restore`（ベアラートークンでエージェントにアクセスするクライアント。ワークスペースの API キーで、それぞれ `add --profile` で指定した room profile で動く。`add` と `rotate` はトークンを一度だけ表示）、`config`。ワークグループ・デバイス・埋め込みは bridge のもの: `sapphire-bridge workgroup|device|embedding`
   - `sapphire-agent chat` — 同じホストで動いているエージェントとローカル IPC 経由で対話する REPL（`-m TEXT` で単発、`--list`、`--history`、`--session ID`、`--json`）。`[cli].room_profile` のルームプロファイルで動く
 
 ## インストール

@@ -19,7 +19,7 @@ use clap::{Args, Parser, Subcommand};
 use sapphire_framework::server::FrameworkCommand;
 use tracing_subscriber::{EnvFilter, fmt};
 
-pub use sapphire_agent_server::Edition;
+pub use sapphire_agent_server::{Edition, configured_key_profiles, init_app_ctx};
 
 #[derive(Parser)]
 #[command(
@@ -92,7 +92,7 @@ pub enum Command {
         json: bool,
     },
     /// The framework's verbs: serve, status, service, update, workspace,
-    /// workgroup, device, embedding, external-device, config.
+    /// api-key, config.
     #[command(flatten)]
     Framework(FrameworkCommand),
 }
@@ -105,7 +105,7 @@ pub fn run(options: Options, command: Command, edition: Edition) -> Result<()> {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         // `tracing_subscriber::fmt` defaults to stdout. Every command's
-        // output is `println!` (`external-device add` prints the minted
+        // output is `println!` (`api-key add` prints the minted
         // token there), so sending logs to stderr keeps a stray log line
         // out of anything piped from a command's output.
         .with_writer(std::io::stderr)
@@ -154,7 +154,9 @@ async fn dispatch(options: Options, command: Command, edition: Edition) -> Resul
             sapphire_agent_server::serve(options.config, options.bind, edition).await
         }
         // The framework's other verbs talk to the running server (which
-        // relays the bridge's), and need no agent config either.
+        // relays the bridge's), or work on the workspace's files, and need no
+        // agent config either: only `api-key` reads the room profiles from
+        // it, as the key profiles.
         Command::Framework(command) => {
             // Warned first: the dispatch exits when the status is not good.
             if matches!(command, FrameworkCommand::Status) {
@@ -166,8 +168,11 @@ async fn dispatch(options: Options, command: Command, edition: Edition) -> Resul
                 .dispatch(
                     &sapphire_agent_server::APP_CTX,
                     (),
+                    // API keys take the room profiles as their profiles.
                     |_: &sapphire_framework::server::Settings| {
-                        sapphire_agent_server::build(edition)
+                        sapphire_agent_server::build(edition).key_profiles(
+                            sapphire_agent_server::configured_key_profiles(options.config.clone()),
+                        )
                     },
                     sapphire_agent_server::VERSION,
                 )
@@ -214,8 +219,8 @@ fn find_on_path(path: &std::ffi::OsStr) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use corundum_framework_keys::KeyCommand;
     use sapphire_framework::server::WorkspaceCommand;
-    use sapphire_framework_bridge_api::ExternalDeviceCommand;
 
     #[test]
     fn version_flag_prints_the_version() {
@@ -230,31 +235,42 @@ mod tests {
     }
 
     #[test]
-    fn device_add_requires_a_name() {
-        assert!(Cli::try_parse_from(["sapphire-agent", "device", "add"]).is_err());
-    }
-
-    #[test]
-    fn external_device_add_takes_a_name_and_a_description() {
+    fn api_key_add_takes_a_name_a_profile_and_a_description() {
         let cli = Cli::try_parse_from([
             "sapphire-agent",
-            "external-device",
+            "api-key",
             "add",
             "pendant",
+            "--profile",
+            "home",
             "--description",
             "the one on the lanyard",
         ])
         .unwrap();
         assert!(matches!(
             cli.command,
-            Command::Framework(FrameworkCommand::ExternalDevice(
-                ExternalDeviceCommand::Add {
-                    ref name,
-                    description: Some(_),
-                    ..
-                }
-            )) if name == "pendant"
+            Command::Framework(FrameworkCommand::ApiKey(KeyCommand::Add {
+                ref name,
+                ref profile,
+                description: Some(_),
+            })) if name == "pendant" && profile == "home"
         ));
+    }
+
+    #[test]
+    fn api_key_add_requires_a_profile() {
+        assert!(Cli::try_parse_from(["sapphire-agent", "api-key", "add", "pendant"]).is_err());
+    }
+
+    /// The bridge's verbs are no longer the agent's.
+    #[test]
+    fn workgroup_and_device_are_gone() {
+        for verb in ["workgroup", "device", "embedding"] {
+            assert!(
+                Cli::try_parse_from(["sapphire-agent", verb, "show"]).is_err(),
+                "{verb}"
+            );
+        }
     }
 
     /// The framework's verbs sit beside the agent's own at the top level,

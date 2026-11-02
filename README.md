@@ -31,8 +31,8 @@ A personal AI assistant agent that works on file-based, local-first [`sapphire-f
   - `sapphire-agent chat` — interactive REPL with the agent running on this host, over its local IPC endpoint (`-m TEXT` for one message, `--list`, `--history`, `--session ID`, `--json`); runs under `[cli].room_profile`
   - `sapphire-agent acp` — ACP on stdio for an editor, relayed to the running agent over IPC
   - `sapphire-agent init [PATH]` — seed a workspace with the files the agent reads (`AGENTS.md`, `SOUL.md`, …), then print the host-local config to paste; never overwrites an existing file
-  - `sapphire-agent verify` — validate config and report loaded workspace files, including the device -> room_profile bindings
-  - The sapphire-framework verbs, which talk to the running server or the bridge: `status`; `service install|uninstall|status`; `workspace init|select|show|…` (the agent serves the selected workspace — `workspace_dir` in `config.toml` is only adopted on the first start, and switching restarts the agent around the new one); `workgroup`; `device`; `embedding`; `external-device add|list|rotate|retire|restore|apps` (clients that reach the agent with a bearer token — `add` and `rotate` print the token once)
+  - `sapphire-agent verify` — validate config and report loaded workspace files, including the room profile each API key runs under
+  - The sapphire-framework verbs, which talk to the running server or the bridge: `status`; `service install|uninstall|status`; `workspace init|select|show|…` (the agent serves the selected workspace — `workspace_dir` in `config.toml` is only adopted on the first start, and switching restarts the agent around the new one); `api-key add|list|rotate|retire|restore` (clients that reach the agent with a bearer token: the workspace's API keys, each running under the room profile `add --profile` names — `add` and `rotate` print the token once); `config`. The workgroup, its devices and embedding are the bridge's: `sapphire-bridge workgroup|device|embedding`
 
 ## Install
 
@@ -459,31 +459,29 @@ enabled = true
 ```
 
 **2. Mint a token.** Authentication works as for `/rpc` and `/a2a`: add an
-external device (the sapphire bridge must be running), bind its name under a
-`[room_profile.<name>]`'s `devices`, and that device's token both authenticates the connection and
-selects the room profile (and therefore the provider and memory namespace)
-the ACP session runs under. A dedicated profile keeps the editor on its own
-model or namespace:
-
-```sh
-sapphire-agent external-device add zed-editor
-# prints the device's id and its token, once
-```
+API key whose profile is a room profile, and its token both authenticates the
+connection and selects the room profile (and therefore the provider and
+memory namespace) the ACP session runs under. A dedicated room profile keeps
+the editor on its own model or namespace:
 
 ```toml
 [room_profile.zed]
 profile = "default"
 rooms   = []              # ACP-only; no chat rooms map here
-devices = ["zed-editor"]  # its name, or the id `external-device add` printed
 ```
 
-Note that `[acp].enabled = true` opens `/acp` to **every** device bound to
+```sh
+sapphire-agent api-key add zed-editor --profile zed
+# prints the key's id and its token, once
+```
+
+Note that `[acp].enabled = true` opens `/acp` to **every** API key of
 **any** room profile, not only to one minted for the editor — each simply
 connects under its own profile. No privilege is gained by doing so (`/a2a`
 already runs the full tool set through the same executor for the same
-devices), but if you want the editor confined to its own model, namespace or
+keys), but if you want the editor confined to its own model, namespace or
 audit trail, that is what the dedicated profile above is for; giving it a
-device does not take `/acp` away from the others.
+key does not take `/acp` away from the others.
 
 **3. Install [`websocat`](https://github.com/vi/websocat).** Zed's
 `agent_servers` setting only takes a `command` to spawn, not a URL — and ACP
@@ -1046,7 +1044,7 @@ author unattended work with nobody watching.
 
 The workspace layer may set `[tools.admin]` too, so whoever can write the synced
 workspace `config.toml` can grant this. Guard that file accordingly: a listed profile
-can rewrite, through the agent, what runs unattended. **Pair it with that profile's own `[room_profile.<name>].devices`
+can rewrite, through the agent, what runs unattended. **Pair it with that profile's own API keys
 or the room's `allowed_users`**, or everyone who can reach a session of that profile
 can author code-adjacent work that runs with nobody watching. `[tools.admin].rooms`
 from an earlier build is rejected at startup and names `room_profiles` in the error.

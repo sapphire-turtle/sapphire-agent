@@ -14,6 +14,13 @@ and predate any user-facing release of this binary.
 
 ## [Unreleased]
 
+### Changed
+
+- [**breaking**] Built on sapphire-framework 0.24 (server API 6, bridge API 4) and corundum-framework 0.7. Update `sapphire-bridge` together with this release: a 0.24 bridge no longer checks the agent's tokens, and the agent no longer asks it
+- [**breaking**] Bearer tokens (`/rpc`, `/a2a`, `/acp`, ambient ingest) are the served workspace's API keys, kept in `<root>/.sapphire-agent/api_keys/` and synced with it: `sapphire-agent external-device` is now `sapphire-agent api-key` (the old name is a hidden alias for this release, without `--app`). The workgroup's external devices are imported once, keeping their tokens
+- [**breaking**] An API key's profile is the room profile it runs under: `api-key add <name> --profile <room profile>` (required), or Settings › API keys. Keys imported from external devices have the profile `read-only` and are still routed by `[room_profile.<n>].devices` until re-issued with a room profile; a key whose profile is no room profile is refused with 403 (no more 503: no bridge is asked). `verify` lists every key and the room profile it runs under
+- [**breaking**] The `workgroup`, `device` and `embedding` commands are gone: use `sapphire-bridge workgroup|device|embedding`
+
 ### Added
 
 - The desktop companion: the window is now a transparent, borderless, always-on-top companion holding the character, with replies in a speech bubble that fades after a time fitting their length. Clicks outside the character and its panels go through to the desktop (X11, Windows and macOS; not on Wayland). Drag the character to move it; its place is remembered

@@ -239,9 +239,9 @@ system_prompt = "You are a helpful personal assistant."
 #
 # API sessions pin a room profile via the bearer token sent in
 # `Authorization: Bearer <token>` on every `/rpc` request. The token
-# resolves to an external device (`sapphire-agent external-device
-# add`, see "External devices" below), whose name or id must appear in some
-# `[room_profile.<n>].devices` below — same mechanism `/a2a`, `/acp`
+# is an API key of the workspace (`sapphire-agent api-key add <name>
+# --profile <room profile>`, see "API keys" below), and the key's profile
+# is the room profile it runs under — same mechanism `/a2a`, `/acp`
 # and ambient ingest all use (sapphire-agent-desktop: `[server].token`).
 #
 # [room_profile.everyday]
@@ -262,24 +262,25 @@ system_prompt = "You are a helpful personal assistant."
 # rooms            = ["!nsfw:example.com"]
 #
 # /rpc (sapphire-agent-desktop), A2A (Agent2Agent Protocol), `/acp`
-# and ambient ingest all reach a room_profile through devices declared
-# here. Each device must be unique across all room profiles — startup
-# fails if two profiles share one — and an incoming
-# `Authorization: Bearer <token>` resolves implicitly (token -> external
-# device -> room profile), so external clients never name room_profile
-# themselves. A device bound to no room profile is refused (`verify`
-# lists them). Leave `devices = []` (or omit) to deny external access to
-# a profile.
+# and ambient ingest all reach a room_profile through the API key's
+# profile: an incoming `Authorization: Bearer <token>` resolves
+# implicitly (token -> API key -> its profile, a room profile), so
+# external clients never name room_profile themselves. A key whose
+# profile is no room profile here (one since removed, say) is refused
+# with 403; `verify` lists every key and where it goes.
 #
-# Each entry is an external device's name or its id, both printed by
-# `sapphire-agent external-device add <name>`. See "External
-# devices" below.
+# `devices` is only for API keys from before key profiles (the
+# workgroup's external devices of `external-device add`, which the
+# framework imported into the workspace with the profile `read-only`). Each entry is
+# such a key's name or id, unique across all room profiles — startup
+# fails if two profiles share one. Re-issue those keys with
+# `api-key add <name> --profile <room profile>` and the entry can go.
 #
 # [room_profile.sapphire_world]
 # profile          = "default"
 # memory_namespace = "sapphire_world"
 # rooms            = []             # A2A-only; no chat rooms map here
-# devices          = ["a2a-client"] # `external-device add a2a-client`
+# # its client's key: `api-key add a2a-client --profile sapphire_world`
 #
 # Caveat: workspace retrieve (FTS / vector search) currently spans every
 # namespace because the agent's retrieve tools don't yet set the
@@ -293,7 +294,7 @@ system_prompt = "You are a helpful personal assistant."
 # Mounts `/a2a` (JSON-RPC) and `/.well-known/agent-card.json` on the
 # same HTTP server as `/rpc`. Disabled by default — flip `enabled` to
 # turn the routes on. Auth resolves like every other endpoint:
-# token -> external device -> `[room_profile.<n>].devices`;
+# token -> API key -> its profile, a `[room_profile.<n>]`;
 # this section configures only the public face of the agent.
 #
 # [a2a]
@@ -558,7 +559,7 @@ system_prompt = "You are a helpful personal assistant."
 # framing (and no base64 inflation) around a multi-kilobyte payload.
 #
 #   POST /audio/ingest?segment=<id>&started_at=<unix_ms>&rate=16000&live=1
-#   Authorization: Bearer <token from `sapphire-agent external-device add`, see below>
+#   Authorization: Bearer <token from `sapphire-agent api-key add`, see below>
 #   Content-Type: audio/L16   (raw s16le)  — or: audio/wav
 #   <raw audio bytes>
 #
@@ -625,31 +626,27 @@ system_prompt = "You are a helpful personal assistant."
 # a promoted candidate's grain-id is written into the marker, that
 # directory gains an id and becomes rename-safe.
 
-# ── External devices (owned by the sapphire bridge, not this file) ──
+# ── API keys (in the workspace, not this file) ──
 # Every authenticated entry point — ambient ingest, `/rpc`, `/a2a`,
-# `/acp` — resolves the same way: bearer token -> external device
-# -> room profile. External devices are the workgroup's synced ledger,
-# owned by the sapphire bridge: only a token's SHA-256 is stored, and
-# every host of the workgroup accepts the same tokens. The agent asks the
-# running bridge about each token and trusts a success for 30 seconds, so
-# a retire or rotate reaches it within the sync delay plus 30 s, without a
-# restart. If the bridge is not running, every authenticated request
-# answers 503. There is no `[keys]` block anymore.
+# `/acp` — resolves the same way: bearer token -> API key -> room
+# profile. API keys live in the served workspace
+# (`<root>/.sapphire-agent/api_keys/`) and sync with it, so every host
+# serving the workspace accepts the same tokens; only a token's hash is
+# stored. A retire or rotate reaches a running agent within the sync delay
+# plus a short cache, without a restart. There is no `[keys]` block
+# anymore, and no bridge is asked.
 #
-#   sapphire-agent external-device add pendant --description "the one on the lanyard"
-#   sapphire-agent external-device list
-#   sapphire-agent external-device rotate <name-or-id>
-#   sapphire-agent external-device retire <name-or-id>
-#   sapphire-agent external-device restore <name-or-id>
+#   sapphire-agent api-key add pendant --profile home --description "the one on the lanyard"
+#   sapphire-agent api-key list
+#   sapphire-agent api-key rotate <name-or-id>
+#   sapphire-agent api-key retire <name-or-id>
+#   sapphire-agent api-key restore <name-or-id>
 #
-# `add` and `rotate` print the token once. `add` allows the device to use
-# this agent (`--app sapphire-agent`) unless `--app` names others.
-#
-# This config only *routes* a device to a room profile, via
-# `[room_profile.<n>].devices` (see the room_profile examples earlier in
-# this file). The room profile a device is bound to decides which LLM
-# profile and which memory namespace its conversations use — ambient-only
-# devices included.
+# `add` and `rotate` print the token once. `--profile` is required and
+# takes the name of a `[room_profile.<n>]`: the room profile the key runs
+# under decides which LLM profile and which memory namespace its
+# conversations use — ambient-only devices included. The desktop app's
+# Settings › API keys does the same.
 
 # ── Timer (sapphire-timer over MCP) ─────────────────────────────────
 # Timers and Pomodoro presets live in sapphire-timer, which the agent
@@ -693,8 +690,8 @@ system_prompt = "You are a helpful personal assistant."
 
 # Agent Client Protocol endpoint (GET /acp, WebSocket).
 # Lets an ACP client such as Zed drive this agent. Authentication resolves
-# like every other endpoint (token -> external device -> room profile via
-# [room_profile.<name>].devices), and the token that
+# like every other endpoint (token -> API key -> its profile, a
+# [room_profile.<name>]), and the token that
 # connects selects the room profile the ACP session runs under.
 # The workspace config layer may set this too.
 #

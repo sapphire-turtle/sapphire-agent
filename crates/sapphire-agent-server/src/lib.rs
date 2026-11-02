@@ -70,6 +70,7 @@ pub use app_server::VERSION;
 /// The server the framework's one-shot verbs (`status`, `workspace`, …)
 /// dispatch against.
 pub use app_server::{Edition, build};
+pub use device_auth::configured_key_profiles;
 
 /// Make ring rustls's process-wide crypto provider.
 ///
@@ -187,64 +188,84 @@ fn group_unknown_keys<'a>(
     by_file.into_iter().collect()
 }
 
-/// `verify`'s device section: the bindings in config, and — when the bridge
-/// is running — the external devices allowed to use this agent, so a device
-/// with no room profile, or a selector naming no device, shows up before a
-/// request is refused for it.
-async fn verify_external_devices(auth: &device_auth::DeviceAuth) {
-    use sapphire_framework_bridge_api::{ExternalDeviceOutcome, ExternalDeviceRequest};
+/// `verify`'s API key section: the keys of the workspace the agent serves
+/// and the room profile each runs under, so a key that would be refused
+/// shows up before a request is. Also the `[room_profile.<n>].devices`
+/// fallback for keys from before profiles, and any entry of it naming no
+/// key. Reads the key files without changing them.
+fn verify_api_keys(auth: &device_auth::DeviceAuth, root: Option<&std::path::Path>) {
+    use sapphire_framework::keys::{KeyStore, MIGRATED, store_dir};
 
-    println!("  Device bindings   :");
-    for (selector, rp) in auth.bindings() {
-        println!("    {selector:<20} -> room_profile '{rp}'");
+    let bindings = auth.bindings();
+    if !bindings.is_empty() {
+        println!("  Device bindings   : (for API keys from before key profiles)");
+        for (selector, rp) in &bindings {
+            println!("    {selector:<20} -> room_profile '{rp}'");
+        }
     }
-    let listed = match sapphire_framework_bridge_client::BridgeClient::connect_running(
-        "cli",
-        env!("CARGO_PKG_VERSION"),
-    )
-    .await
-    {
-        Ok(client) => client
-            .external_device_request(ExternalDeviceRequest::List)
-            .await
-            .map_err(anyhow::Error::from),
-        Err(e) => Err(e.into()),
+    let Some(root) = root else {
+        println!("  API keys          : not checked, no workspace is selected");
+        return;
     };
-    let devices = match listed {
-        Ok(ExternalDeviceOutcome::List(devices)) => devices,
-        Ok(_) => return,
+    let dir = store_dir(APP_CTX.app_name, root);
+    // `KeyStore::open` creates the directory: never for a check.
+    let store = if dir.is_dir() {
+        KeyStore::open(&dir)
+    } else {
+        println!("  API keys          : none ({} absent)", dir.display());
+        return;
+    };
+    let store = match store {
+        Ok(store) => store,
         Err(e) => {
-            println!("  External devices  : not checked, the sapphire bridge is unreachable ({e})");
+            println!(
+                "  API keys          : not checked, {} unreadable ({e})",
+                dir.display()
+            );
             return;
         }
     };
-    let live: Vec<_> = devices
-        .iter()
-        .filter(|d| d.retired_at.is_none() && d.apps.iter().any(|a| a == device_auth::APP_NAME))
-        .collect();
-    println!(
-        "  External devices  : {} allowed to use {}",
-        live.len(),
-        device_auth::APP_NAME
-    );
-    for d in &live {
-        match auth.room_profile_for_device(d.id, &d.name) {
-            Some(rp) => println!("    {:<20} {} -> room_profile '{rp}'", d.name, d.id),
-            None => println!(
-                "    {:<20} {} -> UNBOUND: its token is refused",
-                d.name, d.id
-            ),
+    let live: Vec<_> = store.list().iter().filter(|k| !k.is_retired()).collect();
+    println!("  API keys          : {} in {}", live.len(), dir.display());
+    for key in &live {
+        let profile = key.profile.as_str();
+        if auth.is_room_profile(profile) {
+            println!(
+                "    {:<20} {} -> room_profile '{profile}'",
+                key.name, key.id
+            );
+        } else if profile == MIGRATED {
+            match auth.legacy_binding(key.id.as_str(), &key.name) {
+                Some(rp) => println!(
+                    "    {:<20} {} -> room_profile '{rp}' (by `devices`; re-issue it with \
+                     `--profile {rp}`)",
+                    key.name, key.id
+                ),
+                None => println!(
+                    "    {:<20} {} -> UNBOUND: from before key profiles and in no `devices`; \
+                     its token is refused",
+                    key.name, key.id
+                ),
+            }
+        } else {
+            println!(
+                "    {:<20} {} -> profile '{profile}' is no room profile: its token is refused (403)",
+                key.name, key.id
+            );
         }
     }
-    for (selector, _) in auth.bindings() {
-        let known = devices.iter().any(|d| {
-            d.name == selector
-                || selector
-                    .parse::<grain_id::GrainId>()
-                    .is_ok_and(|id| id == d.id)
+    for (selector, _) in &bindings {
+        let known = store.list().iter().any(|k| {
+            k.name == *selector
+                || k.id.as_str() == *selector
+                || selector.parse::<grain_id::GrainId>().is_ok_and(|id| {
+                    k.id.as_str()
+                        .parse::<grain_id::GrainId>()
+                        .is_ok_and(|k| k == id)
+                })
         });
         if !known {
-            println!("    {selector:<20} names no external device");
+            println!("    {selector:<20} names no API key");
         }
     }
 }
@@ -463,11 +484,13 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
             // attached once built.
             let acp_tunnel = serve::acp_tunnel::AcpTunnel::default();
             let chat_tunnel = serve::chat_ipc::ChatTunnel::default();
-            let server = app_server::build(edition).extend({
-                let acp = acp_tunnel.clone();
-                let chat = chat_tunnel.clone();
-                move |router| chat.router(acp.router(router))
-            });
+            let server = app_server::build(edition)
+                .key_profiles(device_auth::room_key_profiles(&config.room_profiles))
+                .extend({
+                    let acp = acp_tunnel.clone();
+                    let chat = chat_tunnel.clone();
+                    move |router| chat.router(acp.router(router))
+                });
             let (server, sync_runtime) = app_server::with_sync(server)?;
             let host = Arc::clone(server.host());
             let server_task = {
@@ -758,25 +781,13 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
                 Some(Arc::new(providers))
             };
 
-            // ── Device auth (bearer token -> device -> room profile) ────────
+            // ── Device auth (bearer token -> API key -> room profile) ───────
             // Built once, here, and shared as one `Arc` between ambient
             // ingest and `ServeState` (`/rpc`, `/a2a`, `/acp`) so
             // there is exactly one answer to "who is this token" in the
-            // process. Tokens are checked by the sapphire bridge; one that
-            // is not running is not fatal here (it may come up later), but
-            // every authenticated request answers 503 until it does.
-            let device_auth = Arc::new(device_auth::DeviceAuth::bridge(&config.room_profiles)?);
-            if let Err(e) = sapphire_framework_bridge_client::BridgeClient::connect_running(
-                "agent",
-                env!("CARGO_PKG_VERSION"),
-            )
-            .await
-            {
-                tracing::warn!(
-                    "device auth: cannot reach the sapphire bridge ({e}); every authenticated \
-                     endpoint answers 503 until it is running"
-                );
-            }
+            // process. Tokens are checked against the served workspace's
+            // API keys; a key's profile is its room profile.
+            let device_auth = Arc::new(device_auth::DeviceAuth::workspace(&config.room_profiles)?);
 
             // ── Ambient audio ingest (optional) ─────────────────────────────
             // Built here — after `voice_providers` exists, before it is
@@ -1293,10 +1304,11 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
                     println!("    {key} (ignored)");
                 }
             }
-            // The device -> room_profile binding is written by hand, so it
-            // needs somewhere to be checked.
-            match device_auth::DeviceAuth::bridge(&config.room_profiles) {
-                Ok(auth) => verify_external_devices(&auth).await,
+            // Where each API key goes — its profile, or for a key from
+            // before profiles the hand-written `devices` — needs somewhere
+            // to be checked.
+            match device_auth::DeviceAuth::workspace(&config.room_profiles) {
+                Ok(auth) => verify_api_keys(&auth, selection.as_ref().map(|s| s.root.as_path())),
                 Err(e) => println!("  Devices           : INVALID: {e:#}"),
             }
             match &workspace_path {

@@ -38,12 +38,14 @@ impl GuiSettings {
     /// Settings over a client for `app`, refreshing on `runtime` and waking
     /// the GUI with `waker`. `None`, logged, when the client cannot be
     /// configured: the companion works without the settings. `sections`
-    /// are the app's own pages (the Character page).
+    /// are the app's own pages (the Character page); `key_profiles` what the
+    /// API keys page offers, if not the framework's.
     pub(crate) fn spawn(
         app: AppIdentity,
         runtime: &tokio::runtime::Handle,
         waker: Waker,
         sections: Vec<Box<dyn SettingsSection>>,
+        key_profiles: Option<sapphire_framework_keys::KeyProfiles>,
     ) -> Option<GuiSettings> {
         let config = match ClientConfig::new(app) {
             Ok(config) => config,
@@ -53,8 +55,12 @@ impl GuiSettings {
             }
         };
         let client = FrameworkClient::spawn(runtime, config, waker);
+        let mut settings = Settings::new(client).with_app_sections("sapphire-agent", sections);
+        if let Some(profiles) = key_profiles {
+            settings = settings.with_key_profiles(profiles);
+        }
         Some(GuiSettings {
-            settings: Settings::new(client).with_app_sections("sapphire-agent", sections),
+            settings,
             open: false,
         })
     }

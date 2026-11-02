@@ -4,8 +4,8 @@
 //! framework's [`AppServer`] owns the IPC endpoint, the current workspace
 //! (`workspace init|select|show|…`), its search index and the process's
 //! signals, and the framework's verbs (`status`, `service`, `workspace`,
-//! `workgroup`, `device`, `embedding`, `external-device`) are this binary's
-//! too. See `docs/superpowers/specs/2026-10-13-app-server-sync-acp-stdio-design.md`.
+//! `api-key`, `config`) are this binary's too. API keys take the agent's
+//! room profiles as their profiles (`device_auth`). See `docs/superpowers/specs/2026-10-13-app-server-sync-acp-stdio-design.md`.
 //!
 //! What the agent adds on top — channels, the HTTP API, the agent loop — is
 //! built in `serve` around the workspace this server has open, never around
@@ -73,9 +73,10 @@ fn adopt_into(file: &SelectionFile, dir: &Path) -> Result<PathBuf> {
 }
 
 /// The server the framework's one-shot verbs dispatch against. `status`,
-/// `workspace`, `external-device` and the rest read only the app name and
-/// the service spec from it and talk to the running server or the bridge
-/// themselves.
+/// `workspace`, `service` and the rest read only the app name and the
+/// service spec from it and talk to the running server or the bridge
+/// themselves; `api-key` reads its key profiles, which the caller sets
+/// ([`AppServer::key_profiles`]) to the room profiles.
 pub fn build(edition: Edition) -> AppServer {
     AppServer::new(&APP_CTX, VERSION)
         .releases(edition.releases())
@@ -195,7 +196,10 @@ pub async fn serve_without_agent(
     );
 
     let shutdown = CancellationToken::new();
-    let (server, _sync) = with_sync(build(edition))?;
+    // Read from the config when asked: while it does not load, no room
+    // profile is offered as a key profile.
+    let profiles = crate::device_auth::configured_key_profiles(Some(host_config.to_owned()));
+    let (server, _sync) = with_sync(build(edition).key_profiles(profiles))?;
     let host = Arc::clone(server.host());
     let server_task = {
         let shutdown = shutdown.clone();
