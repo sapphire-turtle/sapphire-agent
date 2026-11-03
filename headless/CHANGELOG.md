@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.0](https://github.com/sapphire-turtle/sapphire-agent/compare/v0.11.2...v0.12.0) - 2026-11-04
+
+This release carries the headless edition alone. The desktop edition is still in progress (#334): it builds from source, but no release files are published for it yet.
+
+### Changed
+
+- [**breaking**] The headless edition is the `sapphire-agent-headless` crate (`cargo binstall sapphire-agent-headless`, `cargo install sapphire-agent-headless`); up to 0.11.2 it was published as `sapphire-agent`. The binary is still `sapphire-agent`. Its command line and app server are the `sapphire-agent-cli` and `sapphire-agent-server` libraries, which share the edition's version and `v{version}` tag. The release file is `sapphire-agent-headless-<os>-<arch>`, and `update` installs it
+- [**breaking**] Built on sapphire-framework 0.26 (server API 6, bridge API 4) and corundum-framework 0.8, from 0.22. Update `sapphire-bridge` and the other sapphire apps together with this release
+- [**breaking**] HTTP bearer tokens (`/rpc`, `/a2a`, `/acp`, ambient ingest) are the served workspace's API keys, kept in the workspace, instead of the bridge's external devices. Each key runs under one of the agent's room profiles: `sapphire-agent api-key add <name> --profile <room profile>`. Keys imported from external devices get the framework's `read-only` profile and are still routed by `[room_profile.<n>].devices` until re-issued; a key whose profile is no room profile gets 403. `verify` lists the workspace's API keys and the room profile each runs under
+- [**breaking**] `external-device` is `api-key` (a hidden alias remains for this release), and the `workgroup`, `device` and `embedding` commands moved to `sapphire-bridge`
+- [**breaking**] `workspace init` and `workspace select` without a directory use the app's default workspace, `<data dir>/workspaces/default`, not the current directory; pass `.` for the old behaviour
+- [**breaking**] Through sapphire-framework 0.24: on Windows, settings and data move from `%APPDATA%` to `%LOCALAPPDATA%\sapphire-agent` on the first start; on macOS the service's LaunchAgent label is `org.sapphire-turtle.sapphire-agent`, and `service install`, `uninstall` and `status` move an agent installed under an older label
+- [**breaking**] The avatar config (`<workspace>/avatar/avatar.toml`) has an optional `[vrm]` section (`model`, `idle`, `actions`) and an optional `[sprite]` section (`default_pose` and `poses`, each a `base` image and an image per expression); the old top-level `model` / `idle` / `actions` form is no longer read
+- `status` warns when the `sapphire-agent` on PATH is another executable
+
+### Added
+
+- Avatars for companion clients: a turn's client may declare the avatar it shows (its expressions, actions and poses), and the agent gets the `set_expression`, `play_action` and `set_pose` tools on such turns, narrowed to the declared names and kept out of subagents. Their cues stream to the client as `expression`, `action` and `pose` progress events
+- The avatar's model, gestures and images live in the workspace's `avatar/` folder; local clients list, download, upload and remove them over IPC (`sapphire-agent.avatar.*`), and every path in the config is checked
+- Image attachments on `chat.send` over IPC
+
+### Fixed
+
+- `sapphire-agent --version` works
+- `update` finds the app's releases and installs this edition's own release file
+- Avatar uploads across filesystems go through a hidden unique sibling; hidden and case-variant avatar paths are refused, and config changes are serialized
+- Bump pulldown-cmark to 0.13.6 (RUSTSEC-2026-0433)
+
+
+
 ## [0.11.2](https://github.com/sapphire-turtle/sapphire-agent/compare/v0.11.1...v0.11.2) - 2026-10-27
 
 ### Fixed

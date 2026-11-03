@@ -10,14 +10,19 @@ version with `sapphire-agent-server`) are recorded in the root `CHANGELOG.md`.
 
 ## [Unreleased]
 
+## [0.11.0](https://github.com/sapphire-turtle/sapphire-agent/compare/sapphire-agent-core-v0.10.0...sapphire-agent-core-v0.11.0) - 2026-11-04
+
 ### Changed
 
+- [**breaking**] Built on sapphire-framework 0.26 and sapphire-framework-server-api 6 (from 0.22 and 5): `ChatClient::from_client` takes the framework 0.26 `ipc::Client`, and the handshake names server API 6, so this client talks to sapphire-agent 0.12 and later
+- [**breaking**] `ChatClient::send` takes a `Turn` (the text, its `attachments` and the client's `ClientCaps`; `Turn::text` for a plain message) and hands each `ChatEvent` (a tool call as `ChatEvent::Tool(ToolEvent)`, or an avatar cue) to its callback. `APP_API` is 3
 - [**breaking**] `AvatarConfig` splits into an optional `[vrm]` section (`VrmConfig`: `model`, `idle`, `actions`) and an optional `[sprite]` section (`SpriteConfig`: `default_pose` and `poses`, each a `SpritePose` with a `base` image and an image per expression); the old top-level `model` / `idle` / `actions` form is no longer read. `AvatarConfig::paths` lists every file it references and `AvatarConfig::check` validates it
 
 ### Added
 
-- [**breaking**] `AvatarCaps.poses`: the stances a client's avatar can hold, declared with each turn
-- `ChatEvent::Pose` and `KIND_POSE`, the `pose` cue streamed while a turn runs
+- Client capabilities and attachments per turn: `ClientCaps` with `AvatarCaps` (the `expressions`, `actions` and `poses` the client's avatar can play) and `Attachment` (`Attachment::from_bytes`), sent with `chat.send`
+- Avatar cues streamed while a turn runs: `ChatEvent::Expression`, `ChatEvent::Action` and `ChatEvent::Pose` (`KIND_EXPRESSION`, `KIND_ACTION`, `KIND_POSE`), read by `parse_progress`
+- The avatar's files in the workspace's `avatar/` folder, over IPC: `ChatClient::avatar_manifest`, `avatar_download`, `avatar_upload`, `avatar_set_config` and `avatar_remove` (`AVATAR_MANIFEST`, `AVATAR_READ`, `AVATAR_WRITE_*`, `AVATAR_SET_MANIFEST`, `AVATAR_REMOVE`), with `AvatarManifest`, `AvatarFile`, `AVATAR_CHUNK` and `AVATAR_MAX_FILE`
 - `SPRITE_EXPRESSIONS`: the expressions a sprite pose may have an image for (happy, angry, sad, relaxed, surprised)
 
 ## [0.10.0](https://github.com/sapphire-turtle/sapphire-agent/compare/sapphire-agent-core-v0.9.0...sapphire-agent-core-v0.10.0) - 2026-10-26
