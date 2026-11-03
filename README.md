@@ -83,7 +83,7 @@ cd sapphire-agent
 cargo build --release   # the headless edition: target/release/sapphire-agent
 ```
 
-Release binaries of both editions (`sapphire-agent-headless-<os>-<arch>`, `sapphire-agent-desktop-<os>-<arch>`) are published for **Linux** (x86_64, aarch64), **macOS** (aarch64) and **Windows** (x86_64). Each is a single self-contained file — `sherpa-onnx` and its ONNX Runtime are linked statically, so there is nothing to install alongside it.
+Release binaries of the headless edition (`sapphire-agent-headless-<os>-<arch>`) are published for **Linux** (x86_64, aarch64), **macOS** (aarch64) and **Windows** (x86_64). Each is a single self-contained file — `sherpa-onnx` and its ONNX Runtime are linked statically, so there is nothing to install alongside it. The desktop app is not released until it is ready ([#334](https://github.com/sapphire-turtle/sapphire-agent/issues/334)); build it from source (`cargo build --release -p sapphire-agent-desktop`) to try it.
 
 On Windows the `shell` tool runs commands under Windows PowerShell unless a call names another shell (`pwsh`, `cmd`, `bash`, …); elsewhere it uses `$SHELL`, falling back to `/bin/sh`. Inside an ACP session, commands (and the file and skill tools' scripts) run on the editor's machine under `bash`, so a Windows editor needs Git Bash on `PATH`; with WSL enabled the editor may pick WSL's `bash.exe` instead (#303).
 

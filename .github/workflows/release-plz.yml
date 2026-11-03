@@ -2,14 +2,12 @@ name: Release-plz
 
 # The headless edition (`sapphire-agent-headless`) and the desktop app share
 # one version and its `v{version}` tag, which the headless one makes
-# (release-plz.toml). Both binaries are built once release-plz has made the
-# release.
+# (release-plz.toml). The binaries are built once release-plz has made the
+# release; for now only the headless one (release-binaries.yml, #334).
 #
-# Off on push for now: the next release waits for the desktop app's Velopack
-# packaging (sapphire-turtle/corundum-framework#51), and until then its
-# "install & start" registers the sibling headless binary instead of itself
-# (sapphire-framework#366). Releases are run by hand; put the push trigger back
-# after that release (#338).
+# Off on push for now: releases are run by hand, and carry the headless edition
+# alone until the desktop app is ready (#334). Put the push trigger back once
+# the desktop app is released too (#338).
 on:
   # push:
   #   branches:

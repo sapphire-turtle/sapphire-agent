@@ -2,7 +2,9 @@ name: Release binaries
 
 # Builds the headless edition's and the desktop app's binaries for the release
 # platforms and attaches them to an existing `v{version}` release, which the
-# two share. release-plz.yml calls it after a release; run it by hand to
+# two share. For now only the headless edition is released: the desktop app
+# is still in progress and is not released until it is ready (#334), so its
+# job is off. release-plz.yml calls it after a release; run it by hand to
 # (re)upload the files for an existing tag.
 on:
   workflow_call:
@@ -35,7 +37,10 @@ jobs:
       post-build: .github/scripts/assert-self-contained.sh "$BIN"
 
   # The desktop app runs the agent too, so it links sherpa-onnx the same way.
+  # Off until the desktop app is ready (#334): it is work in progress, and
+  # releases carry the headless edition alone. Drop the `if` to ship it again.
   desktop:
+    if: false
     permissions:
       contents: write
     uses: sapphire-turtle/.github/.github/workflows/release-binary.yml@v1
