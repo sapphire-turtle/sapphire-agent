@@ -7,11 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.12.1](https://github.com/sapphire-turtle/sapphire-agent/compare/v0.12.0...v0.12.1) - 2026-11-04
 
+This release carries the headless edition alone. The desktop edition is still in progress (#334): it builds from source, but no release files are published for it yet.
+
+### Fixed
+
+- On Windows, `service install` no longer fails with "access is denied": the service is now a logon task for the installing user, which needs no administrator (sapphire-framework 0.27, corundum 0.9, sapphire-turtle/corundum-framework#105) ([#365](https://github.com/sapphire-turtle/sapphire-agent/pull/365))
+
 ### Other
 
-- Update Cargo.lock dependencies
-
-
+- sapphire-framework 0.27.1 and corundum 0.9.1 ([#365](https://github.com/sapphire-turtle/sapphire-agent/pull/365)); tokio 1.54.1, uuid 1.29.0, rmcp 3.8.0, bevy 0.20.1 and sherpa-onnx 2.0.1
 
 ## [0.12.0](https://github.com/sapphire-turtle/sapphire-agent/compare/v0.11.2...v0.12.0) - 2026-11-04
 

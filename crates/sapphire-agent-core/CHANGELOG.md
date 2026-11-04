@@ -12,7 +12,9 @@ version with `sapphire-agent-server`) are recorded in the root `CHANGELOG.md`.
 
 ## [0.11.1](https://github.com/sapphire-turtle/sapphire-agent/compare/sapphire-agent-core-v0.11.0...sapphire-agent-core-v0.11.1) - 2026-11-04
 
+### Other
 
+- sapphire-framework 0.27.1 and corundum 0.9.1 ([#365](https://github.com/sapphire-turtle/sapphire-agent/pull/365)); tokio 1.54.1, uuid 1.29.0, rmcp 3.8.0, bevy 0.20.1 and sherpa-onnx 2.0.1
 
 ## [0.11.0](https://github.com/sapphire-turtle/sapphire-agent/compare/sapphire-agent-core-v0.10.0...sapphire-agent-core-v0.11.0) - 2026-11-04
 
