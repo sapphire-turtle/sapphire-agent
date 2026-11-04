@@ -113,11 +113,11 @@ uuid = { version = "1", features = ["v7", "serde"] }
 # `keys` provides the key profiles and `keys::Verifier`; `server` the
 # `api_keys::WorkspaceKeyVerifier`, which checks a bearer token against the
 # served workspace's API keys.
-sapphire-framework = { version = "0.26.1", default-features = false, features = ["workspace", "keys", "frontmatter", "server", "ipc"] }
+sapphire-framework = { version = "0.27.1", default-features = false, features = ["workspace", "keys", "frontmatter", "server", "ipc"] }
 # The bridge's client, which the facade does not re-export: `placement`
 # asks the running bridge about the workgroup's devices.
 # Same release as `sapphire-framework`, so both resolve to one copy.
-sapphire-framework-bridge-client = "0.26.1"
+sapphire-framework-bridge-client = "0.27.1"
 # The app server's API version, which `sapphire-agent acp` names in its
 # IPC handshake. The facade does not re-export it either.
 sapphire-framework-server-api = "6.0.0"
