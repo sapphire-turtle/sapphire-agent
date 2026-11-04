@@ -10,6 +10,10 @@ version with `sapphire-agent-server`) are recorded in the root `CHANGELOG.md`.
 
 ## [Unreleased]
 
+## [0.11.1](https://github.com/sapphire-turtle/sapphire-agent/compare/sapphire-agent-core-v0.11.0...sapphire-agent-core-v0.11.1) - 2026-11-04
+
+
+
 ## [0.11.0](https://github.com/sapphire-turtle/sapphire-agent/compare/sapphire-agent-core-v0.10.0...sapphire-agent-core-v0.11.0) - 2026-11-04
 
 ### Changed

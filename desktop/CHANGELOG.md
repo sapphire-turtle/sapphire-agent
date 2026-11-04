@@ -14,6 +14,14 @@ and predate any user-facing release of this binary.
 
 ## [Unreleased]
 
+## [0.12.1](https://github.com/sapphire-turtle/sapphire-agent/compare/v0.12.0...v0.12.1) - 2026-11-04
+
+### Other
+
+- Update Cargo.lock dependencies
+
+
+
 ### Changed
 
 - [**breaking**] Built on sapphire-framework 0.24 (server API 6, bridge API 4) and corundum-framework 0.7. Update `sapphire-bridge` together with this release: a 0.24 bridge no longer checks the agent's tokens, and the agent no longer asks it

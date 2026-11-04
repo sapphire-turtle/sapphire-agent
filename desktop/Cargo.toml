@@ -2,7 +2,7 @@
 name = "sapphire-agent-desktop"
 # Released together with `sapphire-agent-headless`, under its `v{version}`
 # tags (release-plz.toml).
-version = "0.12.0"
+version = "0.12.1"
 edition.workspace = true
 description = "Desktop GUI client for sapphire-agent (bevy + egui), whose binary also runs the agent's command line"
 license-file = "LICENSE"
@@ -20,12 +20,12 @@ path = "src/main.rs"
 sapphire-agent-gui = { path = "../crates/sapphire-agent-gui" }
 
 # The avatar's file size limit, which the file dialog checks before reading.
-sapphire-agent-core = { path = "../crates/sapphire-agent-core", version = "0.11.0" }
+sapphire-agent-core = { path = "../crates/sapphire-agent-core", version = "0.11.1" }
 
 # Every command but the window — `serve`, `chat`, `acp`, `status`, … — runs
 # the CLI's own code, so this one binary does all the CLI does, the agent
 # server included.
-sapphire-agent-cli = { path = "../crates/sapphire-agent-cli", version = "0.12.0" }
+sapphire-agent-cli = { path = "../crates/sapphire-agent-cli", version = "0.12.1" }
 clap.workspace = true
 anyhow.workspace = true
 

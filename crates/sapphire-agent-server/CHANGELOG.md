@@ -10,6 +10,10 @@ Changes up to `0.8.0`, when this crate was a binary of its own, are recorded in
 
 ## [Unreleased]
 
+## [0.12.1](https://github.com/sapphire-turtle/sapphire-agent/compare/sapphire-agent-server-v0.12.0...sapphire-agent-server-v0.12.1) - 2026-11-04
+
+
+
 ## [0.12.0](https://github.com/sapphire-turtle/sapphire-agent/compare/v0.11.2...v0.12.0) - 2026-11-04
 
 ### Changed

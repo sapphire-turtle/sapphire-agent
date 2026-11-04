@@ -3,7 +3,7 @@
 # the one command both editions put on PATH; the desktop app is
 # `sapphire-agent-desktop`, and runs the same commands.
 name = "sapphire-agent-headless"
-version = "0.12.0"
+version = "0.12.1"
 edition.workspace = true
 description = "A personal AI assistant agent that works on file-based, local-first sapphire-framework workspaces together with you"
 license.workspace = true
@@ -24,7 +24,7 @@ redb-store = ["sapphire-agent-cli/redb-store"]
 voice-sherpa = ["sapphire-agent-cli/voice-sherpa"]
 
 [dependencies]
-sapphire-agent-cli = { path = "../crates/sapphire-agent-cli", version = "0.12.0", default-features = false }
+sapphire-agent-cli = { path = "../crates/sapphire-agent-cli", version = "0.12.1", default-features = false }
 clap.workspace = true
 anyhow.workspace = true
 
