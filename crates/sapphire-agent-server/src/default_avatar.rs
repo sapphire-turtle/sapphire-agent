@@ -105,7 +105,7 @@ pub(crate) fn install_archive(
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
     let staging = staging_root.join(format!("{}-{nanos}", std::process::id()));
-    fs::create_dir_all(&staging)?;
+    fs::create_dir(&staging)?;
     let result = stage_and_place(archive, &staging, &avatar_dir);
     let _ = fs::remove_dir_all(&staging);
     result.map(|()| Outcome::Installed)
@@ -116,11 +116,13 @@ fn stage_and_place(archive: &Path, staging: &Path, avatar_dir: &Path) -> Result<
 
     let config_text = fs::read_to_string(staging.join(CONFIG_FILE))
         .map_err(|e| anyhow!("archive has no readable {CONFIG_FILE}: {e}"))?;
-    let config: AvatarConfig = toml::from_str(&config_text)?;
+    let config: AvatarConfig =
+        toml::from_str(&config_text).map_err(|e| anyhow!("invalid {CONFIG_FILE}: {e}"))?;
     config
         .check()
         .map_err(|e| anyhow!("invalid {CONFIG_FILE}: {e}"))?;
     for p in config.paths() {
+        validate_path(p).map_err(|e| anyhow!("{CONFIG_FILE}: {e}"))?;
         if !join_rel(staging, p).is_file() {
             bail!("{CONFIG_FILE} references {p:?}, which the archive lacks");
         }
@@ -135,6 +137,7 @@ fn stage_and_place(archive: &Path, staging: &Path, avatar_dir: &Path) -> Result<
     let mut placed: Vec<PathBuf> = Vec::new();
     let r = rels.iter().try_for_each(|rel| {
         place_one(
+            rel,
             &join_rel(staging, rel),
             &join_rel(avatar_dir, rel),
             &mut placed,
@@ -181,9 +184,9 @@ fn collect_files(dir: &Path, prefix: &str, out: &mut Vec<String>) -> Result<()> 
 }
 
 /// Move `src` to `dest` without overwriting; record it in `placed`.
-fn place_one(src: &Path, dest: &Path, placed: &mut Vec<PathBuf>) -> Result<()> {
+fn place_one(rel: &str, src: &Path, dest: &Path, placed: &mut Vec<PathBuf>) -> Result<()> {
     if dest.exists() {
-        bail!("{} already exists; not overwriting", dest.display());
+        bail!("avatar/{rel} already exists; not overwriting");
     }
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
@@ -286,6 +289,9 @@ fn fetch_inner(
 
 /// Download `release` and install it into `<workspace_root>/avatar/`.
 /// Does not touch the network when an avatar is already present.
+///
+/// Blocking (uses `reqwest::blocking`); call it from `spawn_blocking` or a
+/// plain thread, never from async code.
 pub(crate) fn install(
     workspace_root: &Path,
     release: &AvatarRelease<'_>,
@@ -296,8 +302,11 @@ pub(crate) fn install(
     }
     let root = staging_root();
     fs::create_dir_all(&root)?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
     let tar = root.join(format!(
-        "{}-v{}-{}.tar",
+        "{}-v{}-{}-{nanos}.tar",
         release.id,
         release.version,
         std::process::id()
@@ -438,6 +447,7 @@ mod tests {
     fn good_entries() -> Vec<(&'static str, Kind, &'static [u8])> {
         vec![
             ("avatar/avatar.toml", Kind::File, CFG),
+            ("avatar/sprite/", Kind::Dir, b""),
             ("avatar/sprite/idle.webp", Kind::File, b"img"),
             ("avatar/profile.md", Kind::File, b"hi"),
         ]
@@ -497,6 +507,17 @@ mod tests {
     fn install_archive_rejects_missing_referenced_file() {
         let (t, ws, st) = env();
         let (a, h) = archive_in(t.path(), &[("avatar/avatar.toml", Kind::File, CFG)]);
+        assert!(install_archive(&ws, &a, &h, &st).is_err());
+        assert!(!ws.join("avatar/avatar.toml").exists());
+    }
+
+    #[test]
+    fn install_archive_rejects_escaping_reference() {
+        let (t, ws, st) = env();
+        // `../x` from staging resolves to a real file beside it.
+        fs::write(st.join("x"), b"outside").unwrap();
+        let cfg = b"[sprite]\ndefault_pose = \"idle\"\n[sprite.poses.idle]\nbase = \"../x\"\n";
+        let (a, h) = archive_in(t.path(), &[("avatar/avatar.toml", Kind::File, cfg)]);
         assert!(install_archive(&ws, &a, &h, &st).is_err());
         assert!(!ws.join("avatar/avatar.toml").exists());
     }

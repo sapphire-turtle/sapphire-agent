@@ -302,9 +302,9 @@ pub(crate) fn install(
 
 1. `<workspace>/avatar/avatar.toml` があれば、何もせず `AlreadyPresent` を返す
    （テンプレートの展開と同じく、上書きしない）。
-2. キャッシュディレクトリの一時ファイルへストリーミングで取得し、同時に sha256 を計算する
-   （`sherpa_download.rs` のように全体をメモリに載せない）。`progress` に受信量と全体の大きさ
-   （`Content-Length` があれば）を渡す。sha256 が違えば失敗。
+2. キャッシュディレクトリの一時ファイルへ進捗つきで取得し（`sherpa_download.rs` のように
+   全体をメモリに載せない）、取得後にそのファイルの sha256 を計算する。`progress` に受信量と
+   全体の大きさ（`Content-Length` があれば）を渡す。sha256 が違えば失敗。
 3. キャッシュディレクトリの作業用ディレクトリに展開する（§3.1 の規則）。ワークスペースの
    外に置くのは、展開途中の状態を同期に見せないため。
 4. 作業用ディレクトリで、`avatar.toml` が `AvatarConfig` として読めて `check` を通り、
