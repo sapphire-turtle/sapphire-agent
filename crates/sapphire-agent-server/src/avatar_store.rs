@@ -126,7 +126,7 @@ pub(crate) struct AvatarStore {
     config_lock: Mutex<()>,
 }
 
-fn sha256_file(path: &Path) -> std::io::Result<String> {
+pub(crate) fn sha256_file(path: &Path) -> std::io::Result<String> {
     let mut f = File::open(path)?;
     let mut h = Sha256::new();
     let mut buf = vec![0u8; 64 * 1024];

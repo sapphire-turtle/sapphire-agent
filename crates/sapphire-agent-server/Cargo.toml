@@ -24,7 +24,7 @@ redb-store = ["sapphire-framework/redb-store"]
 # (sherpa-onnx + ONNX runtime, ~5–10 minutes on a cold cache). Users
 # who only run the Gradio TTS path or who don't need voice at all can
 # opt out with `--no-default-features` plus the other defaults.
-voice-sherpa = ["dep:sherpa-onnx", "dep:tar", "dep:bzip2"]
+voice-sherpa = ["dep:sherpa-onnx", "dep:bzip2"]
 
 [dependencies]
 # Async runtime
@@ -167,10 +167,10 @@ serenity = { version = "0.12", default-features = false, features = [
 # (sherpa-onnx-sys compiles C++ via CMake).
 sherpa-onnx = { version = "2.0", optional = true }
 
-# Model bundle extraction. sherpa-onnx ships pre-trained models as
-# tar.bz2 archives on GitHub releases; both crates are gated alongside
-# sherpa-onnx itself.
-tar = { version = "0.4", optional = true }
+# Archive extraction: sherpa-onnx model bundles (tar.bz2 on GitHub releases,
+# with bzip2 gated alongside sherpa-onnx itself) and the default avatar pack.
+# `tar` is always built; `bzip2` only with `voice-sherpa`.
+tar = "0.4"
 bzip2 = { version = "0.6", optional = true }
 
 # WAV decoding for TTS providers that return audio files (e.g. Gradio Web UI).

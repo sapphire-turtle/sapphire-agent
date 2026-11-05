@@ -26,6 +26,7 @@ mod cli_init;
 mod config;
 mod config_layer;
 mod context_compression;
+mod default_avatar;
 mod device_auth;
 mod frontmatter;
 mod heartbeat;
