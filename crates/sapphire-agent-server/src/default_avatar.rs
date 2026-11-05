@@ -206,6 +206,108 @@ fn place_one(src: &Path, dest: &Path, placed: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// Download cap: the archive's content cap plus tar headers and padding.
+const MAX_DOWNLOAD: u64 = MAX_AVATAR_TOTAL + 8 * 1024 * 1024;
+
+/// A published avatar pack release.
+pub(crate) struct AvatarRelease<'a> {
+    pub id: &'a str,
+    pub version: u32,
+    pub url: &'a str,
+    pub sha256: &'a str,
+}
+
+/// The default avatar pack installed on first run.
+#[cfg_attr(test, allow(dead_code))] // first used by the first-run hook
+pub(crate) const INITIAL: AvatarRelease<'static> = AvatarRelease {
+    id: "default-chibi",
+    version: 1,
+    url: "https://github.com/sapphire-turtle/sapphire-agent-avatars/releases/download/default-chibi-v1/default-chibi-v1.tar",
+    // FIXME(#340): the v1 release's .sha256 (no release exists yet)
+    sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+};
+
+/// Where downloaded archives and their extraction are staged.
+fn staging_root() -> PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("sapphire-agent")
+        .join("avatar-staging")
+}
+
+/// Download `url` into `dest`, calling `progress(received, total)` after each
+/// chunk. Fails (removing `dest`) if the body exceeds `max` bytes.
+fn fetch(
+    url: &str,
+    dest: &Path,
+    max: u64,
+    mut progress: impl FnMut(u64, Option<u64>),
+) -> Result<()> {
+    let result = fetch_inner(url, dest, max, &mut progress);
+    if result.is_err() {
+        let _ = fs::remove_file(dest);
+    }
+    result
+}
+
+fn fetch_inner(
+    url: &str,
+    dest: &Path,
+    max: u64,
+    progress: &mut dyn FnMut(u64, Option<u64>),
+) -> Result<()> {
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    let mut resp = client.get(url).send()?.error_for_status()?;
+    let total = resp.content_length();
+    if let Some(t) = total
+        && t > max
+    {
+        bail!("download is {t} bytes, over the {max} byte limit");
+    }
+    let mut out = File::create(dest)?;
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut received: u64 = 0;
+    loop {
+        let n = resp.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        received += n as u64;
+        if received > max {
+            bail!("download exceeds the {max} byte limit");
+        }
+        io::Write::write_all(&mut out, &buf[..n])?;
+        progress(received, total);
+    }
+    Ok(())
+}
+
+/// Download `release` and install it into `<workspace_root>/avatar/`.
+/// Does not touch the network when an avatar is already present.
+pub(crate) fn install(
+    workspace_root: &Path,
+    release: &AvatarRelease<'_>,
+    progress: impl FnMut(u64, Option<u64>),
+) -> Result<Outcome> {
+    if workspace_root.join("avatar").join(CONFIG_FILE).exists() {
+        return Ok(Outcome::AlreadyPresent);
+    }
+    let root = staging_root();
+    fs::create_dir_all(&root)?;
+    let tar = root.join(format!(
+        "{}-v{}-{}.tar",
+        release.id,
+        release.version,
+        std::process::id()
+    ));
+    let result = fetch(release.url, &tar, MAX_DOWNLOAD, progress)
+        .and_then(|()| install_archive(workspace_root, &tar, release.sha256, &root));
+    let _ = fs::remove_file(&tar);
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -455,5 +557,102 @@ mod tests {
         let (bad, bh) = archive_in(t.path(), &[("avatar/avatar.toml", Kind::File, CFG)]);
         assert!(install_archive(&ws2, &bad, &bh, &st).is_err());
         assert_eq!(fs::read_dir(&st).unwrap().count(), 0);
+    }
+
+    /// Answer one HTTP request with 200 and `body`; returns the URL.
+    fn serve_once(body: Vec<u8>, content_length: Option<usize>) -> String {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let Ok((mut s, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            let mut got = Vec::new();
+            while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+                match s.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => got.extend_from_slice(&buf[..n]),
+                }
+            }
+            let mut head = String::from("HTTP/1.1 200 OK\r\nConnection: close\r\n");
+            if let Some(n) = content_length {
+                head.push_str(&format!("Content-Length: {n}\r\n"));
+            }
+            head.push_str("\r\n");
+            let _ = s.write_all(head.as_bytes());
+            let _ = s.write_all(&body);
+        });
+        format!("http://127.0.0.1:{port}/a.tar")
+    }
+
+    #[test]
+    fn fetch_writes_body_and_reports_progress() {
+        let (t, _, _) = env();
+        let body: Vec<u8> = (0..204_800u32).map(|i| (i % 251) as u8).collect();
+        let url = serve_once(body.clone(), Some(body.len()));
+        let dest = t.path().join("out.tar");
+        let mut last = None;
+        fetch(&url, &dest, 1_000_000, |r, tot| last = Some((r, tot))).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), body);
+        assert_eq!(last, Some((204_800, Some(204_800))));
+    }
+
+    #[test]
+    fn fetch_aborts_past_cap() {
+        let (t, _, _) = env();
+        let url = serve_once(vec![7u8; 5000], None);
+        let dest = t.path().join("out.tar");
+        assert!(fetch(&url, &dest, 1000, |_, _| {}).is_err());
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn fetch_rejects_declared_size_over_cap() {
+        let (t, _, _) = env();
+        let url = serve_once(vec![7u8; 5000], Some(5000));
+        let dest = t.path().join("out.tar");
+        let mut calls = 0;
+        assert!(fetch(&url, &dest, 1000, |_, _| calls += 1).is_err());
+        assert_eq!(calls, 0);
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn install_end_to_end() {
+        let (t, ws, _) = env();
+        let (a, h) = archive_in(t.path(), &good_entries());
+        let body = fs::read(&a).unwrap();
+        let url = serve_once(body.clone(), Some(body.len()));
+        let release = AvatarRelease {
+            id: "test-e2e",
+            version: 1,
+            url: &url,
+            sha256: &h,
+        };
+        assert_eq!(
+            install(&ws, &release, |_, _| {}).unwrap(),
+            Outcome::Installed
+        );
+        assert!(ws.join("avatar/avatar.toml").is_file());
+        assert!(ws.join("avatar/sprite/idle.webp").is_file());
+    }
+
+    #[test]
+    fn install_skips_without_network_when_present() {
+        let (_t, ws, _) = env();
+        fs::create_dir_all(ws.join("avatar")).unwrap();
+        fs::write(ws.join("avatar/avatar.toml"), CFG).unwrap();
+        let release = AvatarRelease {
+            id: "x",
+            version: 1,
+            url: "http://127.0.0.1:9/",
+            sha256: &"0".repeat(64),
+        };
+        assert_eq!(
+            install(&ws, &release, |_, _| {}).unwrap(),
+            Outcome::AlreadyPresent
+        );
     }
 }
