@@ -128,6 +128,7 @@ fn stage_and_place(archive: &Path, staging: &Path, avatar_dir: &Path) -> Result<
 
     let mut rels = Vec::new();
     collect_files(staging, "", &mut rels)?;
+    rels.sort(); // deterministic placing order
     rels.retain(|r| r != CONFIG_FILE);
     rels.push(CONFIG_FILE.to_string()); // last
 
@@ -425,6 +426,8 @@ mod tests {
             b"mine"
         );
         assert!(!ws.join("avatar/avatar.toml").exists());
+        // `profile.md` sorts before `sprite/idle.webp`, so it was placed
+        // first and must have been rolled back.
         assert!(!ws.join("avatar/profile.md").exists());
     }
 
@@ -447,6 +450,10 @@ mod tests {
         let ws2 = t.path().join("ws2");
         fs::create_dir(&ws2).unwrap();
         assert!(install_archive(&ws2, &a, &"0".repeat(64), &st).is_err());
+        assert_eq!(fs::read_dir(&st).unwrap().count(), 0);
+        // Failures after extraction (missing referenced file) clean up too.
+        let (bad, bh) = archive_in(t.path(), &[("avatar/avatar.toml", Kind::File, CFG)]);
+        assert!(install_archive(&ws2, &bad, &bh, &st).is_err());
         assert_eq!(fs::read_dir(&st).unwrap().count(), 0);
     }
 }

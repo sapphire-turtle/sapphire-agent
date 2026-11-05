@@ -307,7 +307,7 @@ pub(crate) fn install(
    （`Content-Length` があれば）を渡す。sha256 が違えば失敗。
 3. キャッシュディレクトリの作業用ディレクトリに展開する（§3.1 の規則）。ワークスペースの
    外に置くのは、展開途中の状態を同期に見せないため。
-4. 作業用ディレクトリで、`avatar.toml` が `AvatarConfig` として読めて `validate` を通り、
+4. 作業用ディレクトリで、`avatar.toml` が `AvatarConfig` として読めて `check` を通り、
    参照するファイルがすべてあることを確かめる。
 5. `<workspace>/avatar/` に移す。キャッシュが別のファイルシステムにあって rename できなければ、
    `avatar_store` と同じくコピーに切り替える。`avatar/` が空のディレクトリとしてすでにあれば、
