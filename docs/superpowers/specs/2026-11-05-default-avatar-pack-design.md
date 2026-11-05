@@ -140,8 +140,11 @@ PR ごとと、リリースの前に CI で走らせる。手元でも同じに�
 
 ### 掃除（`scripts/strip`）
 
-PNG・WebP から許可したチャンク以外を取り除いて書き直す。VRM の `meta` と名前は編集ツールで
-手で直し、直し忘れは `scripts/check` が捕まえる。
+- PNG・WebP から、許可したチャンク以外を取り除いて書き直す。
+- VRM・VRMA の `asset.generator` を決めた値に書き換える（JSON チャンクだけを書き直し、
+  バイナリチャンクには触れない）。編集ツールの多くはこの値を変えられないため。
+- VRM の `meta`、各種の名前、モデルに埋め込むテクスチャは、編集ツールの側で直す
+  （テクスチャは取り込む前に PNG・WebP として掃除しておく）。直し忘れは `scripts/check` が捕まえる。
 
 ## §3 agent のインストーラー
 
@@ -152,7 +155,7 @@ PNG・WebP から許可したチャンク以外を取り除いて書き直す。
 pub(crate) const PACK: Pack = Pack {
     version: 1,
     url: "https://github.com/sapphire-turtle/sapphire-agent-default-avatar/releases/download/v1/default-avatar-v1.tar",
-    sha256: "…",
+    sha256: "…", // the v1 release's `.sha256`, filled in when v1 is released
 };
 
 pub(crate) enum Outcome {
