@@ -75,6 +75,31 @@ pub const AVATAR_WRITE_COMMIT: &str = "sapphire-agent.avatar.write_commit";
 pub const AVATAR_SET_MANIFEST: &str = "sapphire-agent.avatar.set_manifest";
 /// Delete an avatar file.
 pub const AVATAR_REMOVE: &str = "sapphire-agent.avatar.remove";
+/// Ask the agent to download and install the default avatar pack.
+pub const AVATAR_INSTALL_DEFAULT: &str = "sapphire-agent.avatar.install_default";
+/// Notification: download progress of an `AVATAR_INSTALL_DEFAULT` request.
+pub const AVATAR_INSTALL_PROGRESS: &str = "sapphire-agent.avatar.install_progress";
+
+/// The agent's answer to `AVATAR_INSTALL_DEFAULT`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DefaultAvatarAnswer {
+    /// The pack was downloaded and installed.
+    Installed,
+    /// The workspace already has an avatar; nothing was done.
+    AlreadyPresent,
+    /// There is no default avatar release to install.
+    Unavailable,
+    /// An automatic install was declined; the user has to confirm it.
+    NeedsConfirmation,
+}
+
+/// Download progress of the default avatar pack, in bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstallProgress {
+    pub received: u64,
+    pub total: Option<u64>,
+}
 /// Notification: progress in a [`SEND`] turn (a tool call, an avatar cue).
 pub const PROGRESS: &str = "sapphire-agent.chat.progress";
 
