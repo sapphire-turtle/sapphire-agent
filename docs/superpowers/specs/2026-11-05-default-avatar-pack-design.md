@@ -237,7 +237,7 @@ PNG・WebP・glTF バイナリは自前で読む）。exiftool などの外部�
 
 - `avatar.toml` が読め、既存の規則を満たす（`default_pose` が `poses` にある、表情の名前が
   `SPRITE_EXPRESSIONS` のどれか、など）。意味の正しさの基準は agent の
-  `AvatarConfig::validate` で、agent も展開後に検証する（§3）ので、ここで完全に再現しなくてよい。
+  `AvatarConfig::check` で、agent も展開後に検証する（§3）ので、ここで完全に再現しなくてよい。
 - `avatar.toml` が参照するファイルがすべてあり、`avatars/<id>/` の下に
   **参照されていないファイルがない**。
 - 立ち絵はすべて同じキャンバスサイズ（2D の仕様が前提にしている）。

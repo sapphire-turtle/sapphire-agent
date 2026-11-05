@@ -5,12 +5,12 @@
 
 use std::fs::{self, File};
 use std::io::{self, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow, bail};
-use sapphire_agent_core::AVATAR_MAX_FILE;
+use sapphire_agent_core::{AVATAR_MAX_FILE, AvatarConfig};
 
-use crate::avatar_store::validate_path;
+use crate::avatar_store::{sha256_file, validate_path};
 
 /// Upper bound on the summed size of all files in the archive.
 pub(crate) const MAX_AVATAR_TOTAL: u64 = 100_000_000;
@@ -71,6 +71,137 @@ fn extract_with(archive: impl Read, dest: &Path, max_file: u64, max_total: u64) 
             bail!("entry {name:?} has unsupported type {ty:?}");
         }
     }
+    Ok(())
+}
+
+/// What `install_archive` did.
+#[derive(Debug, PartialEq)]
+pub(crate) enum Outcome {
+    Installed,
+    AlreadyPresent,
+}
+
+/// Verify `archive` against `expected_sha256`, extract and check it in a
+/// staging directory under `staging_root`, then place it into
+/// `<workspace_root>/avatar/`. Never overwrites: an existing
+/// `avatar/avatar.toml` means nothing is done, and an existing destination
+/// file aborts the install. `avatar.toml` is placed last, so a failed install
+/// never leaves a config pointing at missing files.
+pub(crate) fn install_archive(
+    workspace_root: &Path,
+    archive: &Path,
+    expected_sha256: &str,
+    staging_root: &Path,
+) -> Result<Outcome> {
+    let avatar_dir = workspace_root.join("avatar");
+    if avatar_dir.join(CONFIG_FILE).exists() {
+        return Ok(Outcome::AlreadyPresent);
+    }
+    let actual = sha256_file(archive)?;
+    if !actual.eq_ignore_ascii_case(expected_sha256) {
+        bail!("archive sha256 is {actual}, expected {expected_sha256}");
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let staging = staging_root.join(format!("{}-{nanos}", std::process::id()));
+    fs::create_dir_all(&staging)?;
+    let result = stage_and_place(archive, &staging, &avatar_dir);
+    let _ = fs::remove_dir_all(&staging);
+    result.map(|()| Outcome::Installed)
+}
+
+fn stage_and_place(archive: &Path, staging: &Path, avatar_dir: &Path) -> Result<()> {
+    extract(File::open(archive)?, staging)?;
+
+    let config_text = fs::read_to_string(staging.join(CONFIG_FILE))
+        .map_err(|e| anyhow!("archive has no readable {CONFIG_FILE}: {e}"))?;
+    let config: AvatarConfig = toml::from_str(&config_text)?;
+    config
+        .check()
+        .map_err(|e| anyhow!("invalid {CONFIG_FILE}: {e}"))?;
+    for p in config.paths() {
+        if !join_rel(staging, p).is_file() {
+            bail!("{CONFIG_FILE} references {p:?}, which the archive lacks");
+        }
+    }
+
+    let mut rels = Vec::new();
+    collect_files(staging, "", &mut rels)?;
+    rels.retain(|r| r != CONFIG_FILE);
+    rels.push(CONFIG_FILE.to_string()); // last
+
+    let mut placed: Vec<PathBuf> = Vec::new();
+    let r = rels.iter().try_for_each(|rel| {
+        place_one(
+            &join_rel(staging, rel),
+            &join_rel(avatar_dir, rel),
+            &mut placed,
+        )
+    });
+    if r.is_err() {
+        for p in &placed {
+            let _ = fs::remove_file(p);
+            let mut dir = p.parent();
+            while let Some(d) = dir.filter(|d| *d != avatar_dir) {
+                if fs::remove_dir(d).is_err() {
+                    break;
+                }
+                dir = d.parent();
+            }
+        }
+    }
+    r
+}
+
+/// Join a validated `/`-separated relative path component-wise.
+fn join_rel(base: &Path, rel: &str) -> PathBuf {
+    let mut p = base.to_path_buf();
+    p.extend(rel.split('/'));
+    p
+}
+
+/// List files under `dir` as `/`-separated paths relative to the root.
+fn collect_files(dir: &Path, prefix: &str, out: &mut Vec<String>) -> Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow!("non-UTF-8 file name in staging"))?;
+        let rel = format!("{prefix}{name}");
+        if entry.file_type()?.is_dir() {
+            collect_files(&entry.path(), &format!("{rel}/"), out)?;
+        } else {
+            out.push(rel);
+        }
+    }
+    Ok(())
+}
+
+/// Move `src` to `dest` without overwriting; record it in `placed`.
+fn place_one(src: &Path, dest: &Path, placed: &mut Vec<PathBuf>) -> Result<()> {
+    if dest.exists() {
+        bail!("{} already exists; not overwriting", dest.display());
+    }
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if fs::rename(src, dest).is_err() {
+        // Likely a cross-device move: copy next to the destination, then
+        // rename, so a half-written file never has the final name.
+        let name = dest.file_name().unwrap_or_default().to_os_string();
+        let mut tmp_name = std::ffi::OsString::from(".");
+        tmp_name.push(&name);
+        tmp_name.push(".installing");
+        let tmp = dest.with_file_name(tmp_name);
+        let r = fs::copy(src, &tmp).and_then(|_| fs::rename(&tmp, dest));
+        if let Err(e) = r {
+            let _ = fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+    }
+    placed.push(dest.to_path_buf());
     Ok(())
 }
 
@@ -188,5 +319,134 @@ mod tests {
         let (_t, d) = dest();
         let tar = tar_of(&[("avatar/a.webp", Kind::File, &[0u8; 11])]);
         assert!(extract_with(&tar[..], &d, 10, 25).is_err());
+    }
+
+    const CFG: &[u8] =
+        b"[sprite]\ndefault_pose = \"idle\"\n[sprite.poses.idle]\nbase = \"sprite/idle.webp\"\n";
+
+    /// Write `entries` as a tar in `dir`; returns its path and sha256.
+    fn archive_in(dir: &Path, entries: &[(&str, Kind, &[u8])]) -> (std::path::PathBuf, String) {
+        let p = dir.join("pack.tar");
+        fs::write(&p, tar_of(entries)).unwrap();
+        let h = crate::avatar_store::sha256_file(&p).unwrap();
+        (p, h)
+    }
+
+    fn good_entries() -> Vec<(&'static str, Kind, &'static [u8])> {
+        vec![
+            ("avatar/avatar.toml", Kind::File, CFG),
+            ("avatar/sprite/idle.webp", Kind::File, b"img"),
+            ("avatar/profile.md", Kind::File, b"hi"),
+        ]
+    }
+
+    /// (tempdir, workspace, staging_root)
+    fn env() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let t = tempfile::tempdir().unwrap();
+        let ws = t.path().join("ws");
+        let st = t.path().join("staging");
+        fs::create_dir(&ws).unwrap();
+        fs::create_dir(&st).unwrap();
+        (t, ws, st)
+    }
+
+    #[test]
+    fn install_archive_installs() {
+        let (t, ws, st) = env();
+        let (a, h) = archive_in(t.path(), &good_entries());
+        assert_eq!(
+            install_archive(&ws, &a, &h, &st).unwrap(),
+            Outcome::Installed
+        );
+        assert!(ws.join("avatar/avatar.toml").is_file());
+        assert_eq!(
+            fs::read(ws.join("avatar/sprite/idle.webp")).unwrap(),
+            b"img"
+        );
+        assert!(ws.join("avatar/profile.md").is_file());
+    }
+
+    #[test]
+    fn install_archive_skips_when_present() {
+        let (t, ws, st) = env();
+        fs::create_dir(ws.join("avatar")).unwrap();
+        fs::write(ws.join("avatar/avatar.toml"), "x").unwrap();
+        let (a, h) = archive_in(t.path(), &good_entries());
+        assert_eq!(
+            install_archive(&ws, &a, &h, &st).unwrap(),
+            Outcome::AlreadyPresent
+        );
+        assert_eq!(
+            fs::read_to_string(ws.join("avatar/avatar.toml")).unwrap(),
+            "x"
+        );
+    }
+
+    #[test]
+    fn install_archive_rejects_bad_hash() {
+        let (t, ws, st) = env();
+        let (a, _) = archive_in(t.path(), &good_entries());
+        assert!(install_archive(&ws, &a, &"0".repeat(64), &st).is_err());
+        assert!(!ws.join("avatar").exists());
+    }
+
+    #[test]
+    fn install_archive_rejects_missing_referenced_file() {
+        let (t, ws, st) = env();
+        let (a, h) = archive_in(t.path(), &[("avatar/avatar.toml", Kind::File, CFG)]);
+        assert!(install_archive(&ws, &a, &h, &st).is_err());
+        assert!(!ws.join("avatar/avatar.toml").exists());
+    }
+
+    #[test]
+    fn install_archive_rejects_invalid_config() {
+        let (t, ws, st) = env();
+        let cfg = b"[sprite]\ndefault_pose = \"nope\"\n[sprite.poses.idle]\nbase = \"sprite/idle.webp\"\n";
+        let (a, h) = archive_in(
+            t.path(),
+            &[
+                ("avatar/avatar.toml", Kind::File, cfg),
+                ("avatar/sprite/idle.webp", Kind::File, b"img"),
+            ],
+        );
+        assert!(install_archive(&ws, &a, &h, &st).is_err());
+        assert!(!ws.join("avatar/avatar.toml").exists());
+    }
+
+    #[test]
+    fn install_refuses_to_overwrite_existing_file() {
+        let (t, ws, st) = env();
+        fs::create_dir_all(ws.join("avatar/sprite")).unwrap();
+        fs::write(ws.join("avatar/sprite/idle.webp"), "mine").unwrap();
+        let (a, h) = archive_in(t.path(), &good_entries());
+        assert!(install_archive(&ws, &a, &h, &st).is_err());
+        assert_eq!(
+            fs::read(ws.join("avatar/sprite/idle.webp")).unwrap(),
+            b"mine"
+        );
+        assert!(!ws.join("avatar/avatar.toml").exists());
+        assert!(!ws.join("avatar/profile.md").exists());
+    }
+
+    #[test]
+    fn install_into_existing_empty_dir() {
+        let (t, ws, st) = env();
+        fs::create_dir(ws.join("avatar")).unwrap();
+        let (a, h) = archive_in(t.path(), &good_entries());
+        assert_eq!(
+            install_archive(&ws, &a, &h, &st).unwrap(),
+            Outcome::Installed
+        );
+    }
+
+    #[test]
+    fn staging_dir_is_removed() {
+        let (t, ws, st) = env();
+        let (a, h) = archive_in(t.path(), &good_entries());
+        install_archive(&ws, &a, &h, &st).unwrap();
+        let ws2 = t.path().join("ws2");
+        fs::create_dir(&ws2).unwrap();
+        assert!(install_archive(&ws2, &a, &"0".repeat(64), &st).is_err());
+        assert_eq!(fs::read_dir(&st).unwrap().count(), 0);
     }
 }
