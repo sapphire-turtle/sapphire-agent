@@ -394,7 +394,7 @@ tar は外から来るので厳しく見る。
   - `installed`: 入れた。
   - `already_present`: もうあった。何もしていない。
   - `unavailable`: `INITIAL` が `None`。
-  - `needs_confirmation`: `auto` が真で、同期が有効かつほかの端末がある。何もしていない。
+  - `needs_confirmation`: `auto` が真で、同期が有効かつほかの端末がある（かもしれない）。何もしていない。
   - 取得や検証に失敗したら、IPC のエラーで答える（メッセージは `install` のエラー）。
 - `sapphire-agent.avatar.install_progress`（通知）: `{ "received": u64, "total": u64 | null }`。
   取得中に、`install` の `progress` から送る。間隔は 250 ミリ秒に 1 回まで。
@@ -406,8 +406,11 @@ tar は外から来るので厳しく見る。
 `enabled` とほかの端末の数（`peers`）しか教えず、「最初の同期が追いついた」は分からないので、
 次のように決める。
 
-- 同期が無効、または `peers` が 0: 自動で取る。
-- 同期が有効で `peers` が 1 以上: 自動では取らない（`needs_confirmation`）。
+- 同期が無効: 自動で取る。
+- 同期が有効で、ブリッジにつながり（`bridge_available`）、`peers` が 0: 自動で取る。
+- 同期が有効で、`peers` が 1 以上か、ブリッジにつながらない: 自動では取らない
+  （`needs_confirmation`）。ブリッジにつながらないと `peers` は 0 と報告されるが、
+  実際の数は分からないため。
 - 判定はサーバーが `install_default` の中で行う（テストできるように）。framework に
   「追いついた」が分かる手段ができたら、それを待ってから自動で取るように改める。
 
@@ -434,7 +437,7 @@ tar は外から来るので厳しく見る。
 
 - `init` が `CHARACTER.md` を置き、すでにあれば上書きしない（中身ができて `TEMPLATES` に
   足すときに足す）。`init` がネットワークを使わないことは、`default_avatar` を呼ばないことで保つ。
-- `install_default` の判定: 同期が無効、`peers` が 0、`peers` が 1 以上 × `auto` の真偽で、
+- `install_default` の判定: 同期が無効、`peers` が 0、`peers` が 1 以上、ブリッジにつながらない × `auto` の真偽で、
   取りに行くかどうかと答え。`INITIAL` が `None` なら `unavailable`。取得先は差し替えられる
   ようにし、テストではループバックの HTTP サーバー（§3 のテストと同じもの）を使う。
 - 同時に 2 つの要求が来ても、取得は 1 回で、両方に同じ答えが返る。
