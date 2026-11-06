@@ -2854,7 +2854,16 @@ impl TurnLoop<'_> {
                         text_results.push((id, output.text));
                         images.extend(output.images);
                     }
-                    let result_msg = ChatMessage::tool_results_with_images(text_results, images);
+                    let mut result_msg =
+                        ChatMessage::tool_results_with_images(text_results, images);
+                    // Background completions ride in beside the tool results
+                    // (after them: providers that fold the tool results into
+                    // one block need the `ToolResult` parts first). Only the
+                    // session's own loop drains — a subagent's nested loop
+                    // has no `persistence`, and its inbox is not its own.
+                    let delivered = self
+                        .persistence
+                        .is_some_and(|p| deliver_into(&self.state, &p.session_id, &mut result_msg));
                     history.push(result_msg.clone());
                     // Gated on `tool_use_persisted`: this append must not run
                     // independently of the `tool_use` append above. If that
@@ -2868,14 +2877,62 @@ impl TurnLoop<'_> {
                     // on-disk session forever. A half-persisted pair is worse
                     // than neither, so skip this append too rather than
                     // leaving only the result on disk.
-                    if tool_use_persisted && let Some(p) = self.persistence {
-                        p.append_message_paired(&result_msg);
+                    if tool_use_persisted
+                        && let Some(p) = self.persistence
+                        && p.append_message_paired(&result_msg)
+                        && delivered
+                    {
+                        self.state.background.commit_delivery(&p.session_id);
                     }
                 }
             }
         };
         (final_text, stop)
     }
+}
+
+/// Where `deliver_into` puts completion text relative to the parts already
+/// in a message.
+enum Placement {
+    /// A user turn: before what the user said.
+    Front,
+    /// A tool-results message: after the `ToolResult` and image parts.
+    Back,
+}
+
+/// Drain `session_id`'s finished background tasks into `msg` as text parts,
+/// in finish order. Returns whether anything was added; if so the caller
+/// owes the registry a `commit_delivery` once `msg` is persisted.
+fn place_completions(
+    state: &ServeState,
+    session_id: &str,
+    msg: &mut ChatMessage,
+    at: Placement,
+) -> bool {
+    let completions = state.background.drain(session_id);
+    if completions.is_empty() {
+        return false;
+    }
+    let texts = completions
+        .iter()
+        .map(|c| ContentPart::Text(crate::background::render(c)));
+    match at {
+        Placement::Front => {
+            msg.parts.splice(0..0, texts);
+        }
+        Placement::Back => msg.parts.extend(texts),
+    }
+    true
+}
+
+/// Append completions to a tool-results message (between rounds).
+fn deliver_into(state: &ServeState, session_id: &str, msg: &mut ChatMessage) -> bool {
+    place_completions(state, session_id, msg, Placement::Back)
+}
+
+/// Prepend completions to the user message that starts a turn.
+fn deliver_before(state: &ServeState, session_id: &str, msg: &mut ChatMessage) -> bool {
+    place_completions(state, session_id, msg, Placement::Front)
 }
 
 /// Execute one full LLM turn for an established session: hydrate history,
@@ -2935,7 +2992,7 @@ impl TurnLoop<'_> {
 pub(crate) async fn run_llm_turn(
     state: Arc<ServeState>,
     session_id: String,
-    user_msg: ChatMessage,
+    mut user_msg: ChatMessage,
     progress: Arc<dyn TurnHost>,
     timer_origin: Option<crate::timer::TimerOrigin>,
 ) -> LlmTurnOutcome {
@@ -3060,16 +3117,27 @@ pub(crate) async fn run_llm_turn(
     // 4. Append user message. Image scrubbing for storage is handled inside
     //    `SessionStore::append` so the in-memory history keeps full image
     //    bytes for the provider call while JSONL gets a hash marker.
+    //
+    //    Background completions that arrived since the last turn go in
+    //    front of what the user said, so they are read as news that
+    //    predates it. They are confirmed delivered only once the message
+    //    is on disk: a crash before that leaves them in the inbox file.
+    let delivered = deliver_before(&state, &session_id, &mut user_msg);
     history.push(user_msg.clone());
-    if is_acp {
-        if let Err(e) = state
+    let persisted = if is_acp {
+        state
             .acp_session_store
             .append_message(&session_id, &user_msg)
-        {
-            warn!("Failed to persist user message: {e}");
-        }
-    } else if let Err(e) = store.append(&session_id, &user_msg) {
-        warn!("Failed to persist user message: {e}");
+            .inspect_err(|e| warn!("Failed to persist user message: {e}"))
+            .is_ok()
+    } else {
+        store
+            .append(&session_id, &user_msg)
+            .inspect_err(|e| warn!("Failed to persist user message: {e}"))
+            .is_ok()
+    };
+    if delivered && persisted {
+        state.background.commit_delivery(&session_id);
     }
 
     // 5. Tool-calling loop — refresh MCP tools if any server signalled a change.
@@ -4380,6 +4448,287 @@ mod tests {
                 _ => None,
             })
             .expect("the call still owes the model a tool_result")
+    }
+
+    /// Register (but do not complete) a background task for `sid`.
+    fn finished_task_pending(state: &Arc<ServeState>, sid: &str, agent: &str) -> String {
+        state
+            .background
+            .register(
+                sid,
+                crate::background::TaskKind::Subagent {
+                    agent: agent.to_string(),
+                    handle: "h".to_string(),
+                },
+                agent.to_string(),
+            )
+            .unwrap()
+    }
+
+    /// Register a completed background task for `sid` and return its id.
+    fn finished_task(state: &Arc<ServeState>, sid: &str, agent: &str, text: &str) -> String {
+        let id = state
+            .background
+            .register(
+                sid,
+                crate::background::TaskKind::Subagent {
+                    agent: agent.to_string(),
+                    handle: "h".to_string(),
+                },
+                agent.to_string(),
+            )
+            .unwrap();
+        complete_task(state, sid, &id, text);
+        id
+    }
+
+    fn complete_task(state: &Arc<ServeState>, sid: &str, id: &str, text: &str) {
+        state.background.complete(
+            sid,
+            id,
+            crate::background::Outcome::Finished {
+                text: text.to_string(),
+                refused: vec![],
+            },
+        );
+    }
+
+    /// A tool that completes the given background tasks (in order) when it
+    /// runs, so their completions arrive in the middle of a turn.
+    struct CompletesTasks {
+        spec: ToolSpec,
+        state: std::sync::Weak<ServeState>,
+        sid: String,
+        tasks: Vec<(String, String)>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for CompletesTasks {
+        fn spec(&self) -> &ToolSpec {
+            &self.spec
+        }
+        fn kind(&self) -> crate::tools::ToolKind {
+            crate::tools::ToolKind::Read
+        }
+        async fn execute(&self, _input: &Value) -> anyhow::Result<String> {
+            let state = self.state.upgrade().unwrap();
+            for (id, text) in &self.tasks {
+                complete_task(&state, &self.sid, id, text);
+            }
+            Ok("tool ran".to_string())
+        }
+    }
+
+    async fn register_completing_tool(
+        state: &Arc<ServeState>,
+        sid: &str,
+        tasks: Vec<(String, String)>,
+    ) {
+        state
+            .tools
+            .register_tool(Box::new(CompletesTasks {
+                spec: ToolSpec {
+                    name: "completes".to_string().into(),
+                    description: String::new().into(),
+                    input_schema: json!({"type": "object"}),
+                },
+                state: Arc::downgrade(state),
+                sid: sid.to_string(),
+                tasks,
+            }))
+            .await;
+    }
+
+    fn tool_round(id: &str) -> crate::provider::ChatResponse {
+        crate::provider::ChatResponse {
+            prompt_usage: None,
+            text: None,
+            tool_calls: vec![crate::provider::ToolCall {
+                id: id.to_string(),
+                name: "completes".to_string(),
+                input: json!({}),
+            }],
+            stop_reason: None,
+        }
+    }
+
+    fn final_round(text: &str) -> crate::provider::ChatResponse {
+        crate::provider::ChatResponse {
+            prompt_usage: None,
+            text: Some(text.to_string()),
+            tool_calls: Vec::new(),
+            stop_reason: None,
+        }
+    }
+
+    fn texts_of(msg: &ChatMessage) -> Vec<String> {
+        msg.parts
+            .iter()
+            .filter_map(|p| match p {
+                ContentPart::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn persisted(state: &Arc<ServeState>, sid: &str) -> Vec<ChatMessage> {
+        state
+            .store_for_session(sid)
+            .load_session(sid)
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn a_completion_is_prepended_to_the_next_turn() {
+        let state = ServeState::for_test_scripted(true, vec![final_round("noted")]);
+        let sid = "bg-turn-start".to_string();
+        finished_task(&state, &sid, "scout", "found it");
+
+        run_llm_turn(
+            Arc::clone(&state),
+            sid.clone(),
+            ChatMessage::user("what now?"),
+            Arc::new(NullProgress),
+            None,
+        )
+        .await;
+
+        let msgs = persisted(&state, &sid).await;
+        let texts = texts_of(&msgs[0]);
+        assert_eq!(texts.len(), 2, "completion then the user's own text");
+        assert!(
+            texts[0].contains("[Background task bg-"),
+            "got {}",
+            texts[0]
+        );
+        assert!(texts[0].contains("found it"));
+        assert_eq!(texts[1], "what now?");
+        assert!(!state.background.has_pending_or_inbox(&sid));
+    }
+
+    #[tokio::test]
+    async fn a_completion_lands_between_rounds_beside_tool_results() {
+        let state =
+            ServeState::for_test_scripted(true, vec![tool_round("call-1"), final_round("done")]);
+        let sid = "bg-between".to_string();
+        let id = finished_task_pending(&state, &sid, "scout");
+        register_completing_tool(&state, &sid, vec![(id, "mid-turn result".to_string())]).await;
+
+        run_llm_turn(
+            Arc::clone(&state),
+            sid.clone(),
+            ChatMessage::user("go"),
+            Arc::new(NullProgress),
+            None,
+        )
+        .await;
+
+        let msgs = persisted(&state, &sid).await;
+        let result_msg = msgs
+            .iter()
+            .find(|m| {
+                m.parts
+                    .iter()
+                    .any(|p| matches!(p, ContentPart::ToolResult { .. }))
+            })
+            .expect("the tool_result message is on disk");
+        assert!(matches!(
+            result_msg.parts[0],
+            ContentPart::ToolResult { .. }
+        ));
+        let texts = texts_of(result_msg);
+        assert_eq!(texts.len(), 1);
+        assert!(texts[0].contains("mid-turn result"));
+        assert!(
+            matches!(result_msg.parts.last(), Some(ContentPart::Text(_))),
+            "the text follows the tool result"
+        );
+        // The pair is intact: repair has nothing to splice.
+        let repaired = crate::session_storage::repair_tool_pairing(msgs.clone());
+        assert_eq!(repaired.len(), msgs.len());
+        assert!(!state.background.has_pending_or_inbox(&sid));
+    }
+
+    #[tokio::test]
+    async fn two_completions_arrive_in_one_round_in_finish_order() {
+        let state =
+            ServeState::for_test_scripted(true, vec![tool_round("call-1"), final_round("done")]);
+        let sid = "bg-order".to_string();
+        let first = finished_task_pending(&state, &sid, "alpha");
+        let second = finished_task_pending(&state, &sid, "beta");
+        // Registered alpha, beta; finished beta, alpha.
+        register_completing_tool(
+            &state,
+            &sid,
+            vec![
+                (second, "beta output".to_string()),
+                (first, "alpha output".to_string()),
+            ],
+        )
+        .await;
+
+        run_llm_turn(
+            Arc::clone(&state),
+            sid.clone(),
+            ChatMessage::user("go"),
+            Arc::new(NullProgress),
+            None,
+        )
+        .await;
+
+        let msgs = persisted(&state, &sid).await;
+        let result_msg = msgs
+            .iter()
+            .find(|m| {
+                m.parts
+                    .iter()
+                    .any(|p| matches!(p, ContentPart::ToolResult { .. }))
+            })
+            .unwrap();
+        let texts = texts_of(result_msg);
+        assert_eq!(texts.len(), 2);
+        assert!(texts[0].contains("beta output"), "got {texts:?}");
+        assert!(texts[1].contains("alpha output"), "got {texts:?}");
+    }
+
+    #[tokio::test]
+    async fn a_subagents_nested_loop_delivers_nothing() {
+        let state =
+            ServeState::for_test_scripted(true, vec![tool_round("call-1"), final_round("done")]);
+        let sid = "bg-nested".to_string();
+        let id = finished_task_pending(&state, &sid, "scout");
+        register_completing_tool(&state, &sid, vec![(id, "for the parent".to_string())]).await;
+
+        let provider = state.provider_for_session(&sid).await;
+        let progress: Arc<dyn TurnHost> = Arc::new(NullProgress);
+        let specs = state.tools.specs_filtered(|_| true).await;
+        let mut history = vec![ChatMessage::user("go")];
+        TurnLoop {
+            state: &state,
+            provider: &provider,
+            system: None,
+            tool_specs: &specs,
+            progress: &progress,
+            timer_origin: None,
+            namespace: crate::config::DEFAULT_NAMESPACE_NAME.to_string(),
+            persistence: None,
+            subagent_depth: 1,
+            admin_room_profile: None,
+        }
+        .run(&mut history)
+        .await;
+
+        assert!(
+            history.iter().all(|m| texts_of(m).is_empty()
+                || m.parts
+                    .iter()
+                    .all(|p| !matches!(p, ContentPart::ToolResult { .. }))),
+            "no text rides beside a nested loop's tool results"
+        );
+        assert!(
+            state.background.has_inbox(&sid),
+            "the completion stays for the session's own loop"
+        );
     }
 
     /// A subagent runs under the parent's `Origin`, so it cannot do
