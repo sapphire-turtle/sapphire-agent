@@ -392,12 +392,24 @@ fn loading_screen(ctx: &egui::Context, default_avatar: &mut DefaultAvatar) {
                 egui::CentralPanel::default().show(ui, |ui| {
                     ui.add_space(ui.available_height() * 0.35);
                     ui.vertical_centered(|ui| {
-                        ui.heading("Downloading your character…");
+                        let flow = default_avatar.flow().clone();
+                        ui.heading(match flow {
+                            Flow::Reloading => "Loading your character…",
+                            Flow::Failed { .. } => "Couldn't download your character",
+                            _ => "Downloading your character…",
+                        });
                         ui.add_space(GAP);
-                        match default_avatar.flow().clone() {
+                        match flow {
                             Flow::Loading { received, total } => {
                                 ui.add(
                                     progress_bar(received, total).desired_width(LOADING_BAR_WIDTH),
+                                );
+                            }
+                            Flow::Reloading => {
+                                ui.add(
+                                    egui::ProgressBar::new(0.0)
+                                        .animate(true)
+                                        .desired_width(LOADING_BAR_WIDTH),
                                 );
                             }
                             Flow::Failed { message } => {
@@ -414,7 +426,7 @@ fn loading_screen(ctx: &egui::Context, default_avatar: &mut DefaultAvatar) {
                                     ui.ctx().request_repaint();
                                 }
                             }
-                            Flow::Checking | Flow::Done { .. } => {}
+                            Flow::Checking | Flow::Asking | Flow::Done { .. } => {}
                         }
                     });
                 });

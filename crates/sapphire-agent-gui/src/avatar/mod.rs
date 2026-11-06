@@ -222,6 +222,15 @@ impl Plugin for AvatarPlugin {
                     .run_if(resource_exists::<ChatBridge>)
                     .run_if(resource_exists::<SyncRequested>),
             )
+            // After the finished syncs land, so the loading screen leaves
+            // in the frame the reloaded avatar arrives.
+            .add_systems(
+                Update,
+                default_install::finish_default_reload
+                    .after(drain_sync)
+                    .before(AvatarSystems::Choose)
+                    .run_if(resource_exists::<DefaultAvatar>),
+            )
             .add_systems(
                 Update,
                 (choose_renderer, tick_state)

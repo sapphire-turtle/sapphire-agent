@@ -12,6 +12,7 @@ use sapphire_agent_core::{ChatClient, DefaultAvatarAnswer, InstallProgress};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 
+use super::AvatarAssets;
 use crate::Waker;
 use crate::chat::{ChatBridge, SyncRequested};
 
@@ -20,8 +21,14 @@ use crate::chat::{ChatBridge, SyncRequested};
 pub(crate) enum Flow {
     /// Connected, the manifest not yet checked.
     Checking,
+    /// No avatar: the agent is asked, and has not said yet whether it will
+    /// download one. The normal screen stays, so an answer that downloads
+    /// nothing never flashes the loading screen.
+    Asking,
     /// The agent is downloading the default avatar.
     Loading { received: u64, total: Option<u64> },
+    /// Installed; the avatar is syncing to the GUI before the normal screen.
+    Reloading,
     /// The download failed; the screen stays blocked until retry or continue.
     Failed { message: String },
     /// The normal screen. `offer`: the Character page shows "Get the default avatar".
@@ -58,28 +65,41 @@ impl Flow {
             *self = Flow::Done { offer: false };
             None
         } else {
-            self.start_loading(true)
+            *self = Flow::Asking;
+            Some(Request { auto: true })
         }
     }
 
-    /// Download progress. Applies only while `Loading`, so a stale one after
-    /// the answer cannot reopen the loading screen.
+    /// Download progress. The first one while `Asking` means the agent is
+    /// downloading, and blocks the screen. Applies only while `Asking` or
+    /// `Loading`, so a stale one after the answer cannot reopen the
+    /// loading screen.
     pub(crate) fn progress(&mut self, p: InstallProgress) {
-        if let Flow::Loading { received, total } = self {
-            *received = p.received;
-            *total = p.total;
+        if matches!(self, Flow::Asking | Flow::Loading { .. }) {
+            *self = Flow::Loading {
+                received: p.received,
+                total: p.total,
+            };
         }
     }
 
     /// The agent answered (or the call failed). Returns whether to resync the
-    /// avatar now. Applies only while `Loading`.
+    /// avatar now. Applies only while `Asking` or `Loading`.
     pub(crate) fn answered(&mut self, a: Result<DefaultAvatarAnswer, String>) -> bool {
-        if !matches!(self, Flow::Loading { .. }) {
-            return false;
-        }
+        let asking = match self {
+            Flow::Asking => true,
+            Flow::Loading { .. } => false,
+            _ => return false,
+        };
         match a {
-            Ok(DefaultAvatarAnswer::Installed | DefaultAvatarAnswer::AlreadyPresent) => {
+            // Nothing was downloaded, so nothing new will load: no reason
+            // to block. The resync is only for a race with another client.
+            Ok(DefaultAvatarAnswer::AlreadyPresent) if asking => {
                 *self = Flow::Done { offer: false };
+                true
+            }
+            Ok(DefaultAvatarAnswer::Installed | DefaultAvatarAnswer::AlreadyPresent) => {
+                *self = Flow::Reloading;
                 true
             }
             Ok(DefaultAvatarAnswer::NeedsConfirmation) => {
@@ -94,6 +114,14 @@ impl Flow {
                 *self = Flow::Failed { message };
                 false
             }
+        }
+    }
+
+    /// The resync after the install finished (see [`resync_finished`]).
+    /// Applies only while `Reloading`.
+    pub(crate) fn reloaded(&mut self) {
+        if *self == Flow::Reloading {
+            *self = Flow::Done { offer: false };
         }
     }
 
@@ -124,8 +152,18 @@ impl Flow {
 
     /// Whether the loading or failure screen replaces the normal one.
     pub(crate) fn blocks_screen(&self) -> bool {
-        matches!(self, Flow::Loading { .. } | Flow::Failed { .. })
+        matches!(
+            self,
+            Flow::Loading { .. } | Flow::Reloading | Flow::Failed { .. }
+        )
     }
+}
+
+/// Whether the avatar resync asked for at the answer has finished: the
+/// loaded avatar changed since `captured` (its generation then), or a sync
+/// failed, which ends the wait too rather than block the GUI.
+fn resync_finished(captured: u64, current: u64, error: bool) -> bool {
+    current != captured || error
 }
 
 /// Whether `live` is a new connection rather than the one `stored` belongs
@@ -157,6 +195,9 @@ pub(crate) struct DefaultAvatar {
     client: Option<Arc<ChatClient>>,
     /// Bumped with each new connection.
     generation: u64,
+    /// [`AvatarAssets::generation`] when the install was answered, for
+    /// [`Flow::Reloading`] to wait past.
+    reload_from: u64,
     runtime: Handle,
     waker: Waker,
     tx: mpsc::UnboundedSender<(u64, Event)>,
@@ -170,6 +211,7 @@ impl DefaultAvatar {
             flow: Flow::new(),
             client: None,
             generation: 0,
+            reload_from: 0,
             runtime,
             waker,
             tx,
@@ -253,8 +295,9 @@ impl DefaultAvatar {
     }
 
     /// Folds the events of this connection into the flow. Returns whether
-    /// to resync the avatar.
-    fn drain(&mut self) -> bool {
+    /// to resync the avatar. `assets_generation` is the avatar's now, kept
+    /// for the reload to wait past.
+    fn drain(&mut self, assets_generation: u64) -> bool {
         let events: Vec<_> = match self.rx.lock() {
             Ok(mut rx) => std::iter::from_fn(|| rx.try_recv().ok()).collect(),
             Err(_) => return false,
@@ -275,7 +318,10 @@ impl DefaultAvatar {
                     if let Err(e) = &answer {
                         tracing::warn!("cannot install the default avatar: {e}");
                     }
-                    resync |= self.flow.answered(answer);
+                    if self.flow.answered(answer) {
+                        self.reload_from = assets_generation;
+                        resync = true;
+                    }
                 }
             }
         }
@@ -288,6 +334,7 @@ impl DefaultAvatar {
 /// the default avatar is installed.
 pub(crate) fn drive_default_avatar(
     bridge: Res<ChatBridge>,
+    assets: Option<Res<AvatarAssets>>,
     mut default_avatar: ResMut<DefaultAvatar>,
     mut sync: ResMut<SyncRequested>,
 ) {
@@ -297,8 +344,27 @@ pub(crate) fn drive_default_avatar(
     {
         default_avatar.connect(client);
     }
-    if default_avatar.drain() {
+    if default_avatar.drain(assets.map_or(0, |a| a.generation)) {
         sync.0 = true;
+    }
+}
+
+/// Every frame, after the finished syncs are folded in: leaves the loading
+/// screen once the resync after the install has finished, in the frame it
+/// lands.
+pub(crate) fn finish_default_reload(
+    assets: Option<Res<AvatarAssets>>,
+    mut default_avatar: ResMut<DefaultAvatar>,
+) {
+    if *default_avatar.flow() != Flow::Reloading {
+        return;
+    }
+    // Without the assets nothing will reload; do not wait for it.
+    let finished = assets.is_none_or(|a| {
+        resync_finished(default_avatar.reload_from, a.generation, a.error.is_some())
+    });
+    if finished {
+        default_avatar.flow.reloaded();
     }
 }
 
@@ -306,9 +372,20 @@ pub(crate) fn drive_default_avatar(
 mod tests {
     use super::*;
 
-    fn loading() -> Flow {
+    /// Checked, no avatar: asked the agent, no answer yet.
+    fn asking() -> Flow {
         let mut f = Flow::new();
         f.checked(false);
+        f
+    }
+
+    /// Asked, and the agent started downloading.
+    fn loading() -> Flow {
+        let mut f = asking();
+        f.progress(InstallProgress {
+            received: 0,
+            total: None,
+        });
         f
     }
 
@@ -321,19 +398,85 @@ mod tests {
     }
 
     #[test]
-    fn no_avatar_loads_automatically() {
+    fn no_avatar_asks_without_blocking() {
         let mut f = Flow::new();
         assert_eq!(f.checked(false), Some(Request { auto: true }));
+        assert_eq!(f, Flow::Asking);
+        assert!(!f.blocks_screen());
+    }
+
+    #[test]
+    fn the_first_progress_blocks() {
+        let mut f = asking();
+        f.progress(InstallProgress {
+            received: 0,
+            total: None,
+        });
+        assert_eq!(
+            f,
+            Flow::Loading {
+                received: 0,
+                total: None
+            }
+        );
         assert!(f.blocks_screen());
     }
 
     #[test]
-    fn installed_resyncs_and_unblocks() {
+    fn non_download_answers_from_asking_never_block() {
+        let mut f = asking();
+        assert!(!f.answered(Ok(DefaultAvatarAnswer::Unavailable)));
+        assert_eq!(f, Flow::Done { offer: false });
+        assert!(!f.blocks_screen());
+        let mut f = asking();
+        assert!(!f.answered(Ok(DefaultAvatarAnswer::NeedsConfirmation)));
+        assert_eq!(f, Flow::Done { offer: true });
+        assert!(!f.blocks_screen());
+        let mut f = asking();
+        assert!(f.answered(Ok(DefaultAvatarAnswer::AlreadyPresent)));
+        assert_eq!(f, Flow::Done { offer: false });
+        assert!(!f.blocks_screen());
+    }
+
+    #[test]
+    fn an_error_from_asking_fails() {
+        let mut f = asking();
+        assert!(!f.answered(Err("offline".into())));
+        assert_eq!(
+            f,
+            Flow::Failed {
+                message: "offline".into()
+            }
+        );
+        assert!(f.blocks_screen());
+    }
+
+    #[test]
+    fn installed_reloads_before_unblocking() {
         let mut f = loading();
         assert!(f.answered(Ok(DefaultAvatarAnswer::Installed)));
+        assert_eq!(f, Flow::Reloading);
+        assert!(f.blocks_screen());
+        f.reloaded();
         assert_eq!(f, Flow::Done { offer: false });
+        assert!(!f.blocks_screen());
         let mut g = loading();
         assert!(g.answered(Ok(DefaultAvatarAnswer::AlreadyPresent)));
+        assert_eq!(g, Flow::Reloading);
+    }
+
+    #[test]
+    fn reloaded_only_while_reloading() {
+        let mut f = loading();
+        f.reloaded();
+        assert!(matches!(f, Flow::Loading { .. }));
+    }
+
+    #[test]
+    fn the_resync_finishes_on_a_new_generation_or_an_error() {
+        assert!(!resync_finished(3, 3, false));
+        assert!(resync_finished(3, 4, false));
+        assert!(resync_finished(3, 3, true));
     }
 
     #[test]
