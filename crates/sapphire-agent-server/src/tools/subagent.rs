@@ -85,6 +85,7 @@ use crate::provider::{ChatMessage, ToolSpec};
 use crate::tools::{Tool, ToolKind};
 use anyhow::Context;
 use async_trait::async_trait;
+use futures_util::FutureExt;
 use serde_json::json;
 use std::sync::Arc;
 use tracing::{debug, warn};
@@ -963,28 +964,37 @@ impl SubagentTool {
         let task_id = id.clone();
         let task_namespace = namespace.clone();
         let run = async move {
-            let result = tool
-                .run_and_store(
-                    &task_ctx,
-                    &def,
-                    &handle,
-                    created_at,
-                    &mut history,
-                    over_cap_reason,
-                    progress,
-                    task_namespace,
-                )
-                .await;
+            // A panic in a tool or the provider must still complete the
+            // task, or it would hold a cap slot and keep the session
+            // waiting on it until a restart. Caught inside the spawned
+            // task, so the attached abort handle still targets it.
+            let result = std::panic::AssertUnwindSafe(tool.run_and_store(
+                &task_ctx,
+                &def,
+                &handle,
+                created_at,
+                &mut history,
+                over_cap_reason,
+                progress,
+                task_namespace,
+            ))
+            .catch_unwind()
+            .await;
             // Free the handle before the completion lands, so a resume
             // that the completion prompts is not refused as busy.
             drop(guard);
             let outcome = match result {
-                Ok(text) => crate::background::Outcome::Finished {
+                Ok(Ok(text)) => crate::background::Outcome::Finished {
                     text,
-                    refused: std::mem::take(&mut *refused.lock().unwrap()),
+                    refused: std::mem::take(
+                        &mut *refused.lock().unwrap_or_else(|e| e.into_inner()),
+                    ),
                 },
-                Err(e) => crate::background::Outcome::Failed {
+                Ok(Err(e)) => crate::background::Outcome::Failed {
                     message: e.to_string(),
+                },
+                Err(payload) => crate::background::Outcome::Failed {
+                    message: panic_message(payload.as_ref()),
                 },
             };
             // `false` when the task was cancelled meanwhile: the
@@ -1346,6 +1356,19 @@ fn background_label(agent: &str, prompt: &str) -> String {
         ""
     };
     format!("subagent \"{agent}\": {short}{more}")
+}
+
+/// What a background child's caught panic is reported as: the payload
+/// when it is the usual `&str` or `String`, else just the fact.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    let detail = payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned());
+    match detail {
+        Some(d) => format!("subagent panicked: {d}"),
+        None => "subagent panicked".to_string(),
+    }
 }
 
 /// `fut` with the task-locals a tool call reads, re-scoped for a spawned
@@ -3966,5 +3989,63 @@ mod tests {
             crate::tools::policy::Origin::Acp(crate::tools::policy::SessionMode::Default)
         );
         assert!(detached.acp_client().is_none());
+    }
+
+    /// A provider whose `chat` panics, standing in for a panicking tool
+    /// or provider inside a background child's turn.
+    struct PanickingProvider;
+
+    #[async_trait]
+    impl crate::provider::Provider for PanickingProvider {
+        fn name(&self) -> &str {
+            "panicking"
+        }
+
+        async fn chat(
+            &self,
+            _system: Option<&str>,
+            _messages: &[ChatMessage],
+            _tools: Option<&[ToolSpec]>,
+        ) -> anyhow::Result<crate::provider::ChatResponse> {
+            panic!("boom");
+        }
+    }
+
+    /// A panic inside the child still completes its task: as `Failed`,
+    /// with the panic's message, the handle released and the session's
+    /// registry able to drain to empty. Without it the task would hold a
+    /// cap slot and keep a suspended autonomous session waiting forever.
+    #[tokio::test]
+    async fn a_panicking_background_child_completes_as_failed() {
+        let state = crate::serve::ServeState::for_test(false);
+        let tool = std::sync::Arc::new(SubagentTool::new(defs(), true));
+        let started = crate::serve::scope_turn_context(
+            background_context(
+                std::sync::Arc::clone(&state),
+                std::sync::Arc::new(PanickingProvider),
+                Vec::new(),
+                std::sync::Arc::new(crate::serve::NullProgress),
+                Some("s-bg-panic"),
+                0,
+            ),
+            Tool::execute(&tool, &bg_input("reviewer", "go")),
+        )
+        .await
+        .unwrap();
+        let handle = started_handle(&started);
+
+        let done = next_completion(&state, "s-bg-panic").await;
+        match done.outcome {
+            crate::background::Outcome::Failed { message } => {
+                assert_eq!(message, "subagent panicked: boom")
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        state.background.commit_delivery("s-bg-panic");
+        assert!(!state.background.has_pending_or_inbox("s-bg-panic"));
+        assert!(
+            !tool.busy_handles.lock().unwrap().contains(&handle),
+            "the panicked child's handle is released"
+        );
     }
 }
