@@ -870,6 +870,34 @@ pub struct ToolsConfig {
     /// them. See [`AdminToolsConfig`].
     #[serde(default)]
     pub admin: AdminToolsConfig,
+    /// Background tasks (`background_task`). See [`BackgroundConfig`].
+    #[serde(default)]
+    pub background: BackgroundConfig,
+}
+
+/// Limits on background tasks, which run a subagent while its parent's turn
+/// carries on and deliver the result into a later turn.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct BackgroundConfig {
+    /// How many background tasks one session may have running at once. A
+    /// further one is refused with an error naming the ones already held, so
+    /// the model can cancel or wait. `0` disables background execution.
+    #[serde(default = "BackgroundConfig::default_max_per_session")]
+    pub max_per_session: usize,
+}
+
+impl BackgroundConfig {
+    fn default_max_per_session() -> usize {
+        4
+    }
+}
+
+impl Default for BackgroundConfig {
+    fn default() -> Self {
+        Self {
+            max_per_session: Self::default_max_per_session(),
+        }
+    }
 }
 
 /// Limits on one delegated subagent turn, as a whole.

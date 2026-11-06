@@ -21,6 +21,7 @@ mod app_server;
 mod autonomous;
 mod autonomous_config;
 mod avatar_store;
+mod background;
 mod channel;
 mod cli_init;
 mod config;
