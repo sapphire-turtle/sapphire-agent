@@ -2035,8 +2035,14 @@ pub(crate) trait TurnHost: Send + Sync {
     /// `UserDeclined` by default, because every host that asks either
     /// got a no or treats a failed question as one. A host that never
     /// asks says so instead, so the model does not read a refusal
-    /// nobody made as the user's decision.
-    fn declined_refusal(&self) -> crate::tools::policy::Refusal {
+    /// nobody made as the user's decision. `approval` is what `approve`
+    /// returned: a host that never asks still passes on a standing
+    /// "always reject", which *was* the user's decision.
+    fn declined_refusal(
+        &self,
+        approval: crate::tools::policy::Approval,
+    ) -> crate::tools::policy::Refusal {
+        let _ = approval;
         crate::tools::policy::Refusal::UserDeclined
     }
 
@@ -2047,8 +2053,6 @@ pub(crate) trait TurnHost: Send + Sync {
     /// Default no-op: the report reaches the model either way — it is
     /// delivered into the session's next turn — so a host with nowhere
     /// to show it loses nothing the agent needs.
-    // Nothing calls this until background subagents are started.
-    #[allow(dead_code)]
     async fn background_finished(&self, text: &str) {
         let _ = text;
     }
@@ -2742,12 +2746,13 @@ impl TurnLoop<'_> {
                                     Some(refusal_message(&call.name, Refusal::Unavailable))
                                 }
                                 Decision::Ask => {
-                                    if progress.approve(call, kind).await.allows() {
+                                    let approval = progress.approve(call, kind).await;
+                                    if approval.allows() {
                                         None
                                     } else {
                                         Some(refusal_message(
                                             &call.name,
-                                            progress.declined_refusal(),
+                                            progress.declined_refusal(approval),
                                         ))
                                     }
                                 }
@@ -4905,16 +4910,17 @@ mod tests {
         state.tools.register_tool(Box::new(risky)).await;
         state
             .tools
-            .register_tool(Box::new(crate::tools::subagent::SubagentTool::new(vec![
-                crate::agents::AgentDef {
+            .register_tool(Box::new(crate::tools::subagent::SubagentTool::new(
+                vec![crate::agents::AgentDef {
                     name: "delegator".to_string(),
                     description: "Delegates a risky call.".to_string(),
                     tools: Some(vec!["risky".to_string()]),
                     subagents: None,
                     prompt: "You are a delegator.".to_string(),
                     profile: None,
-                },
-            ])))
+                }],
+                false,
+            )))
             .await;
 
         let outcome = run_llm_turn(
@@ -5095,16 +5101,17 @@ mod tests {
 
         state
             .tools
-            .register_tool(Box::new(crate::tools::subagent::SubagentTool::new(vec![
-                crate::agents::AgentDef {
+            .register_tool(Box::new(crate::tools::subagent::SubagentTool::new(
+                vec![crate::agents::AgentDef {
                     name: "delegator".to_string(),
                     description: "Delegates.".to_string(),
                     tools: None,
                     subagents: None,
                     prompt: "You are a delegator.".to_string(),
                     profile: None,
-                },
-            ])))
+                }],
+                false,
+            )))
             .await;
 
         let outcome = run_llm_turn(
@@ -5195,16 +5202,17 @@ mod tests {
 
         state
             .tools
-            .register_tool(Box::new(crate::tools::subagent::SubagentTool::new(vec![
-                crate::agents::AgentDef {
+            .register_tool(Box::new(crate::tools::subagent::SubagentTool::new(
+                vec![crate::agents::AgentDef {
                     name: "delegator".to_string(),
                     description: "Delegates.".to_string(),
                     tools: None,
                     subagents: None,
                     prompt: "You are a delegator.".to_string(),
                     profile: None,
-                },
-            ])))
+                }],
+                false,
+            )))
             .await;
 
         let outcome = run_llm_turn(
@@ -5284,16 +5292,17 @@ mod tests {
         state.tools.register_tool(Box::new(risky)).await;
         state
             .tools
-            .register_tool(Box::new(crate::tools::subagent::SubagentTool::new(vec![
-                crate::agents::AgentDef {
+            .register_tool(Box::new(crate::tools::subagent::SubagentTool::new(
+                vec![crate::agents::AgentDef {
                     name: "delegator".to_string(),
                     description: "Delegates, but only echoes.".to_string(),
                     tools: Some(vec!["echo".to_string()]),
                     subagents: None,
                     prompt: "You are a delegator.".to_string(),
                     profile: None,
-                },
-            ])))
+                }],
+                false,
+            )))
             .await;
 
         let outcome = run_llm_turn(
@@ -5477,16 +5486,17 @@ mod tests {
 
         state
             .tools
-            .register_tool(Box::new(crate::tools::subagent::SubagentTool::new(vec![
-                crate::agents::AgentDef {
+            .register_tool(Box::new(crate::tools::subagent::SubagentTool::new(
+                vec![crate::agents::AgentDef {
                     name: "investigator".to_string(),
                     description: "Investigates something.".to_string(),
                     tools: Some(vec!["echo".to_string()]),
                     subagents: None,
                     prompt: "You are an investigator.".to_string(),
                     profile: None,
-                },
-            ])))
+                }],
+                false,
+            )))
             .await;
 
         // A workspace file the *parent's* system prompt is built from
@@ -6055,16 +6065,17 @@ mod tests {
         );
         state
             .tools
-            .register_tool(Box::new(crate::tools::subagent::SubagentTool::new(vec![
-                crate::agents::AgentDef {
+            .register_tool(Box::new(crate::tools::subagent::SubagentTool::new(
+                vec![crate::agents::AgentDef {
                     name: "delegator".to_string(),
                     description: "Delegates.".to_string(),
                     tools: None,
                     subagents: None,
                     prompt: "You are a delegator.".to_string(),
                     profile: None,
-                },
-            ])))
+                }],
+                false,
+            )))
             .await;
 
         let (tx, mut rx) = mpsc::channel(16);

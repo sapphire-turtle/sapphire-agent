@@ -610,7 +610,10 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
             // can create a definition while the process is running. `Arc` rather
             // than a bare `Box` because `agent_config` holds a `Weak` to it —
             // same shape `SkillTool` uses.
-            let subagent = Arc::new(tools::subagent::SubagentTool::new(agent_defs));
+            let subagent = Arc::new(tools::subagent::SubagentTool::new(
+                agent_defs,
+                config.tools.background.max_per_session > 0,
+            ));
             if !no_agent_defs || config.config_tools_enabled() {
                 tool_set
                     .register_tool(Box::new(Arc::clone(&subagent)))
