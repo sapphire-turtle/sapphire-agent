@@ -619,6 +619,12 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
                     .register_tool(Box::new(Arc::clone(&subagent)))
                     .await;
             }
+            // Only when background tasks can exist at all.
+            if config.tools.background.max_per_session > 0 {
+                tool_set
+                    .register_tool(Box::new(tools::background_tools::BackgroundTaskTool::new()))
+                    .await;
+            }
 
             // ── Skills ────────────────────────────────────────────────────
             // Registered unconditionally: unlike subagents there is
