@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0](https://github.com/sapphire-turtle/sapphire-agent/compare/v0.12.1...v0.13.0) - 2026-11-06
+
+### Other
+
+- [**breaking**] *(deps)* Sapphire-framework 0.28, corundum-framework 0.11
+
+
+
 ### Changed
 
 - [**breaking**] Built on sapphire-framework 0.28 and corundum-framework 0.11: `update` installs only a release file signed with sapphire-turtle's key, and refuses one without a valid signature (sapphire-turtle/sapphire-framework#402)

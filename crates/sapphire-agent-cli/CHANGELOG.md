@@ -10,6 +10,14 @@ Changes up to `0.8.0`, when this crate was a binary of its own, are recorded in
 
 ## [Unreleased]
 
+## [0.13.0](https://github.com/sapphire-turtle/sapphire-agent/compare/sapphire-agent-cli-v0.12.1...sapphire-agent-cli-v0.13.0) - 2026-11-06
+
+### Other
+
+- [**breaking**] *(deps)* Sapphire-framework 0.28, corundum-framework 0.11
+
+
+
 ## [0.12.1](https://github.com/sapphire-turtle/sapphire-agent/compare/sapphire-agent-cli-v0.12.0...sapphire-agent-cli-v0.12.1) - 2026-11-04
 
 ### Other
