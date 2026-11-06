@@ -223,6 +223,14 @@ pub struct AutonomousLoop {
     /// `cooldown_days = 0` from meaning "a new session every cycle" within
     /// one run (design decision 12).
     not_before: HashMap<String, DateTime<Utc>>,
+    /// Session id → turns this process has run in it.
+    ///
+    /// A floor under `turns_spent`, which counts only turns whose message
+    /// reached the store: when the store cannot be written, the count on
+    /// disk never advances, and a session the model keeps suspending with
+    /// `WAIT` would otherwise be resumed (and spend a turn) every cycle
+    /// without limit. Dropped when the session closes.
+    turns_run: HashMap<String, usize>,
     /// Which host runs autonomous sessions once the workspace is synced:
     /// the primary device only (`placement`).
     placement: Arc<crate::placement::Placement>,
@@ -248,6 +256,7 @@ impl AutonomousLoop {
             idle,
             poll,
             not_before: HashMap::new(),
+            turns_run: HashMap::new(),
             placement: crate::placement::Placement::alone(),
             #[cfg(test)]
             on_session_created: None,
@@ -377,7 +386,8 @@ impl AutonomousLoop {
         let mut send_body = resume.is_none();
         let (session_id, mut turns) = match resume {
             Some(sid) => {
-                let spent = turns_spent(store, &sid, &task.name);
+                let run = self.turns_run.get(&sid).copied().unwrap_or(0);
+                let spent = turns_spent(store, &sid, &task.name).max(run);
                 (sid, spent)
             }
             None => {
@@ -432,6 +442,7 @@ impl AutonomousLoop {
             .await;
 
             turns += 1;
+            self.turns_run.insert(session_id.clone(), turns);
             let said_done = outcome.text.as_deref().is_some_and(|t| t.trim() == "DONE");
             let said_wait = outcome.text.as_deref().is_some_and(|t| t.trim() == "WAIT");
             // `text == None` means the provider failed or the tool-round
@@ -446,6 +457,7 @@ impl AutonomousLoop {
             // it still had running in the background: nothing is left to
             // deliver those results to.
             if said_done || spent || capped {
+                self.turns_run.remove(&session_id);
                 self.state.background.cancel_all(&session_id);
                 if let Err(e) = store.close_session(&session_id) {
                     warn!("autonomous: cannot close {}: {e}", task.name);
@@ -1076,6 +1088,54 @@ mod tests {
                 .iter()
                 .any(|t| t.contains(&format!("{id} was interrupted by a restart"))),
             "the interrupted task is delivered: {resumed:?}"
+        );
+    }
+
+    /// A session whose store cannot be written does not record its turns,
+    /// so `turns_spent` never advances and the undelivered completion
+    /// stays in the inbox. A model that keeps replying `WAIT` would then be
+    /// resumed, and spend a provider call, on every cycle. The turns this
+    /// process ran still count: the session is capped at `max_turns`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unwritable_session_is_still_capped_at_max_turns() {
+        use std::os::unix::fs::PermissionsExt;
+        let (state, log) = crate::serve::ServeState::for_test_scripted_with_log(
+            false,
+            (0..8).map(|_| response("WAIT")).collect(),
+        );
+        write_task(&state, "a", "max_turns: 3");
+        let (mut lp, seen) = loop_registering(&state, "a");
+        lp.run_cycle().await.unwrap();
+        assert_eq!(log.calls().len(), 1, "suspended after the first WAIT");
+        let (sid, id) = seen.lock().unwrap().clone().unwrap();
+
+        let dir = state
+            .autonomous_session_store
+            .absolute_path_for(&sid)
+            .unwrap();
+        assert!(dir.is_dir(), "a session is a directory of entries");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Root writes through the mode bits; the scenario cannot be built.
+        if std::fs::write(dir.join("probe"), "").is_ok() {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        assert!(state.background.complete(&sid, &id, finished()));
+
+        for _ in 0..6 {
+            lp.run_cycle().await.unwrap();
+        }
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(
+            log.calls().len(),
+            3,
+            "max_turns provider calls, not one per cycle"
+        );
+        assert!(
+            !state.background.has_pending_or_inbox(&sid),
+            "the capped session's registry is torn down"
         );
     }
 }
