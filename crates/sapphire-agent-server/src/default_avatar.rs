@@ -1,8 +1,6 @@
 //! Installer for the default avatar pack: safe extraction of the release
 //! archive into `<workspace>/avatar/`.
 
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -229,7 +227,6 @@ pub(crate) struct AvatarRelease<'a> {
 /// The default avatar pack installed on first run; `None` until a release
 /// exists.
 // FIXME(#340): the first release's URL and `.sha256`
-#[cfg_attr(test, allow(dead_code))] // first used by the first-run hook
 pub(crate) const INITIAL: Option<AvatarRelease<'static>> = None;
 
 /// Where downloaded archives and their extraction are staged.
@@ -337,6 +334,24 @@ pub(crate) fn auto_allowed(sync: SyncView) -> bool {
 #[async_trait::async_trait]
 pub(crate) trait SyncProbe: Send + Sync {
     async fn view(&self) -> SyncView;
+}
+
+/// Reads the sync setup from the framework's runtime.
+pub(crate) struct RuntimeProbe {
+    pub runtime: Arc<sapphire_framework::server::SyncRuntime>,
+    pub root: PathBuf,
+}
+
+#[async_trait::async_trait]
+impl SyncProbe for RuntimeProbe {
+    async fn view(&self) -> SyncView {
+        let s = self.runtime.status(&self.root).await;
+        SyncView {
+            enabled: s.enabled,
+            peers: s.peers,
+            bridge_available: s.bridge_available,
+        }
+    }
 }
 
 /// Lets an event through at most once per interval.
@@ -469,7 +484,7 @@ impl DefaultInstaller {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     pub(crate) enum Kind {
@@ -829,7 +844,10 @@ mod tests {
     }
 
     /// Serve `body` to every request, counting them in `hits`.
-    fn serve_counting(body: Vec<u8>, hits: Arc<std::sync::atomic::AtomicUsize>) -> String {
+    pub(crate) fn serve_counting(
+        body: Vec<u8>,
+        hits: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> String {
         use std::io::Write;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -857,7 +875,7 @@ mod tests {
         format!("http://127.0.0.1:{port}/a.tar")
     }
 
-    struct FixedProbe(Option<SyncView>);
+    pub(crate) struct FixedProbe(pub Option<SyncView>);
 
     #[async_trait::async_trait]
     impl SyncProbe for FixedProbe {
@@ -866,7 +884,7 @@ mod tests {
         }
     }
 
-    fn view(enabled: bool, peers: usize, bridge_available: bool) -> SyncView {
+    pub(crate) fn view(enabled: bool, peers: usize, bridge_available: bool) -> SyncView {
         SyncView {
             enabled,
             peers,
@@ -879,7 +897,7 @@ mod tests {
     }
 
     /// A release for `url` whose hash matches `sha256`; leaked for `'static`.
-    fn release_for(url: String, sha256: &str) -> AvatarRelease<'static> {
+    pub(crate) fn release_for(url: String, sha256: &str) -> AvatarRelease<'static> {
         AvatarRelease {
             id: "test-installer",
             version: 1,
@@ -889,7 +907,7 @@ mod tests {
     }
 
     /// A served good pack: (tempdir, workspace, release, hits, tar length).
-    fn served() -> (
+    pub(crate) fn served() -> (
         tempfile::TempDir,
         PathBuf,
         AvatarRelease<'static>,

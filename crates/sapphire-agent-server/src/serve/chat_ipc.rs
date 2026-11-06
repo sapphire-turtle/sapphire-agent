@@ -35,6 +35,7 @@ use super::{
     spawn_session_title,
 };
 use crate::avatar_store::AvatarStore;
+use crate::default_avatar::DefaultInstaller;
 use crate::provider::ChatMessage;
 use crate::tools::avatar_tools::{AvatarSink, AvatarTurn};
 
@@ -49,6 +50,8 @@ pub struct ChatTunnel {
     state: Arc<OnceLock<Arc<ServeState>>>,
     /// The avatar's files, opened with the agent in [`attach`](Self::attach).
     avatar: Arc<OnceLock<Arc<AvatarStore>>>,
+    /// Installs the default avatar; filled once the agent is built.
+    default_avatar: Arc<OnceLock<Arc<DefaultInstaller>>>,
 }
 
 #[derive(Deserialize)]
@@ -160,6 +163,13 @@ impl ChatTunnel {
         let _ = self.avatar.set(Arc::new(store));
     }
 
+    /// Start answering `avatar.install_default` with `installer`.
+    pub fn attach_default_avatar(&self, installer: DefaultInstaller) {
+        if self.default_avatar.set(Arc::new(installer)).is_err() {
+            warn!("chat tunnel: default avatar attached twice; keeping the first");
+        }
+    }
+
     /// Serve the avatar from `store` instead of the workspace's folder.
     #[cfg(test)]
     pub(super) fn attach_avatar_for_test(&self, store: AvatarStore) {
@@ -172,7 +182,11 @@ impl ChatTunnel {
         let send = self.clone();
         let history = self.clone();
         let sessions = self.clone();
-        let router = super::avatar_ipc::register(router, Arc::clone(&self.avatar));
+        let router = super::avatar_ipc::register(
+            router,
+            Arc::clone(&self.avatar),
+            Arc::clone(&self.default_avatar),
+        );
         router
             .method(OPEN, move |ctx| {
                 let tunnel = open.clone();
