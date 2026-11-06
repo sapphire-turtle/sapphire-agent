@@ -189,6 +189,12 @@ impl BackgroundTasks {
     fn persist(&self, session: &str, s: &SessionTasks) {
         let Some(dir) = &self.dir else { return };
         if check_file_stem(session).is_err() {
+            // A2A session ids carry client-supplied context ids, so this
+            // can happen; say so rather than lose restart safety silently.
+            warn!(
+                "background tasks: session id {session:?} is not a safe file name; \
+                 its state will not survive a restart"
+            );
             return;
         }
         let path = dir.join(format!("{session}.json"));
