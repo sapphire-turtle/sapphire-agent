@@ -153,6 +153,9 @@ pub struct ServeState {
     /// aborting startup — a resumed subagent falls back to one-shot
     /// rather than the process failing to start.
     pub(crate) subagent_cache: Option<Arc<SubagentCache>>,
+    /// Background tasks started by sessions and their undelivered results.
+    #[allow(dead_code)] // Read once the subagent tool and the turn loop use it (Tasks 3-7).
+    pub(crate) background: Arc<crate::background::BackgroundTasks>,
     /// Terminals the model started and has not cleaned up, per agent
     /// session id.
     ///
@@ -192,6 +195,7 @@ impl ServeState {
         device_auth: Arc<crate::device_auth::DeviceAuth>,
         acp_session_store: Arc<AcpSessionStore>,
         subagent_cache: Option<Arc<SubagentCache>>,
+        background: Arc<crate::background::BackgroundTasks>,
     ) -> Self {
         Self {
             config,
@@ -220,6 +224,7 @@ impl ServeState {
             acp_session_store,
             acp_sessions: tokio::sync::Mutex::new(HashSet::new()),
             subagent_cache,
+            background,
             acp_terminals: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
@@ -3991,6 +3996,7 @@ rooms    = []
             acp_session_store,
             acp_sessions: Default::default(),
             subagent_cache,
+            background: crate::background::BackgroundTasks::in_memory(4),
             acp_terminals: Default::default(),
         })
     }

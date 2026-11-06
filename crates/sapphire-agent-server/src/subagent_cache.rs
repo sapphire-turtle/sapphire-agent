@@ -38,6 +38,52 @@ pub struct StoredChild {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Reserved DOS device names. Matched case-insensitively against the
+/// whole handle, because Windows treats `CON`, `CON.txt`, `con`, etc.
+/// as the same reserved device regardless of case or extension, for
+/// any path that isn't `\\?\`-prefixed — an allow-listed charset
+/// alone doesn't exclude these, since every character in `"CON"` is
+/// an ordinary ASCII letter. Unlike the open-ended "Windows filename
+/// quirks" this guard would otherwise have to keep growing to cover,
+/// this is the complete, closed, decades-stable set Win32 documents —
+/// there is nothing left to discover here, which is what makes an
+/// explicit list safe.
+const RESERVED_WINDOWS_NAMES: &[&str] = &[
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// Subagent handles reach here from tool-call arguments, so they are
+/// not trusted to be filenames.
+///
+/// Allow-listed by charset rather than deny-listed by pattern: a
+/// handle is expected to be a short generated id, so requiring ASCII
+/// alphanumerics, `-`, and `_` costs nothing and closes every
+/// open-ended unsafe case in one pass — traversal (`..`, `/`, `\`),
+/// absolute and drive-relative paths, and the trailing dots/spaces
+/// Windows silently strips (making `"foo."` and `"foo"` collide).
+/// That charset does *not* exclude reserved DOS device names on its
+/// own (`"CON"` is three ordinary letters), so those get their own
+/// check against the fixed, complete list above — a closed
+/// enumeration, not the kind of open-ended deny-list that keeps
+/// needing another entry.
+///
+/// Shared with the background-task store, whose files are named by session id.
+pub(crate) fn check_file_stem(s: &str) -> Result<()> {
+    let is_reserved = RESERVED_WINDOWS_NAMES
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(s));
+    if s.is_empty()
+        || is_reserved
+        || !s
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        bail!("'{s}' is not usable as a cache filename");
+    }
+    Ok(())
+}
+
 pub struct SubagentCache {
     dir: PathBuf,
     /// Cap on the serialized `history` size, in bytes. `put` refuses
@@ -58,47 +104,11 @@ impl SubagentCache {
         dirs::cache_dir().map(|d| d.join("sapphire-agent").join("subagents"))
     }
 
-    /// Reserved DOS device names. Matched case-insensitively against the
-    /// whole handle, because Windows treats `CON`, `CON.txt`, `con`, etc.
-    /// as the same reserved device regardless of case or extension, for
-    /// any path that isn't `\\?\`-prefixed — an allow-listed charset
-    /// alone doesn't exclude these, since every character in `"CON"` is
-    /// an ordinary ASCII letter. Unlike the open-ended "Windows filename
-    /// quirks" this guard would otherwise have to keep growing to cover,
-    /// this is the complete, closed, decades-stable set Win32 documents —
-    /// there is nothing left to discover here, which is what makes an
-    /// explicit list safe.
-    const RESERVED_WINDOWS_NAMES: &[&str] = &[
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
-    ];
-
     /// Subagent handles reach here from tool-call arguments, so they are
-    /// not trusted to be filenames.
-    ///
-    /// Allow-listed by charset rather than deny-listed by pattern: a
-    /// handle is expected to be a short generated id, so requiring ASCII
-    /// alphanumerics, `-`, and `_` costs nothing and closes every
-    /// open-ended unsafe case in one pass — traversal (`..`, `/`, `\`),
-    /// absolute and drive-relative paths, and the trailing dots/spaces
-    /// Windows silently strips (making `"foo."` and `"foo"` collide).
-    /// That charset does *not* exclude reserved DOS device names on its
-    /// own (`"CON"` is three ordinary letters), so those get their own
-    /// check against the fixed, complete list above — a closed
-    /// enumeration, not the kind of open-ended deny-list that keeps
-    /// needing another entry.
     fn path_for(&self, handle: &str) -> Result<PathBuf> {
-        let is_reserved = Self::RESERVED_WINDOWS_NAMES
-            .iter()
-            .any(|name| name.eq_ignore_ascii_case(handle));
-        if handle.is_empty()
-            || is_reserved
-            || !handle
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        {
-            bail!("subagent handle '{handle}' is not usable as a cache filename");
-        }
+        check_file_stem(handle).map_err(|_| {
+            anyhow::anyhow!("subagent handle '{handle}' is not usable as a cache filename")
+        })?;
         Ok(self.dir.join(format!("{handle}.json")))
     }
 

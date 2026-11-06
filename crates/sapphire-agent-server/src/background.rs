@@ -8,9 +8,13 @@
 //! model" and "turn saved" loses nothing: `drain` hands the inbox out but
 //! keeps the entries *in flight*, and only `commit_delivery` forgets them.
 //!
-//! This is the in-memory core; persistence and delivery are wired in by
-//! later tasks, hence the `dead_code` allowance until then.
-#![allow(dead_code)] // Tasks 2-7 wire this into the agent.
+//! Each session's `{pending, inbox}` is written to `<dir>/<session>.json`
+//! whenever it changes (in-flight entries count as inbox, so a crash before
+//! `commit_delivery` redelivers). On `open`, tasks that were still pending
+//! are turned into `Interrupted` completions: their futures died with the
+//! process. Delivery is wired in by later tasks, hence the `dead_code`
+//! allowance until then.
+#![allow(dead_code)] // Tasks 3-7 wire this into the agent.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -20,7 +24,10 @@ use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::task::AbortHandle;
+use tracing::warn;
 use uuid::Uuid;
+
+use crate::subagent_cache::check_file_stem;
 
 pub(crate) type TaskId = String;
 
@@ -72,6 +79,13 @@ pub(crate) struct Completion {
     pub finished_at: DateTime<Utc>,
 }
 
+/// What is written for one session. `inbox` includes in-flight entries.
+#[derive(Serialize, Deserialize)]
+struct Persisted {
+    pending: Vec<PendingTask>,
+    inbox: Vec<Completion>,
+}
+
 struct Running {
     task: PendingTask,
     abort: Option<AbortHandle>,
@@ -87,7 +101,8 @@ struct SessionTasks {
 }
 
 pub(crate) struct BackgroundTasks {
-    /// Where persistence will live (Task 2); `None` for the in-memory registry.
+    /// Where state is persisted; `None` for the in-memory registry, which
+    /// never touches disk.
     dir: Option<PathBuf>,
     max_per_session: usize,
     sessions: Mutex<HashMap<String, SessionTasks>>,
@@ -100,6 +115,102 @@ impl BackgroundTasks {
             max_per_session,
             sessions: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// `~/.cache/sapphire-agent/background`, beside the subagent cache.
+    pub(crate) fn default_dir() -> Option<PathBuf> {
+        dirs::cache_dir().map(|d| d.join("sapphire-agent").join("background"))
+    }
+
+    /// Open the registry backed by `dir` (or in memory for `None`), loading
+    /// what a previous run left. Unreadable files count as absent. Tasks that
+    /// were pending become `Interrupted` completions and the file is rewritten.
+    pub(crate) fn open(dir: Option<PathBuf>, max_per_session: usize) -> Arc<Self> {
+        let mut sessions = HashMap::new();
+        if let Some(d) = &dir {
+            if let Err(e) = std::fs::create_dir_all(d) {
+                warn!(
+                    "background tasks: cannot create {d:?} ({e}); state will not survive a restart"
+                );
+            }
+            for entry in std::fs::read_dir(d).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                let Some(session) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                if check_file_stem(session).is_err() {
+                    continue;
+                }
+                let persisted = match std::fs::read_to_string(&path)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|t| serde_json::from_str::<Persisted>(&t).map_err(Into::into))
+                {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!("background tasks: {path:?} is unreadable ({e}); treating as empty");
+                        continue;
+                    }
+                };
+                let mut s = SessionTasks {
+                    inbox: persisted.inbox,
+                    ..Default::default()
+                };
+                let now = Utc::now();
+                for p in persisted.pending {
+                    s.inbox.push(Completion {
+                        task_id: p.id,
+                        kind: p.kind,
+                        outcome: Outcome::Interrupted,
+                        finished_at: now,
+                    });
+                }
+                sessions.insert(session.to_string(), s);
+            }
+        }
+        let this = Arc::new(Self {
+            dir,
+            max_per_session,
+            sessions: Mutex::new(sessions),
+        });
+        {
+            let map = this.lock();
+            for (session, s) in map.iter() {
+                this.persist(session, s);
+            }
+        }
+        this
+    }
+
+    /// Write the session's state, or remove its file when there is none.
+    /// Failures only warn: the in-memory state stays authoritative.
+    fn persist(&self, session: &str, s: &SessionTasks) {
+        let Some(dir) = &self.dir else { return };
+        if check_file_stem(session).is_err() {
+            return;
+        }
+        let path = dir.join(format!("{session}.json"));
+        if s.running.is_empty() && s.inbox.is_empty() && s.in_flight.is_empty() {
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+        let body = Persisted {
+            pending: s.running.iter().map(|r| r.task.clone()).collect(),
+            inbox: s.in_flight.iter().chain(s.inbox.iter()).cloned().collect(),
+        };
+        let result = serde_json::to_string(&body)
+            .map_err(anyhow::Error::from)
+            .and_then(|json| {
+                let tmp = dir.join(format!("{session}.json.{}.tmp", Uuid::now_v7()));
+                std::fs::write(&tmp, json)?;
+                std::fs::rename(&tmp, &path)?;
+                Ok(())
+            });
+        if let Err(e) = result {
+            warn!("background tasks: cannot write {path:?} ({e})");
+        }
     }
 
     /// Whether background execution is on (`max_per_session > 0`).
@@ -138,6 +249,7 @@ impl BackgroundTasks {
             },
             abort: None,
         });
+        self.persist(session, s);
         Ok(id)
     }
 
@@ -170,6 +282,7 @@ impl BackgroundTasks {
             outcome,
             finished_at: Utc::now(),
         });
+        self.persist(session, s);
         true
     }
 
@@ -190,6 +303,7 @@ impl BackgroundTasks {
     pub(crate) fn commit_delivery(&self, session: &str) {
         if let Some(s) = self.lock().get_mut(session) {
             s.in_flight.clear();
+            self.persist(session, s);
         }
     }
 
@@ -230,6 +344,7 @@ impl BackgroundTasks {
         };
         let r = s.running.remove(pos);
         Self::cancel_running(s, r);
+        self.persist(session, s);
         Ok(())
     }
 
@@ -239,6 +354,12 @@ impl BackgroundTasks {
         if let Some(s) = map.get_mut(session) {
             for r in std::mem::take(&mut s.running) {
                 Self::cancel_running(s, r);
+            }
+            // The session is being torn down; nothing is left to deliver.
+            if let Some(dir) = &self.dir
+                && check_file_stem(session).is_ok()
+            {
+                let _ = std::fs::remove_file(dir.join(format!("{session}.json")));
             }
         }
     }
@@ -410,5 +531,91 @@ mod tests {
         let s = render(&mk(Outcome::Interrupted));
         assert!(s.contains("was interrupted by a restart"));
         assert!(s.contains("pass handle h1 as `resume`"));
+    }
+
+    fn on_disk(dir: &std::path::Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn state_round_trips_through_the_file() {
+        let td = tempfile::tempdir().unwrap();
+        let t = BackgroundTasks::open(Some(td.path().to_path_buf()), 4);
+        let id = t.register("s", kind("h"), "a".into()).unwrap();
+        t.complete("s", &id, fin());
+        let t2 = BackgroundTasks::open(Some(td.path().to_path_buf()), 4);
+        assert!(t2.has_inbox("s"));
+        assert_eq!(t2.drain("s")[0].outcome, fin());
+    }
+
+    #[test]
+    fn pending_left_on_disk_becomes_interrupted_on_open() {
+        let td = tempfile::tempdir().unwrap();
+        let t = BackgroundTasks::open(Some(td.path().to_path_buf()), 4);
+        t.register("s", kind("h9"), "a".into()).unwrap();
+        let t2 = BackgroundTasks::open(Some(td.path().to_path_buf()), 4);
+        assert!(t2.pending("s").is_empty());
+        let d = t2.drain("s");
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].outcome, Outcome::Interrupted);
+        assert_eq!(d[0].kind, kind("h9"));
+        // And the rewrite means a third open sees it as an ordinary completion.
+        let t3 = BackgroundTasks::open(Some(td.path().to_path_buf()), 4);
+        assert!(t3.pending("s").is_empty());
+    }
+
+    #[test]
+    fn in_flight_entries_survive_a_crash_before_commit() {
+        let td = tempfile::tempdir().unwrap();
+        let t = BackgroundTasks::open(Some(td.path().to_path_buf()), 4);
+        let id = t.register("s", kind("h"), "a".into()).unwrap();
+        t.complete("s", &id, fin());
+        assert_eq!(t.drain("s").len(), 1);
+        let t2 = BackgroundTasks::open(Some(td.path().to_path_buf()), 4);
+        let d = t2.drain("s");
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].task_id, id);
+        t2.commit_delivery("s");
+        let t3 = BackgroundTasks::open(Some(td.path().to_path_buf()), 4);
+        assert!(!t3.has_pending_or_inbox("s"));
+    }
+
+    #[test]
+    fn an_unreadable_file_is_empty_not_fatal() {
+        let td = tempfile::tempdir().unwrap();
+        std::fs::write(td.path().join("s.json"), "{ not json").unwrap();
+        let t = BackgroundTasks::open(Some(td.path().to_path_buf()), 4);
+        assert!(!t.has_pending_or_inbox("s"));
+        assert!(t.register("s", kind("h"), "a".into()).is_ok());
+    }
+
+    #[test]
+    fn an_unsafe_session_id_is_not_written() {
+        let td = tempfile::tempdir().unwrap();
+        let dir = td.path().join("bg");
+        let t = BackgroundTasks::open(Some(dir.clone()), 4);
+        let id = t.register("../x", kind("h"), "a".into()).unwrap();
+        assert!(t.complete("../x", &id, fin()));
+        assert!(t.has_inbox("../x"));
+        assert!(on_disk(&dir).is_empty());
+        assert_eq!(on_disk(td.path()), vec!["bg".to_string()]);
+    }
+
+    #[test]
+    fn cancel_all_removes_the_file() {
+        let td = tempfile::tempdir().unwrap();
+        let t = BackgroundTasks::open(Some(td.path().to_path_buf()), 4);
+        t.register("s", kind("h"), "a".into()).unwrap();
+        assert_eq!(on_disk(td.path()), vec!["s.json".to_string()]);
+        t.cancel_all("s");
+        assert!(on_disk(td.path()).is_empty());
     }
 }

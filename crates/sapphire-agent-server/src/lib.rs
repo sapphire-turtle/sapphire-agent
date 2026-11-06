@@ -924,6 +924,13 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
                     }
                 };
 
+            // Background tasks: results a previous run left are recovered here
+            // (pending ones become "interrupted").
+            let background = background::BackgroundTasks::open(
+                background::BackgroundTasks::default_dir(),
+                config.tools.background.max_per_session,
+            );
+
             let serve_state = Arc::new(serve::ServeState::new(
                 config.clone(),
                 Arc::clone(&registry),
@@ -937,6 +944,7 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
                 Arc::clone(&device_auth),
                 acp_session_store,
                 subagent_cache,
+                background,
             ));
             // Wire serve_state into the timer dispatcher so voice-origin
             // timers can push their messages back to the satellite.
