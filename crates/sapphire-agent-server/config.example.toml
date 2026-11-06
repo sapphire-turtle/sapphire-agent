@@ -356,9 +356,11 @@ system_prompt = "You are a helpful personal assistant."
 #     `background: true` returns at once and its result is delivered into
 #     the same conversation, at the next turn or between tool rounds.
 #     Background is available only from a session's main conversation.
-#     A background child never asks for permission: only tools already set
-#     to "always allow" run, the rest are refused and listed in the
-#     result. The `background_task` tool lists and cancels running tasks.
+#     A background child never asks for permission. Calls the permission
+#     table already allows run normally; calls it would ask about run only
+#     with a standing "always allow", and the others are refused and listed
+#     in the result. A standing "always reject" is refused and not listed.
+#     The `background_task` tool lists and cancels running tasks.
 #     `0` disables all of this.
 #   - `[[tools.mcp_servers]]` — outbound MCP client. Connects to
 #     external MCP servers and exposes their tools to the agent as

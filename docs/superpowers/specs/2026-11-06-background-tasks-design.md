@@ -37,7 +37,7 @@
    ネストしたターンには `session_id` がなく、結果を届ける会話も残らない。
 4. **バックグラウンドの子は、許可を尋ねない。** 許可の表（`Origin`）は親のものをそのまま使うが、
    `Ask` になった呼び出しは保存済みの「常に許可 / 常に拒否」だけで決め、それ以外は拒否する。
-   拒否した呼び出しは完了に載せて親に返す。親は自分のターンで（人間の許可を得て）実行するか、
+   答えのなかった `Ask` だけを完了に載せて親に返す（「常に拒否」は載せない）。親は自分のターンで（人間の許可を得て）実行するか、
    `resume` で子に続けさせる。**親のモデルに許可を出させることはしない**：
    子に頼んだ当のモデルが承認すると、人間による確認が実質なくなるうえ、
    子が読んだ内容に仕込まれた指示に親が説得されうる。
@@ -85,18 +85,18 @@ pub(crate) struct RefusedCall {
 }
 ```
 
-セッションごとに `pending: Vec<PendingTask>`、`inbox: Vec<Completion>`、
-`notify: tokio::sync::Notify`、実行中の `JoinHandle`（`abort` 用、保存しない）を持つ。
+セッションごとに、実行中のタスク（`PendingTask` と `abort` 用の `AbortHandle`。ハンドルは保存しない）、
+`inbox: Vec<Completion>`、`drain` 済みで未確定の `in_flight` を持つ。
 
 | API | 働き |
 |---|---|
 | `register(session, kind, label) -> Result<TaskId>` | 上限（`max_per_session`）の確認と登録を一度のロックで行う。超えたら、実行中の id をすべて挙げて拒否 |
-| `attach(session, id, JoinHandle)` | 取り消し用に tokio タスクを結びつける |
-| `complete(session, id, outcome)` | pending から外して inbox に積み、`notify` を鳴らす |
+| `attach(session, id, AbortHandle)` | 取り消し用に tokio タスクを結びつける |
+| `complete(session, id, outcome)` | pending から外して inbox に積む |
 | `drain(session) -> Vec<Completion>` | 受け箱を取り出す |
 | `has_pending_or_inbox(session) -> bool` | 自律ループの休止判定用 |
 | `has_inbox(session) -> bool` | 受け箱に未配達の完了があるか。自律ループが毎周期ポーリングする（`wait` は持たない） |
-| `rollback_delivery(session, …)` | 運んだメッセージを保存できなかったとき、配達中のエントリを受け箱へ戻す |
+| `rollback_delivery(session)` | 運んだメッセージを保存できなかったとき、配達中のエントリを受け箱へ戻す |
 | `cancel(session, id)` | `abort` して `Cancelled` を積む |
 | `cancel_all(session)` | 後始末: `abort` し、セッションを忘れ、ファイルを消す。何も積まない |
 
@@ -109,7 +109,8 @@ pub(crate) struct RefusedCall {
 - 状態が変わるたびに書く（件数はたかが知れている）。書けなければ `warn` を出して続ける。
   メモリ上の状態が正しい。
 - **起動時**: 残っている pending をすべて `Outcome::Interrupted` に変えて inbox へ移す。
-  サブエージェントなら `handle` も残るので、親はそのまま `resume` できる。
+  サブエージェントなら `handle` も残る。新規のディスパッチは始める前にプロンプトだけの履歴を
+  `SubagentCache` に保存するので、キャッシュが設定されていれば親はそのまま `resume` できる。
 - 閉じたセッションのファイルは `cancel_all` のときに消す。
 
 ### 完了テキストの形
@@ -124,7 +125,7 @@ Refused (needs approval): shell {"command":"cargo test"}
 
 `Failed` / `Interrupted` / `Cancelled` も同じ見出しで、`finished` の代わりにそれぞれ
 `failed` / `was interrupted by a restart` / `was cancelled` と書き、
-resume できる場合は handle を示す。
+resume できる場合（配達の時点で `SubagentCache` にその handle の履歴がある場合）だけ handle を示す。
 
 ## サブエージェントのバックグラウンド実行
 
@@ -147,7 +148,7 @@ resume できる場合は handle を示す。
 5. ツールの結果としてすぐに返す:
    `Started background task bg-1a2b: subagent "reviewer" (handle h-…). Its result will be delivered to this conversation when it finishes.`
 6. 子が終わったら `run_and_store` で履歴を保存し、`complete(Finished { text, refused })` を呼ぶ。
-   失敗なら `Failed`。`[tools.subagent].turn_timeout_secs` を超えたら
+   失敗や panic なら `Failed`。`[tools.subagent].turn_timeout_secs` を超えたら
    `Failed`（時間切れ、handle で resume 可）。`busy_handles` は終わった時点で外す。
 
 ### `BackgroundSubagentHost`
@@ -158,12 +159,15 @@ resume できる場合は handle を示す。
 - `approve()`（`Ask` のときだけ呼ばれる）: ダイアログを出さない。
   `TurnHost` に新しく `standing_approval(call, kind) -> Option<Approval>`（既定 `None`）を足し、
   ACP の host は `PermissionStore` の「常に許可 / 常に拒否」を返す。
-  許可なら実行し、それ以外は `RejectOnce` にして `RefusedCall` を記録する。
+  「常に許可」なら実行し、「常に拒否」ならそのまま拒否する。
+  どちらもなければ `RejectOnce` にして `RefusedCall` を記録する。
 - 「常に拒否」は記録せず、子には UserDeclined として見える。
   `NeedsApproval` で拒否して完了に載せるのは、答えのなかった `Ask` だけ。
   どちらにするかは `TurnHost::declined_refusal(approval)` が選ぶ。
 - 子は `TurnHost::detached()` の host で動くので、始めたリクエスト（HTTP SSE）を開いたままにしない。
   既定の detached host は origin だけを持つ。ACP は自分の host の複製を持つ。
+  その複製はセッションのモードを `origin()` のたびに読み直すので、子の実行中に `session/set_mode` で
+  厳しいモードへ戻せば子にも効く（ターン自身の host は開始時のモードを保つ）。
 - `tool_start` / `tool_end`: 転送せず、ログに出すだけ。同期の子が転送するのは
   許可ダイアログの出どころを示すためで、ここではダイアログを出さない。
   ターンの外でツール呼び出しの更新を送るとエディタを混乱させうる。
@@ -215,6 +219,8 @@ resume できる場合は handle を示す。
   新しいセッションを作らず、そのセッションを再開する。優先度の順は今までどおり。
 - 使ったターン数は履歴から数える。生のログ（`load_session_full`）から読むので、コンテキスト圧縮を越えても保たれる。休止中はターンを回さないので `max_turns` を消費しない
   （`WAIT` と答えたそのターンは数える）。
+- セッションストアに書けないとログからの数が進まないので、自律ループはこのプロセスで回したターン数を
+  メモリにも持ち、多い方を使う（セッションを閉じたら捨てる）。
 - 再起動後は保留が `Interrupted` として受け箱に入るので、休止中のタスクはそのまま再開できる。
 - 「他のセッションが動いている」の判定（`is_idle` / `busy_rows`）は自律ストアを読まないので、
   休止中のセッションがあっても自律ループは止まらない。変更は要らない。
@@ -249,8 +255,8 @@ max_per_session = 4   # 0 = バックグラウンド実行を無効にする
    完了が次のターンの先頭に差し込まれる。
 2. 親のターンの実行中に子が終わると、ラウンドの合間のツール結果メッセージに差し込まれ、
    tool_use / tool_result の対が保たれる。
-3. ACP の `Ask` は尋ねずに拒否され、`RefusedCall` として完了に載る。
-   「常に許可」のツールは実行される。
+3. 保存済みの答えのない ACP の `Ask` は尋ねずに拒否され、`RefusedCall` として完了に載る。
+   「常に許可」のツールは実行され、「常に拒否」のツールは拒否されるが載らない。
 4. 上限、深さ 0 以外、セッションなしはどれも断る。
 5. 保存ファイルから起動すると、pending が handle つきの `Interrupted` になる。
 6. 自律セッション: `WAIT` で休止し、他のタスクが動き、完了が届くと同じセッションで再開する。
