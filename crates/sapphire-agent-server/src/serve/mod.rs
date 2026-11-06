@@ -2999,9 +2999,10 @@ fn place_completions(
     if completions.is_empty() {
         return false;
     }
-    let texts = completions
-        .iter()
-        .map(|c| ContentPart::Text(crate::background::render(c)));
+    let texts = completions.iter().map(|c| {
+        let resumable = crate::background::resumable(state.subagent_cache.as_deref(), c);
+        ContentPart::Text(crate::background::render(c, resumable))
+    });
     match at {
         Placement::Front => {
             msg.parts.splice(0..0, texts);

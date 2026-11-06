@@ -398,8 +398,22 @@ impl BackgroundTasks {
     }
 }
 
-/// Text shown to the model for one completion.
-pub(crate) fn render(c: &Completion) -> String {
+/// Whether `c`'s handle can be resumed: its history is stored in `cache`.
+/// Checked when the completion is shown, not when it was queued, since
+/// what makes it resumable is the cache entry at that moment.
+pub(crate) fn resumable(
+    cache: Option<&crate::subagent_cache::SubagentCache>,
+    c: &Completion,
+) -> bool {
+    let TaskKind::Subagent { handle, .. } = &c.kind;
+    cache.is_some_and(|cache| cache.get(handle).is_some())
+}
+
+/// Text shown to the model for one completion. An unfinished one offers
+/// its handle for `resume` only when `resumable` (see [`resumable`]):
+/// pointing the model at a handle with no stored history invites a resume
+/// that can only fail.
+pub(crate) fn render(c: &Completion, resumable: bool) -> String {
     let TaskKind::Subagent { agent, handle } = &c.kind;
     let verb = match &c.outcome {
         Outcome::Finished { .. } => "finished",
@@ -428,7 +442,7 @@ pub(crate) fn render(c: &Completion) -> String {
         }
         Outcome::Interrupted | Outcome::Cancelled => {}
     }
-    if !matches!(c.outcome, Outcome::Finished { .. }) {
+    if resumable && !matches!(c.outcome, Outcome::Finished { .. }) {
         out.push_str(&format!(
             "\nTo continue its work, pass handle {handle} as `resume` to the subagent tool."
         ));
@@ -554,21 +568,28 @@ mod tests {
             outcome,
             finished_at: Utc::now(),
         };
-        let s = render(&mk(Outcome::Finished {
-            text: "all good".into(),
-            refused: vec![RefusedCall {
-                name: "shell".into(),
-                input: serde_json::json!({"command": "cargo test"}),
-            }],
-        }));
+        let s = render(
+            &mk(Outcome::Finished {
+                text: "all good".into(),
+                refused: vec![RefusedCall {
+                    name: "shell".into(),
+                    input: serde_json::json!({"command": "cargo test"}),
+                }],
+            }),
+            true,
+        );
         assert!(
             s.starts_with("[Background task bg-1 finished: subagent \"reviewer\" (handle h1)]")
         );
         assert!(s.contains("all good"));
         assert!(s.contains("Refused (needs approval): shell {\"command\":\"cargo test\"}"));
-        let s = render(&mk(Outcome::Interrupted));
+        let s = render(&mk(Outcome::Interrupted), true);
         assert!(s.contains("was interrupted by a restart"));
         assert!(s.contains("pass handle h1 as `resume`"));
+        // A handle with no stored history is not offered for resume.
+        let s = render(&mk(Outcome::Cancelled), false);
+        assert!(s.contains("was cancelled"));
+        assert!(!s.contains("`resume`"), "{s}");
     }
 
     fn on_disk(dir: &std::path::Path) -> Vec<String> {

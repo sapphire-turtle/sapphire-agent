@@ -913,6 +913,7 @@ impl SubagentTool {
                  synchronously"
             ),
         };
+        let fresh = matches!(target, Target::Dispatch(_));
         let (ctx, prepared) = self.prepare(target, prompt)?;
         let Prepared {
             def,
@@ -933,6 +934,20 @@ impl SubagentTool {
             kind.clone(),
             background_label(&def.name, prompt),
         )?;
+        // A fresh handle has nothing stored until the child finishes, so
+        // one cancelled or cut off by a restart could not be resumed.
+        // Storing its prompt now makes it resumable from the start. A
+        // resume already has its stored history.
+        if fresh {
+            persist(
+                ctx.state.subagent_cache.as_deref(),
+                &handle,
+                &def.name,
+                history.clone(),
+                created_at,
+                over_cap_reason,
+            );
+        }
         let started = format!(
             "Started background task {id}: subagent \"{}\" (handle {handle}). \
              Its result will be delivered to this conversation when it finishes.",
@@ -1005,12 +1020,17 @@ impl SubagentTool {
                 .background
                 .complete(&task_session, &task_id, outcome.clone())
             {
-                let report = crate::background::render(&crate::background::Completion {
+                let completion = crate::background::Completion {
                     task_id,
                     kind,
                     outcome,
                     finished_at: chrono::Utc::now(),
-                });
+                };
+                let resumable = crate::background::resumable(
+                    task_ctx.state.subagent_cache.as_deref(),
+                    &completion,
+                );
+                let report = crate::background::render(&completion, resumable);
                 task_ctx.progress.background_finished(&report).await;
             }
         };
@@ -4047,5 +4067,86 @@ mod tests {
             !tool.busy_handles.lock().unwrap().contains(&handle),
             "the panicked child's handle is released"
         );
+    }
+
+    /// Start a background dispatch of `reviewer` whose child never gets
+    /// past its first provider call, then cancel it. Returns its handle
+    /// and the rendered completion, as delivery renders it.
+    async fn cancelled_dispatch(
+        state: &std::sync::Arc<crate::serve::ServeState>,
+        session: &str,
+    ) -> (String, String) {
+        let provider = GatedProvider::new(vec![text_response("never")]);
+        let tool = std::sync::Arc::new(SubagentTool::new(defs(), true));
+        let started = crate::serve::scope_turn_context(
+            background_context(
+                std::sync::Arc::clone(state),
+                std::sync::Arc::clone(&provider) as std::sync::Arc<dyn crate::provider::Provider>,
+                Vec::new(),
+                std::sync::Arc::new(crate::serve::NullProgress),
+                Some(session),
+                0,
+            ),
+            Tool::execute(&tool, &bg_input("reviewer", "go")),
+        )
+        .await
+        .unwrap();
+        let handle = started_handle(&started);
+        provider.wait_entered().await;
+        let id = state.background.pending(session)[0].id.clone();
+        state.background.cancel(session, &id).unwrap();
+        let done = next_completion(state, session).await;
+        let resumable = crate::background::resumable(state.subagent_cache.as_deref(), &done);
+        (handle, crate::background::render(&done, resumable))
+    }
+
+    /// A fresh background dispatch stores its prompt before it runs, so a
+    /// child cancelled (or cut off by a restart) before it finished can
+    /// still be resumed, and its completion says so.
+    #[tokio::test]
+    async fn an_unfinished_background_dispatch_is_resumable_from_its_prompt() {
+        let state = crate::serve::ServeState::for_test(false);
+        let (handle, text) = cancelled_dispatch(&state, "s-bg-stub").await;
+        let stored = state
+            .subagent_cache
+            .as_ref()
+            .unwrap()
+            .get(&handle)
+            .expect("the stub is stored under the handle");
+        assert_eq!(stored.agent, "reviewer");
+        assert_eq!(stored.history.len(), 1);
+        assert_eq!(stored.history[0].role, crate::provider::Role::User);
+        assert!(
+            text.contains(&format!("pass handle {handle} as `resume`")),
+            "{text}"
+        );
+
+        let interrupted = crate::background::Completion {
+            task_id: "bg-1".to_string(),
+            kind: crate::background::TaskKind::Subagent {
+                agent: "reviewer".to_string(),
+                handle: handle.clone(),
+            },
+            outcome: crate::background::Outcome::Interrupted,
+            finished_at: chrono::Utc::now(),
+        };
+        let resumable = crate::background::resumable(state.subagent_cache.as_deref(), &interrupted);
+        assert!(
+            crate::background::render(&interrupted, resumable)
+                .contains(&format!("pass handle {handle} as `resume`"))
+        );
+    }
+
+    /// With no resume cache nothing can be resumed, so no completion
+    /// offers it.
+    #[tokio::test]
+    async fn without_a_cache_no_completion_offers_resume() {
+        let mut state = crate::serve::ServeState::for_test(false);
+        std::sync::Arc::get_mut(&mut state)
+            .expect("uniquely owned immediately after construction")
+            .subagent_cache = None;
+        let (_, text) = cancelled_dispatch(&state, "s-bg-nocache").await;
+        assert!(text.contains("was cancelled"), "{text}");
+        assert!(!text.contains("`resume`"), "{text}");
     }
 }
