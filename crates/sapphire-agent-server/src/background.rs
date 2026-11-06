@@ -307,6 +307,18 @@ impl BackgroundTasks {
         }
     }
 
+    /// The drained completions did not reach the model (the message that
+    /// carried them could not be saved): put them back in the inbox, in
+    /// finish order, so the next turn delivers them. Without this they
+    /// would sit in flight until some later `commit_delivery` wiped them.
+    pub(crate) fn rollback_delivery(&self, session: &str) {
+        if let Some(s) = self.lock().get_mut(session) {
+            s.inbox.append(&mut s.in_flight);
+            s.inbox.sort_by_key(|c| c.finished_at);
+            self.persist(session, s);
+        }
+    }
+
     pub(crate) fn pending(&self, session: &str) -> Vec<PendingTask> {
         self.lock()
             .get(session)
@@ -424,6 +436,23 @@ mod tests {
             agent: "reviewer".into(),
             handle: h.into(),
         }
+    }
+
+    #[test]
+    fn a_rolled_back_delivery_is_drained_again() {
+        let t = BackgroundTasks::in_memory(4);
+        for h in ["a", "b"] {
+            let id = t.register("s", kind(h), h.into()).unwrap();
+            t.complete("s", &id, fin());
+        }
+        let first = t.drain("s");
+        assert_eq!(first.len(), 2);
+        assert!(!t.has_inbox("s"));
+        t.rollback_delivery("s");
+        assert!(t.has_inbox("s"));
+        let again = t.drain("s");
+        let ids = |v: &[Completion]| v.iter().map(|c| c.task_id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&first), ids(&again));
     }
 
     fn fin() -> Outcome {

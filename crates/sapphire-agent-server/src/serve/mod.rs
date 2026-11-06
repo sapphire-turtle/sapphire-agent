@@ -2877,12 +2877,19 @@ impl TurnLoop<'_> {
                     // on-disk session forever. A half-persisted pair is worse
                     // than neither, so skip this append too rather than
                     // leaving only the result on disk.
-                    if tool_use_persisted
-                        && let Some(p) = self.persistence
-                        && p.append_message_paired(&result_msg)
-                        && delivered
-                    {
-                        self.state.background.commit_delivery(&p.session_id);
+                    let saved = tool_use_persisted
+                        && self
+                            .persistence
+                            .is_some_and(|p| p.append_message_paired(&result_msg));
+                    if delivered && let Some(p) = self.persistence {
+                        // Unsaved, the completions exist nowhere on disk and
+                        // the next turn rehydrates without them: give them
+                        // back to the inbox rather than lose them.
+                        if saved {
+                            self.state.background.commit_delivery(&p.session_id);
+                        } else {
+                            self.state.background.rollback_delivery(&p.session_id);
+                        }
                     }
                 }
             }
@@ -3136,8 +3143,12 @@ pub(crate) async fn run_llm_turn(
             .inspect_err(|e| warn!("Failed to persist user message: {e}"))
             .is_ok()
     };
-    if delivered && persisted {
-        state.background.commit_delivery(&session_id);
+    if delivered {
+        if persisted {
+            state.background.commit_delivery(&session_id);
+        } else {
+            state.background.rollback_delivery(&session_id);
+        }
     }
 
     // 5. Tool-calling loop — refresh MCP tools if any server signalled a change.
@@ -4604,6 +4615,30 @@ mod tests {
         assert!(texts[0].contains("found it"));
         assert_eq!(texts[1], "what now?");
         assert!(!state.background.has_pending_or_inbox(&sid));
+    }
+
+    /// An ACP session whose file was never created cannot persist the user
+    /// message; the completion prepended to it must go back to the inbox.
+    #[tokio::test]
+    async fn a_completion_whose_message_was_not_saved_is_redelivered() {
+        let state = ServeState::for_test_scripted(true, vec![final_round("ok")]);
+        let sid = "acp-unsaved".to_string();
+        state.acp_sessions.lock().await.insert(sid.clone());
+        finished_task(&state, &sid, "scout", "found it");
+
+        run_llm_turn(
+            Arc::clone(&state),
+            sid.clone(),
+            ChatMessage::user("hi"),
+            Arc::new(NullProgress),
+            None,
+        )
+        .await;
+
+        assert!(
+            state.background.has_inbox(&sid),
+            "an unsaved delivery must not be lost"
+        );
     }
 
     #[tokio::test]
