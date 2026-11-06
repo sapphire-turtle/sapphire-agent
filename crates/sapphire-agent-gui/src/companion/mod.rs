@@ -276,6 +276,7 @@ pub(crate) fn pointer_input(
     mut wanted: ResMut<PointerWanted>,
     mut requests: MessageWriter<CompanionRequest>,
     settings: Option<NonSend<GuiSettings>>,
+    default_avatar: Option<Res<crate::avatar::DefaultAvatar>>,
 ) {
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
@@ -325,10 +326,12 @@ pub(crate) fn pointer_input(
     if keys.just_pressed(KeyCode::Escape) {
         gestures.push(tracker.escape());
     }
-    let settings_open = settings.is_some_and(|s| s.open);
+    // The settings or the loading screen fill the window: no input box.
+    let covered = settings.is_some_and(|s| s.open)
+        || default_avatar.is_some_and(|d| d.flow().blocks_screen());
     let ctrl = keys.any_pressed([KeyCode::ControlLeft, KeyCode::ControlRight]);
     if keys.any_just_pressed([KeyCode::Enter, KeyCode::NumpadEnter])
-        && !settings_open
+        && !covered
         && !ctx.egui_wants_keyboard_input()
         && (ctrl || *overlay == Overlay::default())
     {

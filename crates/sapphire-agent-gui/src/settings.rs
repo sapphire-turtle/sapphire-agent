@@ -66,11 +66,24 @@ impl GuiSettings {
     }
 }
 
-/// What fills the window: the companion overlay or the settings.
+/// What fills the window: the companion overlay, the settings, or the
+/// default avatar's loading screen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Screen {
     Companion,
     Settings,
+    /// The default avatar is downloading, or its download failed.
+    Loading,
+}
+
+/// The screen for `layout` when the default avatar's flow `blocks` it or
+/// not: a blocking flow takes the whole window, over the settings too.
+pub(crate) fn screen(layout: Layout, blocks: bool) -> Screen {
+    if blocks {
+        Screen::Loading
+    } else {
+        layout.screen
+    }
 }
 
 /// What the frame shows, decided from the settings' state.
@@ -193,5 +206,15 @@ mod tests {
         for health in [Health::Connecting, Health::Healthy, Health::UpdateAvailable] {
             assert!(!Layout::of(Some((false, health))).banner, "{health:?}");
         }
+    }
+
+    #[test]
+    fn blocking_flow_takes_the_whole_window() {
+        let settings = Layout::of(Some((true, Health::Healthy)));
+        assert_eq!(screen(settings, true), Screen::Loading);
+        let companion = Layout::of(None);
+        assert_eq!(screen(companion, true), Screen::Loading);
+        assert_eq!(screen(settings, false), Screen::Settings);
+        assert_eq!(screen(companion, false), Screen::Companion);
     }
 }

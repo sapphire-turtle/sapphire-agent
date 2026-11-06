@@ -73,9 +73,7 @@
 //! waker) to cap it. A still avatar asks for none, so an idle companion
 //! draws no frames.
 
-// Task 4 wires the default-avatar flow in; until then only its tests use it.
 pub mod assets;
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod default_install;
 pub mod mode;
 pub mod placeholder;
@@ -103,6 +101,7 @@ use crate::companion::{CompanionPrefs, CursorOverride};
 pub use assets::{
     AvatarAssets, AvatarEditor, AvatarOps, AvatarSource, Cache, LoadedAvatar, OpTicket, OpsStatus,
 };
+pub(crate) use default_install::{DefaultAvatar, Flow};
 pub use mode::{ActiveRenderer, DisplayMode, choose, renderer_is};
 pub use state::AvatarState;
 
@@ -212,6 +211,17 @@ impl Plugin for AvatarPlugin {
             )
             .add_plugins((sprite::SpriteRendererPlugin, vrm::VrmRendererPlugin))
             .add_systems(Startup, spawn_ui_camera)
+            // Before the sync it may ask for, and so before the choice.
+            .add_systems(
+                Update,
+                default_install::drive_default_avatar
+                    .before(poll_sync)
+                    .before(AvatarSystems::Choose)
+                    // Inserted with the bridge by `AgentGuiPlugin`.
+                    .run_if(resource_exists::<DefaultAvatar>)
+                    .run_if(resource_exists::<ChatBridge>)
+                    .run_if(resource_exists::<SyncRequested>),
+            )
             .add_systems(
                 Update,
                 (choose_renderer, tick_state)

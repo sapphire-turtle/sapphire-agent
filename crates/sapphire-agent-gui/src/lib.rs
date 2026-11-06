@@ -140,6 +140,7 @@ impl Plugin for AgentGuiPlugin {
         }
 
         let avatar_sync = avatar::AvatarSync::new(runtime.handle().clone(), waker.clone());
+        let default_avatar = avatar::DefaultAvatar::new(runtime.handle().clone(), waker.clone());
 
         app.insert_resource(shared)
             .insert_resource(ops)
@@ -147,6 +148,7 @@ impl Plugin for AgentGuiPlugin {
             .insert_resource(GuiRuntime(runtime))
             .insert_resource(GuiWaker(waker))
             .insert_resource(avatar_sync)
+            .insert_resource(default_avatar)
             .insert_resource(chat::SyncRequested::default())
             .insert_resource(chat::ChatState::new())
             .insert_resource(chat::ChatBridge(bridge))

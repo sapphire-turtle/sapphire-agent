@@ -1,9 +1,19 @@
-//! The first-run flow for the default avatar, as a pure state machine: no
-//! bevy, no IO. The caller feeds it what happened (the manifest was checked,
-//! progress arrived, the agent answered, the user pressed a button) and sends
-//! the [`Request`] it returns.
+//! The first-run flow for the default avatar. [`Flow`] is a pure state
+//! machine: no bevy, no IO. The caller feeds it what happened (the manifest
+//! was checked, progress arrived, the agent answered, the user pressed a
+//! button) and sends the [`Request`] it returns. [`DefaultAvatar`] is that
+//! caller: it runs the checks and the requests on the GUI's runtime, and
+//! [`drive_default_avatar`] folds what they report back into the flow.
 
-use sapphire_agent_core::{DefaultAvatarAnswer, InstallProgress};
+use std::sync::{Arc, Mutex};
+
+use bevy::prelude::*;
+use sapphire_agent_core::{ChatClient, DefaultAvatarAnswer, InstallProgress};
+use tokio::runtime::Handle;
+use tokio::sync::mpsc;
+
+use crate::Waker;
+use crate::chat::{ChatBridge, SyncRequested};
 
 /// Where the first-run flow stands.
 #[derive(Clone, Debug, PartialEq)]
@@ -118,6 +128,180 @@ impl Flow {
     }
 }
 
+/// Whether `live` is a new connection rather than the one `stored` belongs
+/// to: the first one, or a reconnect. Losing the connection (`None`) is no
+/// change; the flow keeps its state until the next one comes.
+fn connection_changed<T>(stored: Option<&Arc<T>>, live: Option<&Arc<T>>) -> bool {
+    match (stored, live) {
+        (_, None) => false,
+        (None, Some(_)) => true,
+        (Some(stored), Some(live)) => !Arc::ptr_eq(stored, live),
+    }
+}
+
+/// What a job on the runtime reports.
+enum Event {
+    Checked { has_avatar: bool },
+    Progress(InstallProgress),
+    Answered(Result<DefaultAvatarAnswer, String>),
+}
+
+/// The default avatar's flow for the live connection, and the jobs that
+/// drive it on the GUI's runtime. Each event carries the generation of the
+/// connection it was made for, and one from an older connection is
+/// dropped, so a reconnect's flow never sees the previous one's answer.
+#[derive(Resource)]
+pub(crate) struct DefaultAvatar {
+    flow: Flow,
+    /// The connection the flow belongs to.
+    client: Option<Arc<ChatClient>>,
+    /// Bumped with each new connection.
+    generation: u64,
+    runtime: Handle,
+    waker: Waker,
+    tx: mpsc::UnboundedSender<(u64, Event)>,
+    rx: Mutex<mpsc::UnboundedReceiver<(u64, Event)>>,
+}
+
+impl DefaultAvatar {
+    pub(crate) fn new(runtime: Handle, waker: Waker) -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
+        Self {
+            flow: Flow::new(),
+            client: None,
+            generation: 0,
+            runtime,
+            waker,
+            tx,
+            rx: Mutex::new(rx),
+        }
+    }
+
+    pub(crate) fn flow(&self) -> &Flow {
+        &self.flow
+    }
+
+    /// Try the download again after a failure.
+    pub(crate) fn retry(&mut self) {
+        if let Some(request) = self.flow.retry() {
+            self.send(request);
+        }
+    }
+
+    /// Give up after a failure; the Character page offers the button.
+    pub(crate) fn continue_without(&mut self) {
+        self.flow.continue_without();
+    }
+
+    /// The Character page's "Get the default avatar".
+    pub(crate) fn get(&mut self) {
+        if let Some(request) = self.flow.get() {
+            self.send(request);
+        }
+    }
+
+    /// A new connection: start over, and check whether it has an avatar.
+    fn connect(&mut self, client: Arc<ChatClient>) {
+        self.generation += 1;
+        self.flow = Flow::new();
+        self.client = Some(Arc::clone(&client));
+        let (generation, tx, waker) = (self.generation, self.tx.clone(), Arc::clone(&self.waker));
+        self.runtime.spawn(async move {
+            // A failed read counts as an avatar: an unrelated error must not
+            // block the GUI on the loading screen.
+            let has_avatar = match client.avatar_manifest().await {
+                Ok(m) => m.config.vrm.is_some() || m.config.sprite.is_some(),
+                Err(e) => {
+                    tracing::warn!("cannot read the avatar manifest: {e:#}");
+                    true
+                }
+            };
+            let _ = tx.send((generation, Event::Checked { has_avatar }));
+            waker();
+        });
+    }
+
+    /// Sends `request` on the flow's connection.
+    fn send(&self, request: Request) {
+        let generation = self.generation;
+        let Some(client) = self.client.clone() else {
+            // Unreachable in practice: a request follows a check, which
+            // needs a connection.
+            let _ = self.tx.send((
+                generation,
+                Event::Answered(Err("not connected to the agent".to_owned())),
+            ));
+            (self.waker)();
+            return;
+        };
+        let (tx, waker) = (self.tx.clone(), Arc::clone(&self.waker));
+        self.runtime.spawn(async move {
+            let progress = {
+                let (tx, waker) = (tx.clone(), Arc::clone(&waker));
+                move |p| {
+                    let _ = tx.send((generation, Event::Progress(p)));
+                    waker();
+                }
+            };
+            let answer = client
+                .avatar_install_default(request.auto, progress)
+                .await
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send((generation, Event::Answered(answer)));
+            waker();
+        });
+    }
+
+    /// Folds the events of this connection into the flow. Returns whether
+    /// to resync the avatar.
+    fn drain(&mut self) -> bool {
+        let events: Vec<_> = match self.rx.lock() {
+            Ok(mut rx) => std::iter::from_fn(|| rx.try_recv().ok()).collect(),
+            Err(_) => return false,
+        };
+        let mut resync = false;
+        for (generation, event) in events {
+            if generation != self.generation {
+                continue;
+            }
+            match event {
+                Event::Checked { has_avatar } => {
+                    if let Some(request) = self.flow.checked(has_avatar) {
+                        self.send(request);
+                    }
+                }
+                Event::Progress(p) => self.flow.progress(p),
+                Event::Answered(answer) => {
+                    if let Err(e) = &answer {
+                        tracing::warn!("cannot install the default avatar: {e}");
+                    }
+                    resync |= self.flow.answered(answer);
+                }
+            }
+        }
+        resync
+    }
+}
+
+/// Every frame, before the renderer is chosen: restarts the flow on a new
+/// connection, folds in what the jobs reported, and asks for a resync once
+/// the default avatar is installed.
+pub(crate) fn drive_default_avatar(
+    bridge: Res<ChatBridge>,
+    mut default_avatar: ResMut<DefaultAvatar>,
+    mut sync: ResMut<SyncRequested>,
+) {
+    let live = bridge.client();
+    if connection_changed(default_avatar.client.as_ref(), live.as_ref())
+        && let Some(client) = live
+    {
+        default_avatar.connect(client);
+    }
+    if default_avatar.drain() {
+        sync.0 = true;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,5 +399,16 @@ mod tests {
                 total: Some(10)
             }
         );
+    }
+
+    #[test]
+    fn a_new_client_restarts_the_check() {
+        use std::sync::Arc;
+        let (a, b) = (Arc::new(1), Arc::new(1));
+        assert!(connection_changed(None, Some(&a)), "the first client");
+        assert!(!connection_changed(Some(&a), Some(&a)), "the same client");
+        assert!(connection_changed(Some(&a), Some(&b)), "a reconnect");
+        assert!(!connection_changed(Some(&a), None), "disconnected");
+        assert!(!connection_changed::<i32>(None, None));
     }
 }
