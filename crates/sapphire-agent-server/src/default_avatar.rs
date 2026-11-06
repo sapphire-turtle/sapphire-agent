@@ -405,8 +405,11 @@ impl DefaultInstaller {
 
     /// Decide whether to install, and do it unless another request already is.
     /// With `auto`, a sync setup that might hold an avatar elsewhere answers
-    /// `NeedsConfirmation` instead. Only the request that starts the download
-    /// gets `progress`; the ones that join it get just the answer.
+    /// `NeedsConfirmation` instead. A request that is going to wait on a
+    /// download, its own or one already running, first gets `{ received: 0,
+    /// total: None }` through `progress`, so an answer without one never
+    /// reports progress. Only the request that starts the download gets the
+    /// rest of it; the ones that join it get just the answer.
     pub(crate) async fn run(
         &self,
         auto: bool,
@@ -421,6 +424,10 @@ impl DefaultInstaller {
         if auto && !auto_allowed(self.probe.view().await) {
             return Ok(DefaultAvatarAnswer::NeedsConfirmation);
         }
+        progress(InstallProgress {
+            received: 0,
+            total: None,
+        });
         let flight = {
             let mut slot = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
             match slot.as_ref() {
@@ -1017,6 +1024,72 @@ pub(crate) mod tests {
         let last = *seen.lock().unwrap().last().unwrap();
         assert_eq!(last.received, len as u64);
         assert_eq!(last.total, Some(len as u64));
+    }
+
+    type Seen = Arc<Mutex<Vec<InstallProgress>>>;
+
+    fn recording() -> (Seen, Arc<dyn Fn(InstallProgress) + Send + Sync>) {
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        (seen, Arc::new(move |p| sink.lock().unwrap().push(p)))
+    }
+
+    const STARTED: InstallProgress = InstallProgress {
+        received: 0,
+        total: None,
+    };
+
+    #[tokio::test]
+    async fn a_download_reports_its_start_first() {
+        let (_t, ws, release, _, _) = served();
+        let (seen, progress) = recording();
+        let i = installer(&ws, Some(release), Some(view(false, 0, true)));
+        assert_eq!(
+            i.run(false, progress).await,
+            Ok(DefaultAvatarAnswer::Installed)
+        );
+        assert_eq!(seen.lock().unwrap().first(), Some(&STARTED));
+    }
+
+    #[tokio::test]
+    async fn answers_without_a_download_report_no_progress() {
+        let (_t, ws, release, _, _) = served();
+        let (seen, progress) = recording();
+        assert_eq!(
+            installer(&ws, None, None)
+                .run(false, progress.clone())
+                .await,
+            Ok(DefaultAvatarAnswer::Unavailable)
+        );
+        assert_eq!(
+            installer(&ws, Some(release), Some(view(true, 1, true)))
+                .run(true, progress.clone())
+                .await,
+            Ok(DefaultAvatarAnswer::NeedsConfirmation)
+        );
+        fs::create_dir_all(ws.join("avatar")).unwrap();
+        fs::write(ws.join("avatar/avatar.toml"), CFG).unwrap();
+        assert_eq!(
+            installer(&ws, Some(release), None)
+                .run(true, progress)
+                .await,
+            Ok(DefaultAvatarAnswer::AlreadyPresent)
+        );
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_joiner_of_a_running_install_reports_its_start() {
+        let (_t, ws, release, hits, _) = served();
+        let i = installer(&ws, Some(release), Some(view(false, 0, true)));
+        let (a_seen, a) = recording();
+        let (b_seen, b) = recording();
+        let (ra, rb) = tokio::join!(i.run(false, a), i.run(false, b));
+        assert_eq!(ra, Ok(DefaultAvatarAnswer::Installed));
+        assert_eq!(rb, Ok(DefaultAvatarAnswer::Installed));
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1, "joined");
+        assert_eq!(a_seen.lock().unwrap().first(), Some(&STARTED));
+        assert_eq!(b_seen.lock().unwrap().first(), Some(&STARTED));
     }
 
     #[test]
