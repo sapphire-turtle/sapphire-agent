@@ -2012,6 +2012,46 @@ pub(crate) trait TurnHost: Send + Sync {
         let _ = (call, kind);
         crate::tools::policy::Approval::AllowOnce
     }
+
+    /// The answer this host already has for `call` without asking —
+    /// the editor's stored "always allow" / "always reject".
+    ///
+    /// `None` by default: only ACP keeps standing answers. A host that
+    /// cannot ask (a background subagent's) reads this instead of
+    /// `approve`, so `None` there means "refuse", which is the safe
+    /// direction for a host that forgets to answer.
+    async fn standing_approval(
+        &self,
+        call: &crate::provider::ToolCall,
+        kind: crate::tools::ToolKind,
+    ) -> Option<crate::tools::policy::Approval> {
+        let _ = (call, kind);
+        None
+    }
+
+    /// How `TurnLoop::run` explains an `approve` that did not allow the
+    /// call.
+    ///
+    /// `UserDeclined` by default, because every host that asks either
+    /// got a no or treats a failed question as one. A host that never
+    /// asks says so instead, so the model does not read a refusal
+    /// nobody made as the user's decision.
+    fn declined_refusal(&self) -> crate::tools::policy::Refusal {
+        crate::tools::policy::Refusal::UserDeclined
+    }
+
+    /// A background task this turn started has ended; `text` is its
+    /// completion report. Called the moment it ends, which may be after
+    /// this turn is over.
+    ///
+    /// Default no-op: the report reaches the model either way — it is
+    /// delivered into the session's next turn — so a host with nowhere
+    /// to show it loses nothing the agent needs.
+    // Nothing calls this until background subagents are started.
+    #[allow(dead_code)]
+    async fn background_finished(&self, text: &str) {
+        let _ = text;
+    }
 }
 
 /// Builds the `{id, name}` params shared by the `tool_start`/`tool_end`
@@ -2705,7 +2745,10 @@ impl TurnLoop<'_> {
                                     if progress.approve(call, kind).await.allows() {
                                         None
                                     } else {
-                                        Some(refusal_message(&call.name, Refusal::UserDeclined))
+                                        Some(refusal_message(
+                                            &call.name,
+                                            progress.declined_refusal(),
+                                        ))
                                     }
                                 }
                             }
@@ -4891,6 +4934,96 @@ mod tests {
              one the nested 'risky' call is judged by, and it rejects \
              that call by name"
         );
+    }
+
+    /// A call a background subagent was refused tells the model that it
+    /// needed an approval nobody could give — not that the user said no,
+    /// which nobody did — and the gate that refuses it is the parent's
+    /// own `Origin`, unchanged.
+    ///
+    /// `risky` is `Execute`, in the same risky bucket as `Other`, so
+    /// `Acp(Default)` sends it to `approve`. The parent's `approve` says
+    /// yes; the call must still not run, because the background host
+    /// never reaches it.
+    #[tokio::test]
+    async fn an_ask_declined_by_a_background_host_reads_needs_approval() {
+        use crate::tools::policy::{Approval, Origin, Refusal, SessionMode, refusal_message};
+
+        struct AcpParent;
+        #[async_trait::async_trait]
+        impl TurnHost for AcpParent {
+            async fn tool_start(&self, _id: &str, _name: &str, _input: &Value) {}
+            async fn tool_end(&self, _id: &str, _name: &str) {}
+            async fn turn_error(&self, _message: &str) {}
+            fn origin(&self) -> Origin {
+                Origin::Acp(SessionMode::Default)
+            }
+            async fn approve(
+                &self,
+                _call: &crate::provider::ToolCall,
+                _kind: crate::tools::ToolKind,
+            ) -> Approval {
+                Approval::AllowOnce
+            }
+        }
+
+        let state = ServeState::for_test_scripted(
+            true,
+            vec![
+                crate::provider::ChatResponse {
+                    prompt_usage: None,
+                    text: None,
+                    tool_calls: vec![crate::provider::ToolCall {
+                        id: "call-1".to_string(),
+                        name: "risky".to_string(),
+                        input: json!({}),
+                    }],
+                    stop_reason: None,
+                },
+                final_round("could not run it"),
+            ],
+        );
+        let risky = RiskyTool::new();
+        let ran = risky.ran_flag();
+        state.tools.register_tool(Box::new(risky)).await;
+
+        let refused = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let host = crate::tools::subagent::BackgroundSubagentHost::new(
+            Arc::new(AcpParent) as Arc<dyn TurnHost>,
+            Arc::clone(&refused),
+        );
+        let sid = "s-background-ask".to_string();
+        run_llm_turn(
+            Arc::clone(&state),
+            sid.clone(),
+            ChatMessage::user("run it"),
+            Arc::new(host) as Arc<dyn TurnHost>,
+            None,
+        )
+        .await;
+
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "a background host must not run what needed the user"
+        );
+        // The in-memory history, as `a_refused_tool_returns_a_result_and_the_turn_continues`
+        // reads it: the stored copy elides tool results.
+        let sessions = state.sessions.lock().await;
+        let result = sessions
+            .get(&sid)
+            .expect("the session exists")
+            .iter()
+            .flat_map(|m| m.parts.clone())
+            .find_map(|part| match part {
+                ContentPart::ToolResult {
+                    tool_use_id,
+                    content,
+                } if tool_use_id == "call-1" => Some(content),
+                _ => None,
+            })
+            .expect("the refused call still owes the model a tool_result");
+        assert_eq!(result, refusal_message("risky", Refusal::NeedsApproval));
+        assert_eq!(refused.lock().unwrap().len(), 1);
     }
 
     /// The depth cap is enforced by the *gate*, not just by the list.

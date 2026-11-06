@@ -87,7 +87,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use tracing::warn;
+use tracing::{debug, warn};
 
 pub(crate) const SUBAGENT_TOOL_NAME: &str = "subagent";
 
@@ -321,7 +321,8 @@ fn build_spec(agents: &[AgentDef]) -> ToolSpec {
 /// the parent's own terminal-response channel.
 ///
 /// Every other method is forwarded completely unchanged: `origin()`,
-/// `approve()`, `acp_client()`, `client_fs_caps()`,
+/// `approve()`, `standing_approval()`, `declined_refusal()`,
+/// `acp_client()`, `client_fs_caps()`,
 /// `client_terminal_cap()`, `tool_start`/`tool_end`/`tool_allowed` all
 /// still resolve to the parent's own host, because those are what keep
 /// delegation inside the same permission gate — `turn_error`,
@@ -413,6 +414,149 @@ impl crate::serve::TurnHost for SubagentHost {
         kind: ToolKind,
     ) -> crate::tools::policy::Approval {
         self.0.approve(call, kind).await
+    }
+
+    async fn standing_approval(
+        &self,
+        call: &crate::provider::ToolCall,
+        kind: ToolKind,
+    ) -> Option<crate::tools::policy::Approval> {
+        self.0.standing_approval(call, kind).await
+    }
+
+    /// Forwarded with `approve`: whoever answered says why it was no.
+    /// Under a background subagent that is nobody, and the nested
+    /// child's refusal must not claim the user declined.
+    fn declined_refusal(&self) -> crate::tools::policy::Refusal {
+        self.0.declined_refusal()
+    }
+}
+
+/// The host a background subagent's nested turn runs under.
+///
+/// The parent's turn has usually ended by the time the child calls a
+/// tool, so nobody is there to answer a permission dialog. The
+/// permission table stays the parent's own — `origin()` is forwarded
+/// unchanged, so a background child cannot run what its parent would
+/// be refused — and only the `Ask` row changes meaning: `approve` never
+/// asks. It takes the editor's standing "always allow" (through the
+/// parent's `standing_approval`) and refuses everything else, recording
+/// the call in `refused` so the completion report can tell the user
+/// what is waiting on them. Falling through to the parent's `approve`
+/// instead would put a dialog in front of the user that is not about
+/// the turn they are looking at, or, on a host whose `approve` defaults
+/// to `AllowOnce`, run the call with nobody's say-so.
+///
+/// `tool_start` / `tool_end` / `tool_allowed` are logged, not
+/// forwarded. `SubagentHost` forwards them to make a permission prompt
+/// legible as coming from this session; with no prompt, all they would
+/// do is push tool-call updates for calls that belong to no turn the
+/// editor is showing, which can confuse it.
+///
+/// `turn_error` and `message_chunk` are swallowed and `round_budget` is
+/// `Unattended`, for the reasons `SubagentHost` gives. `acp_client`,
+/// `cwd` and the client capabilities are forwarded: the child works on
+/// the editor's machine while the connection lasts, and its client-side
+/// tools fail once it is gone, which the child reads and reports.
+/// `avatar` is `None`: a background child has no gesture to make in
+/// the parent's turn.
+pub(crate) struct BackgroundSubagentHost {
+    parent: Arc<dyn crate::serve::TurnHost>,
+    refused: Arc<std::sync::Mutex<Vec<crate::background::RefusedCall>>>,
+}
+
+impl BackgroundSubagentHost {
+    /// `refused` is shared so the caller can read it after the child's
+    /// turn ends.
+    // Nothing starts a background subagent yet; the `subagent` tool's
+    // `background` argument will.
+    #[allow(dead_code)]
+    pub(crate) fn new(
+        parent: Arc<dyn crate::serve::TurnHost>,
+        refused: Arc<std::sync::Mutex<Vec<crate::background::RefusedCall>>>,
+    ) -> Self {
+        Self { parent, refused }
+    }
+}
+
+#[async_trait]
+impl crate::serve::TurnHost for BackgroundSubagentHost {
+    async fn tool_start(&self, id: &str, name: &str, _input: &serde_json::Value) {
+        debug!("background subagent: tool call {id} ({name}) started");
+    }
+
+    async fn tool_end(&self, id: &str, name: &str) {
+        debug!("background subagent: tool call {id} ({name}) ended");
+    }
+
+    async fn turn_error(&self, _message: &str) {}
+
+    async fn message_chunk(&self, _text: &str) {}
+
+    fn round_budget(&self) -> crate::serve::RoundBudget {
+        crate::serve::RoundBudget::Unattended
+    }
+
+    fn origin(&self) -> crate::tools::policy::Origin {
+        self.parent.origin()
+    }
+
+    fn acp_client(&self) -> Option<Arc<dyn crate::tools::acp_client::AcpClient>> {
+        self.parent.acp_client()
+    }
+
+    fn cwd(&self) -> Option<String> {
+        self.parent.cwd()
+    }
+
+    fn client_fs_caps(&self) -> (bool, bool) {
+        self.parent.client_fs_caps()
+    }
+
+    fn client_terminal_cap(&self) -> bool {
+        self.parent.client_terminal_cap()
+    }
+
+    fn avatar(&self) -> Option<Arc<crate::tools::avatar_tools::AvatarTurn>> {
+        None
+    }
+
+    async fn tool_allowed(&self, id: &str) {
+        debug!("background subagent: tool call {id} allowed");
+    }
+
+    /// Never asks — see the type doc.
+    async fn approve(
+        &self,
+        call: &crate::provider::ToolCall,
+        kind: ToolKind,
+    ) -> crate::tools::policy::Approval {
+        use crate::tools::policy::Approval;
+        if let Some(standing) = self.parent.standing_approval(call, kind).await
+            && standing.allows()
+        {
+            return standing;
+        }
+        self.refused
+            .lock()
+            .unwrap()
+            .push(crate::background::RefusedCall {
+                name: call.name.clone(),
+                input: call.input.clone(),
+            });
+        Approval::RejectOnce
+    }
+
+    async fn standing_approval(
+        &self,
+        call: &crate::provider::ToolCall,
+        kind: ToolKind,
+    ) -> Option<crate::tools::policy::Approval> {
+        self.parent.standing_approval(call, kind).await
+    }
+
+    fn declined_refusal(&self) -> crate::tools::policy::Refusal {
+        crate::tools::policy::Refusal::NeedsApproval
     }
 }
 
@@ -1646,6 +1790,162 @@ mod tests {
         assert!(
             reaches_editor,
             "a delegated child's tool call must reach the editor, not the agent's own disk"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Background subagents
+    // -----------------------------------------------------------------
+
+    /// A parent host whose `approve` would say yes to anything, so a
+    /// background host that reached it would let the call run. Its
+    /// `standing_approval` answers whatever the test sets.
+    struct StandingParent {
+        standing: Option<crate::tools::policy::Approval>,
+        tool_starts: std::sync::Mutex<Vec<String>>,
+        asked: std::sync::atomic::AtomicBool,
+    }
+
+    impl StandingParent {
+        fn new(standing: Option<crate::tools::policy::Approval>) -> Self {
+            Self {
+                standing,
+                tool_starts: std::sync::Mutex::new(Vec::new()),
+                asked: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl crate::serve::TurnHost for StandingParent {
+        async fn tool_start(&self, id: &str, _name: &str, _input: &serde_json::Value) {
+            self.tool_starts.lock().unwrap().push(id.to_string());
+        }
+        async fn tool_end(&self, _id: &str, _name: &str) {}
+        async fn turn_error(&self, _message: &str) {}
+        fn origin(&self) -> crate::tools::policy::Origin {
+            crate::tools::policy::Origin::Acp(crate::tools::policy::SessionMode::Default)
+        }
+        async fn standing_approval(
+            &self,
+            _call: &crate::provider::ToolCall,
+            _kind: ToolKind,
+        ) -> Option<crate::tools::policy::Approval> {
+            self.standing
+        }
+        async fn approve(
+            &self,
+            _call: &crate::provider::ToolCall,
+            _kind: ToolKind,
+        ) -> crate::tools::policy::Approval {
+            self.asked.store(true, std::sync::atomic::Ordering::SeqCst);
+            crate::tools::policy::Approval::AllowOnce
+        }
+    }
+
+    fn background_host(
+        parent: std::sync::Arc<StandingParent>,
+    ) -> (
+        BackgroundSubagentHost,
+        std::sync::Arc<std::sync::Mutex<Vec<crate::background::RefusedCall>>>,
+    ) {
+        let refused = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let host = BackgroundSubagentHost::new(
+            parent as std::sync::Arc<dyn crate::serve::TurnHost>,
+            std::sync::Arc::clone(&refused),
+        );
+        (host, refused)
+    }
+
+    fn shell_call() -> crate::provider::ToolCall {
+        crate::provider::ToolCall {
+            id: "bg-call-1".to_string(),
+            name: "shell".to_string(),
+            input: json!({"command": "rm -rf build"}),
+        }
+    }
+
+    /// Nobody can answer a dialog for a background task, so a call with
+    /// no standing answer is refused — without asking the parent, whose
+    /// `approve` would put a prompt in front of the user (or here, say
+    /// yes) — and kept for the completion report.
+    #[tokio::test]
+    async fn background_host_refuses_an_ask_and_records_it() {
+        let parent = std::sync::Arc::new(StandingParent::new(None));
+        let (host, refused) = background_host(std::sync::Arc::clone(&parent));
+
+        let answer = crate::serve::TurnHost::approve(&host, &shell_call(), ToolKind::Execute).await;
+
+        assert_eq!(answer, crate::tools::policy::Approval::RejectOnce);
+        assert!(
+            !parent.asked.load(std::sync::atomic::Ordering::SeqCst),
+            "a background host must never fall through to the parent's dialog"
+        );
+        assert_eq!(
+            refused.lock().unwrap().as_slice(),
+            [crate::background::RefusedCall {
+                name: "shell".to_string(),
+                input: json!({"command": "rm -rf build"}),
+            }]
+        );
+        assert_eq!(
+            crate::serve::TurnHost::declined_refusal(&host),
+            crate::tools::policy::Refusal::NeedsApproval
+        );
+    }
+
+    /// A standing "always reject" is a refusal too: it does not run, and
+    /// it is reported like any other call that needed the user.
+    #[tokio::test]
+    async fn background_host_refuses_a_standing_reject() {
+        let parent = std::sync::Arc::new(StandingParent::new(Some(
+            crate::tools::policy::Approval::RejectAlways,
+        )));
+        let (host, refused) = background_host(std::sync::Arc::clone(&parent));
+
+        let answer = crate::serve::TurnHost::approve(&host, &shell_call(), ToolKind::Execute).await;
+
+        assert!(!answer.allows());
+        assert!(!parent.asked.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(refused.lock().unwrap().len(), 1);
+    }
+
+    /// What the user already told the editor to always allow runs in the
+    /// background as it would in the foreground, and is not reported.
+    #[tokio::test]
+    async fn background_host_runs_a_standing_allow() {
+        let parent = std::sync::Arc::new(StandingParent::new(Some(
+            crate::tools::policy::Approval::AllowAlways,
+        )));
+        let (host, refused) = background_host(std::sync::Arc::clone(&parent));
+
+        let answer = crate::serve::TurnHost::approve(&host, &shell_call(), ToolKind::Execute).await;
+
+        assert!(answer.allows());
+        assert!(!parent.asked.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(refused.lock().unwrap().is_empty());
+    }
+
+    /// The permission table is the parent's own, but the parent's tool
+    /// events are not: a background child's calls are not part of the
+    /// turn the editor is showing.
+    #[tokio::test]
+    async fn background_host_forwards_origin_but_not_tool_events() {
+        let parent = std::sync::Arc::new(StandingParent::new(None));
+        let (host, _refused) = background_host(std::sync::Arc::clone(&parent));
+
+        assert_eq!(
+            crate::serve::TurnHost::origin(&host),
+            crate::tools::policy::Origin::Acp(crate::tools::policy::SessionMode::Default)
+        );
+        crate::serve::TurnHost::tool_start(&host, "bg-call-1", "shell", &json!({})).await;
+        assert!(
+            parent.tool_starts.lock().unwrap().is_empty(),
+            "tool_start must not reach the parent's host"
+        );
+        assert_eq!(
+            crate::serve::TurnHost::round_budget(&host),
+            crate::serve::RoundBudget::Unattended
         );
     }
 

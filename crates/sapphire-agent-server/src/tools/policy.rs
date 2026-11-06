@@ -142,6 +142,11 @@ pub enum Refusal {
     /// a subagent's `tools:` restriction, or `subagent` itself once
     /// removed from a nested turn's own list.
     NotOffered,
+    /// The call needed a human's answer and the turn has nobody to ask:
+    /// a background task. Distinct from `UserDeclined`, because nobody
+    /// said no — the model should report the call, not treat it as a
+    /// decision the user made.
+    NeedsApproval,
 }
 
 /// Look a tool's kind up by name.
@@ -180,6 +185,10 @@ pub fn refusal_message(tool: &str, why: Refusal) -> String {
         Refusal::NotOffered => format!(
             "The '{tool}' tool is not available in this conversation. \
              Try another approach, or ask the user."
+        ),
+        Refusal::NeedsApproval => format!(
+            "{tool} needs the user's approval, which a background task cannot \
+             ask for. Report it in your answer instead of retrying."
         ),
     }
 }
@@ -481,6 +490,17 @@ mod tests {
         assert!(
             !not_offered.contains("Permission denied"),
             "an invented/out-of-round name has no permission to be denied: {not_offered}"
+        );
+
+        let needs_approval = refusal_message("shell", Refusal::NeedsApproval);
+        assert_eq!(
+            needs_approval,
+            "shell needs the user's approval, which a background task cannot ask for. \
+             Report it in your answer instead of retrying."
+        );
+        assert_ne!(
+            declined, needs_approval,
+            "nobody said no to a background task's call, so it must not read as a decline"
         );
 
         assert_ne!(

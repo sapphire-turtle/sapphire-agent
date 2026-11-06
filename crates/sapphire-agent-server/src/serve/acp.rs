@@ -484,6 +484,32 @@ impl super::TurnHost for AcpProgress {
         )));
     }
 
+    /// What the user already told this editor to always allow or always
+    /// reject, under this connection's profile. `approve` starts here,
+    /// and a background subagent's host reads only this.
+    async fn standing_approval(
+        &self,
+        call: &crate::provider::ToolCall,
+        _kind: crate::tools::ToolKind,
+    ) -> Option<crate::tools::policy::Approval> {
+        use crate::tools::policy::Approval;
+        match self.permissions.standing(&self.profile, &call.name) {
+            Some(true) => Some(Approval::AllowAlways),
+            Some(false) => Some(Approval::RejectAlways),
+            None => None,
+        }
+    }
+
+    /// A thought chunk rather than a message chunk: the report is not
+    /// the agent's reply, and it may arrive while no turn is running.
+    /// An editor that shows nothing outside a turn just drops it, which
+    /// costs nothing — the model gets the report in its next turn.
+    async fn background_finished(&self, text: &str) {
+        self.notify(SessionUpdate::AgentThoughtChunk(ContentChunk::new(
+            ContentBlock::Text(TextContent::new(text.to_string())),
+        )));
+    }
+
     /// Put the call to the user, unless a standing answer settles it.
     ///
     /// The standing answer is consulted here rather than inside
@@ -500,10 +526,8 @@ impl super::TurnHost for AcpProgress {
         // A standing answer settles it without a round trip. Moving the
         // call off `Pending` is not done here: the gate calls
         // `tool_allowed` for every permitted call, asked or not.
-        match self.permissions.standing(&self.profile, &call.name) {
-            Some(true) => return Approval::AllowAlways,
-            Some(false) => return Approval::RejectAlways,
-            None => {}
+        if let Some(standing) = self.standing_approval(call, kind).await {
+            return standing;
         }
 
         let request = RequestPermissionRequest::new(
