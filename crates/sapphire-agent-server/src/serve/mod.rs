@@ -154,7 +154,6 @@ pub struct ServeState {
     /// rather than the process failing to start.
     pub(crate) subagent_cache: Option<Arc<SubagentCache>>,
     /// Background tasks started by sessions and their undelivered results.
-    #[allow(dead_code)] // Read once the subagent tool and the turn loop use it (Tasks 3-7).
     pub(crate) background: Arc<crate::background::BackgroundTasks>,
     /// Terminals the model started and has not cleaned up, per agent
     /// session id.
