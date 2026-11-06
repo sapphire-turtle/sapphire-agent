@@ -186,8 +186,11 @@ fn suspended_session(
 /// front of the marker.
 fn turns_spent(store: &SessionStore, session_id: &str, task: &str) -> usize {
     let marker = marker(task);
+    // The raw log, not `load_session`: that one is the model's view, which
+    // a compaction checkpoint trims, and turns before it still count.
     store
-        .load_session(session_id)
+        .load_session_full(session_id)
+        .map(|(messages, _)| messages)
         .unwrap_or_default()
         .iter()
         .filter(|m| m.role == Role::User)
@@ -198,6 +201,10 @@ fn turns_spent(store: &SessionStore, session_id: &str, task: &str) -> usize {
         })
         .count()
 }
+
+/// See `AutonomousLoop::on_session_created`.
+#[cfg(test)]
+type SessionCreatedHook = Box<dyn Fn(&str, &str) + Send>;
 
 /// The idle loop.
 pub struct AutonomousLoop {
@@ -224,7 +231,7 @@ pub struct AutonomousLoop {
     /// whose id it cannot know in advance (the scripted provider calls no
     /// tool that would).
     #[cfg(test)]
-    on_session_created: Option<Box<dyn Fn(&str, &str) + Send>>,
+    on_session_created: Option<SessionCreatedHook>,
 }
 
 impl AutonomousLoop {
@@ -792,6 +799,9 @@ mod tests {
         .unwrap();
     }
 
+    /// `(session_id, task_id)` of the task `loop_registering` registered.
+    type Seen = Arc<std::sync::Mutex<Option<(String, String)>>>;
+
     /// A loop whose new sessions for `task` get one pending background
     /// task registered before their first turn — standing in for a tool
     /// that would register it during the turn. The returned cell holds
@@ -799,10 +809,7 @@ mod tests {
     fn loop_registering(
         state: &Arc<crate::serve::ServeState>,
         task: &'static str,
-    ) -> (
-        AutonomousLoop,
-        Arc<std::sync::Mutex<Option<(String, String)>>>,
-    ) {
+    ) -> (AutonomousLoop, Seen) {
         let seen = Arc::new(std::sync::Mutex::new(None));
         let mut lp = AutonomousLoop::new(Arc::clone(state), None);
         let bg = Arc::clone(&state.background);
@@ -966,6 +973,29 @@ mod tests {
         assert_eq!(log.calls().len(), 2, "no third turn");
     }
 
+    /// Turns before a compaction checkpoint still count: the model's view
+    /// of the history loses them, the log does not.
+    #[tokio::test]
+    async fn turns_before_a_compaction_still_count_on_resume() {
+        let (state, log) = crate::serve::ServeState::for_test_scripted_with_log(
+            false,
+            vec![response("WAIT"), response("working"), response("working")],
+        );
+        write_task(&state, "a", "max_turns: 2");
+        let (mut lp, seen) = loop_registering(&state, "a");
+        lp.run_cycle().await.unwrap();
+        let (sid, id) = seen.lock().unwrap().clone().unwrap();
+        state
+            .autonomous_session_store
+            .append_summary(&sid, "the WAIT turn", 0)
+            .unwrap();
+        state.background.complete(&sid, &id, finished());
+
+        lp.run_cycle().await.unwrap();
+        assert!(rows_for(&state, "a")[0].is_closed, "turn 2 caps");
+        assert_eq!(log.calls().len(), 2, "the compacted turn was counted");
+    }
+
     #[tokio::test]
     async fn done_cancels_pending_tasks() {
         let state = crate::serve::ServeState::for_test_scripted(false, vec![response("DONE")]);
@@ -976,8 +1006,8 @@ mod tests {
 
         assert!(rows_for(&state, "a")[0].is_closed);
         assert!(
-            state.background.pending(&sid).is_empty(),
-            "closing the session stops its background tasks"
+            !state.background.has_pending_or_inbox(&sid),
+            "closing the session tears down its background tasks"
         );
         assert!(
             !state.background.complete(&sid, &id, finished()),
