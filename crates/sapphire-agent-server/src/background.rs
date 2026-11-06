@@ -360,19 +360,28 @@ impl BackgroundTasks {
         Ok(())
     }
 
-    /// Abort every task of the session (e.g. when it is reset).
+    /// Tear the session down: abort every running task and forget the
+    /// session entirely — its entry, its undelivered completions and its
+    /// file. Nothing is queued, because a closed session has no next turn
+    /// to deliver to. Callers are session-close paths; to stop one task
+    /// and tell the model about it, use [`cancel`](Self::cancel).
+    ///
+    /// A child that outlives this (aborted mid-poll, or finishing between
+    /// `register` and `attach`) gets `false` from `complete`, which never
+    /// creates an entry, so neither the entry nor the file comes back.
     pub(crate) fn cancel_all(&self, session: &str) {
-        let mut map = self.lock();
-        if let Some(s) = map.get_mut(session) {
-            for r in std::mem::take(&mut s.running) {
-                Self::cancel_running(s, r);
+        let removed = self.lock().remove(session);
+        if let Some(s) = removed {
+            for r in s.running {
+                if let Some(a) = r.abort {
+                    a.abort();
+                }
             }
-            // The session is being torn down; nothing is left to deliver.
-            if let Some(dir) = &self.dir
-                && check_file_stem(session).is_ok()
-            {
-                let _ = std::fs::remove_file(dir.join(format!("{session}.json")));
-            }
+        }
+        if let Some(dir) = &self.dir
+            && check_file_stem(session).is_ok()
+        {
+            let _ = std::fs::remove_file(dir.join(format!("{session}.json")));
         }
     }
 
@@ -645,6 +654,20 @@ mod tests {
         t.register("s", kind("h"), "a".into()).unwrap();
         assert_eq!(on_disk(td.path()), vec!["s.json".to_string()]);
         t.cancel_all("s");
+        assert!(on_disk(td.path()).is_empty());
+        assert!(!t.has_pending_or_inbox("s"));
+    }
+
+    /// A child that finishes after teardown is dropped and resurrects
+    /// neither the session's entry nor its file.
+    #[test]
+    fn complete_after_cancel_all_resurrects_nothing() {
+        let td = tempfile::tempdir().unwrap();
+        let t = BackgroundTasks::open(Some(td.path().to_path_buf()), 4);
+        let id = t.register("s", kind("h"), "a".into()).unwrap();
+        t.cancel_all("s");
+        assert!(!t.complete("s", &id, fin()));
+        assert!(!t.has_pending_or_inbox("s"));
         assert!(on_disk(td.path()).is_empty());
     }
 }
