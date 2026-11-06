@@ -95,8 +95,10 @@ pub(crate) struct RefusedCall {
 | `complete(session, id, outcome)` | pending から外して inbox に積み、`notify` を鳴らす |
 | `drain(session) -> Vec<Completion>` | 受け箱を取り出す |
 | `has_pending_or_inbox(session) -> bool` | 自律ループの休止判定用 |
-| `wait(session)` | 受け箱が空でなくなるまで待つ |
-| `cancel(session, id)` / `cancel_all(session)` | `abort` して `Cancelled` を積む |
+| `has_inbox(session) -> bool` | 受け箱に未配達の完了があるか。自律ループが毎周期ポーリングする（`wait` は持たない） |
+| `rollback_delivery(session, …)` | 運んだメッセージを保存できなかったとき、配達中のエントリを受け箱へ戻す |
+| `cancel(session, id)` | `abort` して `Cancelled` を積む |
+| `cancel_all(session)` | 後始末: `abort` し、セッションを忘れ、ファイルを消す。何も積まない |
 
 ### 保存
 
@@ -136,7 +138,8 @@ resume できる場合は handle を示す。
 
 1. 今までどおり確認する（定義の有無、深さの上限、`resume` なら `busy_handles` の取得）。
    加えて `TurnContext::session_id` が `Some` で、`subagent_depth == 0` であることを確認する。
-2. **ハンドルを開始時に決める**（今は `run_and_store` の保存時に決まる）。
+2. ハンドルはもともとディスパッチの開始時に決まっているので、変更は要らない。
+   バックグラウンドの場合は、子が終わるまで `busy_handles` でそのハンドルも押さえる。
 3. `BackgroundTasks::register` に `Subagent { agent, handle }` を登録する。
 4. `tokio::spawn` で子のターンを始め、`attach` する。task-local は spawn で引き継がれないので、
    メモリの名前空間・timer origin・ACP クライアント・admin room profile・`TurnContext` を
@@ -156,6 +159,11 @@ resume できる場合は handle を示す。
   `TurnHost` に新しく `standing_approval(call, kind) -> Option<Approval>`（既定 `None`）を足し、
   ACP の host は `PermissionStore` の「常に許可 / 常に拒否」を返す。
   許可なら実行し、それ以外は `RejectOnce` にして `RefusedCall` を記録する。
+- 「常に拒否」は記録せず、子には UserDeclined として見える。
+  `NeedsApproval` で拒否して完了に載せるのは、答えのなかった `Ask` だけ。
+  どちらにするかは `TurnHost::declined_refusal(approval)` が選ぶ。
+- 子は `TurnHost::detached()` の host で動くので、始めたリクエスト（HTTP SSE）を開いたままにしない。
+  既定の detached host は origin だけを持つ。ACP は自分の host の複製を持つ。
 - `tool_start` / `tool_end`: 転送せず、ログに出すだけ。同期の子が転送するのは
   許可ダイアログの出どころを示すためで、ここではダイアログを出さない。
   ターンの外でツール呼び出しの更新を送るとエディタを混乱させうる。
@@ -187,7 +195,8 @@ resume できる場合は handle を示す。
 - **ラウンドの合間**: ツール結果をまとめたユーザーメッセージを作るときに `drain` し、
   空でなければ同じメッセージにテキストブロックとして足す。
 - 順序は `drain` → 履歴に保存 → 受け箱のファイルを書き直す。途中で落ちると
-  二度届くことはあるが、届かないことはない。
+  二度届くことはあるが、届かないことはない。メッセージを保存できなかったときは
+  `rollback_delivery` で受け箱へ戻すので、失われずに再配達される。
 - **ACP**: 完了の時点で `session/update` を送り、エディタに完了を知らせる。
   ターンの外では表示されないこともあるが害はない。
 
@@ -204,7 +213,7 @@ resume できる場合は handle を示す。
 
 - `next_task` は休止中のタスクを、受け箱が空の間は飛ばす。空でなくなったら、
   新しいセッションを作らず、そのセッションを再開する。優先度の順は今までどおり。
-- 使ったターン数は履歴から数える。休止中はターンを回さないので `max_turns` を消費しない
+- 使ったターン数は履歴から数える。生のログ（`load_session_full`）から読むので、コンテキスト圧縮を越えても保たれる。休止中はターンを回さないので `max_turns` を消費しない
   （`WAIT` と答えたそのターンは数える）。
 - 再起動後は保留が `Interrupted` として受け箱に入るので、休止中のタスクはそのまま再開できる。
 - 「他のセッションが動いている」の判定（`is_idle` / `busy_rows`）は自律ストアを読まないので、
