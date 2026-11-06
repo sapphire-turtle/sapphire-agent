@@ -35,7 +35,7 @@
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use base64::Engine as _;
-use sapphire_framework::ipc::{Client, ClientInfo, Notification};
+use sapphire_framework::ipc::{Client, ClientInfo, Notification, codes};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -51,7 +51,9 @@ pub const APP: &str = "sapphire-agent";
 /// 3: `chat.send` takes `attachments` and `client`; `chat.progress` carries
 /// `expression`, `action` and `pose`; added `set_pose` and
 /// `sapphire-agent.avatar.*`.
-pub const APP_API: u32 = 3;
+/// 4: added `sapphire-agent.avatar.install_default` and its `install_progress`
+/// notification.
+pub const APP_API: u32 = 4;
 
 /// Open (resume or reserve) a session.
 pub const OPEN: &str = "sapphire-agent.chat.open";
@@ -372,6 +374,47 @@ impl ChatClient {
         Ok(serde_json::from_value(result)?)
     }
 
+    /// Ask the agent to download and install the default avatar, handing
+    /// each [`InstallProgress`] to `on_progress`. With `auto`, the agent may
+    /// decline with `NeedsConfirmation`. `Unavailable` when the agent
+    /// predates the method.
+    pub async fn avatar_install_default(
+        &self,
+        auto: bool,
+        mut on_progress: impl FnMut(InstallProgress),
+    ) -> Result<DefaultAvatarAnswer> {
+        // Subscribed before the call, so no notification can be missed.
+        let mut events = self.client.notifications();
+        let call = self
+            .client
+            .call::<_, DefaultAvatarAnswer>(AVATAR_INSTALL_DEFAULT, json!({ "auto": auto }));
+        tokio::pin!(call);
+        let mut handle = |event: Notification| {
+            if event.method != AVATAR_INSTALL_PROGRESS {
+                return;
+            }
+            if let Ok(p) = serde_json::from_value::<InstallProgress>(event.params) {
+                on_progress(p);
+            }
+        };
+        let answered = loop {
+            tokio::select! {
+                biased;
+                event = events.recv() => {
+                    if let Ok(event) = event {
+                        handle(event);
+                    }
+                }
+                answered = &mut call => break answered,
+            }
+        };
+        // Whatever arrived with the answer.
+        while let Ok(event) = events.try_recv() {
+            handle(event);
+        }
+        install_answer(answered)
+    }
+
     /// A whole avatar file, read [`AVATAR_CHUNK`] at a time.
     pub async fn avatar_download(&self, path: &str) -> Result<Vec<u8>> {
         let mut out = Vec::new();
@@ -606,9 +649,43 @@ pub struct AvatarManifest {
     pub files: Vec<AvatarFile>,
 }
 
+/// The answer to `AVATAR_INSTALL_DEFAULT`: an agent that does not know the
+/// method (METHOD_NOT_FOUND) has no default avatar to install.
+fn install_answer(
+    answered: std::result::Result<DefaultAvatarAnswer, sapphire_framework::ipc::Error>,
+) -> Result<DefaultAvatarAnswer> {
+    match answered {
+        Err(sapphire_framework::ipc::Error::Rpc(e)) if e.code == codes::METHOD_NOT_FOUND => {
+            Ok(DefaultAvatarAnswer::Unavailable)
+        }
+        other => other.map_err(|e| anyhow!(e)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn method_not_found_means_unavailable() {
+        use sapphire_framework::ipc::{Error, RpcError};
+        let rpc = |code| {
+            Err(Error::Rpc(RpcError {
+                code,
+                message: "x".into(),
+                data: None,
+            }))
+        };
+        assert_eq!(
+            install_answer(rpc(codes::METHOD_NOT_FOUND)).unwrap(),
+            DefaultAvatarAnswer::Unavailable
+        );
+        assert!(install_answer(rpc(codes::INTERNAL_ERROR)).is_err());
+        assert_eq!(
+            install_answer(Ok(DefaultAvatarAnswer::Installed)).unwrap(),
+            DefaultAvatarAnswer::Installed
+        );
+    }
 
     #[test]
     fn progress_kinds_parse_into_events() {
