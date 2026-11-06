@@ -529,7 +529,8 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
                 Arc::clone(&restart),
             );
             // ── Placement: which host runs what, once synced ───────────────
-            let placement = placement::Placement::synced(sync_runtime, served_root);
+            let placement =
+                placement::Placement::synced(Arc::clone(&sync_runtime), served_root.clone());
             placement::spawn_claim_keeper(
                 Arc::clone(&placement),
                 workspace_dir.clone(),
@@ -941,6 +942,14 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
             timer_dispatch.set_serve_state(Arc::downgrade(&serve_state));
             acp_tunnel.attach(Arc::clone(&serve_state));
             chat_tunnel.attach(Arc::clone(&serve_state));
+            chat_tunnel.attach_default_avatar(default_avatar::DefaultInstaller::new(
+                served_root.clone(),
+                default_avatar::INITIAL,
+                Arc::new(default_avatar::RuntimeProbe {
+                    runtime: sync_runtime,
+                    root: served_root.clone(),
+                }),
+            ));
 
             // ── Autonomous sessions (off unless configured) ─────────────────
             // Spawned outside the channel block on purpose: this loop needs

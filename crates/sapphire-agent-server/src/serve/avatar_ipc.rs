@@ -6,16 +6,18 @@ use std::sync::{Arc, OnceLock};
 
 use base64::Engine as _;
 use sapphire_agent_core::{
-    AVATAR_MANIFEST, AVATAR_READ, AVATAR_REMOVE, AVATAR_SET_MANIFEST, AVATAR_WRITE_BEGIN,
-    AVATAR_WRITE_CHUNK, AVATAR_WRITE_COMMIT, AvatarConfig,
+    AVATAR_INSTALL_DEFAULT, AVATAR_INSTALL_PROGRESS, AVATAR_MANIFEST, AVATAR_READ, AVATAR_REMOVE,
+    AVATAR_SET_MANIFEST, AVATAR_WRITE_BEGIN, AVATAR_WRITE_CHUNK, AVATAR_WRITE_COMMIT, AvatarConfig,
 };
 use sapphire_framework::ipc::{RequestCtx, Router, RpcError, codes};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::avatar_store::{AvatarError, AvatarStore};
+use crate::default_avatar::DefaultInstaller;
 
 type Cell = Arc<OnceLock<Arc<AvatarStore>>>;
+type InstallerCell = Arc<OnceLock<Arc<DefaultInstaller>>>;
 type Reply = std::result::Result<Value, RpcError>;
 
 fn rpc_error(code: i32, message: String) -> RpcError {
@@ -66,6 +68,64 @@ where
         .map_err(store_error)
 }
 
+fn still_starting() -> RpcError {
+    rpc_error(
+        codes::INTERNAL_ERROR,
+        "the agent is still starting; try again once `sapphire-agent status` shows it serving"
+            .to_owned(),
+    )
+}
+
+#[derive(Deserialize)]
+struct InstallParams {
+    #[serde(default)]
+    auto: bool,
+}
+
+/// `avatar.install_default`: run the installer, sending its progress to the
+/// asking client as notifications (best effort: the install goes on, and
+/// the callback keeps firing, when that client has gone).
+async fn install_default(cell: InstallerCell, ctx: RequestCtx) -> Reply {
+    let installer = cell.get().cloned().ok_or_else(still_starting)?;
+    let params: InstallParams = serde_json::from_value(ctx.params).map_err(|e| {
+        rpc_error(
+            codes::INVALID_PARAMS,
+            format!("bad {AVATAR_INSTALL_DEFAULT} parameters: {e}"),
+        )
+    })?;
+    // The callback runs on a blocking thread: hand each step to a task
+    // through an unbounded channel rather than awaiting the send there.
+    let (tx, mut rx) =
+        tokio::sync::mpsc::unbounded_channel::<sapphire_agent_core::InstallProgress>();
+    let peer = ctx.peer;
+    let pump = tokio::spawn(async move {
+        while let Some(p) = rx.recv().await {
+            if let Ok(params) = serde_json::to_value(p) {
+                let _ = peer.notify(AVATAR_INSTALL_PROGRESS, params).await;
+            }
+        }
+    });
+    let answer = installer
+        .run(
+            params.auto,
+            Arc::new(move |p| {
+                let _ = tx.send(p);
+            }),
+        )
+        .await;
+    // The sender is dropped with the callback once the install ends; let the
+    // queued steps go out before the answer.
+    let _ = pump.await;
+    answer
+        .map(|a| serde_json::to_value(a).unwrap_or(Value::Null))
+        .map_err(|m| {
+            rpc_error(
+                codes::INTERNAL_ERROR,
+                format!("install default avatar: {m}"),
+            )
+        })
+}
+
 #[derive(Deserialize)]
 struct ReadParams {
     path: String,
@@ -98,9 +158,9 @@ struct RemoveParams {
     path: String,
 }
 
-/// Register the seven `avatar.*` methods on `router`; they answer from
+/// Register the eight `avatar.*` methods on `router`; they answer from
 /// `cell` once the agent has filled it.
-pub fn register(router: Router, cell: Cell) -> Router {
+pub fn register(router: Router, cell: Cell, installer: InstallerCell) -> Router {
     let (c1, c2, c3, c4, c5, c6, c7) = (
         cell.clone(),
         cell.clone(),
@@ -176,6 +236,10 @@ pub fn register(router: Router, cell: Cell) -> Router {
                 })
                 .await
             }
+        })
+        .method(AVATAR_INSTALL_DEFAULT, move |ctx| {
+            let cell = installer.clone();
+            async move { install_default(cell, ctx).await }
         })
         .method(AVATAR_REMOVE, move |ctx| {
             let cell = c7.clone();
@@ -266,5 +330,67 @@ mod tests {
         let chat = crate::serve::chat_ipc::tests::connected(&tunnel).await;
         let err = chat.avatar_manifest().await.unwrap_err();
         assert!(err.to_string().contains("still starting"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn install_default_installs_and_reports_progress() {
+        use crate::default_avatar::tests::{FixedProbe, served, view};
+        let (t, ws, release, _hits, len) = served();
+        let tunnel = ChatTunnel::default();
+        tunnel.attach_avatar_for_test(AvatarStore::new(
+            ws.join("avatar"),
+            t.path().join("staging2"),
+        ));
+        tunnel.attach_default_avatar(crate::default_avatar::DefaultInstaller::new(
+            ws,
+            Some(release),
+            Arc::new(FixedProbe(Some(view(false, 0, false)))),
+        ));
+        let chat = crate::serve::chat_ipc::tests::connected(&tunnel).await;
+        let mut seen = Vec::new();
+        let answer = chat
+            .avatar_install_default(false, |p| seen.push(p))
+            .await
+            .unwrap();
+        assert_eq!(answer, sapphire_agent_core::DefaultAvatarAnswer::Installed);
+        assert_eq!(seen.last().unwrap().total, Some(len as u64));
+        assert!(
+            chat.avatar_manifest()
+                .await
+                .unwrap()
+                .config
+                .sprite
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn install_default_auto_with_peers_needs_confirmation() {
+        use crate::default_avatar::tests::{FixedProbe, served, view};
+        let (_t, ws, release, hits, _) = served();
+        let tunnel = ChatTunnel::default();
+        tunnel.attach_default_avatar(crate::default_avatar::DefaultInstaller::new(
+            ws,
+            Some(release),
+            Arc::new(FixedProbe(Some(view(true, 2, true)))),
+        ));
+        let chat = crate::serve::chat_ipc::tests::connected(&tunnel).await;
+        let answer = chat.avatar_install_default(true, |_| {}).await.unwrap();
+        assert_eq!(
+            answer,
+            sapphire_agent_core::DefaultAvatarAnswer::NeedsConfirmation
+        );
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn install_default_before_attach_is_an_error() {
+        let tunnel = ChatTunnel::default();
+        let chat = crate::serve::chat_ipc::tests::connected(&tunnel).await;
+        let err = chat
+            .avatar_install_default(false, |_| {})
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("starting"), "{err}");
     }
 }

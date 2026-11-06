@@ -19,7 +19,8 @@ use sapphire_framework_gui::SettingsSection;
 
 use super::{CompanionPrefs, FilePicker};
 use crate::avatar::{
-    ActiveRenderer, AvatarAssets, AvatarOps, DisplayMode, OpsStatus, RendererError,
+    ActiveRenderer, AvatarAssets, AvatarOps, DefaultAvatar, DisplayMode, Flow, OpsStatus,
+    RendererError,
 };
 
 /// A renderer's section of the Character page: the settings for the
@@ -108,6 +109,11 @@ pub(crate) struct CharacterModel {
     /// Why the latest sync of the avatar failed.
     sync_error: Option<String>,
     active: ActiveRenderer,
+    /// The default avatar's flow offers "Get the default avatar".
+    offer_default: bool,
+    /// The page's "Get the default avatar" was clicked, until
+    /// [`Self::take_default_request`].
+    default_requested: bool,
     /// `None` only in a `Default` model, which has no agent and no panels
     /// to draw; the page's model always has one.
     ops: Option<AvatarOps>,
@@ -127,6 +133,8 @@ impl Default for CharacterModel {
             error: None,
             sync_error: None,
             active: ActiveRenderer::Placeholder,
+            offer_default: false,
+            default_requested: false,
             ops: None,
             file_picker: None,
             panels: Vec::new(),
@@ -163,6 +171,11 @@ impl CharacterModel {
         std::mem::take(&mut self.edited).then(|| self.prefs.clone())
     }
 
+    /// Whether "Get the default avatar" was clicked, once after each click.
+    pub(crate) fn take_default_request(&mut self) -> bool {
+        std::mem::take(&mut self.default_requested)
+    }
+
     /// Copies what the page displays from the resources. A pending edit
     /// is not overwritten by the prefs it came from.
     pub(crate) fn refresh(
@@ -171,6 +184,7 @@ impl CharacterModel {
         assets: &AvatarAssets,
         error: Option<&str>,
         active: ActiveRenderer,
+        default_flow: &Flow,
     ) {
         if !self.edited && self.prefs != *prefs {
             self.prefs = prefs.clone();
@@ -187,6 +201,7 @@ impl CharacterModel {
             self.sync_error.clone_from(&assets.error);
         }
         self.active = active;
+        self.offer_default = *default_flow == (Flow::Done { offer: true });
     }
 
     fn ui(&mut self, ui: &mut egui::Ui) {
@@ -212,6 +227,11 @@ impl CharacterModel {
                 .suffix(" s")
                 .text("Revert after"),
         );
+        if self.offer_default && ui.button("Get the default avatar").clicked() {
+            self.default_requested = true;
+            // The next frame hands it over and shows the loading screen.
+            ui.ctx().request_repaint();
+        }
         ui.checkbox(&mut prefs.show_buttons, "Show buttons");
         if prefs != self.prefs {
             self.edit_prefs(|p| *p = prefs);
@@ -316,21 +336,32 @@ impl SettingsSection for CharacterPage {
     }
 }
 
-/// Every frame: hands the page's edits to the prefs and shows the page
-/// the resources as they are. Only reads the resources the renderers
-/// watch, and writes the prefs only when the page edited them.
+/// Every frame: hands the page's edits to the prefs (and its "Get the
+/// default avatar" to the flow) and shows the page the resources as they
+/// are. Only reads the resources the renderers watch, and writes the prefs
+/// only when the page edited them.
 pub(crate) fn refresh(
     shared: Res<CharacterShared>,
     mut prefs: ResMut<CompanionPrefs>,
     assets: Res<AvatarAssets>,
     error: Res<RendererError>,
     active: Res<ActiveRenderer>,
+    mut default_avatar: ResMut<DefaultAvatar>,
 ) {
     let mut model = shared.lock();
     if let Some(edited) = model.take_prefs_edit() {
         *prefs = edited;
     }
-    model.refresh(&prefs, &assets, error.0.as_deref(), *active);
+    if model.take_default_request() {
+        default_avatar.get();
+    }
+    model.refresh(
+        &prefs,
+        &assets,
+        error.0.as_deref(),
+        *active,
+        default_avatar.flow(),
+    );
 }
 
 /// Turns an op's request for a sync into [`crate::chat::SyncRequested`].
@@ -354,7 +385,7 @@ mod tests {
 
         model.edit_prefs(|p| p.revert_secs = 90);
         let older = CompanionPrefs::default();
-        model.refresh(&older, &assets, None, active);
+        model.refresh(&older, &assets, None, active, &Flow::new());
         assert_eq!(model.prefs.revert_secs, 90, "the pending edit stays");
         assert!(model.take_prefs_edit().is_some());
 
@@ -362,7 +393,7 @@ mod tests {
             show_buttons: true,
             ..CompanionPrefs::default()
         };
-        model.refresh(&newer, &assets, None, active);
+        model.refresh(&newer, &assets, None, active, &Flow::new());
         assert_eq!(model.prefs, newer, "idle, the resource's prefs show");
         assert_eq!(model.take_prefs_edit(), None);
     }
@@ -377,6 +408,7 @@ mod tests {
             &assets,
             None,
             ActiveRenderer::Placeholder,
+            &Flow::new(),
         );
         assert_eq!(model.sync_error.as_deref(), Some("offline"));
 
@@ -389,6 +421,7 @@ mod tests {
             &assets,
             None,
             ActiveRenderer::Placeholder,
+            &Flow::new(),
         );
         assert_eq!(model.sync_error, None, "a sync that succeeds clears it");
     }
@@ -402,5 +435,21 @@ mod tests {
         let edited = model.take_prefs_edit().expect("the edit is handed over");
         assert_eq!(edited.revert_secs, 90);
         assert_eq!(model.take_prefs_edit(), None, "once");
+    }
+
+    #[test]
+    fn the_page_offers_the_default_avatar_only_when_the_flow_does() {
+        let mut model = CharacterModel::default();
+        let (prefs, assets) = (CompanionPrefs::default(), AvatarAssets::default());
+        let active = ActiveRenderer::Placeholder;
+        model.refresh(&prefs, &assets, None, active, &Flow::Done { offer: false });
+        assert!(!model.offer_default);
+        model.refresh(&prefs, &assets, None, active, &Flow::Done { offer: true });
+        assert!(model.offer_default);
+
+        assert!(!model.take_default_request());
+        model.default_requested = true;
+        assert!(model.take_default_request(), "the click is handed over");
+        assert!(!model.take_default_request(), "once");
     }
 }

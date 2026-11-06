@@ -1,7 +1,8 @@
 //! The overlay's egui: the bubble above the character, the input box at
 //! its lower half, the history over it, the menu at the click and, with
 //! [`CompanionPrefs::show_buttons`], the gesture buttons beside it. Or the
-//! settings, filling the window, while they are open.
+//! settings, filling the window, while they are open; or, over everything,
+//! the default avatar's loading screen while it downloads.
 //!
 //! Each part is an egui area of its own above `Order::Background`, so the
 //! renderer's avatar shows through everywhere else.
@@ -14,10 +15,11 @@ use sapphire_agent_core::ClientCaps;
 use super::bubble::{self, Absence, BubbleContent};
 use super::{CompanionPrefs, CompanionRequest, Gesture, Overlay, OverlayInput, Speech};
 use crate::avatar::{
-    ActiveRenderer, AvatarAssets, AvatarBounds, AvatarState, DeclaredAvatar, RendererError,
+    ActiveRenderer, AvatarAssets, AvatarBounds, AvatarState, DeclaredAvatar, DefaultAvatar, Flow,
+    RendererError,
 };
 use crate::chat::{ChatBridge, ChatEntry, ChatRole, ChatState, Session, TurnState};
-use crate::settings::{GuiSettings, Layout, Screen};
+use crate::settings::{self, GuiSettings, Layout, Screen};
 
 const ICON_SEND: egui::ImageSource<'_> = egui::include_image!("../../assets/icons/send.svg");
 
@@ -35,6 +37,8 @@ const INPUT_WIDTH: f32 = 280.0;
 const HISTORY_MIN: egui::Vec2 = egui::vec2(320.0, 200.0);
 /// How much of the theme's window colour shows through the history.
 const HISTORY_OPACITY: f32 = 0.85;
+/// The loading screen's progress bar width, in points.
+const LOADING_BAR_WIDTH: f32 = 280.0;
 
 fn icon_image<'a>(ui: &egui::Ui, src: egui::ImageSource<'a>) -> egui::Image<'a> {
     egui::Image::new(src)
@@ -65,7 +69,8 @@ pub(crate) struct Parts<'w> {
     time: Res<'w, Time<Real>>,
 }
 
-/// Draws the overlay, or the settings while they are open.
+/// Draws the overlay, or the settings while they are open, or the default
+/// avatar's loading screen while its flow blocks the window.
 // A bevy system: each argument is a resource it reads or writes.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn ui(
@@ -76,6 +81,7 @@ pub(crate) fn ui(
     mut parts: Parts,
     mut requests: MessageWriter<CompanionRequest>,
     mut settings: Option<NonSendMut<GuiSettings>>,
+    mut default_avatar: ResMut<DefaultAvatar>,
     mut input_was_open: Local<bool>,
 ) {
     let Ok(ctx) = contexts.ctx_mut() else {
@@ -83,11 +89,18 @@ pub(crate) fn ui(
     };
     let mut settings = settings.as_deref_mut();
     let layout = Layout::of(settings.as_ref().map(|s| (s.open, s.settings.health())));
-    if layout.screen == Screen::Settings
-        && let Some(settings) = settings
-    {
-        settings_screen(ctx, settings);
-        return;
+    match settings::screen(layout, default_avatar.flow().blocks_screen()) {
+        Screen::Loading => {
+            loading_screen(ctx, &mut default_avatar);
+            return;
+        }
+        Screen::Settings => {
+            if let Some(settings) = settings {
+                settings_screen(ctx, settings);
+                return;
+            }
+        }
+        Screen::Companion => {}
     }
 
     let screen = ctx.content_rect();
@@ -364,6 +377,75 @@ fn settings_screen(ctx: &egui::Context, settings: &mut GuiSettings) {
                 egui::CentralPanel::default().show(ui, |ui| settings.settings.ui(ui));
             });
         });
+}
+
+/// The default avatar downloading, or why it failed, filling the window
+/// over everything else.
+fn loading_screen(ctx: &egui::Context, default_avatar: &mut DefaultAvatar) {
+    let screen = ctx.content_rect();
+    egui::Area::new(egui::Id::unique("companion_loading"))
+        .order(egui::Order::Middle)
+        .fixed_pos(screen.min)
+        .movable(false)
+        .show(ctx, |ui| {
+            ui.scope_builder(egui::UiBuilder::new().max_rect(screen), |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    ui.add_space(ui.available_height() * 0.35);
+                    ui.vertical_centered(|ui| {
+                        let flow = default_avatar.flow().clone();
+                        ui.heading(match flow {
+                            Flow::Reloading => "Loading your character…",
+                            Flow::Failed { .. } => "Couldn't download your character",
+                            _ => "Downloading your character…",
+                        });
+                        ui.add_space(GAP);
+                        match flow {
+                            Flow::Loading { received, total } => {
+                                ui.add(
+                                    progress_bar(received, total).desired_width(LOADING_BAR_WIDTH),
+                                );
+                            }
+                            Flow::Reloading => {
+                                ui.add(
+                                    egui::ProgressBar::new(0.0)
+                                        .animate(true)
+                                        .desired_width(LOADING_BAR_WIDTH),
+                                );
+                            }
+                            Flow::Failed { message } => {
+                                ui.colored_label(ui.visuals().error_fg_color, message);
+                                ui.add_space(GAP);
+                                if ui.button("Retry").clicked() {
+                                    default_avatar.retry();
+                                    ui.ctx().request_repaint();
+                                }
+                                if ui.button("Continue without an avatar").clicked() {
+                                    default_avatar.continue_without();
+                                    // This frame is already drawn; the next
+                                    // one shows the companion.
+                                    ui.ctx().request_repaint();
+                                }
+                            }
+                            Flow::Checking | Flow::Asking | Flow::Done { .. } => {}
+                        }
+                    });
+                });
+            });
+        });
+}
+
+/// The download's bar: the fraction once the size is known, else an
+/// animated one; `received` in MB as its text either way.
+fn progress_bar(received: u64, total: Option<u64>) -> egui::ProgressBar {
+    const MB: f32 = 1_000_000.0;
+    let got = received as f32 / MB;
+    match total {
+        Some(total) if total > 0 => egui::ProgressBar::new(received as f32 / total as f32)
+            .text(format!("{got:.1} / {:.1} MB", total as f32 / MB)),
+        _ => egui::ProgressBar::new(0.0)
+            .animate(true)
+            .text(format!("{got:.1} MB")),
+    }
 }
 
 fn render_entry(ui: &mut egui::Ui, entry: &ChatEntry) {

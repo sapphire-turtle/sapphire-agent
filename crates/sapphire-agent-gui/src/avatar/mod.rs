@@ -74,6 +74,7 @@
 //! draws no frames.
 
 pub mod assets;
+pub(crate) mod default_install;
 pub mod mode;
 pub mod placeholder;
 pub mod sprite;
@@ -100,6 +101,7 @@ use crate::companion::{CompanionPrefs, CursorOverride};
 pub use assets::{
     AvatarAssets, AvatarEditor, AvatarOps, AvatarSource, Cache, LoadedAvatar, OpTicket, OpsStatus,
 };
+pub(crate) use default_install::{DefaultAvatar, Flow};
 pub use mode::{ActiveRenderer, DisplayMode, choose, renderer_is};
 pub use state::AvatarState;
 
@@ -209,6 +211,26 @@ impl Plugin for AvatarPlugin {
             )
             .add_plugins((sprite::SpriteRendererPlugin, vrm::VrmRendererPlugin))
             .add_systems(Startup, spawn_ui_camera)
+            // Before the sync it may ask for, and so before the choice.
+            .add_systems(
+                Update,
+                default_install::drive_default_avatar
+                    .before(poll_sync)
+                    .before(AvatarSystems::Choose)
+                    // Inserted with the bridge by `AgentGuiPlugin`.
+                    .run_if(resource_exists::<DefaultAvatar>)
+                    .run_if(resource_exists::<ChatBridge>)
+                    .run_if(resource_exists::<SyncRequested>),
+            )
+            // After the finished syncs land, so the loading screen leaves
+            // in the frame the reloaded avatar arrives.
+            .add_systems(
+                Update,
+                default_install::finish_default_reload
+                    .after(drain_sync)
+                    .before(AvatarSystems::Choose)
+                    .run_if(resource_exists::<DefaultAvatar>),
+            )
             .add_systems(
                 Update,
                 (choose_renderer, tick_state)

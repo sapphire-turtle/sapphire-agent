@@ -1,12 +1,13 @@
 # デフォルトキャラクターの素材（素材リポジトリと、agent のインストーラー）
 
-- **対象**: 新設リポジトリ `sapphire-turtle/sapphire-agent-avatars`（仮称）、
-  `crates/sapphire-agent-server/`（新設モジュール `default_avatar`）
+- **対象**: 新設リポジトリ `sapphire-turtle/sapphire-agent-avatars`、
+  `crates/sapphire-agent-server/`（新設モジュール `default_avatar`、`cli_init`、IPC メソッド）、
+  `crates/sapphire-agent-core/`（IPC の型）、`crates/sapphire-agent-gui/`（起動時の取得）
 - **参照**: `crates/sapphire-agent-core/src/lib.rs` の `AvatarConfig` と `AVATAR_MAX_FILE`、
   `crates/sapphire-agent-server/src/avatar_store.rs`（パスの検証と、`avatar/` の外での一時置き）、
   `crates/sapphire-agent-server/src/voice/providers/sherpa_download.rs`（取得と展開の前例）、
   [デスクトップマスコットの仕様](2026-10-28-desktop-companion-design.md)
-- **関連 issue**: #340（デフォルトキャラクターと初回起動の流れ）のやること 1。
+- **関連 issue**: #340（デフォルトキャラクターと初回起動の流れ）のやること 1・3・4。
   ワークスペースの既定の場所は sapphire-turtle/sapphire-framework#398（framework 0.26.0）。
   1 つのワークスペースに複数のアバターを置いて切り替える仕組みは別の issue で扱う
 - **状態**: 設計
@@ -14,17 +15,16 @@
 ## なぜ
 
 デスクトップマスコットは、ユーザーが VRM モデルや立ち絵を用意しないとキャラクターが出ない。
-新規ワークスペースにデフォルトのオリジナルキャラクターを入れておき、すぐに使えるようにする（#340）。
+デフォルトのオリジナルキャラクターを用意し、アバターを用意していなくてもすぐに使えるようにする（#340）。
 
 #340 で決めた前提:
 
 - 素材はソースコードと別のリポジトリに置き、GitHub Releases で配布する。
-- 新規ワークスペースの初期化時に**一度だけ**取得し、`<workspace>/avatar/` に展開する。
-  取り込んだあとはユーザーが置いた素材と同じ扱いで、削除も差し替えも自由。
+- 取り込んだアバターはユーザーが置いた素材と同じ扱いで、削除も差し替えも自由。
 - 自動アップグレードはしない。新しい版が効くのは、その後に取得したものだけ。
 - オフライン用の代替は埋め込まない（アプリはオンラインが前提）。
-- 素材は見た目と、`profile.md`（名前・口調などの**案**）だけ。人格はブートストラップで
-  ユーザーが決め、`IDENTITY.md` / `SOUL.md` に書く。
+- 人格はブートストラップでユーザーが決め、`IDENTITY.md` / `SOUL.md` に書く。
+  agent が配るのは見た目と、名前・口調などの**案**だけ。
 - ワークスペースの同期は 1 GiB まで。
 
 その後に決めたこと:
@@ -32,21 +32,31 @@
 - デフォルトキャラクターは 1 人。ただし**通常の等身とデフォルメの等身**の 2 種類を、
   2D・3D とも用意する。
 - 衣装は少しずつ増やす（季節の衣装など）。初回に入るのは 1 つだけで、ほかはあとから
-  追加で取得する（無料の「ショップ」。#340 のやること 5 以降）。
+  追加で取得する（無料の「ショップ」。別に扱う）。
+- **キャラクター設定とアバターは、入るタイミングを分ける**（§4）。
+  - キャラクター設定（案）は、ワークスペースの初期化（`init`）で、テンプレートと一緒に置く。
+    agent に埋め込んであるので、ネットワークは使わない。
+  - アバターは、**GUI が起動したときにアバターが 1 つもなければ**取得する。
+  - 理由: CLI だけで使う人にアバターは要らない。逆に GUI では、アバターを消したり
+    取得に失敗したりすると表示するものがなくなるので、そのときに取り直せるほうがよい。
+  - このため、#340 の「新規ワークスペースの初期化時に一度だけ取得する」と
+    「既存のワークスペースには適用しない」は改める。アバターのないワークスペースを GUI で
+    開けば、既存のものでもデフォルトのアバターが入る。アバターのある
+    ワークスペースには何もしない（自動アップグレードはしない、は変わらない）。
 
 ## 範囲
 
-この仕様が扱うのは次の 2 つ。
+この仕様が扱うのは次の 3 つ。
 
 1. 素材リポジトリ: 構成、ライセンス、検証、リリースとカタログの形式（§1・§2）
 2. agent 側の、アバターを 1 つ取得して `avatar/` に入れる部品（§3）
+3. それを使う 2 つの入口: `init` でのキャラクター設定と、GUI の起動時のアバターの取得（§4）
 
 扱わないもの:
 
-- どの `init`（agent 単独の `sapphire-agent init` か、サーバー経由の framework の
-  `workspace init` か）がこの部品を呼ぶか、`init` の既定の場所の追従（#340 のやること 2）
-- `BOOTSTRAP.md` の改訂（やること 4）
-- GUI の初回起動画面と、取得をやり直す入口（IPC メソッドや設定ページのボタン。やること 5）
+- `init` の既定の場所の追従（#340 のやること 7）
+- `BOOTSTRAP.md` の改訂（やること 5）。この仕様は `CHARACTER.md` を置くところまで
+- GUI の初回起動画面（join するか新規に初期化するかの選択。やること 6）
 - ショップの画面と、カタログを読んで追加のアバターを入れる流れ
 - 1 つのワークスペースに複数のアバターを置き、選んで切り替える仕組み（別の issue）。
   それまでは、入れる先は今の `avatar/` 1 つ
@@ -54,7 +64,9 @@
 
 ## 用語
 
-- **キャラクター**: デフォルトのオリジナルキャラクター（1 人）。`profile.md` はキャラクター単位。
+- **キャラクター**: デフォルトのオリジナルキャラクター（1 人）。
+- **キャラクター設定**: キャラクターの名前・口調・一人称・雰囲気の案。キャラクター単位で 1 つ。
+  ワークスペースでは `CHARACTER.md`（§4.1）。
 - **アバター**: 配布の単位。**衣装 1 つ × 等身 1 つ**で、2D と 3D を両方含む。
   ID は `<衣装>-<等身>`（例: `default-regular`、`default-chibi`、`santa-chibi`）。
   等身は `regular`（通常）と `chibi`（デフォルメ）。
@@ -73,13 +85,16 @@
 | 一覧 | CI が作る `catalog.json` を、決まった URL に置く |
 | sha256 の信頼 | 初回に入るアバターは agent に埋め込んだ値で確かめる。追加のアバターはカタログの値で確かめる |
 | アバター 1 つの上限 | 100 MB（VRM の実寸を見て見直す） |
+| キャラクター設定 | agent に `templates/workspace/CHARACTER.md` として埋め込み、`init` で置く |
+| アバターを入れる契機 | GUI がサーバーにつないだとき、アバターが 1 つもなければ。CLI と headless は取得しない |
+| 同期との関係 | 同期が有効で、ほかの端末がある場合は自動で取らず、ボタンで取る |
 
 ### リポジトリを分けない理由
 
 - ショップには「何があるか」の一覧が要る。1 つのリポジトリなら `catalog.json` 1 つで済む。
   アバターごとのリポジトリだと、GitHub API でリポジトリを列挙することになり、
   レート制限や、どれが公開してよいものかの区別が問題になる。
-- `profile.md`、LICENSE、`scripts/check`、CI はキャラクターで共通。リポジトリを分けると
+- LICENSE、`scripts/check`、CI はキャラクターで共通。リポジトリを分けると
   衣装を足すたびに複製になり、ずれていく。
 - リポジトリの大きさが効くのは clone する作者だけ。ユーザーはリリースの tar だけを取得する。
   GitHub はリポジトリを 1 GB 以下に保つよう勧めている（5 GB で強く求める）。衣装が増えて
@@ -113,8 +128,6 @@ GitHub のリリースが差し替えられても、初回の取得は検出で�
 
 ```
 sapphire-agent-avatars/
-  character/
-    profile.md             ← 名前・口調・一人称・雰囲気の案（キャラクター単位）
   avatars/
     <id>/                  ← 1 つのアバター。tar では avatar/ になる
       avatar.toml          ← 既存の形式（[vrm] と [sprite]）
@@ -140,9 +153,8 @@ sapphire-agent-avatars/
 - 立ち絵は PNG か WebP（GUI はどちらも読める）。サイズの小さい WebP を基本にする。
 - **LFS は使わない**。配布物は 1 ファイルあたり数十 MB までで、GitHub の上限
   （50 MB で警告、100 MB で拒否）に収まる。
-- `profile.md` は案であって設定ではない。agent はこのファイルを読み込みに使わず、
-  ブートストラップが提案の材料として読むだけ（#340 のやること 4）。リポジトリには 1 つだけ置き、
-  CI が各アバターの tar に同じものを入れる。どのアバターから始めても手元にあるようにするため。
+- キャラクター設定（名前・口調などの案）はこのリポジトリに置かず、tar にも入れない。
+  agent に埋め込み、`init` でワークスペースに置く（§4.1）。
 
 ### `catalog.toml`
 
@@ -161,8 +173,7 @@ title = { en = "…", ja = "…" }
 
 - tag `<id>-vN` を push すると、CI が次を行う。
   1. `avatars/<id>/` と `catalog.toml` の項目があることを確かめ、`scripts/check` を通す。
-  2. `avatars/<id>/` を `avatar/` として、`character/profile.md` を `avatar/profile.md` として
-     tar にまとめ、`<id>-vN.tar` と `<id>-vN.tar.sha256` をリリースに添付する。
+  2. `avatars/<id>/` を `avatar/` として tar にまとめ、`<id>-vN.tar` と `<id>-vN.tar.sha256` をリリースに添付する。
   3. `scripts/catalog` で `catalog.json` を作り直し、`catalog` という名前の固定のリリースに
      添付し直す（§1.1）。
 - **tar は CI でだけ作り、手元では作らない**。再現できるように、エントリーを名前順に並べ、
@@ -231,7 +242,6 @@ PNG・WebP・glTF バイナリは自前で読む）。exiftool などの外部�
   - VRM の `meta`: 作者はプロジェクト名 1 つ（`sapphire-agent`）、ライセンスは CC0、
     許可の項目はすべて許可。
   - `asset.generator` は、決めた値（`sapphire-agent-avatars`）と一致すること。
-- **`profile.md`**: UTF-8 のテキストであること。
 
 ### アバターの中身
 
@@ -241,7 +251,7 @@ PNG・WebP・glTF バイナリは自前で読む）。exiftool などの外部�
 - `avatar.toml` が参照するファイルがすべてあり、`avatars/<id>/` の下に
   **参照されていないファイルがない**。
 - 立ち絵はすべて同じキャンバスサイズ（2D の仕様が前提にしている）。
-- アバター 1 つ（`profile.md` を含めて）が 100 MB 以下、1 ファイルが `AVATAR_MAX_FILE`
+- アバター 1 つが 100 MB 以下、1 ファイルが `AVATAR_MAX_FILE`
   （256 MiB）以下。
 
 ### リポジトリ全体
@@ -271,13 +281,14 @@ pub(crate) struct AvatarRelease<'a> {
     pub sha256: &'a str,
 }
 
-/// The avatar a new workspace gets, pinned.
-pub(crate) const INITIAL: AvatarRelease<'static> = AvatarRelease {
+/// The avatar a workspace without one gets, pinned. `None` until the
+/// first avatar is released: there is nothing to fetch yet.
+pub(crate) const INITIAL: Option<AvatarRelease<'static>> = Some(AvatarRelease {
     id: "…", // decided with the first release
     version: 1,
     url: "https://github.com/sapphire-turtle/sapphire-agent-avatars/releases/download/<id>-v1/<id>-v1.tar",
-    sha256: "…", // the release's `.sha256`, filled in when it is released
-};
+    sha256: "…", // the release's `.sha256`
+});
 
 pub(crate) enum Outcome {
     Installed,
@@ -292,7 +303,10 @@ pub(crate) fn install(
 ) -> anyhow::Result<Outcome>;
 ```
 
-- 初回は `INITIAL` を渡す。初回のアバターを替えるのは、`INITIAL` を書き換える PR。
+- デフォルトのアバターは `INITIAL` を渡す（§4.2）。替えるのは、`INITIAL` を書き換える PR。
+- 最初のアバターがリリースされるまで `INITIAL` は `None`。仮の値（全部 0 の sha256 や
+  `placeholder-chibi-v1`）は入れない。前者は取得のたびに失敗し、後者はその間にアプリが
+  リリースされると、仮の素材が利用者に届いてしまう。
 - 追加のアバター（ショップ）は、カタログの項目から `AvatarRelease` を作って同じ関数を呼ぶ想定。
   カタログを読む部分はショップと一緒に作る。
 - 入れる先は今の `avatar/` 1 つ。複数のアバターを置けるようになったら（別の issue）、
@@ -326,9 +340,8 @@ tar は外から来るので厳しく見る。
 
 ### 失敗したとき
 
-インストールに失敗しても、ワークスペースの初期化は失敗にしない。警告を出し、マスコットは
-今の仕様どおりの仮表示（シルエット）になる。`install` は冪等なので、やり直しはもう一度呼ぶだけ。
-やり直しの入口（IPC メソッドや設定ページ）は #340 のやること 2・5 で決める。
+`install` は失敗を返すだけで、ワークスペースには何も残さない（§3 の流れ 5・6）。冪等なので、
+やり直しはもう一度呼ぶだけ。失敗したときの見せ方とやり直しの入口は §4.2。
 
 ### 依存
 
@@ -348,9 +361,93 @@ tar は外から来るので厳しく見る。
 - 上限を超えるファイルで失敗する
 - 失敗のあとに `avatar/` が半端な状態で残らない
 
+## §4 入口
+
+### 4.1 `init`: キャラクター設定
+
+- キャラクター設定を `crates/sapphire-agent-server/templates/workspace/CHARACTER.md` に置き、
+  `cli_init::TEMPLATES` に `CHARACTER.md`（ワークスペースのルート）として足す。
+  ほかのテンプレートと同じく `include_str!` で埋め込み、上書きはしない。
+- `init` はネットワークを使わない。アバターも取りに行かない。
+- `CHARACTER.md` は案であって設定ではない。agent はシステムプロンプトに読み込まず
+  （`workspace.rs` の読むファイルに足さない）、ブートストラップが提案の材料として読むだけ
+  （`BOOTSTRAP.md` の改訂は #340 のやること 5）。`avatar/` の外に置くので、アバターを
+  消しても差し替えても残る。
+- 中身（名前・口調・一人称・雰囲気の案）はキャラクターの制作と一緒に書く。中身ができるまでは
+  `TEMPLATES` に足さない。空のひな形を利用者に配らないため。
+- ライセンスは素材と同じ CC0 1.0。コードの GPL とは別なので、ファイルの先頭と README の
+  ライセンス表に書く。
+- 正本は agent のリポジトリ。素材リポジトリにはキャラクター設定を置かない（今ある
+  `character/profile.md` は消す）。
+
+### 4.2 GUI: アバターがないときの取得
+
+**判定**: GUI がサーバーにつないだとき（起動時と、ワークスペースを切り替えてつなぎ直したとき）に
+`avatar.manifest` を読み、`config` がなければ（`avatar/avatar.toml` がなければ）
+「アバターが 1 つもない」とみなす。複数のアバターを置けるようになったら（#369）、
+そのどれもないときに読み替える。
+
+**IPC メソッド**（`sapphire-agent-core` に定数と型、サーバーに実装。`APP_API` を上げる）:
+
+- `sapphire-agent.avatar.install_default`（要求）: パラメーター `{ "auto": bool }`。
+  取得が終わってから答える。答えは次のどれか。
+  - `installed`: 入れた。
+  - `already_present`: もうあった。何もしていない。
+  - `unavailable`: `INITIAL` が `None`。
+  - `needs_confirmation`: `auto` が真で、同期が有効かつほかの端末がある（かもしれない）。何もしていない。
+  - 取得や検証に失敗したら、IPC のエラーで答える（メッセージは `install` のエラー）。
+- `sapphire-agent.avatar.install_progress`（通知）: `{ "received": u64, "total": u64 | null }`。
+  取得中に、`install` の `progress` から送る。間隔は 250 ミリ秒に 1 回まで。
+- サーバーは `install` を `spawn_blocking` で走らせる。同時に走るのは 1 つだけで、
+  走っている間に来た要求は、その結果を待って同じ答えを返す。
+
+**同期との関係**: 既存のワークスペースに join したばかりの端末では、アバターが同期でまだ届いて
+いないだけのことがある。そこで取ると、届いたファイルとぶつかる。framework の `sync.status` は
+`enabled` とほかの端末の数（`peers`）しか教えず、「最初の同期が追いついた」は分からないので、
+次のように決める。
+
+- 同期が無効: 自動で取る。
+- 同期が有効で、ブリッジにつながり（`bridge_available`）、`peers` が 0: 自動で取る。
+- 同期が有効で、`peers` が 1 以上か、ブリッジにつながらない: 自動では取らない
+  （`needs_confirmation`）。ブリッジにつながらないと `peers` は 0 と報告されるが、
+  実際の数は分からないため。
+- 判定はサーバーが `install_default` の中で行う（テストできるように）。framework に
+  「追いついた」が分かる手段ができたら、それを待ってから自動で取るように改める。
+
+**GUI の見せ方**: ゲームの初回ダウンロードのように、取得が終わるまでローディング画面で待たせる。
+
+- つないだときにアバターがなければ、`install_default { auto: true }` を呼ぶ。
+- 答えを待つ間は、ウィンドウ全体をローディング画面にする。マスコットのシルエットも
+  チャットも出さない。画面には「キャラクターをダウンロードしています」と、進み具合の
+  バー（受信量 / 全体。`total` がなければ受信量だけで、バーは不定）を出す。
+- `installed` なら、アバターを読み直してから通常の画面に移る。
+- 失敗したら、ローディング画面のままエラーのメッセージと、「再試行」
+  （`install_default { auto: false }`）・「アバターなしで続ける」の 2 つのボタンを出す。
+  オフラインでもアプリを使えるように、後者は必ず出す。選ぶと今の仮表示（シルエット）で
+  通常の画面に移り、そのつなぎの間はもう自動で取りに行かない。
+- `needs_confirmation`・`unavailable` なら、ローディング画面を出さずに仮表示で通常の画面に
+  移る。`needs_confirmation` は、アバターが同期で届く見込みがあるため。
+- 仮表示のときは、「キャラクター」設定ページに「デフォルトのアバターを取得」ボタンを出す
+  （`unavailable` なら出さない）。押すと同じローディング画面に移る。
+- アバターを意図して「なし」にしておく設定は作らない。必要になったら足す。
+
+**headless**: GUI がないので、このメソッドを呼ぶものがない。headless は取得しない。
+
+### 4.3 テスト
+
+- `init` が `CHARACTER.md` を置き、すでにあれば上書きしない（中身ができて `TEMPLATES` に
+  足すときに足す）。`init` がネットワークを使わないことは、`default_avatar` を呼ばないことで保つ。
+- `install_default` の判定: 同期が無効、`peers` が 0、`peers` が 1 以上、ブリッジにつながらない × `auto` の真偽で、
+  取りに行くかどうかと答え。`INITIAL` が `None` なら `unavailable`。取得先は差し替えられる
+  ようにし、テストではループバックの HTTP サーバー（§3 のテストと同じもの）を使う。
+- 同時に 2 つの要求が来ても、取得は 1 回で、両方に同じ答えが返る。
+- 進み具合の通知が、`total` を含めて届く。
+- GUI: マニフェストに `config` がないときだけ `install_default` を呼び、答えを待つ間はローディング画面、
+  入ったら読み直して通常の画面、失敗なら 2 つのボタン、`needs_confirmation` なら仮表示。
+  画面の状態の移り変わりを、描画と分けた関数で確かめる。
+
 ## 未決のこと
 
-- 素材リポジトリの名前（仮称 `sapphire-agent-avatars`）
 - 初回に入るアバター（`default-regular` か `default-chibi` か。初回起動で選ばせる案もある）
 - 最初のポーズとアクションのセット（素材の制作と合わせて決める）
 - アバター 1 つの上限 100 MB の妥当性（VRM の実寸を見て見直す）

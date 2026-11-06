@@ -1,14 +1,17 @@
 //! Installer for the default avatar pack: safe extraction of the release
 //! archive into `<workspace>/avatar/`.
 
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
 use anyhow::{Result, anyhow, bail};
-use sapphire_agent_core::{AVATAR_MAX_FILE, AvatarConfig};
+use futures_util::FutureExt as _;
+use futures_util::future::{BoxFuture, Shared};
+use sapphire_agent_core::{AVATAR_MAX_FILE, AvatarConfig, DefaultAvatarAnswer, InstallProgress};
 
 use crate::avatar_store::{sha256_file, validate_path};
 
@@ -213,6 +216,7 @@ fn place_one(rel: &str, src: &Path, dest: &Path, placed: &mut Vec<PathBuf>) -> R
 const MAX_DOWNLOAD: u64 = MAX_AVATAR_TOTAL + 8 * 1024 * 1024;
 
 /// A published avatar pack release.
+#[derive(Clone, Copy)]
 pub(crate) struct AvatarRelease<'a> {
     pub id: &'a str,
     pub version: u32,
@@ -220,15 +224,10 @@ pub(crate) struct AvatarRelease<'a> {
     pub sha256: &'a str,
 }
 
-/// The default avatar pack installed on first run.
-#[cfg_attr(test, allow(dead_code))] // first used by the first-run hook
-pub(crate) const INITIAL: AvatarRelease<'static> = AvatarRelease {
-    id: "default-chibi",
-    version: 1,
-    url: "https://github.com/sapphire-turtle/sapphire-agent-avatars/releases/download/default-chibi-v1/default-chibi-v1.tar",
-    // FIXME(#340): the v1 release's .sha256 (no release exists yet)
-    sha256: "0000000000000000000000000000000000000000000000000000000000000000",
-};
+/// The default avatar pack installed on first run; `None` until a release
+/// exists.
+// FIXME(#340): the first release's URL and `.sha256`
+pub(crate) const INITIAL: Option<AvatarRelease<'static>> = None;
 
 /// Where downloaded archives and their extraction are staged.
 fn staging_root() -> PathBuf {
@@ -317,8 +316,182 @@ pub(crate) fn install(
     result
 }
 
+/// What the sync setup looks like, for deciding on an automatic install.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SyncView {
+    pub enabled: bool,
+    pub peers: usize,
+    pub bridge_available: bool,
+}
+
+/// Whether the avatar may be downloaded without asking: sync is off, or it is
+/// on and certain to have no peer that might already hold an avatar.
+pub(crate) fn auto_allowed(sync: SyncView) -> bool {
+    !sync.enabled || (sync.bridge_available && sync.peers == 0)
+}
+
+/// Looks up the sync setup when the install decision needs it.
+#[async_trait::async_trait]
+pub(crate) trait SyncProbe: Send + Sync {
+    async fn view(&self) -> SyncView;
+}
+
+/// Reads the sync setup from the framework's runtime.
+pub(crate) struct RuntimeProbe {
+    pub runtime: Arc<sapphire_framework::server::SyncRuntime>,
+    pub root: PathBuf,
+}
+
+#[async_trait::async_trait]
+impl SyncProbe for RuntimeProbe {
+    async fn view(&self) -> SyncView {
+        let s = self.runtime.status(&self.root).await;
+        SyncView {
+            enabled: s.enabled,
+            peers: s.peers,
+            bridge_available: s.bridge_available,
+        }
+    }
+}
+
+/// Lets an event through at most once per interval.
+struct Throttle {
+    last: Option<Instant>,
+}
+
+impl Throttle {
+    const EVERY: Duration = Duration::from_millis(250);
+
+    fn new() -> Self {
+        Self { last: None }
+    }
+
+    /// True when an event at `now` should be let through.
+    fn due(&mut self, now: Instant) -> bool {
+        if self
+            .last
+            .is_some_and(|t| now.duration_since(t) < Self::EVERY)
+        {
+            return false;
+        }
+        self.last = Some(now);
+        true
+    }
+}
+
+type Flight = Shared<BoxFuture<'static, Result<DefaultAvatarAnswer, String>>>;
+
+/// Installs the default avatar, one download at a time.
+pub(crate) struct DefaultInstaller {
+    root: PathBuf,
+    release: Option<AvatarRelease<'static>>,
+    probe: Arc<dyn SyncProbe>,
+    in_flight: Arc<Mutex<Option<Flight>>>,
+}
+
+impl DefaultInstaller {
+    pub(crate) fn new(
+        root: PathBuf,
+        release: Option<AvatarRelease<'static>>,
+        probe: Arc<dyn SyncProbe>,
+    ) -> Self {
+        Self {
+            root,
+            release,
+            probe,
+            in_flight: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Decide whether to install, and do it unless another request already is.
+    /// With `auto`, a sync setup that might hold an avatar elsewhere answers
+    /// `NeedsConfirmation` instead. A request that is going to wait on a
+    /// download, its own or one already running, first gets `{ received: 0,
+    /// total: None }` through `progress`, so an answer without one never
+    /// reports progress. Only the request that starts the download gets the
+    /// rest of it; the ones that join it get just the answer.
+    pub(crate) async fn run(
+        &self,
+        auto: bool,
+        progress: Arc<dyn Fn(InstallProgress) + Send + Sync>,
+    ) -> Result<DefaultAvatarAnswer, String> {
+        let Some(release) = self.release.as_ref() else {
+            return Ok(DefaultAvatarAnswer::Unavailable);
+        };
+        if self.root.join("avatar").join(CONFIG_FILE).exists() {
+            return Ok(DefaultAvatarAnswer::AlreadyPresent);
+        }
+        if auto && !auto_allowed(self.probe.view().await) {
+            return Ok(DefaultAvatarAnswer::NeedsConfirmation);
+        }
+        progress(InstallProgress {
+            received: 0,
+            total: None,
+        });
+        let flight = {
+            let mut slot = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+            match slot.as_ref() {
+                Some(f) => f.clone(),
+                None => {
+                    let f = self.start(release, progress);
+                    *slot = Some(f.clone());
+                    f
+                }
+            }
+        };
+        flight.await
+    }
+
+    /// Spawn the install. It runs to the end even if every waiter goes away,
+    /// and clears the in-flight slot when it finishes.
+    fn start(
+        &self,
+        release: &AvatarRelease<'static>,
+        progress: Arc<dyn Fn(InstallProgress) + Send + Sync>,
+    ) -> Flight {
+        let root = self.root.clone();
+        let release = *release;
+        let slot = Arc::clone(&self.in_flight);
+        let handle = tokio::spawn(async move {
+            let joined = tokio::task::spawn_blocking(move || {
+                let mut throttle = Throttle::new();
+                let mut unsent = None;
+                let outcome = install(&root, &release, |received, total| {
+                    let p = InstallProgress { received, total };
+                    if throttle.due(Instant::now()) {
+                        unsent = None;
+                        progress(p);
+                    } else {
+                        unsent = Some(p);
+                    }
+                });
+                // The end is only known now; make sure the last step is seen.
+                if let Some(p) = unsent {
+                    progress(p);
+                }
+                outcome.map_err(|e| format!("{e:#}"))
+            })
+            .await;
+            *slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            match joined {
+                Ok(Ok(Outcome::Installed)) => Ok(DefaultAvatarAnswer::Installed),
+                Ok(Ok(Outcome::AlreadyPresent)) => Ok(DefaultAvatarAnswer::AlreadyPresent),
+                Ok(Err(msg)) => Err(msg),
+                Err(e) => Err(format!("install task failed: {e}")),
+            }
+        });
+        async move {
+            handle
+                .await
+                .unwrap_or_else(|e| Err(format!("install task failed: {e}")))
+        }
+        .boxed()
+        .shared()
+    }
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     pub(crate) enum Kind {
@@ -675,5 +848,256 @@ mod tests {
             install(&ws, &release, |_, _| {}).unwrap(),
             Outcome::AlreadyPresent
         );
+    }
+
+    /// Serve `body` to every request, counting them in `hits`.
+    pub(crate) fn serve_counting(
+        body: Vec<u8>,
+        hits: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> String {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            while let Ok((mut s, _)) = listener.accept() {
+                hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let mut got = Vec::new();
+                while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match s.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => got.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                );
+                let _ = s.write_all(head.as_bytes());
+                let _ = s.write_all(&body);
+                // Slow enough that concurrent runs overlap.
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+        format!("http://127.0.0.1:{port}/a.tar")
+    }
+
+    pub(crate) struct FixedProbe(pub Option<SyncView>);
+
+    #[async_trait::async_trait]
+    impl SyncProbe for FixedProbe {
+        async fn view(&self) -> SyncView {
+            self.0.expect("the probe must not be asked")
+        }
+    }
+
+    pub(crate) fn view(enabled: bool, peers: usize, bridge_available: bool) -> SyncView {
+        SyncView {
+            enabled,
+            peers,
+            bridge_available,
+        }
+    }
+
+    fn no_progress() -> Arc<dyn Fn(InstallProgress) + Send + Sync> {
+        Arc::new(|_| {})
+    }
+
+    /// A release for `url` whose hash matches `sha256`; leaked for `'static`.
+    pub(crate) fn release_for(url: String, sha256: &str) -> AvatarRelease<'static> {
+        AvatarRelease {
+            id: "test-installer",
+            version: 1,
+            url: Box::leak(url.into_boxed_str()),
+            sha256: Box::leak(sha256.to_string().into_boxed_str()),
+        }
+    }
+
+    /// A served good pack: (tempdir, workspace, release, hits, tar length).
+    pub(crate) fn served() -> (
+        tempfile::TempDir,
+        PathBuf,
+        AvatarRelease<'static>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        usize,
+    ) {
+        let (t, ws, _) = env();
+        let (a, h) = archive_in(t.path(), &good_entries());
+        let body = fs::read(&a).unwrap();
+        let len = body.len();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let url = serve_counting(body, hits.clone());
+        (t, ws, release_for(url, &h), hits, len)
+    }
+
+    fn installer(
+        ws: &Path,
+        release: Option<AvatarRelease<'static>>,
+        v: Option<SyncView>,
+    ) -> DefaultInstaller {
+        DefaultInstaller::new(ws.to_path_buf(), release, Arc::new(FixedProbe(v)))
+    }
+
+    #[test]
+    fn auto_allowed_follows_the_sync_rule() {
+        assert!(auto_allowed(view(false, 3, false)));
+        assert!(auto_allowed(view(true, 0, true)));
+        assert!(!auto_allowed(view(true, 1, true)));
+        assert!(!auto_allowed(view(true, 0, false)));
+    }
+
+    #[tokio::test]
+    async fn run_without_a_release_is_unavailable() {
+        let (_t, ws, _) = env();
+        let i = installer(&ws, None, None);
+        assert_eq!(
+            i.run(false, no_progress()).await,
+            Ok(DefaultAvatarAnswer::Unavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn run_with_an_avatar_is_already_present_without_probing() {
+        let (_t, ws, release, hits, _) = served();
+        fs::create_dir_all(ws.join("avatar")).unwrap();
+        fs::write(ws.join("avatar/avatar.toml"), CFG).unwrap();
+        let i = installer(&ws, Some(release), None);
+        assert_eq!(
+            i.run(true, no_progress()).await,
+            Ok(DefaultAvatarAnswer::AlreadyPresent)
+        );
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn run_auto_with_peers_needs_confirmation_and_fetches_nothing() {
+        let (_t, ws, release, hits, _) = served();
+        let i = installer(&ws, Some(release), Some(view(true, 1, true)));
+        assert_eq!(
+            i.run(true, no_progress()).await,
+            Ok(DefaultAvatarAnswer::NeedsConfirmation)
+        );
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!ws.join("avatar").exists());
+    }
+
+    #[tokio::test]
+    async fn run_not_auto_ignores_the_sync_rule() {
+        let (_t, ws, release, _, _) = served();
+        let i = installer(&ws, Some(release), Some(view(true, 1, true)));
+        assert_eq!(
+            i.run(false, no_progress()).await,
+            Ok(DefaultAvatarAnswer::Installed)
+        );
+        assert!(ws.join("avatar/avatar.toml").is_file());
+    }
+
+    #[tokio::test]
+    async fn concurrent_runs_download_once_and_share_the_answer() {
+        let (_t, ws, release, hits, _) = served();
+        let i = installer(&ws, Some(release), Some(view(false, 0, true)));
+        let (a, b) = tokio::join!(i.run(false, no_progress()), i.run(false, no_progress()));
+        assert_eq!(a, Ok(DefaultAvatarAnswer::Installed));
+        assert_eq!(b, Ok(DefaultAvatarAnswer::Installed));
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_run_reports_install_s_error_and_leaves_no_avatar() {
+        let (_t, ws, release, _, _) = served();
+        let bad = release_for(release.url.to_string(), &"0".repeat(64));
+        let i = installer(&ws, Some(bad), Some(view(false, 0, true)));
+        let err = i.run(false, no_progress()).await.unwrap_err();
+        assert!(err.contains("sha256"), "{err}");
+        assert!(!ws.join("avatar/avatar.toml").exists());
+    }
+
+    #[tokio::test]
+    async fn progress_reports_the_total_and_ends_at_the_full_size() {
+        let (_t, ws, release, _, len) = served();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let i = installer(&ws, Some(release), Some(view(false, 0, true)));
+        i.run(false, Arc::new(move |p| sink.lock().unwrap().push(p)))
+            .await
+            .unwrap();
+        let last = *seen.lock().unwrap().last().unwrap();
+        assert_eq!(last.received, len as u64);
+        assert_eq!(last.total, Some(len as u64));
+    }
+
+    type Seen = Arc<Mutex<Vec<InstallProgress>>>;
+
+    fn recording() -> (Seen, Arc<dyn Fn(InstallProgress) + Send + Sync>) {
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        (seen, Arc::new(move |p| sink.lock().unwrap().push(p)))
+    }
+
+    const STARTED: InstallProgress = InstallProgress {
+        received: 0,
+        total: None,
+    };
+
+    #[tokio::test]
+    async fn a_download_reports_its_start_first() {
+        let (_t, ws, release, _, _) = served();
+        let (seen, progress) = recording();
+        let i = installer(&ws, Some(release), Some(view(false, 0, true)));
+        assert_eq!(
+            i.run(false, progress).await,
+            Ok(DefaultAvatarAnswer::Installed)
+        );
+        assert_eq!(seen.lock().unwrap().first(), Some(&STARTED));
+    }
+
+    #[tokio::test]
+    async fn answers_without_a_download_report_no_progress() {
+        let (_t, ws, release, _, _) = served();
+        let (seen, progress) = recording();
+        assert_eq!(
+            installer(&ws, None, None)
+                .run(false, progress.clone())
+                .await,
+            Ok(DefaultAvatarAnswer::Unavailable)
+        );
+        assert_eq!(
+            installer(&ws, Some(release), Some(view(true, 1, true)))
+                .run(true, progress.clone())
+                .await,
+            Ok(DefaultAvatarAnswer::NeedsConfirmation)
+        );
+        fs::create_dir_all(ws.join("avatar")).unwrap();
+        fs::write(ws.join("avatar/avatar.toml"), CFG).unwrap();
+        assert_eq!(
+            installer(&ws, Some(release), None)
+                .run(true, progress)
+                .await,
+            Ok(DefaultAvatarAnswer::AlreadyPresent)
+        );
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_joiner_of_a_running_install_reports_its_start() {
+        let (_t, ws, release, hits, _) = served();
+        let i = installer(&ws, Some(release), Some(view(false, 0, true)));
+        let (a_seen, a) = recording();
+        let (b_seen, b) = recording();
+        let (ra, rb) = tokio::join!(i.run(false, a), i.run(false, b));
+        assert_eq!(ra, Ok(DefaultAvatarAnswer::Installed));
+        assert_eq!(rb, Ok(DefaultAvatarAnswer::Installed));
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1, "joined");
+        assert_eq!(a_seen.lock().unwrap().first(), Some(&STARTED));
+        assert_eq!(b_seen.lock().unwrap().first(), Some(&STARTED));
+    }
+
+    #[test]
+    fn progress_is_throttled() {
+        let t0 = Instant::now();
+        let mut th = Throttle::new();
+        assert!(th.due(t0));
+        assert!(!th.due(t0 + Duration::from_millis(100)));
+        assert!(th.due(t0 + Duration::from_millis(260)));
     }
 }

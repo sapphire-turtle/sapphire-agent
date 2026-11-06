@@ -217,10 +217,14 @@ pub struct AvatarAssets {
     pub error: Option<String>,
     /// Bumps whenever `loaded` changes, so a renderer knows to reload.
     pub generation: u64,
+    /// Bumps on every finished sync, whether it changed anything or failed,
+    /// so a waiter knows a sync it asked for has landed.
+    pub syncs: u64,
 }
 
 impl AvatarAssets {
     pub fn apply(&mut self, result: Result<LoadedAvatar>) {
+        self.syncs += 1;
         match result {
             Ok(avatar) => {
                 self.error = None;
@@ -880,6 +884,20 @@ mod tests {
         // The same avatar again changes nothing but clears the error.
         assets.apply(Ok(good));
         assert!(assets.error.is_none());
+        assert_eq!(assets.generation, 1);
+    }
+
+    #[test]
+    fn every_finished_sync_counts_even_when_nothing_changes() {
+        let good = LoadedAvatar {
+            config: AvatarConfig::default(),
+            files: Default::default(),
+        };
+        let mut assets = AvatarAssets::default();
+        assets.apply(Ok(good.clone()));
+        assets.apply(Ok(good));
+        assets.apply(Err(anyhow::anyhow!("offline")));
+        assert_eq!(assets.syncs, 3);
         assert_eq!(assets.generation, 1);
     }
 }
