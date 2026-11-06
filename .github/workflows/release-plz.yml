@@ -33,5 +33,7 @@ jobs:
     permissions:
       contents: write
     uses: ./.github/workflows/release-binaries.yml
+    # The signing key, for the files' `<file>.sig` (release-binaries.yml).
+    secrets: inherit
     with:
       tag: ${{ fromJSON(needs.release-plz.outputs.tags)['sapphire-agent-headless'] }}
