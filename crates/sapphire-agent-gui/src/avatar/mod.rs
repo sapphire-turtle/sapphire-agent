@@ -73,7 +73,10 @@
 //! waker) to cap it. A still avatar asks for none, so an idle companion
 //! draws no frames.
 
+// Task 4 wires the default-avatar flow in; until then only its tests use it.
 pub mod assets;
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod default_install;
 pub mod mode;
 pub mod placeholder;
 pub mod sprite;
