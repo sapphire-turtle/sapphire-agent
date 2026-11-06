@@ -2056,6 +2056,38 @@ pub(crate) trait TurnHost: Send + Sync {
     async fn background_finished(&self, text: &str) {
         let _ = text;
     }
+
+    /// The host a background task keeps after the request that started
+    /// it has ended.
+    ///
+    /// It must hold no per-request sink. An HTTP turn's SSE stream ends
+    /// only when every `Sender` is dropped, so a background child that
+    /// kept `SseProgress` would hold `/chat`'s response open until the
+    /// child finished. The default keeps `origin()` — the permission row
+    /// the child is judged by — and nothing else. A host whose
+    /// connection outlives one response (ACP's) overrides it.
+    fn detached(&self) -> Arc<dyn TurnHost> {
+        Arc::new(DetachedHost {
+            origin: self.origin(),
+        })
+    }
+}
+
+/// [`TurnHost::detached`]'s default: the origin, and every other method
+/// at the trait default.
+struct DetachedHost {
+    origin: crate::tools::policy::Origin,
+}
+
+#[async_trait::async_trait]
+impl TurnHost for DetachedHost {
+    async fn tool_start(&self, _id: &str, _name: &str, _input: &Value) {}
+    async fn tool_end(&self, _id: &str, _name: &str) {}
+    async fn turn_error(&self, _message: &str) {}
+
+    fn origin(&self) -> crate::tools::policy::Origin {
+        self.origin
+    }
 }
 
 /// Builds the `{id, name}` params shared by the `tool_start`/`tool_end`
@@ -2911,7 +2943,7 @@ impl TurnLoop<'_> {
                     // has no `persistence`, and its inbox is not its own.
                     let delivered = self
                         .persistence
-                        .is_some_and(|p| deliver_into(&self.state, &p.session_id, &mut result_msg));
+                        .is_some_and(|p| deliver_into(self.state, &p.session_id, &mut result_msg));
                     history.push(result_msg.clone());
                     // Gated on `tool_use_persisted`: this append must not run
                     // independently of the `tool_use` append above. If that

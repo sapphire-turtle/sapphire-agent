@@ -938,14 +938,27 @@ impl SubagentTool {
             def.name
         );
 
+        // The child outlives the request that started it, so it must not
+        // keep that request's host (an HTTP turn's `SseProgress` holds the
+        // response stream open) or the context carrying it. It gets the
+        // host's detached form and a context of its own around that.
+        let detached = ctx.progress.detached();
+        let task_ctx = Arc::new(crate::serve::TurnContext {
+            state: Arc::clone(&ctx.state),
+            provider: Arc::clone(&ctx.provider),
+            progress: Arc::clone(&detached),
+            visible_specs: Arc::clone(&ctx.visible_specs),
+            timer_origin: ctx.timer_origin.clone(),
+            session_id: ctx.session_id.clone(),
+            subagent_depth: ctx.subagent_depth,
+            admin_room_profile: ctx.admin_room_profile.clone(),
+        });
         let refused = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let progress: Arc<dyn crate::serve::TurnHost> = Arc::new(BackgroundSubagentHost::new(
-            Arc::clone(&ctx.progress),
-            Arc::clone(&refused),
-        ));
+        let progress: Arc<dyn crate::serve::TurnHost> =
+            Arc::new(BackgroundSubagentHost::new(detached, Arc::clone(&refused)));
         let namespace = crate::tools::workspace_tools::current_memory_namespace();
         let tool = Arc::clone(self);
-        let task_ctx = Arc::clone(&ctx);
+        let scope_ctx = Arc::clone(&task_ctx);
         let task_session = session.clone();
         let task_id = id.clone();
         let task_namespace = namespace.clone();
@@ -991,7 +1004,7 @@ impl SubagentTool {
                 task_ctx.progress.background_finished(&report).await;
             }
         };
-        let task = tokio::spawn(scope_background(Arc::clone(&ctx), namespace, run));
+        let task = tokio::spawn(scope_background(scope_ctx, namespace, run));
         ctx.state
             .background
             .attach(&session, &id, task.abort_handle());
@@ -3895,5 +3908,63 @@ mod tests {
             }
             other => panic!("expected Finished, got {other:?}"),
         }
+    }
+
+    /// The request that starts a background child must be able to end
+    /// before the child does. An HTTP turn's SSE stream closes only once
+    /// every `Sender` is dropped, so a child that kept the parent's
+    /// `SseProgress` would hold `/chat`'s response open until it finished.
+    #[tokio::test]
+    async fn a_background_child_does_not_hold_the_parents_stream_open() {
+        let state = crate::serve::ServeState::for_test(false);
+        let provider = GatedProvider::new(vec![text_response("child answer")]);
+        let tool = std::sync::Arc::new(SubagentTool::new(defs(), true));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let parent: std::sync::Arc<dyn crate::serve::TurnHost> =
+            std::sync::Arc::new(crate::serve::SseProgress::new(tx, json!(1)));
+
+        crate::serve::scope_turn_context(
+            background_context(
+                std::sync::Arc::clone(&state),
+                std::sync::Arc::clone(&provider) as std::sync::Arc<dyn crate::provider::Provider>,
+                Vec::new(),
+                std::sync::Arc::clone(&parent),
+                Some("s-bg-sse"),
+                0,
+            ),
+            Tool::execute(&tool, &bg_input("reviewer", "go")),
+        )
+        .await
+        .unwrap();
+        provider.wait_entered().await;
+        // The parent turn ends: its context went with the scope above,
+        // and this is its host.
+        drop(parent);
+
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the parent's stream must close while the child still runs");
+        assert!(closed.is_none(), "nothing is sent to an ended request");
+        assert_eq!(state.background.pending("s-bg-sse").len(), 1);
+
+        provider.gate.notify_one();
+        let done = next_completion(&state, "s-bg-sse").await;
+        assert!(matches!(
+            done.outcome,
+            crate::background::Outcome::Finished { .. }
+        ));
+    }
+
+    /// What a background task keeps by default is the permission row and
+    /// nothing else.
+    #[test]
+    fn the_default_detached_host_keeps_only_the_origin() {
+        let parent = StandingParent::new(Some(crate::tools::policy::Approval::AllowAlways));
+        let detached = crate::serve::TurnHost::detached(&parent);
+        assert_eq!(
+            detached.origin(),
+            crate::tools::policy::Origin::Acp(crate::tools::policy::SessionMode::Default)
+        );
+        assert!(detached.acp_client().is_none());
     }
 }

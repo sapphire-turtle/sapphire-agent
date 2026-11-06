@@ -510,6 +510,25 @@ impl super::TurnHost for AcpProgress {
         )));
     }
 
+    /// An equivalent of this host with a fresh error slot: the
+    /// connection, the editor's client capabilities and the standing
+    /// answers belong to the session, not to the one `session/prompt`
+    /// response, so a background child keeps them. Built field by field
+    /// rather than by holding the turn's own `Arc`, which `&self` cannot
+    /// reach; the copy is cheap (clones of handles and `Arc`s).
+    fn detached(&self) -> Arc<dyn super::TurnHost> {
+        Arc::new(AcpProgress::new(
+            self.session_id.clone(),
+            self.connection.clone(),
+            self.profile.clone(),
+            self.mode,
+            Arc::clone(&self.permissions),
+            self.client_capabilities.clone(),
+            self.cwd.clone(),
+            Arc::clone(&self.terminals),
+        ))
+    }
+
     /// Put the call to the user, unless a standing answer settles it.
     ///
     /// The standing answer is consulted here rather than inside
