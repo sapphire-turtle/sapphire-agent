@@ -159,11 +159,12 @@ impl Flow {
     }
 }
 
-/// Whether the avatar resync asked for at the answer has finished: the
-/// loaded avatar changed since `captured` (its generation then), or a sync
-/// failed, which ends the wait too rather than block the GUI.
-fn resync_finished(captured: u64, current: u64, error: bool) -> bool {
-    current != captured || error
+/// Whether the avatar resync asked for at the answer has finished: a sync
+/// completed since `captured` ([`AvatarAssets::syncs`] then). Whether it
+/// changed the avatar or failed does not matter; either way the wait ends
+/// rather than block the GUI.
+fn resync_finished(captured: u64, current: u64) -> bool {
+    current != captured
 }
 
 /// Whether `live` is a new connection rather than the one `stored` belongs
@@ -195,7 +196,7 @@ pub(crate) struct DefaultAvatar {
     client: Option<Arc<ChatClient>>,
     /// Bumped with each new connection.
     generation: u64,
-    /// [`AvatarAssets::generation`] when the install was answered, for
+    /// [`AvatarAssets::syncs`] when the install was answered, for
     /// [`Flow::Reloading`] to wait past.
     reload_from: u64,
     runtime: Handle,
@@ -295,9 +296,9 @@ impl DefaultAvatar {
     }
 
     /// Folds the events of this connection into the flow. Returns whether
-    /// to resync the avatar. `assets_generation` is the avatar's now, kept
-    /// for the reload to wait past.
-    fn drain(&mut self, assets_generation: u64) -> bool {
+    /// to resync the avatar. `assets_syncs` is the avatar's sync count now,
+    /// kept for the reload to wait past.
+    fn drain(&mut self, assets_syncs: u64) -> bool {
         let events: Vec<_> = match self.rx.lock() {
             Ok(mut rx) => std::iter::from_fn(|| rx.try_recv().ok()).collect(),
             Err(_) => return false,
@@ -319,7 +320,7 @@ impl DefaultAvatar {
                         tracing::warn!("cannot install the default avatar: {e}");
                     }
                     if self.flow.answered(answer) {
-                        self.reload_from = assets_generation;
+                        self.reload_from = assets_syncs;
                         resync = true;
                     }
                 }
@@ -344,7 +345,7 @@ pub(crate) fn drive_default_avatar(
     {
         default_avatar.connect(client);
     }
-    if default_avatar.drain(assets.map_or(0, |a| a.generation)) {
+    if default_avatar.drain(assets.map_or(0, |a| a.syncs)) {
         sync.0 = true;
     }
 }
@@ -360,9 +361,7 @@ pub(crate) fn finish_default_reload(
         return;
     }
     // Without the assets nothing will reload; do not wait for it.
-    let finished = assets.is_none_or(|a| {
-        resync_finished(default_avatar.reload_from, a.generation, a.error.is_some())
-    });
+    let finished = assets.is_none_or(|a| resync_finished(default_avatar.reload_from, a.syncs));
     if finished {
         default_avatar.flow.reloaded();
     }
@@ -473,10 +472,10 @@ mod tests {
     }
 
     #[test]
-    fn the_resync_finishes_on_a_new_generation_or_an_error() {
-        assert!(!resync_finished(3, 3, false));
-        assert!(resync_finished(3, 4, false));
-        assert!(resync_finished(3, 3, true));
+    fn the_resync_finishes_once_a_sync_completes() {
+        assert!(!resync_finished(3, 3));
+        // A sync that loaded the avatar already shown, or failed, ends it too.
+        assert!(resync_finished(3, 4));
     }
 
     #[test]
