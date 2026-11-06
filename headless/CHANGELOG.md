@@ -7,9 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0](https://github.com/sapphire-turtle/sapphire-agent/compare/v0.12.1...v0.13.0) - 2026-11-06
+
+### Added
+
+- The app server installs the default avatar for a GUI that connects to an agent without one (`sapphire-agent.avatar.install_default`, with progress in `avatar.install_progress`), only when sync is off or the bridge has no peers; `init` seeds the character settings without the network, and the CLI never fetches an avatar ([#340](https://github.com/sapphire-turtle/sapphire-agent/issues/340), [#370](https://github.com/sapphire-turtle/sapphire-agent/pull/370), [#373](https://github.com/sapphire-turtle/sapphire-agent/pull/373)). The app API is version 4.
+
 ### Changed
 
 - [**breaking**] Built on sapphire-framework 0.28 and corundum-framework 0.11: `update` installs only a release file signed with sapphire-turtle's key, and refuses one without a valid signature (sapphire-turtle/sapphire-framework#402)
+- [**breaking**] Each release file comes with its `<file>.sig`, made with sapphire-turtle's minisign key, which `update` checks (sapphire-turtle/sapphire-framework#402)
 
 ## [0.12.1](https://github.com/sapphire-turtle/sapphire-agent/compare/v0.12.0...v0.12.1) - 2026-11-04
 

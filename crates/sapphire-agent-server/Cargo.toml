@@ -3,7 +3,7 @@ name = "sapphire-agent-server"
 # Released together with the editions that run it (release-plz.toml). The
 # server binary was published under this name up to 0.8.0, so it resumes at
 # 0.12.0.
-version = "0.12.1"
+version = "0.13.0"
 edition.workspace = true
 description = "sapphire-agent's app server: the agent itself, with its channels, tools, memory and IPC, which `sapphire-agent serve` runs"
 license.workspace = true
@@ -205,7 +205,7 @@ agent-client-protocol = "3.3.0"
 
 # The local chat protocol (method names, APP_API) and its client, shared
 # with sapphire-agent-desktop.
-sapphire-agent-core = { path = "../sapphire-agent-core", version = "0.11.1" }
+sapphire-agent-core = { path = "../sapphire-agent-core", version = "0.12.0" }
 
 [dev-dependencies]
 tempfile = "3"

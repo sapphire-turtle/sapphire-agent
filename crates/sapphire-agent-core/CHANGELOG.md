@@ -10,6 +10,16 @@ version with `sapphire-agent-server`) are recorded in the root `CHANGELOG.md`.
 
 ## [Unreleased]
 
+## [0.12.0](https://github.com/sapphire-turtle/sapphire-agent/compare/sapphire-agent-core-v0.11.1...sapphire-agent-core-v0.12.0) - 2026-11-06
+
+### Added
+
+- Install the default avatar when the GUI finds none ([#373](https://github.com/sapphire-turtle/sapphire-agent/pull/373))
+
+### Other
+
+- [**breaking**] *(deps)* sapphire-framework 0.28, corundum-framework 0.11
+
 ## [0.11.1](https://github.com/sapphire-turtle/sapphire-agent/compare/sapphire-agent-core-v0.11.0...sapphire-agent-core-v0.11.1) - 2026-11-04
 
 ### Other
