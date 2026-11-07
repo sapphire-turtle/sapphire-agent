@@ -44,7 +44,7 @@ A `Channel` implementation provides exactly three things:
 | Capability | Trait | Discord | Matrix |
 |---|---|---|---|
 | Return the IDs of posted messages | `send -> Result<Vec<String>>` | message IDs (several when split) | the event ID from `room.send`'s response |
-| Carry the reply target on incoming messages | `IncomingMessage.reply_to: Option<String>` | `message_reference.message_id` | `Relation::Reply`'s `in_reply_to`; for a reply inside a thread, `Relation::Thread`'s `in_reply_to` when it is not `is_falling_back` |
+| Carry the reply target on incoming messages | `IncomingMessage.reply_to: Option<String>` | `message_reference.message_id` | `Relation::Reply`'s `in_reply_to`; for a thread, `Relation::Thread`'s `in_reply_to` when it is not `is_falling_back`, else the thread root (Element's "Reply in thread" on the question) |
 | Post as a reply | `OutgoingMessage.reply_to: Option<String>` | a message reference | an `in_reply_to` relation |
 
 - Replies are sent through `send`; there is no separate method. When a message is split, only the first
@@ -130,7 +130,8 @@ autonomous origin `channel` (the policy table is unchanged).
 - **When it is offered**: `[autonomous] consult_room` is set, and the turn belongs to an autonomous session.
   `TurnHost` gains `consult_identity() -> Option<ConsultIdentity>` (task name, owning session, and the
   asking subagent's handle), returned by the autonomous host. `detached()` keeps it, and a background
-  child's host forwards the parent's with its own handle as `asked_by`.
+  child's host forwards the parent's with its own handle as `asked_by`. A synchronous child's host has
+  none, so a child is offered `ask_human` only when its host has an identity.
 - **Behaviour**:
   1. With 3 open questions, refuse: `You already have 3 questions waiting for an answer. Wait for one, or withdraw one with background_task.`
   2. Refuse when the consult room isn't served on this host (`placement`), or its channel doesn't support
@@ -167,7 +168,13 @@ Messages in the consult room are taken aside before `handle_message` and passed 
 - At registration, a `tokio::time::sleep_until(deadline)` task is started. When it fires and `expire`
   returns true, the bot replies to the question with
   `No answer by the deadline; the session will decide on its own. A reply now still reaches it as extra information.`
-- At start, deadlines of the questions `open` kept are re-armed (expired at once if already past).
+- At start, deadlines of the questions `open` kept are re-armed (expired at once if already past). With no
+  consult room on this host (unset, or no channel block), they still expire at their deadlines, without a
+  note, logging `consult room unavailable; {n} pending question(s) will expire without a note`.
+- `consult_timeout_hours` is clamped to `1..=8760` with a warning; a deadline that would overflow falls back
+  to 8760 hours.
+- Asks are serialized (check, post, register under one lock), so concurrent calls in one round can't pass
+  the cap together.
 - Withdrawal notes: for each question `cancel` / `cancel_all` returns, the bot replies
   `This question was withdrawn.`
 
@@ -181,7 +188,8 @@ consult_timeout_hours = 24
 
 - Without `consult_room`, `ask_human` isn't offered.
 - `verify` warns when the consult room isn't among any channel's rooms (Discord `channel_ids` / Matrix
-  `room_ids`), when `[autonomous]` is disabled, and when the room's channel doesn't support replies.
+  `room_ids`; a numeric room counts as listed while Discord's `channel_ids` is empty, i.e. listens to all,
+  and is routed to Discord at start), when `[autonomous]` is disabled, and when the room's channel doesn't support replies.
 - Synced hosts: autonomous sessions run on the primary device. If the channel serving the consult room is on
   another host, `ask_human` is refused (`consult room <room> is not served on this host`), and a warning is
   logged at start.
