@@ -56,16 +56,11 @@ pub(crate) const MAX_OPEN_QUESTIONS: usize = 3;
 /// Where a reply to a consult-room message belongs.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Route {
-    /// The question is still open.
-    Pending {
-        session: String,
-        id: TaskId,
-    },
-    /// The question has ended (answered, expired or withdrawn).
-    Answered {
-        session: String,
-        id: TaskId,
-    },
+    /// A reply to a question still waiting for its answer.
+    Pending { session: String, id: TaskId },
+    /// A reply to a question already answered, or past its deadline.
+    Answered { session: String, id: TaskId },
+    /// A withdrawn question, a question of a finished session, or an unknown message.
     Unknown,
 }
 
@@ -581,10 +576,6 @@ impl BackgroundTasks {
         };
         let r = s.running.remove(pos);
         let task = r.task.clone();
-        if is_question(&task) {
-            // Replies to a withdrawn question still need routing.
-            s.closed_questions.push(task.clone());
-        }
         Self::cancel_running(s, r);
         self.persist(session, s);
         Ok(task)
@@ -1103,6 +1094,18 @@ mod tests {
         assert!(d.iter().any(|c| c.outcome == Outcome::Interrupted));
         assert!(matches!(t2.route_reply("!r", "m1"), Route::Pending { .. }));
         assert!(matches!(t2.route_reply("!r", "m2"), Route::Answered { .. }));
+    }
+
+    #[test]
+    fn a_withdrawn_question_is_unknown() {
+        let t = BackgroundTasks::in_memory(4);
+        let id = t
+            .register_question("s", question("!r", "m1", "ok?", None), "q".into())
+            .unwrap();
+        t.cancel("s", &id).unwrap();
+        assert_eq!(t.route_reply("!r", "m1"), Route::Unknown);
+        assert!(!t.follow_up("s", &id, "x".into(), "bob".into()));
+        assert_eq!(t.drain("s")[0].outcome, Outcome::Cancelled);
     }
 
     #[test]
