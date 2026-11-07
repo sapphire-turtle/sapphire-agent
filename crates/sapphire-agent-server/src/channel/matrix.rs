@@ -11,10 +11,10 @@ use matrix_sdk::{
     media::{MediaFormat, MediaRequestParameters},
     ruma::{
         OwnedEventId, OwnedRoomId, OwnedUserId,
-        events::relation::Thread,
+        events::relation::{InReplyTo, Reply, Thread},
         events::room::message::{
             ImageMessageEventContent, MessageType, OriginalSyncRoomMessageEvent, Relation,
-            RoomMessageEventContent,
+            RoomMessageEventContent, RoomMessageEventContentWithoutRelation,
         },
     },
 };
@@ -217,9 +217,18 @@ impl Channel for MatrixChannel {
             )));
         }
 
-        room.send(content).await.context("Failed to send message")?;
-        // Task 2 returns the posted event ID.
-        Ok(vec![])
+        // A reply wins over a thread relation.
+        if let Some(reply_to) = &message.reply_to {
+            let target: OwnedEventId = reply_to.parse().context("Invalid reply_to")?;
+            content.relates_to = Some(Relation::Reply(Reply::new(InReplyTo::new(target))));
+        }
+
+        let response = room.send(content).await.context("Failed to send message")?;
+        Ok(vec![response.response.event_id.to_string()])
+    }
+
+    fn supports_replies(&self) -> bool {
+        true
     }
 
     async fn listen(&self, tx: mpsc::Sender<IncomingMessage>) -> Result<()> {
@@ -259,8 +268,17 @@ impl Channel for MatrixChannel {
                         }
                     });
 
+                    let reply_to = reply_target(event.content.relates_to.as_ref());
+
                     let (content, attachments) = match &event.content.msgtype {
-                        MessageType::Text(text_content) => (text_content.body.clone(), Vec::new()),
+                        MessageType::Text(text_content) => {
+                            let body = if reply_to.is_some() {
+                                strip_reply_fallback(&text_content.body)
+                            } else {
+                                text_content.body.clone()
+                            };
+                            (body, Vec::new())
+                        }
                         MessageType::Image(image_content) => {
                             let result =
                                 download_matrix_image(&room.client(), image_content).await;
@@ -286,7 +304,7 @@ impl Channel for MatrixChannel {
                                         timestamp: 0,
                                         thread_id,
                                         attachments: Vec::new(),
-                        reply_to: None,
+                                        reply_to,
                                     };
                                     if let Err(e) = tx.send(msg).await {
                                         warn!("Failed to forward unsupported-format event: {e}");
@@ -307,7 +325,7 @@ impl Channel for MatrixChannel {
                         timestamp: 0,
                         thread_id,
                         attachments,
-                        reply_to: None,
+                        reply_to,
                     };
 
                     if let Err(e) = tx.send(msg).await {
@@ -368,5 +386,87 @@ impl Channel for MatrixChannel {
             description,
             kind: "matrix".to_string(),
         })
+    }
+}
+
+/// The event ID a message replies to, if it is a reply. A thread message
+/// counts only when its `in_reply_to` is a real reply rather than the
+/// fallback pointer clients add for threads-unaware readers.
+pub fn reply_target(
+    rel: Option<&Relation<RoomMessageEventContentWithoutRelation>>,
+) -> Option<String> {
+    match rel? {
+        Relation::Reply(reply) => Some(reply.in_reply_to.event_id.to_string()),
+        Relation::Thread(thread) if !thread.is_falling_back => {
+            thread.in_reply_to.as_ref().map(|r| r.event_id.to_string())
+        }
+        _ => None,
+    }
+}
+
+/// Drop the `> ` quoted fallback block that older clients prepend to replies.
+pub fn strip_reply_fallback(body: &str) -> String {
+    if !body.starts_with('>') {
+        return body.to_string();
+    }
+    let rest = body
+        .split_inclusive('\n')
+        .skip_while(|l| l.starts_with('>'))
+        .collect::<String>();
+    rest.trim_start_matches(['\n', '\r']).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use matrix_sdk::ruma::EventId;
+
+    fn eid(s: &str) -> OwnedEventId {
+        EventId::parse(s).unwrap()
+    }
+
+    fn thread(fallback: bool) -> Relation<RoomMessageEventContentWithoutRelation> {
+        let mut t = Thread::plain(eid("$root:x"), eid("$e2:x"));
+        t.in_reply_to = Some(InReplyTo::new(eid("$e2:x")));
+        t.is_falling_back = fallback;
+        Relation::Thread(t)
+    }
+
+    #[test]
+    fn reply_relation_is_a_reply() {
+        let rel = Relation::Reply(Reply::new(InReplyTo::new(eid("$e1:x"))));
+        assert_eq!(reply_target(Some(&rel)), Some("$e1:x".to_string()));
+    }
+
+    #[test]
+    fn thread_reply_is_a_reply() {
+        assert_eq!(
+            reply_target(Some(&thread(false))),
+            Some("$e2:x".to_string())
+        );
+    }
+
+    #[test]
+    fn thread_fallback_is_not_a_reply() {
+        assert_eq!(reply_target(Some(&thread(true))), None);
+    }
+
+    #[test]
+    fn no_relation_is_not_a_reply() {
+        assert_eq!(reply_target(None), None);
+    }
+
+    #[test]
+    fn strips_reply_fallback() {
+        assert_eq!(
+            strip_reply_fallback("> <@a:x> q\n> more\n\nanswer"),
+            "answer"
+        );
+        assert_eq!(strip_reply_fallback("answer"), "answer");
+        assert_eq!(strip_reply_fallback("> quoted only"), "");
+        assert_eq!(
+            strip_reply_fallback("line\n> not leading"),
+            "line\n> not leading"
+        );
     }
 }
