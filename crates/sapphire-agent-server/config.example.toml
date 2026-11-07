@@ -77,6 +77,11 @@
 # idle_minutes = 30
 # poll_seconds = 60
 # origin = "trusted"
+# Chat room where autonomous sessions post questions (the `ask_human`
+# tool); a reply to a question's message is the answer. The room must also
+# be in the channel's room list (`discord.channel_ids` / `matrix.room_ids`).
+# consult_room = "123456789012345678"
+# consult_timeout_hours = 24
 
 # Day-boundary session policy. One of:
 #   "reset"   — close the session; next message starts a new one (legacy default)

@@ -26,7 +26,6 @@ mod channel;
 mod cli_init;
 mod config;
 mod config_layer;
-#[allow(dead_code)] // the serve loop wires in the rest (a later task)
 mod consult;
 mod context_compression;
 mod default_avatar;
@@ -197,6 +196,37 @@ fn group_unknown_keys<'a>(
 /// shows up before a request is. Also the `[room_profile.<n>].devices`
 /// fallback for keys from before profiles, and any entry of it naming no
 /// key. Reads the key files without changing them.
+/// `verify`'s consult room warnings, one line each: a room no channel lists
+/// (`ask_human` would refuse), and a room set while autonomous sessions are
+/// off (nothing would ever ask).
+fn consult_room_warnings(config: &config::Config) -> Vec<String> {
+    let Some(room) = config.autonomous.consult_room.as_deref() else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+    let listed = config
+        .discord
+        .as_ref()
+        .is_some_and(|d| d.channel_ids.iter().any(|c| c == room))
+        || config
+            .matrix
+            .as_ref()
+            .is_some_and(|m| m.room_ids.iter().any(|r| r == room));
+    if !listed {
+        lines.push(format!(
+            "  Consult room      : {room} is in neither discord.channel_ids nor \
+             matrix.room_ids: ask_human will refuse"
+        ));
+    }
+    if !config.autonomous.enabled {
+        lines.push(format!(
+            "  Consult room      : {room} is set but [autonomous] is not enabled: \
+             nothing will ask"
+        ));
+    }
+    lines
+}
+
 fn verify_api_keys(auth: &device_auth::DeviceAuth, root: Option<&std::path::Path>) {
     use sapphire_framework::keys::{KeyStore, MIGRATED, store_dir};
 
@@ -1078,6 +1108,27 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
                     Arc::clone(&channel_session_store),
                     image_cache.clone(),
                 ));
+                // ── Consult room ────────────────────────────────────────────
+                if let Some(room) = config.autonomous.consult_room.clone() {
+                    if channels.serves(&room).await {
+                        let consult = consult::Consult::new(
+                            Arc::clone(&channels),
+                            Arc::clone(&serve_state.background),
+                            room,
+                            std::time::Duration::from_secs(
+                                config.autonomous.consult_timeout_hours.saturating_mul(3600),
+                            ),
+                        );
+                        serve_state.set_consult(Arc::clone(&consult));
+                        agent.set_consult(Arc::clone(&consult));
+                        // Questions that outlived a restart get their timers back.
+                        consult.rearm();
+                    } else {
+                        tracing::warn!(
+                            "consult room {room} is not served on this host; ask_human will refuse"
+                        );
+                    }
+                }
                 // Wire the agent into the timer dispatcher so chat-origin
                 // timers are announced through `Agent::trigger`.
                 timer_dispatch.set_agent(Arc::downgrade(&agent));
@@ -1134,6 +1185,14 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
                         tracing::error!("Agent error: {e:#}");
                     }
                 }));
+            }
+
+            if channel_agent.is_none()
+                && let Some(room) = &config.autonomous.consult_room
+            {
+                tracing::warn!(
+                    "consult room {room} is not served on this host; ask_human will refuse"
+                );
             }
 
             // ── Catch-up and heartbeat ──────────────────────────────────────
@@ -1412,6 +1471,9 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
                 config.heartbeat_enabled,
                 layer_tag(&provenance, "heartbeat_enabled")
             );
+            for line in consult_room_warnings(&config) {
+                println!("{line}");
+            }
             println!();
             println!("Workspace-supplied settings:");
             let ws_settings: Vec<&String> = provenance
@@ -1830,6 +1892,33 @@ fn migrate_pre_namespace_layout(workspace_dir: &std::path::Path) -> anyhow::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn consult_config(extra: &str) -> config::Config {
+        config::Config::parse_for_test(&format!("[anthropic]\napi_key = \"t\"\n{extra}"))
+    }
+
+    #[test]
+    fn verify_warns_about_an_unlisted_consult_room() {
+        let cfg = consult_config(
+            "[autonomous]\nenabled = true\nconsult_room = \"c1\"\n\
+             [discord]\nbot_token = \"x\"\nchannel_ids = [\"other\"]\nallowed_users = []\n",
+        );
+        let lines = consult_room_warnings(&cfg);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("neither discord.channel_ids nor matrix.room_ids"));
+    }
+
+    #[test]
+    fn verify_accepts_a_listed_consult_room_and_warns_when_autonomous_is_off() {
+        let cfg = consult_config(
+            "[autonomous]\nconsult_room = \"c1\"\n\
+             [discord]\nbot_token = \"x\"\nchannel_ids = [\"c1\"]\nallowed_users = []\n",
+        );
+        let lines = consult_room_warnings(&cfg);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("not enabled"));
+        assert!(consult_room_warnings(&consult_config("")).is_empty());
+    }
 
     fn acp_meta(namespace: &str) -> session::SessionMeta {
         session::SessionMeta {

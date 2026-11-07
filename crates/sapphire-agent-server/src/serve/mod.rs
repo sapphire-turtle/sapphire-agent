@@ -239,7 +239,6 @@ impl ServeState {
     }
 
     /// Install the consult room. A second call is ignored.
-    #[allow(dead_code)] // the serve loop calls it (a later task)
     pub(crate) fn set_consult(&self, consult: Arc<crate::consult::Consult>) {
         if self.consult.set(consult).is_err() {
             warn!("consult room already set; ignoring the second one");

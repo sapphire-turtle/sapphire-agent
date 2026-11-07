@@ -274,6 +274,12 @@ pub(crate) mod test_support {
         }
 
         pub(crate) fn with_timeout(timeout: Duration) -> Self {
+            Self::over(BackgroundTasks::in_memory(4), timeout)
+        }
+
+        /// A fixture whose questions live in `background`, for a test that
+        /// already has a state with its own tasks.
+        pub(crate) fn over(background: Arc<BackgroundTasks>, timeout: Duration) -> Self {
             let channel = Arc::new(FakeChannel {
                 posts: Mutex::new(Vec::new()),
                 next: AtomicUsize::new(0),
@@ -283,7 +289,6 @@ pub(crate) mod test_support {
                 vec![("fake".to_string(), channel.clone() as Arc<dyn Channel>)],
                 HashMap::from([("room".to_string(), "fake".to_string())]),
             ));
-            let background = BackgroundTasks::in_memory(4);
             let consult =
                 Consult::new(channels.clone(), background.clone(), "room".into(), timeout);
             Self {
