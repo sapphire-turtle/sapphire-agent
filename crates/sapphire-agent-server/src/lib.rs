@@ -26,6 +26,8 @@ mod channel;
 mod cli_init;
 mod config;
 mod config_layer;
+#[allow(dead_code)] // wired in by the ask_human tool and the serve loop (later tasks)
+mod consult;
 mod context_compression;
 mod default_avatar;
 mod device_auth;

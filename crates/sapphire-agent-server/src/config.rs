@@ -1452,6 +1452,14 @@ pub struct AutonomousConfig {
     /// `file_write` before the table is consulted at all.
     #[serde(default)]
     pub origin: AutonomousOrigin,
+    /// Chat room where autonomous sessions post questions for a human to
+    /// answer by replying (`ask_human`). `None`: the tool is not offered.
+    #[serde(default)]
+    pub consult_room: Option<String>,
+    /// How long a question waits for an answer before the session decides
+    /// on its own, in hours.
+    #[serde(default = "default_consult_timeout_hours")]
+    pub consult_timeout_hours: u64,
 }
 
 impl Default for AutonomousConfig {
@@ -1461,8 +1469,14 @@ impl Default for AutonomousConfig {
             idle_minutes: default_autonomous_idle_minutes(),
             poll_seconds: default_autonomous_poll_seconds(),
             origin: AutonomousOrigin::Channel,
+            consult_room: None,
+            consult_timeout_hours: default_consult_timeout_hours(),
         }
     }
+}
+
+fn default_consult_timeout_hours() -> u64 {
+    24
 }
 
 fn default_autonomous_idle_minutes() -> u64 {
@@ -2423,6 +2437,19 @@ mod tests {
     fn a_typo_in_the_autonomous_table_is_rejected() {
         let raw =
             "[anthropic]\napi_key = \"test\"\n\n[autonomous]\nenabled = true\nidle_minute = 5\n";
+        assert!(toml::from_str::<Config>(raw).is_err());
+    }
+
+    #[test]
+    fn config_parses_consult_fields() {
+        let cfg = parse("[anthropic]\napi_key = \"test\"\n\n[autonomous]\nconsult_room = \"r\"\n");
+        assert_eq!(cfg.autonomous.consult_room.as_deref(), Some("r"));
+        assert_eq!(cfg.autonomous.consult_timeout_hours, 24);
+        let cfg =
+            parse("[anthropic]\napi_key = \"test\"\n\n[autonomous]\nconsult_timeout_hours = 2\n");
+        assert_eq!(cfg.autonomous.consult_room, None);
+        assert_eq!(cfg.autonomous.consult_timeout_hours, 2);
+        let raw = "[anthropic]\napi_key = \"test\"\n\n[autonomous]\nconsult_roomm = \"r\"\n";
         assert!(toml::from_str::<Config>(raw).is_err());
     }
 

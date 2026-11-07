@@ -94,7 +94,6 @@ impl OutgoingMessage {
     }
 
     /// Post this message as a reply to the message with platform ID `id`.
-    #[allow(dead_code)] // used by the consult room (later task)
     pub fn replying_to(mut self, id: impl Into<String>) -> Self {
         self.reply_to = Some(id.into());
         self
@@ -213,14 +212,12 @@ impl Channels {
     }
 
     /// Whether a channel serves `room_id` (no single-channel fallback).
-    #[allow(dead_code)] // used by the consult room (later task)
     pub async fn serves(&self, room_id: &str) -> bool {
         self.channel_for_room(room_id).await.is_some()
     }
 
     /// Whether the channel serving `room_id` supports replies; `None`
     /// when no channel serves the room.
-    #[allow(dead_code)] // used by the consult room (later task)
     pub async fn supports_replies(&self, room_id: &str) -> Option<bool> {
         self.channel_for_room(room_id)
             .await
