@@ -180,6 +180,7 @@ impl Agent {
             timestamp: now_ms,
             thread_id: None,
             attachments: Vec::new(),
+            reply_to: None,
         };
         Arc::clone(self).handle_message(incoming).await
     }
@@ -509,6 +510,7 @@ impl Agent {
             content: text.to_string(),
             room_id: incoming.room_id.clone(),
             thread_id: incoming.thread_id.clone(),
+            reply_to: None,
         };
         if let Err(e) = self.channels.send(&out).await {
             warn!("Failed to send a turn message: {e:#}");
@@ -1099,14 +1101,17 @@ mod tests {
             "test"
         }
 
-        async fn send(&self, message: &crate::channel::OutgoingMessage) -> anyhow::Result<()> {
+        async fn send(
+            &self,
+            message: &crate::channel::OutgoingMessage,
+        ) -> anyhow::Result<Vec<String>> {
             let mut calls = self.calls.lock().unwrap();
             *calls += 1;
             if self.fail_first && *calls == 1 {
                 return Err(anyhow::anyhow!("simulated send failure"));
             }
             self.sent.lock().unwrap().push(message.clone());
-            Ok(())
+            Ok(vec![])
         }
 
         async fn start_typing(&self, _room_id: &str) -> anyhow::Result<()> {
@@ -1246,6 +1251,7 @@ api_key = "test"
             timestamp: 0,
             thread_id: None,
             attachments: Vec::new(),
+            reply_to: None,
         }
     }
 

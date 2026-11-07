@@ -204,7 +204,7 @@ impl Channel for MatrixChannel {
         "matrix"
     }
 
-    async fn send(&self, message: &OutgoingMessage) -> Result<()> {
+    async fn send(&self, message: &OutgoingMessage) -> Result<Vec<String>> {
         let room = self.get_room(&message.room_id).await?;
 
         let mut content = RoomMessageEventContent::text_markdown(&message.content);
@@ -218,7 +218,8 @@ impl Channel for MatrixChannel {
         }
 
         room.send(content).await.context("Failed to send message")?;
-        Ok(())
+        // Task 2 returns the posted event ID.
+        Ok(vec![])
     }
 
     async fn listen(&self, tx: mpsc::Sender<IncomingMessage>) -> Result<()> {
@@ -285,6 +286,7 @@ impl Channel for MatrixChannel {
                                         timestamp: 0,
                                         thread_id,
                                         attachments: Vec::new(),
+                        reply_to: None,
                                     };
                                     if let Err(e) = tx.send(msg).await {
                                         warn!("Failed to forward unsupported-format event: {e}");
@@ -305,6 +307,7 @@ impl Channel for MatrixChannel {
                         timestamp: 0,
                         thread_id,
                         attachments,
+                        reply_to: None,
                     };
 
                     if let Err(e) = tx.send(msg).await {
