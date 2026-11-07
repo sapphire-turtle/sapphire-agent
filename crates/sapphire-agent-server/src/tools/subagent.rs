@@ -495,6 +495,8 @@ impl crate::serve::TurnHost for SubagentHost {
 pub(crate) struct BackgroundSubagentHost {
     parent: Arc<dyn crate::serve::TurnHost>,
     refused: Arc<std::sync::Mutex<Vec<crate::background::RefusedCall>>>,
+    /// The child's own handle, which names it when it asks a question.
+    handle: String,
 }
 
 impl BackgroundSubagentHost {
@@ -503,8 +505,13 @@ impl BackgroundSubagentHost {
     pub(crate) fn new(
         parent: Arc<dyn crate::serve::TurnHost>,
         refused: Arc<std::sync::Mutex<Vec<crate::background::RefusedCall>>>,
+        handle: String,
     ) -> Self {
-        Self { parent, refused }
+        Self {
+            parent,
+            refused,
+            handle,
+        }
     }
 }
 
@@ -548,6 +555,17 @@ impl crate::serve::TurnHost for BackgroundSubagentHost {
 
     fn avatar(&self) -> Option<Arc<crate::tools::avatar_tools::AvatarTurn>> {
         None
+    }
+
+    /// The parent's identity, with this child named as the one asking, so
+    /// the answer goes to the session that started it.
+    fn consult_identity(&self) -> Option<crate::serve::ConsultIdentity> {
+        self.parent
+            .consult_identity()
+            .map(|id| crate::serve::ConsultIdentity {
+                asked_by: Some(self.handle.clone()),
+                ..id
+            })
     }
 
     async fn tool_allowed(&self, id: &str) {
@@ -970,8 +988,11 @@ impl SubagentTool {
             admin_room_profile: ctx.admin_room_profile.clone(),
         });
         let refused = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let progress: Arc<dyn crate::serve::TurnHost> =
-            Arc::new(BackgroundSubagentHost::new(detached, Arc::clone(&refused)));
+        let progress: Arc<dyn crate::serve::TurnHost> = Arc::new(BackgroundSubagentHost::new(
+            detached,
+            Arc::clone(&refused),
+            handle.clone(),
+        ));
         let namespace = crate::tools::workspace_tools::current_memory_namespace();
         let tool = Arc::clone(self);
         let scope_ctx = Arc::clone(&task_ctx);
@@ -2248,8 +2269,37 @@ mod tests {
         let host = BackgroundSubagentHost::new(
             parent as std::sync::Arc<dyn crate::serve::TurnHost>,
             std::sync::Arc::clone(&refused),
+            "h-1".to_string(),
         );
         (host, refused)
+    }
+
+    #[test]
+    fn background_child_forwards_identity_with_its_handle() {
+        use crate::serve::{AutonomousHost, ConsultIdentity, NullProgress, TurnHost};
+        let parent_id = ConsultIdentity {
+            task: "t".into(),
+            owner_session: "s".into(),
+            asked_by: None,
+        };
+        let parent: std::sync::Arc<dyn TurnHost> = std::sync::Arc::new(AutonomousHost {
+            origin: crate::tools::policy::Origin::Trusted,
+            consult: Some(parent_id.clone()),
+        });
+        let host = BackgroundSubagentHost::new(parent, Default::default(), "h-9".into());
+        assert_eq!(
+            host.consult_identity(),
+            Some(ConsultIdentity {
+                asked_by: Some("h-9".into()),
+                ..parent_id
+            })
+        );
+        let host = BackgroundSubagentHost::new(
+            std::sync::Arc::new(NullProgress),
+            Default::default(),
+            "h-9".into(),
+        );
+        assert_eq!(host.consult_identity(), None);
     }
 
     fn shell_call() -> crate::provider::ToolCall {

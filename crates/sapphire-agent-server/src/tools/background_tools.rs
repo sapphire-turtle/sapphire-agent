@@ -107,7 +107,13 @@ impl Tool for BackgroundTaskTool {
                     bail!("`cancel` needs an `id`; use `list` to see the running ids");
                 };
                 let (session, tasks) = session_tasks()?;
-                tasks.cancel(&session, id)?;
+                let task = tasks.cancel(&session, id)?;
+                if matches!(task.kind, TaskKind::Question { .. })
+                    && let Some(ctx) = crate::serve::current_turn_context()
+                    && let Some(consult) = ctx.state.consult()
+                {
+                    consult.withdraw(vec![task]).await;
+                }
                 Ok(format!("Cancelled background task {id}."))
             }
             other => bail!("unknown action {other:?}; use \"list\" or \"cancel\""),
@@ -189,6 +195,27 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("nope"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_question_posts_the_withdrawal() {
+        let mut state = ServeState::for_test(false);
+        let f = crate::consult::test_support::Fixture::new();
+        // The tool cancels in the state's registry, which is the consult's.
+        Arc::get_mut(&mut state).unwrap().background = Arc::clone(&f.background);
+        state.set_consult(f.consult.clone());
+        let id = f.consult.ask("s", "t", None, "why?").await.unwrap();
+        let out = run(&state, Some("s"), json!({"action": "cancel", "id": id}))
+            .await
+            .unwrap();
+        assert_eq!(out, format!("Cancelled background task {id}."));
+        let posts = f.channel.posts();
+        assert_eq!(posts.len(), 2, "{posts:?}");
+        assert_eq!(posts[1].content, "This question was withdrawn.");
+        assert_eq!(
+            f.background.route_reply("room", "m1"),
+            crate::background::Route::Unknown
+        );
     }
 
     #[tokio::test]

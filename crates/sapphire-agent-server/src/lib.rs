@@ -26,7 +26,7 @@ mod channel;
 mod cli_init;
 mod config;
 mod config_layer;
-#[allow(dead_code)] // wired in by the ask_human tool and the serve loop (later tasks)
+#[allow(dead_code)] // the serve loop wires in the rest (a later task)
 mod consult;
 mod context_compression;
 mod default_avatar;
@@ -625,6 +625,13 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
             if config.tools.background.max_per_session > 0 {
                 tool_set
                     .register_tool(Box::new(tools::background_tools::BackgroundTaskTool::new()))
+                    .await;
+            }
+            // Only where a consult room is configured; `run_llm_turn` still
+            // offers it to autonomous sessions alone.
+            if config.autonomous.consult_room.is_some() {
+                tool_set
+                    .register_tool(Box::new(tools::ask_human::AskHumanTool::new()))
                     .await;
             }
 

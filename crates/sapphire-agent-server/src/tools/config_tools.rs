@@ -774,6 +774,7 @@ impl TaskTestTool {
             ChatMessage::user(text),
             Arc::new(AutonomousHost {
                 origin: self.origin(),
+                consult: None,
             }),
             None,
         )

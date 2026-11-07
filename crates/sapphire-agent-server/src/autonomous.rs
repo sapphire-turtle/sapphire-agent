@@ -35,7 +35,7 @@ use crate::autonomous_config::{AutonomousTask, load_autonomous_dir};
 use crate::background::BackgroundTasks;
 use crate::config::{AutonomousOrigin, DEFAULT_NAMESPACE_NAME};
 use crate::provider::{ChatMessage, ContentPart, Role};
-use crate::serve::{AutonomousHost, ServeState};
+use crate::serve::{AutonomousHost, ConsultIdentity, ServeState};
 use crate::session::{SessionRow, SessionStore};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -436,6 +436,11 @@ impl AutonomousLoop {
                 ChatMessage::user(text),
                 Arc::new(AutonomousHost {
                     origin: self.origin(),
+                    consult: Some(ConsultIdentity {
+                        task: task.name.clone(),
+                        owner_session: session_id.clone(),
+                        asked_by: None,
+                    }),
                 }),
                 None,
             )

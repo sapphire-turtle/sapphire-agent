@@ -172,6 +172,10 @@ pub struct ServeState {
     /// cap check can see it without `tools::client_tools` depending on
     /// `ServeState` itself — see `TerminalRegistry`'s doc.
     pub(crate) acp_terminals: crate::tools::acp_client::TerminalRegistry,
+    /// The consult room, set once at startup when `[autonomous]
+    /// consult_room` is configured and its channels are up. Empty until
+    /// then (and forever on a host without one): `ask_human` reads it.
+    consult: std::sync::OnceLock<Arc<crate::consult::Consult>>,
 }
 
 impl ServeState {
@@ -225,6 +229,20 @@ impl ServeState {
             subagent_cache,
             background,
             acp_terminals: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            consult: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// The consult room, once [`set_consult`](Self::set_consult) has run.
+    pub(crate) fn consult(&self) -> Option<&Arc<crate::consult::Consult>> {
+        self.consult.get()
+    }
+
+    /// Install the consult room. A second call is ignored.
+    #[allow(dead_code)] // the serve loop calls it (a later task)
+    pub(crate) fn set_consult(&self, consult: Arc<crate::consult::Consult>) {
+        if self.consult.set(consult).is_err() {
+            warn!("consult room already set; ignoring the second one");
         }
     }
 
@@ -1860,6 +1878,17 @@ fn apply_input_kind_label(mut msg: ChatMessage) -> ChatMessage {
     msg
 }
 
+/// Who an autonomous turn's `ask_human` question is on behalf of.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ConsultIdentity {
+    /// The task's name, shown at the head of the post.
+    pub task: String,
+    /// The session the answer is delivered to.
+    pub owner_session: String,
+    /// The background subagent's handle, when a child asks.
+    pub asked_by: Option<String>,
+}
+
 /// Where a turn reports its per-tool progress — and who it asks before
 /// running a tool the policy wants asked about.
 ///
@@ -1988,6 +2017,16 @@ pub(crate) trait TurnHost: Send + Sync {
         None
     }
 
+    /// Who `ask_human` asks on behalf of, when this turn is an autonomous
+    /// session's (or a background child of one).
+    ///
+    /// `None` by default: only the autonomous loop's host answers.
+    /// `run_llm_turn` offers `ask_human` only when this does, the same way
+    /// it offers the avatar tools only when `avatar` does.
+    fn consult_identity(&self) -> Option<ConsultIdentity> {
+        None
+    }
+
     /// This call cleared the gate and is about to run.
     ///
     /// Separate from `tool_start`, which fires *before* the gate and so
@@ -2068,6 +2107,7 @@ pub(crate) trait TurnHost: Send + Sync {
     fn detached(&self) -> Arc<dyn TurnHost> {
         Arc::new(DetachedHost {
             origin: self.origin(),
+            consult: self.consult_identity(),
         })
     }
 }
@@ -2076,6 +2116,7 @@ pub(crate) trait TurnHost: Send + Sync {
 /// at the trait default.
 struct DetachedHost {
     origin: crate::tools::policy::Origin,
+    consult: Option<ConsultIdentity>,
 }
 
 #[async_trait::async_trait]
@@ -2086,6 +2127,10 @@ impl TurnHost for DetachedHost {
 
     fn origin(&self) -> crate::tools::policy::Origin {
         self.origin
+    }
+
+    fn consult_identity(&self) -> Option<ConsultIdentity> {
+        self.consult.clone()
     }
 }
 
@@ -2169,6 +2214,9 @@ impl TurnHost for NullProgress {
 /// the default is already that.
 pub(crate) struct AutonomousHost {
     pub(crate) origin: crate::tools::policy::Origin,
+    /// Who `ask_human` speaks for; `None` for a run that must not post to
+    /// the consult room (the `autonomous` test run).
+    pub(crate) consult: Option<ConsultIdentity>,
 }
 
 #[async_trait::async_trait]
@@ -2181,6 +2229,10 @@ impl TurnHost for AutonomousHost {
 
     fn origin(&self) -> crate::tools::policy::Origin {
         self.origin
+    }
+
+    fn consult_identity(&self) -> Option<ConsultIdentity> {
+        self.consult.clone()
     }
 }
 
@@ -2307,6 +2359,12 @@ pub(crate) fn visible_tool_predicate(
         // speaks for. `run_llm_turn` lets them back in when the turn's
         // client declared one.
         if crate::tools::avatar_tools::is_avatar_tool(name) {
+            return false;
+        }
+
+        // Likewise `ask_human`: only an autonomous session's host has an
+        // identity to ask under, and `run_llm_turn` lets it back in then.
+        if name == crate::tools::ask_human::NAME {
             return false;
         }
 
@@ -3267,11 +3325,15 @@ pub(crate) async fn run_llm_turn(
     // to what it declared.
     let avatar = progress.avatar();
     let has_avatar = avatar.is_some();
+    let has_consult = progress.consult_identity().is_some();
     let mut tool_specs = state
         .tools
         .specs_filtered(move |name: &str| {
             if crate::tools::avatar_tools::is_avatar_tool(name) {
                 return has_avatar;
+            }
+            if name == crate::tools::ask_human::NAME {
+                return has_consult;
             }
             if !base(name) {
                 return false;
@@ -3974,6 +4036,18 @@ impl ServeState {
         )
     }
 
+    /// [`Self::for_test`] with `[autonomous] consult_room` configured but
+    /// no consult set, as on a host whose room's channel is not up.
+    pub(crate) fn for_test_with_consult_room(room: &str) -> Arc<Self> {
+        let mut state = Self::for_test(false);
+        Arc::get_mut(&mut state)
+            .expect("a fresh state has one owner")
+            .config
+            .autonomous
+            .consult_room = Some(room.to_string());
+        state
+    }
+
     pub(crate) fn for_test_scripted(
         acp_enabled: bool,
         responses: Vec<crate::provider::ChatResponse>,
@@ -4157,6 +4231,7 @@ rooms    = []
             subagent_cache,
             background: crate::background::BackgroundTasks::in_memory(4),
             acp_terminals: Default::default(),
+            consult: Default::default(),
         })
     }
 }
@@ -5029,6 +5104,7 @@ mod tests {
         let host = crate::tools::subagent::BackgroundSubagentHost::new(
             Arc::new(AcpParent) as Arc<dyn TurnHost>,
             Arc::clone(&refused),
+            "h-1".to_string(),
         );
         let sid = "s-background-ask".to_string();
         run_llm_turn(
@@ -6881,6 +6957,70 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ask_human_is_hidden_without_consult_identity() {
+        for bits in 0..32u8 {
+            let f = |i: u8| bits & (1 << i) != 0;
+            let visible = visible_tool_predicate(f(0), f(1), f(2), f(3), f(4));
+            assert!(!visible("ask_human"), "visible for flags {bits:05b}");
+        }
+    }
+
+    /// `run_llm_turn` offers `ask_human` to a host with an identity and to
+    /// no other: the provider's first request carries the specs.
+    #[tokio::test]
+    async fn ask_human_is_offered_only_to_a_host_with_an_identity() {
+        async fn offered(consult: Option<ConsultIdentity>) -> bool {
+            let state = ServeState::for_test(false);
+            state
+                .tools
+                .register_tool(Box::new(crate::tools::ask_human::AskHumanTool::new()))
+                .await;
+            let seen = state.tools.specs_filtered(|_| true).await;
+            assert!(seen.iter().any(|t| t.name == "ask_human"));
+            let host = AutonomousHost {
+                origin: crate::tools::policy::Origin::Trusted,
+                consult,
+            };
+            let progress: Arc<dyn TurnHost> = Arc::new(host);
+            let has_consult = progress.consult_identity().is_some();
+            // The same closure shape `run_llm_turn` builds.
+            let base = visible_tool_predicate(false, false, false, false, false);
+            let specs = state
+                .tools
+                .specs_filtered(move |name: &str| {
+                    if name == crate::tools::ask_human::NAME {
+                        return has_consult;
+                    }
+                    base(name)
+                })
+                .await;
+            specs.iter().any(|t| t.name == "ask_human")
+        }
+        let id = ConsultIdentity {
+            task: "t".into(),
+            owner_session: "s".into(),
+            asked_by: None,
+        };
+        assert!(offered(Some(id)).await);
+        assert!(!offered(None).await);
+    }
+
+    #[test]
+    fn detached_keeps_consult_identity() {
+        let id = ConsultIdentity {
+            task: "t".into(),
+            owner_session: "s".into(),
+            asked_by: None,
+        };
+        let host = AutonomousHost {
+            origin: crate::tools::policy::Origin::Trusted,
+            consult: Some(id.clone()),
+        };
+        assert_eq!(host.detached().consult_identity(), Some(id));
+        assert_eq!(NullProgress.detached().consult_identity(), None);
+    }
+
     /// A turn with an editor on the other end, for the two tests below.
     /// `origin` is `Acp(Default)` — where an `Execute` name would be asked
     /// about, but a `Read` one is allowed outright — and `fs_read` is the
@@ -7456,12 +7596,14 @@ mod tests {
     fn the_autonomous_host_is_trusted_and_unattended() {
         let host = AutonomousHost {
             origin: crate::tools::policy::Origin::Trusted,
+            consult: None,
         };
         assert_eq!(host.origin(), crate::tools::policy::Origin::Trusted);
         assert_eq!(host.round_budget(), RoundBudget::Unattended);
 
         let host = AutonomousHost {
             origin: crate::tools::policy::Origin::Channel,
+            consult: None,
         };
         assert_eq!(host.origin(), crate::tools::policy::Origin::Channel);
     }
