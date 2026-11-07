@@ -35,7 +35,7 @@ use crate::autonomous_config::{AutonomousTask, load_autonomous_dir};
 use crate::background::BackgroundTasks;
 use crate::config::{AutonomousOrigin, DEFAULT_NAMESPACE_NAME};
 use crate::provider::{ChatMessage, ContentPart, Role};
-use crate::serve::{AutonomousHost, ServeState};
+use crate::serve::{AutonomousHost, ConsultIdentity, ServeState};
 use crate::session::{SessionRow, SessionStore};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -436,6 +436,11 @@ impl AutonomousLoop {
                 ChatMessage::user(text),
                 Arc::new(AutonomousHost {
                     origin: self.origin(),
+                    consult: Some(ConsultIdentity {
+                        task: task.name.clone(),
+                        owner_session: session_id.clone(),
+                        asked_by: None,
+                    }),
                 }),
                 None,
             )
@@ -458,7 +463,10 @@ impl AutonomousLoop {
             // deliver those results to.
             if said_done || spent || capped {
                 self.turns_run.remove(&session_id);
-                self.state.background.cancel_all(&session_id);
+                let withdrawn = self.state.background.cancel_all(&session_id);
+                if let Some(consult) = self.state.consult() {
+                    consult.withdraw(withdrawn).await;
+                }
                 if let Err(e) = store.close_session(&session_id) {
                     warn!("autonomous: cannot close {}: {e}", task.name);
                 }
@@ -961,6 +969,99 @@ mod tests {
         assert!(
             resumed.contains(&format!("[Autonomous: a]\n{CONTINUE_PROMPT}")),
             "a resume continues, it does not resend the body: {resumed:?}"
+        );
+    }
+
+    fn ask_call(question: &str) -> ChatResponse {
+        ChatResponse {
+            prompt_usage: None,
+            text: None,
+            tool_calls: vec![crate::provider::ToolCall {
+                id: "call-1".to_string(),
+                name: "ask_human".to_string(),
+                input: serde_json::json!({ "question": question }),
+            }],
+            stop_reason: None,
+        }
+    }
+
+    /// A state with `ask_human` registered and a consult room over a fake
+    /// channel, sharing the state's background tasks.
+    async fn state_with_consult(
+        responses: Vec<ChatResponse>,
+    ) -> (
+        Arc<crate::serve::ServeState>,
+        crate::consult::test_support::Fixture,
+    ) {
+        let state = crate::serve::ServeState::for_test_scripted(false, responses);
+        state
+            .tools
+            .register_tool(Box::new(crate::tools::ask_human::AskHumanTool::new()))
+            .await;
+        let fixture = crate::consult::test_support::Fixture::over(
+            Arc::clone(&state.background),
+            std::time::Duration::from_secs(3600),
+        );
+        state.set_consult(Arc::clone(&fixture.consult));
+        (state, fixture)
+    }
+
+    #[tokio::test]
+    async fn a_question_answer_resumes_the_session() {
+        use crate::consult::test_support::incoming as room_message;
+        let (state, fx) = state_with_consult(vec![
+            ask_call("Which port?"),
+            response("WAIT"),
+            response("DONE"),
+        ])
+        .await;
+        write_task(&state, "a", "max_turns: 5");
+        let mut lp = AutonomousLoop::new(Arc::clone(&state), None);
+        lp.run_cycle().await.unwrap();
+
+        let posts = fx.channel.posts();
+        assert_eq!(posts.len(), 1, "the question was posted");
+        assert!(!rows_for(&state, "a")[0].is_closed, "suspended on WAIT");
+        fx.consult
+            .handle_incoming(&room_message("r1", "8080", Some("m1")))
+            .await;
+
+        lp.run_cycle().await.unwrap();
+        let rows = rows_for(&state, "a");
+        assert_eq!(rows.len(), 1, "resumed, not started afresh");
+        assert!(rows[0].is_closed);
+        let history = state
+            .autonomous_session_store
+            .load_session(&rows[0].meta.session_id)
+            .unwrap();
+        let resumed: Vec<String> = history.iter().flat_map(texts).collect();
+        assert!(
+            resumed
+                .iter()
+                .any(|t| t.starts_with("[Question ") && t.contains("answered by @alice")),
+            "the answer is delivered: {resumed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn done_withdraws_open_questions() {
+        use crate::consult::test_support::incoming as room_message;
+        let (state, fx) = state_with_consult(vec![ask_call("Which port?"), response("DONE")]).await;
+        write_task(&state, "a", "max_turns: 5");
+        let mut lp = AutonomousLoop::new(Arc::clone(&state), None);
+        lp.run_cycle().await.unwrap();
+
+        assert!(rows_for(&state, "a")[0].is_closed);
+        let posts = fx.channel.posts();
+        assert_eq!(posts.len(), 2, "the question, then the withdrawal");
+        assert_eq!(posts[1].content, "This question was withdrawn.");
+        fx.consult
+            .handle_incoming(&room_message("r1", "8080", Some("m1")))
+            .await;
+        let posts = fx.channel.posts();
+        assert_eq!(
+            posts[2].content,
+            "That question has ended (withdrawn, or its session finished)."
         );
     }
 

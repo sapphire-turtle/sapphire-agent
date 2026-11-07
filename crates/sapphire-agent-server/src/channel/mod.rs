@@ -66,6 +66,8 @@ pub struct IncomingMessage {
     pub thread_id: Option<String>,
     /// Image attachments accompanying the message.
     pub attachments: Vec<Attachment>,
+    /// ID of the message this one replies to, when the platform says so.
+    pub reply_to: Option<String>,
 }
 
 /// A message to send through a channel.
@@ -76,6 +78,9 @@ pub struct OutgoingMessage {
     pub room_id: String,
     /// Thread identifier for threaded replies.
     pub thread_id: Option<String>,
+    /// ID of a message to post this one as a reply to (first chunk only
+    /// when the platform splits it).
+    pub reply_to: Option<String>,
 }
 
 impl OutgoingMessage {
@@ -84,7 +89,14 @@ impl OutgoingMessage {
             content: content.into(),
             room_id: room_id.into(),
             thread_id: None,
+            reply_to: None,
         }
+    }
+
+    /// Post this message as a reply to the message with platform ID `id`.
+    pub fn replying_to(mut self, id: impl Into<String>) -> Self {
+        self.reply_to = Some(id.into());
+        self
     }
 }
 
@@ -114,7 +126,14 @@ pub struct RoomInfo {
 pub trait Channel: Send + Sync {
     fn name(&self) -> &str;
 
-    async fn send(&self, message: &OutgoingMessage) -> anyhow::Result<()>;
+    /// Post `message`; returns the IDs of the posted messages in order.
+    async fn send(&self, message: &OutgoingMessage) -> anyhow::Result<Vec<String>>;
+
+    /// Whether `send` honours `OutgoingMessage::reply_to` and incoming
+    /// messages carry `reply_to`. Default: `false`.
+    fn supports_replies(&self) -> bool {
+        false
+    }
 
     /// Long-running: receive messages and forward them through `tx`.
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<IncomingMessage>) -> anyhow::Result<()>;
@@ -192,7 +211,35 @@ impl Channels {
         None
     }
 
-    pub async fn send(&self, msg: &OutgoingMessage) -> Result<()> {
+    /// Route `room_id` to the channel named `channel`, as if a message had
+    /// arrived there. For a room the seed from `Config` can't know, such as
+    /// a Discord consult room when `channel_ids` is empty (listen to all).
+    pub async fn seed_room(&self, room_id: &str, channel: &str) {
+        self.routing
+            .write()
+            .await
+            .insert(room_id.to_string(), channel.to_string());
+    }
+
+    /// Whether a channel serves `room_id` (no single-channel fallback).
+    pub async fn serves(&self, room_id: &str) -> bool {
+        self.channel_for_room(room_id).await.is_some()
+    }
+
+    /// Whether the channel serving `room_id` supports replies; `None`
+    /// when no channel serves the room.
+    pub async fn supports_replies(&self, room_id: &str) -> Option<bool> {
+        self.channel_for_room(room_id)
+            .await
+            .map(|c| c.supports_replies())
+    }
+
+    async fn channel_for_room(&self, room_id: &str) -> Option<Arc<dyn Channel>> {
+        let name = self.channel_name_for_room(room_id).await?;
+        self.channel_by_name(&name).map(Arc::clone)
+    }
+
+    pub async fn send(&self, msg: &OutgoingMessage) -> Result<Vec<String>> {
         let ch = self
             .channel_for_room_or_first(&msg.room_id)
             .await
@@ -289,7 +336,51 @@ pub fn seed_routing_from_config(config: &crate::config::Config) -> HashMap<Strin
 
 #[cfg(test)]
 mod tests {
-    use super::sniff_image_mime;
+    use super::*;
+
+    struct FakeChannel;
+
+    #[async_trait]
+    impl Channel for FakeChannel {
+        fn name(&self) -> &str {
+            "fake"
+        }
+        async fn send(&self, _message: &OutgoingMessage) -> anyhow::Result<Vec<String>> {
+            Ok(vec!["a".to_string(), "b".to_string()])
+        }
+        fn supports_replies(&self) -> bool {
+            true
+        }
+        async fn listen(&self, _tx: mpsc::Sender<IncomingMessage>) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn channels_report_reply_support_per_room() {
+        let ch: Arc<dyn Channel> = Arc::new(FakeChannel);
+        let seed = HashMap::from([("r1".to_string(), "fake".to_string())]);
+        let channels = Channels::new(vec![("fake".to_string(), ch)], seed);
+        assert_eq!(channels.supports_replies("r1").await, Some(true));
+        assert_eq!(channels.supports_replies("r2").await, None);
+        assert!(channels.serves("r1").await);
+        assert!(!channels.serves("r2").await);
+        let ids = channels
+            .send(&OutgoingMessage::new("hi", "r1").replying_to("9"))
+            .await
+            .unwrap();
+        assert_eq!(ids, vec!["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn a_seeded_room_is_served() {
+        let ch: Arc<dyn Channel> = Arc::new(FakeChannel);
+        let channels = Channels::new(vec![("fake".to_string(), ch)], HashMap::new());
+        assert!(!channels.serves("42").await);
+        channels.seed_room("42", "fake").await;
+        assert!(channels.serves("42").await);
+        assert_eq!(channels.supports_replies("42").await, Some(true));
+    }
 
     #[test]
     fn sniffs_jpeg() {

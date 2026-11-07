@@ -6,7 +6,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serenity::Client;
 use serenity::all::{
-    ChannelId, Context as SerenityCtx, EventHandler, GatewayIntents, Message, Ready,
+    ChannelId, Context as SerenityCtx, CreateMessage, EventHandler, GatewayIntents, Message,
+    MessageId, Ready,
 };
 use serenity::http::Http;
 use std::collections::HashSet;
@@ -64,6 +65,7 @@ impl EventHandler for DiscordHandler {
             timestamp: msg.timestamp.unix_timestamp() as u64 * 1000,
             thread_id: None,
             attachments,
+            reply_to: reply_target(&msg),
         };
 
         if let Err(e) = self.tx.send(incoming).await {
@@ -137,7 +139,11 @@ impl Channel for DiscordChannel {
         "discord"
     }
 
-    async fn send(&self, message: &OutgoingMessage) -> Result<()> {
+    fn supports_replies(&self) -> bool {
+        true
+    }
+
+    async fn send(&self, message: &OutgoingMessage) -> Result<Vec<String>> {
         let http = self.get_http_or_new();
         let channel_id: u64 = message
             .room_id
@@ -145,13 +151,29 @@ impl Channel for DiscordChannel {
             .context("Discord room_id is not a valid channel ID")?;
         let channel_id = ChannelId::new(channel_id);
 
-        for chunk in split_for_discord(&message.content) {
-            channel_id
-                .say(http.as_ref(), chunk)
+        let reply_to = match &message.reply_to {
+            Some(id) => Some(MessageId::new(
+                id.parse::<u64>()
+                    .context("Discord reply_to is not a message ID")?,
+            )),
+            None => None,
+        };
+
+        let mut ids = Vec::new();
+        for (i, chunk) in split_for_discord(&message.content).into_iter().enumerate() {
+            let mut builder = CreateMessage::new().content(chunk);
+            if i == 0
+                && let Some(target) = reply_to
+            {
+                builder = builder.reference_message((channel_id, target));
+            }
+            let sent = channel_id
+                .send_message(http.as_ref(), builder)
                 .await
                 .context("Failed to send Discord message")?;
+            ids.push(sent.id.to_string());
         }
-        Ok(())
+        Ok(ids)
     }
 
     /// Long-running: connects to the Discord gateway and forwards incoming
@@ -343,4 +365,46 @@ fn split_for_discord(content: &str) -> Vec<String> {
     }
 
     chunks
+}
+
+/// The ID of the message `msg` replies to, if it is a reply.
+pub fn reply_target(msg: &Message) -> Option<String> {
+    msg.message_reference
+        .as_ref()
+        .and_then(|r| r.message_id)
+        .map(|id| id.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn message(reference: Option<&str>) -> Message {
+        let mut v = serde_json::json!({
+            "id": "100",
+            "channel_id": "7",
+            "author": {"id": "1", "username": "u", "discriminator": "0", "avatar": null},
+            "content": "hi",
+            "timestamp": "2026-01-01T00:00:00.000000+00:00",
+            "edited_timestamp": null,
+            "tts": false,
+            "mention_everyone": false,
+            "mentions": [],
+            "mention_roles": [],
+            "attachments": [],
+            "embeds": [],
+            "pinned": false,
+            "type": 0
+        });
+        if let Some(r) = reference {
+            v["message_reference"] = serde_json::json!({"message_id": r, "channel_id": "7"});
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn reply_target_reads_message_reference() {
+        assert_eq!(reply_target(&message(Some("42"))), Some("42".to_string()));
+        assert_eq!(reply_target(&message(None)), None);
+    }
 }

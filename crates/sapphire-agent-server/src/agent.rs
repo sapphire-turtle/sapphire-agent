@@ -61,6 +61,9 @@ pub struct Agent {
     /// Prevents re-firing within the same day for policies that don't rotate
     /// the session file (Compact, None).
     boundary_handled: Mutex<HashMap<ConversationKey, NaiveDate>>,
+    /// The consult room, set once at startup when one is configured. A
+    /// message in that room is an answer, never chat.
+    consult: std::sync::OnceLock<Arc<crate::consult::Consult>>,
 }
 
 impl Agent {
@@ -143,7 +146,33 @@ impl Agent {
             snapshots: Mutex::new(HashMap::new()),
             prefetch_cache: Mutex::new(HashMap::new()),
             boundary_handled: Mutex::new(HashMap::new()),
+            consult: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Install the consult room. A second call is ignored.
+    pub(crate) fn set_consult(&self, consult: Arc<crate::consult::Consult>) {
+        let _ = self.consult.set(consult);
+    }
+
+    /// Hand one incoming message to its handler in a spawned task: the
+    /// consult room's for messages there, the chat turn for the rest.
+    fn dispatch(
+        self: &Arc<Self>,
+        incoming: crate::channel::IncomingMessage,
+    ) -> tokio::task::JoinHandle<()> {
+        let agent = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Some(consult) = agent.consult.get()
+                && consult.is_consult_room(&incoming.room_id)
+            {
+                consult.handle_incoming(&incoming).await;
+                return;
+            }
+            if let Err(e) = agent.handle_message(incoming).await {
+                error!("Error handling message: {e:#}");
+            }
+        })
     }
 
     /// Drop all cached system-prompt snapshots AND the workspace's pinned file
@@ -180,6 +209,7 @@ impl Agent {
             timestamp: now_ms,
             thread_id: None,
             attachments: Vec::new(),
+            reply_to: None,
         };
         Arc::clone(self).handle_message(incoming).await
     }
@@ -205,12 +235,7 @@ impl Agent {
                 msg = rx.recv() => {
                     match msg {
                         Some(incoming) => {
-                            let agent = Arc::clone(&self);
-                            tokio::spawn(async move {
-                                if let Err(e) = agent.handle_message(incoming).await {
-                                    error!("Error handling message: {e:#}");
-                                }
-                            });
+                            self.dispatch(incoming);
                         }
                         None => {
                             warn!("Message channel closed");
@@ -509,6 +534,7 @@ impl Agent {
             content: text.to_string(),
             room_id: incoming.room_id.clone(),
             thread_id: incoming.thread_id.clone(),
+            reply_to: None,
         };
         if let Err(e) = self.channels.send(&out).await {
             warn!("Failed to send a turn message: {e:#}");
@@ -1099,14 +1125,17 @@ mod tests {
             "test"
         }
 
-        async fn send(&self, message: &crate::channel::OutgoingMessage) -> anyhow::Result<()> {
+        async fn send(
+            &self,
+            message: &crate::channel::OutgoingMessage,
+        ) -> anyhow::Result<Vec<String>> {
             let mut calls = self.calls.lock().unwrap();
             *calls += 1;
             if self.fail_first && *calls == 1 {
                 return Err(anyhow::anyhow!("simulated send failure"));
             }
             self.sent.lock().unwrap().push(message.clone());
-            Ok(())
+            Ok(vec![])
         }
 
         async fn start_typing(&self, _room_id: &str) -> anyhow::Result<()> {
@@ -1246,7 +1275,65 @@ api_key = "test"
             timestamp: 0,
             thread_id: None,
             attachments: Vec::new(),
+            reply_to: None,
         }
+    }
+
+    fn with_consult(agent: &Arc<super::Agent>) -> Arc<crate::consult::Consult> {
+        let consult = crate::consult::Consult::new(
+            Arc::clone(&agent.channels),
+            crate::background::BackgroundTasks::in_memory(4),
+            "consult".to_string(),
+            std::time::Duration::from_secs(3600),
+        );
+        agent.set_consult(Arc::clone(&consult));
+        consult
+    }
+
+    #[tokio::test]
+    async fn consult_room_messages_skip_chat() {
+        let (agent, sent, _typing) = agent_with_scripted_provider(vec![]);
+        with_consult(&agent);
+        let mut msg = incoming("hello");
+        msg.room_id = "consult".to_string();
+        agent.dispatch(msg).await.unwrap();
+
+        let bodies: Vec<String> = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|m| m.content.clone())
+            .collect();
+        assert_eq!(
+            bodies,
+            vec!["Reply to a question to answer it.".to_string()]
+        );
+        assert!(agent.history.lock().await.is_empty(), "no history entry");
+        assert!(
+            agent.active_sessions.lock().await.is_empty(),
+            "no chat session"
+        );
+    }
+
+    #[tokio::test]
+    async fn other_rooms_still_reach_chat() {
+        let (agent, sent, _typing) =
+            agent_with_scripted_provider(vec![crate::provider::ChatResponse {
+                prompt_usage: None,
+                text: Some("ok".to_string()),
+                tool_calls: Vec::new(),
+                stop_reason: None,
+            }]);
+        with_consult(&agent);
+        agent.dispatch(incoming("hello")).await.unwrap();
+        let bodies: Vec<String> = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|m| m.content.clone())
+            .collect();
+        assert_eq!(bodies, vec!["ok".to_string()]);
+        assert!(!agent.history.lock().await.is_empty());
     }
 
     /// The test harness itself. `Agent` gets built, `handle_message` runs

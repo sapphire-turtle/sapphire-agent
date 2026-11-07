@@ -495,6 +495,8 @@ impl crate::serve::TurnHost for SubagentHost {
 pub(crate) struct BackgroundSubagentHost {
     parent: Arc<dyn crate::serve::TurnHost>,
     refused: Arc<std::sync::Mutex<Vec<crate::background::RefusedCall>>>,
+    /// The child's own handle, which names it when it asks a question.
+    handle: String,
 }
 
 impl BackgroundSubagentHost {
@@ -503,8 +505,13 @@ impl BackgroundSubagentHost {
     pub(crate) fn new(
         parent: Arc<dyn crate::serve::TurnHost>,
         refused: Arc<std::sync::Mutex<Vec<crate::background::RefusedCall>>>,
+        handle: String,
     ) -> Self {
-        Self { parent, refused }
+        Self {
+            parent,
+            refused,
+            handle,
+        }
     }
 }
 
@@ -548,6 +555,17 @@ impl crate::serve::TurnHost for BackgroundSubagentHost {
 
     fn avatar(&self) -> Option<Arc<crate::tools::avatar_tools::AvatarTurn>> {
         None
+    }
+
+    /// The parent's identity, with this child named as the one asking, so
+    /// the answer goes to the session that started it.
+    fn consult_identity(&self) -> Option<crate::serve::ConsultIdentity> {
+        self.parent
+            .consult_identity()
+            .map(|id| crate::serve::ConsultIdentity {
+                asked_by: Some(self.handle.clone()),
+                ..id
+            })
     }
 
     async fn tool_allowed(&self, id: &str) {
@@ -970,8 +988,11 @@ impl SubagentTool {
             admin_room_profile: ctx.admin_room_profile.clone(),
         });
         let refused = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let progress: Arc<dyn crate::serve::TurnHost> =
-            Arc::new(BackgroundSubagentHost::new(detached, Arc::clone(&refused)));
+        let progress: Arc<dyn crate::serve::TurnHost> = Arc::new(BackgroundSubagentHost::new(
+            detached,
+            Arc::clone(&refused),
+            handle.clone(),
+        ));
         let namespace = crate::tools::workspace_tools::current_memory_namespace();
         let tool = Arc::clone(self);
         let scope_ctx = Arc::clone(&task_ctx);
@@ -1254,13 +1275,19 @@ impl SubagentTool {
         }
 
         let system = subagent_system_prompt(def);
-        let specs = subagent_tool_specs(
+        let mut specs = subagent_tool_specs(
             def,
             &ctx.visible_specs,
             &self.agents(),
             ctx.subagent_depth,
             ctx.state.config.tools.subagent.max_depth,
         );
+        // `ask_human` needs a host that can ask: a background child's
+        // forwards the session's identity, a synchronous child's has none,
+        // and a tool that can only refuse is worse than absent.
+        if progress.consult_identity().is_none() {
+            specs.retain(|s| s.name.as_ref() != crate::tools::ask_human::NAME);
+        }
 
         // A definition that pins a profile runs on that profile's provider —
         // resolved through the very same `ProviderRegistry::for_profile` that
@@ -2248,8 +2275,37 @@ mod tests {
         let host = BackgroundSubagentHost::new(
             parent as std::sync::Arc<dyn crate::serve::TurnHost>,
             std::sync::Arc::clone(&refused),
+            "h-1".to_string(),
         );
         (host, refused)
+    }
+
+    #[test]
+    fn background_child_forwards_identity_with_its_handle() {
+        use crate::serve::{AutonomousHost, ConsultIdentity, NullProgress, TurnHost};
+        let parent_id = ConsultIdentity {
+            task: "t".into(),
+            owner_session: "s".into(),
+            asked_by: None,
+        };
+        let parent: std::sync::Arc<dyn TurnHost> = std::sync::Arc::new(AutonomousHost {
+            origin: crate::tools::policy::Origin::Trusted,
+            consult: Some(parent_id.clone()),
+        });
+        let host = BackgroundSubagentHost::new(parent, Default::default(), "h-9".into());
+        assert_eq!(
+            host.consult_identity(),
+            Some(ConsultIdentity {
+                asked_by: Some("h-9".into()),
+                ..parent_id
+            })
+        );
+        let host = BackgroundSubagentHost::new(
+            std::sync::Arc::new(NullProgress),
+            Default::default(),
+            "h-9".into(),
+        );
+        assert_eq!(host.consult_identity(), None);
     }
 
     fn shell_call() -> crate::provider::ToolCall {
@@ -3583,6 +3639,79 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+    }
+
+    /// An autonomous turn's host, able to ask in the consult room.
+    fn asking_host() -> std::sync::Arc<dyn crate::serve::TurnHost> {
+        std::sync::Arc::new(crate::serve::AutonomousHost {
+            origin: crate::tools::policy::Origin::Trusted,
+            consult: Some(crate::serve::ConsultIdentity {
+                task: "t".into(),
+                owner_session: "s-ask".into(),
+                asked_by: None,
+            }),
+        })
+    }
+
+    fn offers_ask_human(specs: &[ToolSpec]) -> bool {
+        specs
+            .iter()
+            .any(|s| s.name.as_ref() == crate::tools::ask_human::NAME)
+    }
+
+    /// A synchronous child can't ask (its host has no identity, so every
+    /// call would refuse); it is not offered `ask_human` at all.
+    #[tokio::test]
+    async fn a_sync_child_is_not_offered_ask_human() {
+        let state = crate::serve::ServeState::for_test(false);
+        let provider = ScriptedProvider::new(vec![text_response("done")]);
+        let tool = std::sync::Arc::new(SubagentTool::new(worker_defs(), true));
+        crate::serve::scope_turn_context(
+            background_context(
+                std::sync::Arc::clone(&state),
+                std::sync::Arc::clone(&provider) as std::sync::Arc<dyn crate::provider::Provider>,
+                vec![
+                    spec_named("file_read"),
+                    spec_named(crate::tools::ask_human::NAME),
+                ],
+                asking_host(),
+                Some("s-ask"),
+                0,
+            ),
+            Tool::execute(&tool, &json!({"agent": "worker", "prompt": "go"})),
+        )
+        .await
+        .unwrap();
+        let specs = provider.last_specs();
+        assert!(!offers_ask_human(&specs), "{specs:?}");
+        assert!(specs.iter().any(|s| s.name.as_ref() == "file_read"));
+    }
+
+    /// A background child asks for the session that started it, so it
+    /// keeps `ask_human`.
+    #[tokio::test]
+    async fn a_background_child_keeps_ask_human() {
+        let state = crate::serve::ServeState::for_test(false);
+        let provider = ScriptedProvider::new(vec![text_response("done")]);
+        let tool = std::sync::Arc::new(SubagentTool::new(worker_defs(), true));
+        crate::serve::scope_turn_context(
+            background_context(
+                std::sync::Arc::clone(&state),
+                std::sync::Arc::clone(&provider) as std::sync::Arc<dyn crate::provider::Provider>,
+                vec![
+                    spec_named("file_read"),
+                    spec_named(crate::tools::ask_human::NAME),
+                ],
+                asking_host(),
+                Some("s-ask"),
+                0,
+            ),
+            Tool::execute(&tool, &bg_input("worker", "go")),
+        )
+        .await
+        .unwrap();
+        next_completion(&state, "s-ask").await;
+        assert!(offers_ask_human(&provider.last_specs()));
     }
 
     #[tokio::test]

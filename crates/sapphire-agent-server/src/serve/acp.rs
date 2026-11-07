@@ -4856,6 +4856,7 @@ mod tests {
                     let child = crate::tools::subagent::BackgroundSubagentHost::new(
                         detached,
                         Arc::clone(&refused),
+                        "h-1".to_string(),
                     );
                     let call = crate::provider::ToolCall {
                         id: "c1".to_string(),

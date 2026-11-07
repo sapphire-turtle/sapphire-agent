@@ -26,6 +26,7 @@ mod channel;
 mod cli_init;
 mod config;
 mod config_layer;
+mod consult;
 mod context_compression;
 mod default_avatar;
 mod device_auth;
@@ -188,6 +189,60 @@ fn group_unknown_keys<'a>(
         by_file.entry(file).or_default().push(key.as_str());
     }
     by_file.into_iter().collect()
+}
+
+/// `verify`'s consult room warnings, one line each: a room no channel lists
+/// (`ask_human` would refuse), and a room set while autonomous sessions are
+/// off (nothing would ever ask).
+fn consult_room_warnings(config: &config::Config) -> Vec<String> {
+    let Some(room) = config.autonomous.consult_room.as_deref() else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+    let listed = config
+        .discord
+        .as_ref()
+        .is_some_and(|d| d.channel_ids.iter().any(|c| c == room))
+        || config
+            .matrix
+            .as_ref()
+            .is_some_and(|m| m.room_ids.iter().any(|r| r == room))
+        || discord_listens_to_room(config, room);
+    if !listed {
+        lines.push(format!(
+            "  Consult room      : {room} is in neither discord.channel_ids nor \
+             matrix.room_ids: ask_human will refuse"
+        ));
+    }
+    if !config.autonomous.enabled {
+        lines.push(format!(
+            "  Consult room      : {room} is set but [autonomous] is not enabled: \
+             nothing will ask"
+        ));
+    }
+    lines
+}
+
+/// Whether Discord listens in `room` without listing it: an empty
+/// `channel_ids` means every channel, and a Discord channel ID is numeric.
+fn discord_listens_to_room(config: &config::Config, room: &str) -> bool {
+    config
+        .discord
+        .as_ref()
+        .is_some_and(|d| d.channel_ids.is_empty())
+        && room.parse::<u64>().is_ok()
+}
+
+/// `consult_timeout_hours` as a duration, clamped to
+/// `1..=consult::MAX_TIMEOUT_HOURS` hours.
+fn consult_timeout(hours: u64) -> std::time::Duration {
+    let clamped = hours.clamp(1, consult::MAX_TIMEOUT_HOURS);
+    if clamped != hours {
+        tracing::warn!(
+            "[autonomous] consult_timeout_hours = {hours} is out of range; using {clamped}"
+        );
+    }
+    std::time::Duration::from_secs(clamped * 3600)
 }
 
 /// `verify`'s API key section: the keys of the workspace the agent serves
@@ -625,6 +680,13 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
                     .register_tool(Box::new(tools::background_tools::BackgroundTaskTool::new()))
                     .await;
             }
+            // Only where a consult room is configured; `run_llm_turn` still
+            // offers it to autonomous sessions alone.
+            if config.autonomous.consult_room.is_some() {
+                tool_set
+                    .register_tool(Box::new(tools::ask_human::AskHumanTool::new()))
+                    .await;
+            }
 
             // ── Skills ────────────────────────────────────────────────────
             // Registered unconditionally: unlike subagents there is
@@ -1039,6 +1101,7 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
 
             // ── Channel + Agent (Matrix and/or Discord, if configured) ──────
             let mut channel_agent: Option<Arc<Agent>> = None;
+            let mut consult_built = false;
             if config.matrix.is_some() || config.discord.is_some() {
                 let mut channel_list: Vec<(String, Arc<dyn channel::Channel>)> = Vec::new();
                 if let Some(m) = &config.matrix {
@@ -1069,6 +1132,31 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
                     Arc::clone(&channel_session_store),
                     image_cache.clone(),
                 ));
+                // ── Consult room ────────────────────────────────────────────
+                // Built whenever a room is set, served or not, so the agent
+                // always keeps the room's messages out of chat; `ask` checks
+                // `serves` again at call time.
+                if let Some(room) = config.autonomous.consult_room.clone() {
+                    if !channels.serves(&room).await && discord_listens_to_room(&config, &room) {
+                        channels.seed_room(&room, "discord").await;
+                    }
+                    if !channels.serves(&room).await {
+                        tracing::warn!(
+                            "consult room {room} is not served on this host; ask_human will refuse"
+                        );
+                    }
+                    let consult = consult::Consult::new(
+                        Arc::clone(&channels),
+                        Arc::clone(&serve_state.background),
+                        room,
+                        consult_timeout(config.autonomous.consult_timeout_hours),
+                    );
+                    serve_state.set_consult(Arc::clone(&consult));
+                    agent.set_consult(Arc::clone(&consult));
+                    // Questions that outlived a restart get their timers back.
+                    consult.rearm();
+                    consult_built = true;
+                }
                 // Wire the agent into the timer dispatcher so chat-origin
                 // timers are announced through `Agent::trigger`.
                 timer_dispatch.set_agent(Arc::downgrade(&agent));
@@ -1125,6 +1213,17 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
                         tracing::error!("Agent error: {e:#}");
                     }
                 }));
+            }
+
+            if !consult_built {
+                if let Some(room) = &config.autonomous.consult_room {
+                    tracing::warn!(
+                        "consult room {room} is not served on this host; ask_human will refuse"
+                    );
+                }
+                // No room to answer in: questions that outlived a restart
+                // still end at their deadlines rather than wedge a session.
+                consult::arm_deadlines_without_room(Arc::clone(&serve_state.background));
             }
 
             // ── Catch-up and heartbeat ──────────────────────────────────────
@@ -1403,6 +1502,9 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
                 config.heartbeat_enabled,
                 layer_tag(&provenance, "heartbeat_enabled")
             );
+            for line in consult_room_warnings(&config) {
+                println!("{line}");
+            }
             println!();
             println!("Workspace-supplied settings:");
             let ws_settings: Vec<&String> = provenance
@@ -1821,6 +1923,63 @@ fn migrate_pre_namespace_layout(workspace_dir: &std::path::Path) -> anyhow::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn consult_config(extra: &str) -> config::Config {
+        config::Config::parse_for_test(&format!("[anthropic]\napi_key = \"t\"\n{extra}"))
+    }
+
+    #[test]
+    fn verify_warns_about_an_unlisted_consult_room() {
+        let cfg = consult_config(
+            "[autonomous]\nenabled = true\nconsult_room = \"c1\"\n\
+             [discord]\nbot_token = \"x\"\nchannel_ids = [\"other\"]\nallowed_users = []\n",
+        );
+        let lines = consult_room_warnings(&cfg);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("neither discord.channel_ids nor matrix.room_ids"));
+    }
+
+    #[test]
+    fn verify_accepts_a_listed_consult_room_and_warns_when_autonomous_is_off() {
+        let cfg = consult_config(
+            "[autonomous]\nconsult_room = \"c1\"\n\
+             [discord]\nbot_token = \"x\"\nchannel_ids = [\"c1\"]\nallowed_users = []\n",
+        );
+        let lines = consult_room_warnings(&cfg);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("not enabled"));
+        assert!(consult_room_warnings(&consult_config("")).is_empty());
+    }
+
+    #[test]
+    fn verify_accepts_a_numeric_room_when_discord_listens_everywhere() {
+        let cfg = consult_config(
+            "[autonomous]\nenabled = true\nconsult_room = \"123\"\n\
+             [discord]\nbot_token = \"x\"\nchannel_ids = []\nallowed_users = []\n",
+        );
+        assert!(consult_room_warnings(&cfg).is_empty());
+        assert!(discord_listens_to_room(&cfg, "123"));
+        // A non-numeric room can't be a Discord channel.
+        let cfg = consult_config(
+            "[autonomous]\nenabled = true\nconsult_room = \"!r:x\"\n\
+             [discord]\nbot_token = \"x\"\nchannel_ids = []\nallowed_users = []\n",
+        );
+        assert_eq!(consult_room_warnings(&cfg).len(), 1);
+        assert!(!discord_listens_to_room(&cfg, "!r:x"));
+    }
+
+    #[test]
+    fn consult_timeout_is_clamped() {
+        assert_eq!(consult_timeout(0), std::time::Duration::from_secs(3600));
+        assert_eq!(
+            consult_timeout(24),
+            std::time::Duration::from_secs(24 * 3600)
+        );
+        assert_eq!(
+            consult_timeout(1_000_000_000_000),
+            std::time::Duration::from_secs(8760 * 3600)
+        );
+    }
 
     fn acp_meta(namespace: &str) -> session::SessionMeta {
         session::SessionMeta {
