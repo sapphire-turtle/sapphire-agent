@@ -110,7 +110,7 @@ pub(crate) enum Route {
 [Question bg-1a2b3c4d answered by <from>: "<first line of the question>"]
 <answer>
 
-[Question bg-1a2b3c4d: no answer within 24h: "<first line of the question>"]
+[Question bg-1a2b3c4d: no answer by the deadline: "<first line of the question>"]
 Decide for yourself whether to proceed on a guess or stop; if you proceed, say so in your report.
 
 [Question bg-1a2b3c4d follow-up by <from>: "<first line of the question>"]
@@ -128,9 +128,9 @@ config and the model can't choose it. Being `Think`, it runs without approval ev
 autonomous origin `channel` (the policy table is unchanged).
 
 - **When it is offered**: `[autonomous] consult_room` is set, and the turn belongs to an autonomous session.
-  `TurnContext` gains `autonomous_task: Option<String>` (the task name), set by `autonomous.rs`.
-  A background child's `TurnContext` inherits the parent's value and the parent's session ID
-  (`question_owner`).
+  `TurnHost` gains `consult_identity() -> Option<ConsultIdentity>` (task name, owning session, and the
+  asking subagent's handle), returned by the autonomous host. `detached()` keeps it, and a background
+  child's host forwards the parent's with its own handle as `asked_by`.
 - **Behaviour**:
   1. With 3 open questions, refuse: `You already have 3 questions waiting for an answer. Wait for one, or withdraw one with background_task.`
   2. Refuse when the consult room isn't served on this host (`placement`), or its channel doesn't support
