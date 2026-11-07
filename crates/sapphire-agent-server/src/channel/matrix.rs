@@ -280,8 +280,7 @@ impl Channel for MatrixChannel {
                             (body, Vec::new())
                         }
                         MessageType::Image(image_content) => {
-                            let result =
-                                download_matrix_image(&room.client(), image_content).await;
+                            let result = download_matrix_image(&room.client(), image_content).await;
                             // Use the body as a caption fallback (filename or user-supplied text).
                             let caption = image_content
                                 .caption()
@@ -293,19 +292,12 @@ impl Channel for MatrixChannel {
                                     // Forward a synthetic prompt to the agent so it generates
                                     // a natural-language reply asking the user to resend in a
                                     // supported format (JPEG / PNG / GIF / WebP).
-                                    let msg = IncomingMessage {
-                                        id: event.event_id.to_string(),
-                                        sender: event.sender.to_string(),
-                                        content: "[system] An image was received in an unsupported format. \
-                                                  Please inform the user and ask them to resend it \
-                                                  as JPEG, PNG, GIF, or WebP."
-                                            .to_string(),
-                                        room_id: room_id_str,
-                                        timestamp: 0,
+                                    let msg = unsupported_image_notice(
+                                        event.event_id.to_string(),
+                                        event.sender.to_string(),
+                                        room_id_str,
                                         thread_id,
-                                        attachments: Vec::new(),
-                                        reply_to,
-                                    };
+                                    );
                                     if let Err(e) = tx.send(msg).await {
                                         warn!("Failed to forward unsupported-format event: {e}");
                                     }
@@ -397,10 +389,36 @@ pub fn reply_target(
 ) -> Option<String> {
     match rel? {
         Relation::Reply(reply) => Some(reply.in_reply_to.event_id.to_string()),
-        Relation::Thread(thread) if !thread.is_falling_back => {
-            thread.in_reply_to.as_ref().map(|r| r.event_id.to_string())
-        }
+        // A reply inside a thread names its target; otherwise ("Reply in
+        // thread" on a message, or a fallback reply) it answers the root.
+        Relation::Thread(thread) => match &thread.in_reply_to {
+            Some(r) if !thread.is_falling_back => Some(r.event_id.to_string()),
+            _ => Some(thread.event_id.to_string()),
+        },
         _ => None,
+    }
+}
+
+/// The synthetic prompt forwarded for an image in an unsupported format.
+/// It carries no `reply_to`: in the consult room it must not become an answer.
+fn unsupported_image_notice(
+    id: String,
+    sender: String,
+    room_id: String,
+    thread_id: Option<String>,
+) -> IncomingMessage {
+    IncomingMessage {
+        id,
+        sender,
+        content: "[system] An image was received in an unsupported format. \
+                  Please inform the user and ask them to resend it \
+                  as JPEG, PNG, GIF, or WebP."
+            .to_string(),
+        room_id,
+        timestamp: 0,
+        thread_id,
+        attachments: Vec::new(),
+        reply_to: None,
     }
 }
 
@@ -447,8 +465,26 @@ mod tests {
     }
 
     #[test]
-    fn thread_fallback_is_not_a_reply() {
-        assert_eq!(reply_target(Some(&thread(true))), None);
+    fn thread_fallback_targets_the_root() {
+        // Element's "Reply in thread" on the question: the question is the
+        // thread root and the reply relation is only a fallback.
+        assert_eq!(
+            reply_target(Some(&thread(true))),
+            Some("$root:x".to_string())
+        );
+        let mut bare = Thread::plain(eid("$root:x"), eid("$root:x"));
+        bare.in_reply_to = None;
+        assert_eq!(
+            reply_target(Some(&Relation::Thread(bare))),
+            Some("$root:x".to_string())
+        );
+    }
+
+    #[test]
+    fn unsupported_image_notice_answers_nothing() {
+        let msg = unsupported_image_notice("$e:x".into(), "@a:x".into(), "!r:x".into(), None);
+        assert_eq!(msg.reply_to, None);
+        assert!(msg.content.starts_with("[system] An image was received"));
     }
 
     #[test]
