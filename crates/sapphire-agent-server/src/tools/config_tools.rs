@@ -804,7 +804,7 @@ impl TaskTestTool {
         answer: Option<String>,
     ) -> Result<String> {
         // A test run's background tasks end with it, as a real run's do.
-        self.state.background.cancel_all(session_id);
+        let _ = self.state.background.cancel_all(session_id);
         if let Err(e) = self
             .state
             .autonomous_session_store

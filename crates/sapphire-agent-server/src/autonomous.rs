@@ -458,7 +458,7 @@ impl AutonomousLoop {
             // deliver those results to.
             if said_done || spent || capped {
                 self.turns_run.remove(&session_id);
-                self.state.background.cancel_all(&session_id);
+                let _ = self.state.background.cancel_all(&session_id);
                 if let Err(e) = store.close_session(&session_id) {
                     warn!("autonomous: cannot close {}: {e}", task.name);
                 }

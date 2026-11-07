@@ -92,6 +92,9 @@ impl Tool for BackgroundTaskTool {
                     .map(|t| {
                         let what = match &t.kind {
                             TaskKind::Subagent { agent, .. } => format!("subagent {agent}"),
+                            TaskKind::Question { question, .. } => {
+                                format!("question \"{}\"", question.lines().next().unwrap_or(""))
+                            }
                         };
                         let secs = (now - t.started_at).num_seconds().max(0);
                         format!("- {} ({what}): {} — started {secs}s ago", t.id, t.label)
