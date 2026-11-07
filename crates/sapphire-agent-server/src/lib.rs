@@ -21,6 +21,7 @@ mod app_server;
 mod autonomous;
 mod autonomous_config;
 mod avatar_store;
+mod background;
 mod channel;
 mod cli_init;
 mod config;
@@ -609,10 +610,19 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
             // can create a definition while the process is running. `Arc` rather
             // than a bare `Box` because `agent_config` holds a `Weak` to it —
             // same shape `SkillTool` uses.
-            let subagent = Arc::new(tools::subagent::SubagentTool::new(agent_defs));
+            let subagent = Arc::new(tools::subagent::SubagentTool::new(
+                agent_defs,
+                config.tools.background.max_per_session > 0,
+            ));
             if !no_agent_defs || config.config_tools_enabled() {
                 tool_set
                     .register_tool(Box::new(Arc::clone(&subagent)))
+                    .await;
+            }
+            // Only when background tasks can exist at all.
+            if config.tools.background.max_per_session > 0 {
+                tool_set
+                    .register_tool(Box::new(tools::background_tools::BackgroundTaskTool::new()))
                     .await;
             }
 
@@ -923,6 +933,13 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
                     }
                 };
 
+            // Background tasks: results a previous run left are recovered here
+            // (pending ones become "interrupted").
+            let background = background::BackgroundTasks::open(
+                background::BackgroundTasks::default_dir(),
+                config.tools.background.max_per_session,
+            );
+
             let serve_state = Arc::new(serve::ServeState::new(
                 config.clone(),
                 Arc::clone(&registry),
@@ -936,6 +953,7 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
                 Arc::clone(&device_auth),
                 acp_session_store,
                 subagent_cache,
+                background,
             ));
             // Wire serve_state into the timer dispatcher so voice-origin
             // timers can push their messages back to the satellite.

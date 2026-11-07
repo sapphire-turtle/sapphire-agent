@@ -21,10 +21,20 @@
 //! is in, when it last ran, and how many turns it has spent are all
 //! derived from the session store (design decisions 3 and 5), because a
 //! second copy of that state is a second thing to keep true.
+//!
+//! A task that is only waiting on background tasks replies `WAIT` and is
+//! *suspended*: its session stays open and the loop moves on to other
+//! tasks. "Suspended" has no state file either — it is an open session of
+//! the task whose background registry still holds something
+//! (`has_pending_or_inbox`). Once a completion lands in its inbox, the
+//! next cycle resumes that same session ahead of any new start, and the
+//! completion is delivered by `run_llm_turn` like any other. This revises
+//! design decision 13, which had no paused state.
 
 use crate::autonomous_config::{AutonomousTask, load_autonomous_dir};
+use crate::background::BackgroundTasks;
 use crate::config::{AutonomousOrigin, DEFAULT_NAMESPACE_NAME};
-use crate::provider::ChatMessage;
+use crate::provider::{ChatMessage, ContentPart, Role};
 use crate::serve::{AutonomousHost, ServeState};
 use crate::session::{SessionRow, SessionStore};
 use chrono::{DateTime, Duration, Utc};
@@ -40,11 +50,12 @@ use tracing::{info, warn};
 /// history, and re-sending it every turn invalidates the provider's
 /// prompt cache for nothing.
 ///
-/// The last line is a protocol rather than politeness: the loop closes the
-/// session the moment a turn's final text is exactly `DONE`, so a task
-/// that finishes early does not spend its remaining turns announcing it.
-pub const CONTINUE_PROMPT: &str =
-    "Continue the task. When it is finished, reply with exactly:\nDONE";
+/// The last lines are a protocol rather than politeness: the loop closes
+/// the session the moment a turn's final text is exactly `DONE`, so a task
+/// that finishes early does not spend its remaining turns announcing it;
+/// and it suspends the session on exactly `WAIT` while background tasks
+/// are outstanding, so waiting does not spend turns either.
+pub const CONTINUE_PROMPT: &str = "Continue the task. When it is finished, reply with exactly:\nDONE\nIf you are only waiting on background tasks, reply with exactly:\nWAIT";
 
 /// The first line of every user message this loop sends.
 ///
@@ -150,8 +161,50 @@ fn is_due(
     }
 }
 
-// There is no resume: every run starts a fresh session and runs it to the
-// end of the cycle (design decisions 5 and 13).
+/// The task's suspended session, if it has one: its newest open session
+/// that still has background tasks pending or undelivered.
+///
+/// An open session with nothing outstanding is not suspended — that is a
+/// run cut short (a crash mid-turn), and the next run starts afresh as it
+/// always has. Suspension revises design decision 13 (no paused state).
+fn suspended_session(
+    task: &AutonomousTask,
+    rows: &[SessionRow],
+    bg: &BackgroundTasks,
+) -> Option<String> {
+    rows.iter()
+        .filter(|r| r.meta.room_id == task.name && !r.is_closed)
+        .filter(|r| bg.has_pending_or_inbox(&r.meta.session_id))
+        .max_by_key(|r| r.last_at.unwrap_or(r.meta.created_at))
+        .map(|r| r.meta.session_id.clone())
+}
+
+/// How many turns `session_id` has taken: the user messages this loop
+/// sent, told apart by their marker. Counted from the history so a resume
+/// (in this process or after a restart) picks up where the run left off.
+/// Any text part counts, because delivered completions are placed in
+/// front of the marker.
+fn turns_spent(store: &SessionStore, session_id: &str, task: &str) -> usize {
+    let marker = marker(task);
+    // The raw log, not `load_session`: that one is the model's view, which
+    // a compaction checkpoint trims, and turns before it still count.
+    store
+        .load_session_full(session_id)
+        .map(|(messages, _)| messages)
+        .unwrap_or_default()
+        .iter()
+        .filter(|m| m.role == Role::User)
+        .filter(|m| {
+            m.parts
+                .iter()
+                .any(|p| matches!(p, ContentPart::Text(t) if t.starts_with(&marker)))
+        })
+        .count()
+}
+
+/// See `AutonomousLoop::on_session_created`.
+#[cfg(test)]
+type SessionCreatedHook = Box<dyn Fn(&str, &str) + Send>;
 
 /// The idle loop.
 pub struct AutonomousLoop {
@@ -170,9 +223,23 @@ pub struct AutonomousLoop {
     /// `cooldown_days = 0` from meaning "a new session every cycle" within
     /// one run (design decision 12).
     not_before: HashMap<String, DateTime<Utc>>,
+    /// Session id → turns this process has run in it.
+    ///
+    /// A floor under `turns_spent`, which counts only turns whose message
+    /// reached the store: when the store cannot be written, the count on
+    /// disk never advances, and a session the model keeps suspending with
+    /// `WAIT` would otherwise be resumed (and spend a turn) every cycle
+    /// without limit. Dropped when the session closes.
+    turns_run: HashMap<String, usize>,
     /// Which host runs autonomous sessions once the workspace is synced:
     /// the primary device only (`placement`).
     placement: Arc<crate::placement::Placement>,
+    /// Called with `(task, session_id)` right after a fresh session is
+    /// created, so a test can register a background task for a session
+    /// whose id it cannot know in advance (the scripted provider calls no
+    /// tool that would).
+    #[cfg(test)]
+    on_session_created: Option<SessionCreatedHook>,
 }
 
 impl AutonomousLoop {
@@ -189,7 +256,10 @@ impl AutonomousLoop {
             idle,
             poll,
             not_before: HashMap::new(),
+            turns_run: HashMap::new(),
             placement: crate::placement::Placement::alone(),
+            #[cfg(test)]
+            on_session_created: None,
         }
     }
 
@@ -274,27 +344,61 @@ impl AutonomousLoop {
 
         let store = Arc::clone(&self.state.autonomous_session_store);
         let rows = store.session_rows();
-        let picked = next_task(&tasks, |t| is_due(t, &rows, &self.not_before, now)).cloned();
+        let bg = &self.state.background;
+
+        // A suspended task whose completion has arrived goes first, in
+        // priority order. Its cooldown and back-off do not apply: it is
+        // finishing a run, not starting one.
+        let resume = tasks.iter().filter(|t| t.enabled).find_map(|t| {
+            suspended_session(t, &rows, bg)
+                .filter(|sid| bg.has_inbox(sid))
+                .map(|sid| (t.clone(), sid))
+        });
+        if let Some((task, sid)) = resume {
+            return self.run_task(&task, &store, Some(sid)).await;
+        }
+
+        // Otherwise a new start, skipping tasks that are suspended and
+        // still waiting.
+        let picked = next_task(&tasks, |t| {
+            suspended_session(t, &rows, bg).is_none() && is_due(t, &rows, &self.not_before, now)
+        })
+        .cloned();
         let Some(task) = picked else {
             write_state(&self.workspace_dir, "idle", "nothing due".to_string());
             return Ok(());
         };
 
-        self.run_task(&task, &store).await
+        self.run_task(&task, &store, None).await
     }
 
     /// The session-level unit of work: create a fresh session for the
-    /// task, then turn until done or capped. There is no resume — every
-    /// run starts a new session and closes it at the end (design
-    /// decisions 5 and 13).
+    /// task (or resume the suspended one in `resume`), then turn until
+    /// done, capped, or suspended on `WAIT`.
     async fn run_task(
         &mut self,
         task: &AutonomousTask,
         store: &Arc<SessionStore>,
+        resume: Option<String>,
     ) -> anyhow::Result<()> {
         let namespace = DEFAULT_NAMESPACE_NAME;
-        let session_id = store.create_autonomous_session(&task.name, namespace)?;
-        let mut turns = 0;
+        // Only a fresh session gets the body; a resumed one already has it.
+        let mut send_body = resume.is_none();
+        let (session_id, mut turns) = match resume {
+            Some(sid) => {
+                let run = self.turns_run.get(&sid).copied().unwrap_or(0);
+                let spent = turns_spent(store, &sid, &task.name).max(run);
+                (sid, spent)
+            }
+            None => {
+                let sid = store.create_autonomous_session(&task.name, namespace)?;
+                #[cfg(test)]
+                if let Some(hook) = &self.on_session_created {
+                    hook(&task.name, &sid);
+                }
+                (sid, 0)
+            }
+        };
 
         // The session's own path, workspace-relative: the second line of
         // the first message, so a task that keeps a journal can name the
@@ -311,7 +415,7 @@ impl AutonomousLoop {
             .unwrap_or_else(|| format!("sessions/{namespace}/autonomous/{session_id}"));
 
         loop {
-            let text = if turns == 0 {
+            let text = if std::mem::take(&mut send_body) {
                 format!(
                     "{}\nSession: {session_rel}\n\n{}",
                     marker(&task.name),
@@ -338,7 +442,9 @@ impl AutonomousLoop {
             .await;
 
             turns += 1;
+            self.turns_run.insert(session_id.clone(), turns);
             let said_done = outcome.text.as_deref().is_some_and(|t| t.trim() == "DONE");
+            let said_wait = outcome.text.as_deref().is_some_and(|t| t.trim() == "WAIT");
             // `text == None` means the provider failed or the tool-round
             // budget ran out. Either way the turn produced no answer, so
             // the session is spent; closing it makes the next cycle start
@@ -347,10 +453,12 @@ impl AutonomousLoop {
             let spent = outcome.text.is_none();
             let capped = turns >= task.max_turns;
 
-            // Every run runs the session to the end of the cycle: done or
-            // capped closes it; there is no paused state to fall back to
-            // (design decision 13).
+            // Done, spent or capped closes the session, and stops whatever
+            // it still had running in the background: nothing is left to
+            // deliver those results to.
             if said_done || spent || capped {
+                self.turns_run.remove(&session_id);
+                self.state.background.cancel_all(&session_id);
                 if let Err(e) = store.close_session(&session_id) {
                     warn!("autonomous: cannot close {}: {e}", task.name);
                 }
@@ -369,6 +477,22 @@ impl AutonomousLoop {
                     &self.workspace_dir,
                     "idle",
                     format!("task: {} finished after {turns} turn(s)", task.name),
+                );
+                return Ok(());
+            }
+
+            // Suspend: leave the session open and set no back-off, so the
+            // first cycle after a completion arrives resumes it. A `WAIT`
+            // with nothing to wait on is an ordinary continue.
+            if said_wait && self.state.background.has_pending_or_inbox(&session_id) {
+                info!(
+                    "autonomous: {} suspended after {turns} turn(s), waiting on background tasks",
+                    task.name
+                );
+                write_state(
+                    &self.workspace_dir,
+                    "idle",
+                    format!("task: {} waiting on background tasks", task.name),
                 );
                 return Ok(());
             }
@@ -672,5 +796,346 @@ mod tests {
         let st: AutonomousState = serde_json::from_str(&raw).unwrap();
         assert_eq!(st.status, "idle");
         assert!(st.reason.contains("busy"), "reason was {:?}", st.reason);
+    }
+
+    // ---- Suspend on `WAIT`, resume on a completion ----
+
+    /// Write `autonomous/<name>.md` with the given front matter lines.
+    fn write_task(state: &crate::serve::ServeState, name: &str, front: &str) {
+        let dir = state.workspace.dir().join("autonomous");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{name}.md")),
+            format!("---\n{front}\n---\nWork.\n"),
+        )
+        .unwrap();
+    }
+
+    /// `(session_id, task_id)` of the task `loop_registering` registered.
+    type Seen = Arc<std::sync::Mutex<Option<(String, String)>>>;
+
+    /// A loop whose new sessions for `task` get one pending background
+    /// task registered before their first turn — standing in for a tool
+    /// that would register it during the turn. The returned cell holds
+    /// `(session_id, task_id)` once it fired.
+    fn loop_registering(
+        state: &Arc<crate::serve::ServeState>,
+        task: &'static str,
+    ) -> (AutonomousLoop, Seen) {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let mut lp = AutonomousLoop::new(Arc::clone(state), None);
+        let bg = Arc::clone(&state.background);
+        let cell = Arc::clone(&seen);
+        lp.on_session_created = Some(Box::new(move |name, sid| {
+            if name != task {
+                return;
+            }
+            let id = bg
+                .register(
+                    sid,
+                    crate::background::TaskKind::Subagent {
+                        agent: "worker".to_string(),
+                        handle: "h".to_string(),
+                    },
+                    "worker".to_string(),
+                )
+                .unwrap();
+            *cell.lock().unwrap() = Some((sid.to_string(), id));
+        }));
+        (lp, seen)
+    }
+
+    fn rows_for(state: &crate::serve::ServeState, name: &str) -> Vec<SessionRow> {
+        state
+            .autonomous_session_store
+            .session_rows()
+            .into_iter()
+            .filter(|r| r.meta.room_id == name)
+            .collect()
+    }
+
+    fn texts(msg: &ChatMessage) -> Vec<String> {
+        msg.parts
+            .iter()
+            .filter_map(|p| match p {
+                crate::provider::ContentPart::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn finished() -> crate::background::Outcome {
+        crate::background::Outcome::Finished {
+            text: "all done".to_string(),
+            refused: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_with_a_pending_task_suspends_without_closing() {
+        let state = crate::serve::ServeState::for_test_scripted(false, vec![response("WAIT")]);
+        write_task(&state, "a", "max_turns: 3");
+        let (mut lp, seen) = loop_registering(&state, "a");
+        lp.run_cycle().await.unwrap();
+
+        let rows = rows_for(&state, "a");
+        assert_eq!(rows.len(), 1);
+        assert!(
+            !rows[0].is_closed,
+            "WAIT with a pending task must not close"
+        );
+        let (sid, _) = seen.lock().unwrap().clone().unwrap();
+        assert_eq!(rows[0].meta.session_id, sid);
+        assert_eq!(
+            state
+                .autonomous_session_store
+                .load_session(&sid)
+                .unwrap()
+                .len(),
+            2,
+            "one turn, then suspended"
+        );
+        assert!(state.background.has_pending_or_inbox(&sid));
+        let raw =
+            std::fs::read_to_string(state.workspace.dir().join("state/autonomous.json")).unwrap();
+        let st: AutonomousState = serde_json::from_str(&raw).unwrap();
+        assert_eq!(st.status, "idle");
+        assert!(st.reason.contains("waiting"), "reason was {:?}", st.reason);
+    }
+
+    #[tokio::test]
+    async fn a_suspended_task_is_skipped_while_its_inbox_is_empty_and_another_runs() {
+        let state = crate::serve::ServeState::for_test_scripted(
+            false,
+            vec![response("WAIT"), response("ok")],
+        );
+        write_task(&state, "a", "priority: 1\nmax_turns: 3");
+        write_task(&state, "b", "priority: 2\nmax_turns: 1");
+        let (mut lp, _) = loop_registering(&state, "a");
+        lp.run_cycle().await.unwrap();
+        assert!(rows_for(&state, "b").is_empty(), "a outranks b");
+
+        lp.run_cycle().await.unwrap();
+        let a = rows_for(&state, "a");
+        assert_eq!(a.len(), 1, "no second session for the suspended task");
+        assert!(!a[0].is_closed);
+        assert_eq!(
+            state
+                .autonomous_session_store
+                .load_session(&a[0].meta.session_id)
+                .unwrap()
+                .len(),
+            2,
+            "a suspended task with an empty inbox takes no turn"
+        );
+        let b = rows_for(&state, "b");
+        assert_eq!(b.len(), 1, "the other task runs while a waits");
+        assert!(b[0].is_closed);
+    }
+
+    #[tokio::test]
+    async fn a_completion_resumes_the_same_session() {
+        let state = crate::serve::ServeState::for_test_scripted(
+            false,
+            vec![response("WAIT"), response("DONE")],
+        );
+        write_task(&state, "a", "max_turns: 5");
+        let (mut lp, seen) = loop_registering(&state, "a");
+        lp.run_cycle().await.unwrap();
+        let (sid, id) = seen.lock().unwrap().clone().unwrap();
+        assert!(state.background.complete(&sid, &id, finished()));
+
+        lp.run_cycle().await.unwrap();
+        let rows = rows_for(&state, "a");
+        assert_eq!(rows.len(), 1, "resumed, not started afresh");
+        assert!(rows[0].is_closed, "the resumed turn said DONE");
+        let history = state.autonomous_session_store.load_session(&sid).unwrap();
+        assert_eq!(history.len(), 4);
+        let resumed = texts(&history[2]);
+        assert!(
+            resumed
+                .iter()
+                .any(|t| t.starts_with(&format!("[Background task {id} finished"))),
+            "the completion is delivered: {resumed:?}"
+        );
+        assert!(
+            resumed.contains(&format!("[Autonomous: a]\n{CONTINUE_PROMPT}")),
+            "a resume continues, it does not resend the body: {resumed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn suspension_does_not_spend_max_turns() {
+        let (state, log) = crate::serve::ServeState::for_test_scripted_with_log(
+            false,
+            vec![response("WAIT"), response("working"), response("DONE")],
+        );
+        write_task(&state, "a", "max_turns: 2");
+        let (mut lp, seen) = loop_registering(&state, "a");
+        lp.run_cycle().await.unwrap();
+        assert_eq!(log.calls().len(), 1, "suspended after the WAIT turn");
+        assert!(!rows_for(&state, "a")[0].is_closed);
+        let (sid, id) = seen.lock().unwrap().clone().unwrap();
+        state.background.complete(&sid, &id, finished());
+
+        lp.run_cycle().await.unwrap();
+        let rows = rows_for(&state, "a");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].is_closed, "the WAIT turn counts: turn 2 caps");
+        assert_eq!(log.calls().len(), 2, "no third turn");
+    }
+
+    /// Turns before a compaction checkpoint still count: the model's view
+    /// of the history loses them, the log does not.
+    #[tokio::test]
+    async fn turns_before_a_compaction_still_count_on_resume() {
+        let (state, log) = crate::serve::ServeState::for_test_scripted_with_log(
+            false,
+            vec![response("WAIT"), response("working"), response("working")],
+        );
+        write_task(&state, "a", "max_turns: 2");
+        let (mut lp, seen) = loop_registering(&state, "a");
+        lp.run_cycle().await.unwrap();
+        let (sid, id) = seen.lock().unwrap().clone().unwrap();
+        state
+            .autonomous_session_store
+            .append_summary(&sid, "the WAIT turn", 0)
+            .unwrap();
+        state.background.complete(&sid, &id, finished());
+
+        lp.run_cycle().await.unwrap();
+        assert!(rows_for(&state, "a")[0].is_closed, "turn 2 caps");
+        assert_eq!(log.calls().len(), 2, "the compacted turn was counted");
+    }
+
+    #[tokio::test]
+    async fn done_cancels_pending_tasks() {
+        let state = crate::serve::ServeState::for_test_scripted(false, vec![response("DONE")]);
+        write_task(&state, "a", "max_turns: 3");
+        let (mut lp, seen) = loop_registering(&state, "a");
+        lp.run_cycle().await.unwrap();
+        let (sid, id) = seen.lock().unwrap().clone().unwrap();
+
+        assert!(rows_for(&state, "a")[0].is_closed);
+        assert!(
+            !state.background.has_pending_or_inbox(&sid),
+            "closing the session tears down its background tasks"
+        );
+        assert!(
+            !state.background.complete(&sid, &id, finished()),
+            "the task was cancelled, so a late completion is dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_with_nothing_pending_continues() {
+        let state = crate::serve::ServeState::for_test_scripted(
+            false,
+            vec![response("WAIT"), response("working")],
+        );
+        write_task(&state, "a", "max_turns: 2");
+        let mut lp = AutonomousLoop::new(Arc::clone(&state), None);
+        lp.run_cycle().await.unwrap();
+
+        let rows = rows_for(&state, "a");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].is_closed, "max_turns closes it");
+        let history = state
+            .autonomous_session_store
+            .load_session(&rows[0].meta.session_id)
+            .unwrap();
+        assert_eq!(history.len(), 4, "WAIT with nothing to wait on continues");
+        assert_eq!(
+            texts(&history[2]),
+            vec![format!("[Autonomous: a]\n{CONTINUE_PROMPT}")]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_suspended_task_resumes_after_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut first = crate::serve::ServeState::for_test_scripted(false, vec![response("WAIT")]);
+        Arc::get_mut(&mut first).unwrap().background =
+            crate::background::BackgroundTasks::open(Some(dir.path().to_path_buf()), 4);
+        write_task(&first, "a", "max_turns: 5");
+        let (mut lp, seen) = loop_registering(&first, "a");
+        lp.run_cycle().await.unwrap();
+        drop(lp);
+        let (sid, id) = seen.lock().unwrap().clone().unwrap();
+        assert!(!rows_for(&first, "a")[0].is_closed);
+
+        // The restarted process: same workspace and session store, a
+        // registry reopened from the same directory.
+        let mut second = crate::serve::ServeState::for_test_scripted(false, vec![response("DONE")]);
+        {
+            let s = Arc::get_mut(&mut second).unwrap();
+            s.background =
+                crate::background::BackgroundTasks::open(Some(dir.path().to_path_buf()), 4);
+            s.workspace = Arc::clone(&first.workspace);
+            s.autonomous_session_store = Arc::clone(&first.autonomous_session_store);
+        }
+        let mut lp = AutonomousLoop::new(Arc::clone(&second), None);
+        lp.run_cycle().await.unwrap();
+
+        let rows = rows_for(&second, "a");
+        assert_eq!(rows.len(), 1, "resumed, not started afresh");
+        assert!(rows[0].is_closed);
+        let history = second.autonomous_session_store.load_session(&sid).unwrap();
+        assert_eq!(history.len(), 4);
+        let resumed = texts(&history[2]);
+        assert!(
+            resumed
+                .iter()
+                .any(|t| t.contains(&format!("{id} was interrupted by a restart"))),
+            "the interrupted task is delivered: {resumed:?}"
+        );
+    }
+
+    /// A session whose store cannot be written does not record its turns,
+    /// so `turns_spent` never advances and the undelivered completion
+    /// stays in the inbox. A model that keeps replying `WAIT` would then be
+    /// resumed, and spend a provider call, on every cycle. The turns this
+    /// process ran still count: the session is capped at `max_turns`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unwritable_session_is_still_capped_at_max_turns() {
+        use std::os::unix::fs::PermissionsExt;
+        let (state, log) = crate::serve::ServeState::for_test_scripted_with_log(
+            false,
+            (0..8).map(|_| response("WAIT")).collect(),
+        );
+        write_task(&state, "a", "max_turns: 3");
+        let (mut lp, seen) = loop_registering(&state, "a");
+        lp.run_cycle().await.unwrap();
+        assert_eq!(log.calls().len(), 1, "suspended after the first WAIT");
+        let (sid, id) = seen.lock().unwrap().clone().unwrap();
+
+        let dir = state
+            .autonomous_session_store
+            .absolute_path_for(&sid)
+            .unwrap();
+        assert!(dir.is_dir(), "a session is a directory of entries");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Root writes through the mode bits; the scenario cannot be built.
+        if std::fs::write(dir.join("probe"), "").is_ok() {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        assert!(state.background.complete(&sid, &id, finished()));
+
+        for _ in 0..6 {
+            lp.run_cycle().await.unwrap();
+        }
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(
+            log.calls().len(),
+            3,
+            "max_turns provider calls, not one per cycle"
+        );
+        assert!(
+            !state.background.has_pending_or_inbox(&sid),
+            "the capped session's registry is torn down"
+        );
     }
 }

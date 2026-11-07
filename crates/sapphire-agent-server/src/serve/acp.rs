@@ -153,7 +153,18 @@ struct AcpSession {
     turns: HashMap<u64, CancellationToken>,
     /// The permission mode this session is in. Per session, not per
     /// connection: two sessions on one socket are judged separately.
-    mode: crate::tools::policy::SessionMode,
+    /// Shared, so a background child started from this session follows a
+    /// later `session/set_mode` (see [`AcpProgress::detached`]).
+    mode: LiveMode,
+}
+
+/// A session's current mode, written by `session/set_mode` and read live
+/// by the detached hosts of its background children. A blocking mutex:
+/// it is never held across an await.
+type LiveMode = Arc<std::sync::Mutex<crate::tools::policy::SessionMode>>;
+
+fn read_mode(mode: &LiveMode) -> crate::tools::policy::SessionMode {
+    *mode.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Sessions live for the lifetime of one ACP connection: a `HashMap` behind
@@ -200,6 +211,14 @@ struct AcpProgress {
     /// rather than shared: a `session/set_mode` arriving mid-turn must
     /// not change the rules under a call already being judged.
     mode: crate::tools::policy::SessionMode,
+    /// The session's live mode. Read by `origin` only when `follow_live`.
+    live_mode: LiveMode,
+    /// Set on the [`detached`](super::TurnHost::detached) copy a background
+    /// child runs under. Its turn outlives this one, and a user who
+    /// switches the session to a stricter mode must rein it in too: a
+    /// child left on the old mode would do by delegation what the parent
+    /// is now refused directly.
+    follow_live: bool,
     permissions: Arc<super::acp_permissions::PermissionStore>,
     /// This turn's session's recorded `client_capabilities`
     /// ([`AcpSession::client_capabilities`]), copied in at construction
@@ -228,10 +247,10 @@ struct AcpProgress {
 /// test can call it directly against a hand-built `ClientCapabilities`
 /// — the only way to prove these two lines actually read the recorded
 /// value rather than, say, returning a constant or swapping the two
-/// fields. `AcpProgress` itself is built at exactly one call site
-/// (`serve_connection`'s `session/prompt` handler) and never in a test,
-/// so a test that only reached `AcpProgress::client_fs_caps` through
-/// `&self` would need one anyway; this is the smaller thing to build.
+/// fields. `AcpProgress` itself needs a live `ConnectionTo<Client>` to
+/// build, so a test that only reached `AcpProgress::client_fs_caps`
+/// through `&self` would need one too; this is the smaller thing to
+/// build.
 ///
 /// The two flags are read independently — never folded into one "fs"
 /// bit — because a client can implement `fs/read_text_file` without
@@ -316,6 +335,7 @@ impl AcpProgress {
         connection: ConnectionTo<Client>,
         profile: String,
         mode: crate::tools::policy::SessionMode,
+        live_mode: LiveMode,
         permissions: Arc<super::acp_permissions::PermissionStore>,
         client_capabilities: ClientCapabilities,
         cwd: PathBuf,
@@ -327,6 +347,8 @@ impl AcpProgress {
             error: std::sync::Mutex::new(None),
             profile,
             mode,
+            live_mode,
+            follow_live: false,
             permissions,
             client_capabilities,
             cwd,
@@ -427,7 +449,12 @@ impl super::TurnHost for AcpProgress {
     }
 
     fn origin(&self) -> crate::tools::policy::Origin {
-        crate::tools::policy::Origin::Acp(self.mode)
+        let mode = if self.follow_live {
+            read_mode(&self.live_mode)
+        } else {
+            self.mode
+        };
+        crate::tools::policy::Origin::Acp(mode)
     }
 
     /// The client-side tools reach the editor through this. Built fresh
@@ -484,6 +511,57 @@ impl super::TurnHost for AcpProgress {
         )));
     }
 
+    /// What the user already told this editor to always allow or always
+    /// reject, under this connection's profile. `approve` starts here,
+    /// and a background subagent's host reads only this.
+    async fn standing_approval(
+        &self,
+        call: &crate::provider::ToolCall,
+        _kind: crate::tools::ToolKind,
+    ) -> Option<crate::tools::policy::Approval> {
+        use crate::tools::policy::Approval;
+        match self.permissions.standing(&self.profile, &call.name) {
+            Some(true) => Some(Approval::AllowAlways),
+            Some(false) => Some(Approval::RejectAlways),
+            None => None,
+        }
+    }
+
+    /// A thought chunk rather than a message chunk: the report is not
+    /// the agent's reply, and it may arrive while no turn is running.
+    /// An editor that shows nothing outside a turn just drops it, which
+    /// costs nothing — the model gets the report in its next turn.
+    async fn background_finished(&self, text: &str) {
+        self.notify(SessionUpdate::AgentThoughtChunk(ContentChunk::new(
+            ContentBlock::Text(TextContent::new(text.to_string())),
+        )));
+    }
+
+    /// An equivalent of this host with a fresh error slot: the
+    /// connection, the editor's client capabilities and the standing
+    /// answers belong to the session, not to the one `session/prompt`
+    /// response, so a background child keeps them. Built field by field
+    /// rather than by holding the turn's own `Arc`, which `&self` cannot
+    /// reach; the copy is cheap (clones of handles and `Arc`s).
+    ///
+    /// Unlike the turn's own host, the copy reads the session's mode live
+    /// (`follow_live`).
+    fn detached(&self) -> Arc<dyn super::TurnHost> {
+        let mut host = AcpProgress::new(
+            self.session_id.clone(),
+            self.connection.clone(),
+            self.profile.clone(),
+            self.mode,
+            Arc::clone(&self.live_mode),
+            Arc::clone(&self.permissions),
+            self.client_capabilities.clone(),
+            self.cwd.clone(),
+            Arc::clone(&self.terminals),
+        );
+        host.follow_live = true;
+        Arc::new(host)
+    }
+
     /// Put the call to the user, unless a standing answer settles it.
     ///
     /// The standing answer is consulted here rather than inside
@@ -500,10 +578,8 @@ impl super::TurnHost for AcpProgress {
         // A standing answer settles it without a round trip. Moving the
         // call off `Pending` is not done here: the gate calls
         // `tool_allowed` for every permitted call, asked or not.
-        match self.permissions.standing(&self.profile, &call.name) {
-            Some(true) => return Approval::AllowAlways,
-            Some(false) => return Approval::RejectAlways,
-            None => {}
+        if let Some(standing) = self.standing_approval(call, kind).await {
+            return standing;
         }
 
         let request = RequestPermissionRequest::new(
@@ -1200,21 +1276,34 @@ async fn adopt_session(
         .await
         .insert(id.clone(), profile_name.to_string());
     state.acp_sessions.lock().await.insert(id.clone());
-    let already_held = sessions
-        .inner
-        .lock()
-        .await
-        .insert(
-            session_id.clone(),
-            AcpSession {
-                agent_session_id: id.clone(),
-                cwd,
-                client_capabilities: sessions.client_capabilities.lock().unwrap().clone(),
-                turns: HashMap::new(),
-                mode: crate::tools::policy::SessionMode::Default,
-            },
-        )
-        .is_some();
+    let already_held = {
+        let mut guard = sessions.inner.lock().await;
+        // A re-adopted session starts in `default` like any other, but it
+        // keeps its mode cell, so background children started before the
+        // re-adoption follow the reset and later `session/set_mode`s.
+        let mode = match guard.get(session_id) {
+            Some(held) => {
+                *held.mode.lock().unwrap_or_else(|e| e.into_inner()) =
+                    crate::tools::policy::SessionMode::Default;
+                Arc::clone(&held.mode)
+            }
+            None => Arc::new(std::sync::Mutex::new(
+                crate::tools::policy::SessionMode::Default,
+            )),
+        };
+        guard
+            .insert(
+                session_id.clone(),
+                AcpSession {
+                    agent_session_id: id.clone(),
+                    cwd,
+                    client_capabilities: sessions.client_capabilities.lock().unwrap().clone(),
+                    turns: HashMap::new(),
+                    mode,
+                },
+            )
+            .is_some()
+    };
     if !already_held {
         // Count holders, not adoptions. Re-adopting a session this
         // connection already has — a `load` then a `resume`, or a
@@ -1406,7 +1495,9 @@ pub(crate) async fn serve_connection<O, I>(
                             // No turn is running yet, so there is nothing for
                             // a `session/cancel` to reach.
                             turns: HashMap::new(),
-                            mode: crate::tools::policy::SessionMode::Default,
+                            mode: Arc::new(std::sync::Mutex::new(
+                                crate::tools::policy::SessionMode::Default,
+                            )),
                         },
                     );
 
@@ -1622,7 +1713,7 @@ pub(crate) async fn serve_connection<O, I>(
                                     .data(format!("unknown session '{}'", req.session_id)),
                             );
                         };
-                        session.mode = mode;
+                        *session.mode.lock().unwrap_or_else(|e| e.into_inner()) = mode;
                     }
 
                     // Announce it: a client that changed the mode from
@@ -1660,13 +1751,13 @@ pub(crate) async fn serve_connection<O, I>(
                             (
                                 session.agent_session_id.clone(),
                                 turn_cancel,
-                                session.mode,
+                                Arc::clone(&session.mode),
                                 session.client_capabilities.clone(),
                                 session.cwd.clone(),
                             )
                         })
                     };
-                    let Some((agent_session_id, turn_cancel, mode, client_capabilities, cwd)) =
+                    let Some((agent_session_id, turn_cancel, live_mode, client_capabilities, cwd)) =
                         looked_up
                     else {
                         // Not created on the fly: a prompt naming a session
@@ -1732,7 +1823,8 @@ pub(crate) async fn serve_connection<O, I>(
                         session_id.clone(),
                         connection.clone(),
                         profile_name.clone(),
-                        mode,
+                        read_mode(&live_mode),
+                        live_mode,
                         Arc::clone(&state.permissions),
                         client_capabilities,
                         cwd,
@@ -4715,4 +4807,68 @@ mod tests {
     // observable end to end even though no single test crosses the
     // wire. See task-3-report.md and task-4-report.md for the record
     // of this decision.
+
+    /// A background child's detached host reads the session's mode live:
+    /// started in `bypass`, it is reined in by a later switch to
+    /// `default`, so a risky call is asked about and, with no standing
+    /// allow, refused. The turn's own host keeps its snapshot.
+    #[tokio::test]
+    async fn a_detached_host_follows_a_later_set_mode() {
+        use crate::tools::policy::{Approval, Decision, Origin, SessionMode, decide};
+        let state = ServeState::for_test(false);
+        let live: LiveMode = Arc::new(std::sync::Mutex::new(SessionMode::Bypass));
+        let outgoing =
+            futures_util::sink::drain().sink_map_err(|e: std::convert::Infallible| match e {});
+        let incoming = futures_util::stream::pending::<std::io::Result<String>>();
+        Agent
+            .builder()
+            .connect_with(
+                Lines::new(outgoing, incoming),
+                async |connection: ConnectionTo<Client>| {
+                    let progress = AcpProgress::new(
+                        SessionId::new("s-live-mode"),
+                        connection,
+                        "default".to_string(),
+                        read_mode(&live),
+                        Arc::clone(&live),
+                        Arc::clone(&state.permissions),
+                        ClientCapabilities::default(),
+                        PathBuf::from("/work"),
+                        Arc::clone(&state.acp_terminals),
+                    );
+                    let detached = progress.detached();
+                    assert_eq!(detached.origin(), Origin::Acp(SessionMode::Bypass));
+
+                    // What `session/set_mode` does to the session's cell.
+                    *live.lock().unwrap() = SessionMode::Default;
+                    assert_eq!(detached.origin(), Origin::Acp(SessionMode::Default));
+                    assert_eq!(
+                        progress.origin(),
+                        Origin::Acp(SessionMode::Bypass),
+                        "the running turn keeps the mode it started with"
+                    );
+                    assert_eq!(
+                        decide(detached.origin(), crate::tools::ToolKind::Execute),
+                        Decision::Ask
+                    );
+
+                    let refused = Arc::new(std::sync::Mutex::new(Vec::new()));
+                    let child = crate::tools::subagent::BackgroundSubagentHost::new(
+                        detached,
+                        Arc::clone(&refused),
+                    );
+                    let call = crate::provider::ToolCall {
+                        id: "c1".to_string(),
+                        name: "never-stood-for".to_string(),
+                        input: serde_json::json!({}),
+                    };
+                    let answer = child.approve(&call, crate::tools::ToolKind::Execute).await;
+                    assert_eq!(answer, Approval::RejectOnce);
+                    assert_eq!(refused.lock().unwrap().len(), 1);
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+    }
 }

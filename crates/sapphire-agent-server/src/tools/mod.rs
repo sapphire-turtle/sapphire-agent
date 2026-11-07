@@ -1,6 +1,7 @@
 pub mod acp_client;
 pub mod ambient_tools;
 pub mod avatar_tools;
+pub mod background_tools;
 pub mod builtin_tools;
 pub mod client_exec;
 pub mod client_tools;
@@ -581,7 +582,10 @@ mod tests {
     #[tokio::test]
     async fn replace_spec_swaps_what_the_model_is_offered() {
         let set = ToolSet::new(
-            vec![Box::new(crate::tools::subagent::SubagentTool::new(Vec::new())) as Box<dyn Tool>],
+            vec![
+                Box::new(crate::tools::subagent::SubagentTool::new(Vec::new(), false))
+                    as Box<dyn Tool>,
+            ],
             Vec::new(),
         );
         let mut swapped = set.specs_filtered(|_| true).await[0].clone();

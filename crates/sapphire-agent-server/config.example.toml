@@ -64,6 +64,10 @@
 #   - `origin = "trusted"` lets the permission table allow `shell` and
 #     `file_write`. With `origin = "channel"` they are refused and the
 #     feature can only read and edit workspace files.
+#     `subagent` is an `Other`-kind tool, so an autonomous task that
+#     delegates (background delegation included) needs `trusted` too.
+#     A task may also reply `WAIT` to suspend until its background tasks
+#     finish.
 #   - `[tools] host_access.enabled = true` — without it the host tools
 #     are refused before the permission table is consulted at all, for
 #     every origin.
@@ -347,6 +351,17 @@ system_prompt = "You are a helpful personal assistant."
 #     forbids delegation outright — the `subagent` tool is not offered to
 #     any turn, the main agent's included — and `1` is the old
 #     "never nest" behaviour.
+#   - `[tools.background]` — `max_per_session` caps how many background
+#     tasks one session may have running, default 4. `subagent` with
+#     `background: true` returns at once and its result is delivered into
+#     the same conversation, at the next turn or between tool rounds.
+#     Background is available only from a session's main conversation.
+#     A background child never asks for permission. Calls the permission
+#     table already allows run normally; calls it would ask about run only
+#     with a standing "always allow", and the others are refused and listed
+#     in the result. A standing "always reject" is refused and not listed.
+#     The `background_task` tool lists and cancels running tasks.
+#     `0` disables all of this.
 #   - `[[tools.mcp_servers]]` — outbound MCP client. Connects to
 #     external MCP servers and exposes their tools to the agent as
 #     `mcp__<name>__<tool_name>`. Distinct from the inbound MCP
@@ -421,6 +436,9 @@ system_prompt = "You are a helpful personal assistant."
 # turn_timeout_secs = 3600                  # 0 = no limit
 # max_depth = 2                             # nesting cap; 0 = no
 #                                           # delegation, 1 = never nest
+#
+# [tools.background]
+# max_per_session = 4                       # 0 = no background execution
 #
 # # Example: let the `ops` and `developer` room profiles manage the
 # # heartbeat/autonomous/agents definitions. Empty by default (all four

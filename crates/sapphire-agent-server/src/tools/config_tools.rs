@@ -803,6 +803,8 @@ impl TaskTestTool {
         stop: &TurnStop,
         answer: Option<String>,
     ) -> Result<String> {
+        // A test run's background tasks end with it, as a real run's do.
+        self.state.background.cancel_all(session_id);
         if let Err(e) = self
             .state
             .autonomous_session_store
@@ -1651,7 +1653,7 @@ mod tests {
     #[tokio::test]
     async fn a_written_agent_definition_is_offered_and_callable() {
         let (_dir, root, ws) = test_workspace();
-        let subagent = Arc::new(SubagentTool::new(Vec::new()));
+        let subagent = Arc::new(SubagentTool::new(Vec::new(), false));
         let set = Arc::new(ToolSet::new(
             vec![Box::new(Arc::clone(&subagent)) as Box<dyn Tool>],
             Vec::new(),

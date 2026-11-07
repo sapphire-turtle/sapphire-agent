@@ -85,9 +85,10 @@ use crate::provider::{ChatMessage, ToolSpec};
 use crate::tools::{Tool, ToolKind};
 use anyhow::Context;
 use async_trait::async_trait;
+use futures_util::FutureExt;
 use serde_json::json;
 use std::sync::Arc;
-use tracing::warn;
+use tracing::{debug, warn};
 
 pub(crate) const SUBAGENT_TOOL_NAME: &str = "subagent";
 
@@ -200,10 +201,12 @@ pub(crate) fn subagent_tool_specs(
         let nested = match &def.subagents {
             // `None`: inherit the delegating turn's own view verbatim — the
             // spec already embedded there carries exactly the set it can see.
+            // Less `background`, which only a main turn may use.
             None => parent_visible
                 .iter()
                 .find(|s| s.name.as_ref() == SUBAGENT_TOOL_NAME)
-                .cloned(),
+                .cloned()
+                .map(without_background),
             // `Some(list)`: rebuild the spec narrowed to the listed names,
             // against the full registered list.
             Some(allowed) => {
@@ -212,7 +215,7 @@ pub(crate) fn subagent_tool_specs(
                     .filter(|a| allowed.contains(&a.name))
                     .cloned()
                     .collect();
-                Some(build_spec(&visible))
+                Some(build_spec(&visible, false))
             }
         };
         specs.extend(nested);
@@ -230,7 +233,12 @@ pub(crate) fn subagent_tool_specs(
 /// instead of starting a fresh one. `agent` and `resume` are mutually
 /// exclusive: `SubagentTool::execute` rejects a call giving both, or
 /// neither, naming the rule rather than picking a default.
-fn build_spec(agents: &[AgentDef]) -> ToolSpec {
+///
+/// `background` adds the `background` argument. Only the main turn's
+/// spec carries it, and only while `[tools.background] max_per_session`
+/// is above zero: a nested turn has no session to deliver into, so
+/// `subagent_tool_specs` always builds its spec without it.
+fn build_spec(agents: &[AgentDef], background: bool) -> ToolSpec {
     let mut description = String::from(
         "Delegate a task to a specialised agent, or continue one you already \
          started. A dispatched agent's own system prompt and its own \
@@ -252,7 +260,7 @@ fn build_spec(agents: &[AgentDef]) -> ToolSpec {
         description.push_str("(none yet \u{2014} create one with `agent_config` action `write`)\n");
     }
 
-    ToolSpec {
+    let mut spec = ToolSpec {
         name: SUBAGENT_TOOL_NAME.into(),
         description: description.into(),
         input_schema: json!({
@@ -281,7 +289,26 @@ fn build_spec(agents: &[AgentDef]) -> ToolSpec {
             },
             "required": ["prompt"]
         }),
+    };
+    if background && let Some(properties) = spec.input_schema["properties"].as_object_mut() {
+        properties.insert(
+            "background".to_string(),
+            json!({
+                "type": "boolean",
+                "description": "Run it in the background and return at once; the result is delivered to this conversation when it finishes. Main conversation only."
+            }),
+        );
     }
+    spec
+}
+
+/// `spec` without its `background` argument — what a nested turn
+/// inherits from its delegator's spec.
+fn without_background(mut spec: ToolSpec) -> ToolSpec {
+    if let Some(properties) = spec.input_schema["properties"].as_object_mut() {
+        properties.remove("background");
+    }
+    spec
 }
 
 /// Forwards every `TurnHost` method to the parent's host except three:
@@ -321,7 +348,8 @@ fn build_spec(agents: &[AgentDef]) -> ToolSpec {
 /// the parent's own terminal-response channel.
 ///
 /// Every other method is forwarded completely unchanged: `origin()`,
-/// `approve()`, `acp_client()`, `client_fs_caps()`,
+/// `approve()`, `standing_approval()`, `declined_refusal()`,
+/// `acp_client()`, `client_fs_caps()`,
 /// `client_terminal_cap()`, `tool_start`/`tool_end`/`tool_allowed` all
 /// still resolve to the parent's own host, because those are what keep
 /// delegation inside the same permission gate — `turn_error`,
@@ -414,6 +442,158 @@ impl crate::serve::TurnHost for SubagentHost {
     ) -> crate::tools::policy::Approval {
         self.0.approve(call, kind).await
     }
+
+    async fn standing_approval(
+        &self,
+        call: &crate::provider::ToolCall,
+        kind: ToolKind,
+    ) -> Option<crate::tools::policy::Approval> {
+        self.0.standing_approval(call, kind).await
+    }
+
+    /// Forwarded with `approve`: whoever answered says why it was no.
+    /// Under a background subagent that is nobody, and the nested
+    /// child's refusal must not claim the user declined.
+    fn declined_refusal(
+        &self,
+        approval: crate::tools::policy::Approval,
+    ) -> crate::tools::policy::Refusal {
+        self.0.declined_refusal(approval)
+    }
+}
+
+/// The host a background subagent's nested turn runs under.
+///
+/// The parent's turn has usually ended by the time the child calls a
+/// tool, so nobody is there to answer a permission dialog. The
+/// permission table stays the parent's own — `origin()` is forwarded
+/// unchanged, so a background child cannot run what its parent would
+/// be refused — and only the `Ask` row changes meaning: `approve` never
+/// asks. It takes the editor's standing answer (through the parent's
+/// `standing_approval`) and refuses everything without one, recording
+/// the call in `refused` so the completion report can tell the user
+/// what is waiting on them. A standing "always reject" is not recorded:
+/// the user already said never, and is not waiting to be asked. Falling
+/// through to the parent's `approve` instead would put a dialog in
+/// front of the user that is not about the turn they are looking at,
+/// or, on a host whose `approve` defaults to `AllowOnce`, run the call
+/// with nobody's say-so.
+///
+/// `tool_start` / `tool_end` / `tool_allowed` are logged, not
+/// forwarded. `SubagentHost` forwards them to make a permission prompt
+/// legible as coming from this session; with no prompt, all they would
+/// do is push tool-call updates for calls that belong to no turn the
+/// editor is showing, which can confuse it.
+///
+/// `turn_error` and `message_chunk` are swallowed and `round_budget` is
+/// `Unattended`, for the reasons `SubagentHost` gives. `acp_client`,
+/// `cwd` and the client capabilities are forwarded: the child works on
+/// the editor's machine while the connection lasts, and its client-side
+/// tools fail once it is gone, which the child reads and reports.
+/// `avatar` is `None`: a background child has no gesture to make in
+/// the parent's turn.
+pub(crate) struct BackgroundSubagentHost {
+    parent: Arc<dyn crate::serve::TurnHost>,
+    refused: Arc<std::sync::Mutex<Vec<crate::background::RefusedCall>>>,
+}
+
+impl BackgroundSubagentHost {
+    /// `refused` is shared so the caller can read it after the child's
+    /// turn ends.
+    pub(crate) fn new(
+        parent: Arc<dyn crate::serve::TurnHost>,
+        refused: Arc<std::sync::Mutex<Vec<crate::background::RefusedCall>>>,
+    ) -> Self {
+        Self { parent, refused }
+    }
+}
+
+#[async_trait]
+impl crate::serve::TurnHost for BackgroundSubagentHost {
+    async fn tool_start(&self, id: &str, name: &str, _input: &serde_json::Value) {
+        debug!("background subagent: tool call {id} ({name}) started");
+    }
+
+    async fn tool_end(&self, id: &str, name: &str) {
+        debug!("background subagent: tool call {id} ({name}) ended");
+    }
+
+    async fn turn_error(&self, _message: &str) {}
+
+    async fn message_chunk(&self, _text: &str) {}
+
+    fn round_budget(&self) -> crate::serve::RoundBudget {
+        crate::serve::RoundBudget::Unattended
+    }
+
+    fn origin(&self) -> crate::tools::policy::Origin {
+        self.parent.origin()
+    }
+
+    fn acp_client(&self) -> Option<Arc<dyn crate::tools::acp_client::AcpClient>> {
+        self.parent.acp_client()
+    }
+
+    fn cwd(&self) -> Option<String> {
+        self.parent.cwd()
+    }
+
+    fn client_fs_caps(&self) -> (bool, bool) {
+        self.parent.client_fs_caps()
+    }
+
+    fn client_terminal_cap(&self) -> bool {
+        self.parent.client_terminal_cap()
+    }
+
+    fn avatar(&self) -> Option<Arc<crate::tools::avatar_tools::AvatarTurn>> {
+        None
+    }
+
+    async fn tool_allowed(&self, id: &str) {
+        debug!("background subagent: tool call {id} allowed");
+    }
+
+    /// Never asks — see the type doc.
+    async fn approve(
+        &self,
+        call: &crate::provider::ToolCall,
+        kind: ToolKind,
+    ) -> crate::tools::policy::Approval {
+        use crate::tools::policy::Approval;
+        if let Some(standing) = self.parent.standing_approval(call, kind).await {
+            return standing;
+        }
+        self.refused
+            .lock()
+            .unwrap()
+            .push(crate::background::RefusedCall {
+                name: call.name.clone(),
+                input: call.input.clone(),
+            });
+        Approval::RejectOnce
+    }
+
+    async fn standing_approval(
+        &self,
+        call: &crate::provider::ToolCall,
+        kind: ToolKind,
+    ) -> Option<crate::tools::policy::Approval> {
+        self.parent.standing_approval(call, kind).await
+    }
+
+    /// A standing "always reject" is the user's own no; anything else
+    /// this host refused was waiting on an approval nobody could give.
+    fn declined_refusal(
+        &self,
+        approval: crate::tools::policy::Approval,
+    ) -> crate::tools::policy::Refusal {
+        use crate::tools::policy::{Approval, Refusal};
+        match approval {
+            Approval::RejectAlways => Refusal::UserDeclined,
+            _ => Refusal::NeedsApproval,
+        }
+    }
 }
 
 /// Delegates a task to a specialised agent and returns only its final
@@ -439,26 +619,36 @@ pub struct SubagentTool {
     /// [`Self::newly_unknown_tools`], so a typo in one definition's
     /// `tools:` list is logged once rather than once per delegation.
     warned_unknown_tools: std::sync::Mutex<std::collections::HashSet<(String, String)>>,
-    /// Handles currently being resumed, for the duration of one
-    /// `resume` call each. Claimed and released through [`ResumeGuard`]
-    /// — a `Drop` guard, not a remember-to-remove-the-entry pattern, for
+    /// Whether the main turn's spec offers `background` (`[tools.background]
+    /// max_per_session > 0`).
+    background: bool,
+    /// Handles currently running, for the duration of one call each, or
+    /// of one background child's whole turn. Claimed and released
+    /// through [`ResumeGuard`] — `Arc` so a background child's guard can
+    /// move into its spawned task. A `Drop` guard, not a
+    /// remember-to-remove-the-entry pattern, for
     /// the same reason `TerminalReservation`
     /// (`src/tools/acp_client.rs`) is one: two turns resuming the same
     /// handle concurrently would interleave writes into one history, and
     /// a resume that errors out — or whose turn is simply cancelled
     /// mid-flight, which ACP treats as routine — must still release the
     /// handle rather than leaving it refused forever.
-    busy_handles: std::sync::Mutex<std::collections::HashSet<String>>,
+    busy_handles: BusyHandles,
 }
 
+type BusyHandles = Arc<std::sync::Mutex<std::collections::HashSet<String>>>;
+
 impl SubagentTool {
-    pub fn new(agents: Vec<AgentDef>) -> Self {
-        let spec = build_spec(&agents);
+    /// `background` offers the `background` argument; pass
+    /// `[tools.background] max_per_session > 0`.
+    pub fn new(agents: Vec<AgentDef>, background: bool) -> Self {
+        let spec = build_spec(&agents, background);
         Self {
             agents: std::sync::RwLock::new(agents),
             spec,
             warned_unknown_tools: std::sync::Mutex::new(std::collections::HashSet::new()),
-            busy_handles: std::sync::Mutex::new(std::collections::HashSet::new()),
+            background,
+            busy_handles: BusyHandles::default(),
         }
     }
 
@@ -504,7 +694,7 @@ impl SubagentTool {
     /// and wants the description the model is offered to list exactly
     /// the agents a dispatch would accept.
     pub fn live_spec(&self) -> ToolSpec {
-        build_spec(&self.agents())
+        build_spec(&self.agents(), self.background)
     }
 
     /// Which of `def.tools`' names resolve to nothing the parent can
@@ -556,14 +746,48 @@ impl Tool for SubagentTool {
         ToolKind::Other
     }
 
+    /// Synchronous only: a background child has to own the tool it runs
+    /// on after this call returns, which `&self` cannot give it. The
+    /// registered tool is the `Arc<SubagentTool>` below, which can.
     async fn execute(&self, input: &serde_json::Value) -> anyhow::Result<String> {
+        let request = Request::parse(input)?;
+        if request.background {
+            anyhow::bail!(
+                "background runs are not available here; call `subagent` \
+                 without `background` to run it synchronously"
+            );
+        }
+        self.run_sync(request.target, request.prompt).await
+    }
+}
+
+/// One `subagent` call's arguments, parsed once for both `execute`s.
+struct Request<'a> {
+    prompt: &'a str,
+    target: Target<'a>,
+    background: bool,
+}
+
+/// A new child by definition name, or an existing one by handle.
+enum Target<'a> {
+    Dispatch(&'a str),
+    Resume(&'a str),
+}
+
+impl<'a> Request<'a> {
+    fn parse(input: &'a serde_json::Value) -> anyhow::Result<Self> {
         let prompt = input["prompt"].as_str().context("missing 'prompt'")?;
         let agent = string_field(input, "agent")?;
         let resume = string_field(input, "resume")?;
+        let background = match input.get("background") {
+            None | Some(serde_json::Value::Null) => false,
+            Some(serde_json::Value::Bool(b)) => *b,
+            Some(_) => anyhow::bail!("'background' must be a boolean"),
+        };
 
         // Neither given, or both given, is a recoverable error naming
         // the rule rather than guessing which one was meant.
-        match (agent, resume) {
+        let target = match (agent, resume) {
             (Some(_), Some(_)) => anyhow::bail!(
                 "'agent' and 'resume' are mutually exclusive: dispatch a new \
                  agent by name, or continue an existing one by its handle — \
@@ -573,9 +797,14 @@ impl Tool for SubagentTool {
                 "either 'agent' (to dispatch a new subagent) or 'resume' \
                  (to continue one by handle) is required"
             ),
-            (Some(name), None) => self.dispatch(name, prompt).await,
-            (None, Some(handle)) => self.resume(handle, prompt).await,
-        }
+            (Some(name), None) => Target::Dispatch(name),
+            (None, Some(handle)) => Target::Resume(handle),
+        };
+        Ok(Self {
+            prompt,
+            target,
+            background,
+        })
     }
 }
 
@@ -595,14 +824,248 @@ impl Tool for Arc<SubagentTool> {
     }
 
     async fn execute(&self, input: &serde_json::Value) -> anyhow::Result<String> {
-        (**self).execute(input).await
+        self.execute_arc(input).await
     }
 }
 
 impl SubagentTool {
-    /// Start a fresh child conversation with `def`, run it to
-    /// completion, and store it under a freshly generated handle.
-    async fn dispatch(&self, name: &str, prompt: &str) -> anyhow::Result<String> {
+    /// The `execute` the registered tool runs: synchronous, or with
+    /// `background`, started in a task of its own.
+    async fn execute_arc(self: &Arc<Self>, input: &serde_json::Value) -> anyhow::Result<String> {
+        let request = Request::parse(input)?;
+        if request.background {
+            return self.start_background(request.target, request.prompt);
+        }
+        self.run_sync(request.target, request.prompt).await
+    }
+
+    /// Run the child to completion inside this call, under the parent's
+    /// own host, and return its answer.
+    async fn run_sync(&self, target: Target<'_>, prompt: &str) -> anyhow::Result<String> {
+        let (ctx, prepared) = self.prepare(target, prompt)?;
+        let Prepared {
+            def,
+            handle,
+            created_at,
+            mut history,
+            over_cap_reason,
+            guard: _guard,
+        } = prepared;
+        // The parent's host, deliberately: a permission request from a
+        // subagent must reach the same person, judged by the same
+        // origin. A different host here would make delegation a way
+        // around the gate. `turn_error` is the one method NOT forwarded
+        // unchanged — see `SubagentHost`'s doc for why a
+        // subagent's own provider failure must not report itself as
+        // *this request's* terminal outcome.
+        let progress: Arc<dyn crate::serve::TurnHost> =
+            Arc::new(SubagentHost(Arc::clone(&ctx.progress)));
+        // The subagent's own memory-tool calls (if it has any) write
+        // under the same namespace the delegating conversation is in —
+        // a fact about where this deployment's memory lives, not a
+        // personality trait, so it travels through like the date does
+        // rather than being stripped like the workspace files are.
+        let namespace = crate::tools::workspace_tools::current_memory_namespace();
+        self.run_and_store(
+            &ctx,
+            &def,
+            &handle,
+            created_at,
+            &mut history,
+            over_cap_reason,
+            progress,
+            namespace,
+        )
+        .await
+    }
+
+    /// Start the child in a spawned task and return at once; its outcome
+    /// is registered in `ServeState::background`, which delivers it into
+    /// this session's next turn (or between this turn's rounds).
+    ///
+    /// Only a main turn may: it needs a session to deliver into, and a
+    /// subagent's own turn has none. The child runs under
+    /// [`BackgroundSubagentHost`], so it never asks for permission, and
+    /// it holds its handle's [`ResumeGuard`] until it ends, so a resume
+    /// of the same handle meanwhile is refused rather than interleaved.
+    ///
+    /// Task-locals do not cross `tokio::spawn`, so the spawned future
+    /// re-scopes those the tools read, in `TurnLoop::run`'s order.
+    fn start_background(
+        self: &Arc<Self>,
+        target: Target<'_>,
+        prompt: &str,
+    ) -> anyhow::Result<String> {
+        let ctx = crate::serve::current_turn_context().context("no turn to delegate from")?;
+        if !self.background {
+            anyhow::bail!(
+                "background runs are turned off on this deployment \
+                 ([tools.background] max_per_session = 0); call `subagent` \
+                 without `background` to run it synchronously"
+            );
+        }
+        let session = match (&ctx.session_id, ctx.subagent_depth) {
+            (Some(session), 0) => session.clone(),
+            _ => anyhow::bail!(
+                "background subagents can only be started from the main \
+                 conversation, not from inside a subagent or a turn without \
+                 a session; call `subagent` without `background` to run it \
+                 synchronously"
+            ),
+        };
+        let fresh = matches!(target, Target::Dispatch(_));
+        let (ctx, prepared) = self.prepare(target, prompt)?;
+        let Prepared {
+            def,
+            handle,
+            created_at,
+            mut history,
+            over_cap_reason,
+            guard,
+        } = prepared;
+
+        let kind = crate::background::TaskKind::Subagent {
+            agent: def.name.clone(),
+            handle: handle.clone(),
+        };
+        // Past the cap this refuses, and `guard` drops on the way out.
+        let id = ctx.state.background.register(
+            &session,
+            kind.clone(),
+            background_label(&def.name, prompt),
+        )?;
+        // A fresh handle has nothing stored until the child finishes, so
+        // one cancelled or cut off by a restart could not be resumed.
+        // Storing its prompt now makes it resumable from the start. A
+        // resume already has its stored history.
+        if fresh {
+            persist(
+                ctx.state.subagent_cache.as_deref(),
+                &handle,
+                &def.name,
+                history.clone(),
+                created_at,
+                over_cap_reason,
+            );
+        }
+        let started = format!(
+            "Started background task {id}: subagent \"{}\" (handle {handle}). \
+             Its result will be delivered to this conversation when it finishes.",
+            def.name
+        );
+
+        // The child outlives the request that started it, so it must not
+        // keep that request's host (an HTTP turn's `SseProgress` holds the
+        // response stream open) or the context carrying it. It gets the
+        // host's detached form and a context of its own around that.
+        let detached = ctx.progress.detached();
+        let task_ctx = Arc::new(crate::serve::TurnContext {
+            state: Arc::clone(&ctx.state),
+            provider: Arc::clone(&ctx.provider),
+            progress: Arc::clone(&detached),
+            visible_specs: Arc::clone(&ctx.visible_specs),
+            timer_origin: ctx.timer_origin.clone(),
+            session_id: ctx.session_id.clone(),
+            subagent_depth: ctx.subagent_depth,
+            admin_room_profile: ctx.admin_room_profile.clone(),
+        });
+        let refused = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let progress: Arc<dyn crate::serve::TurnHost> =
+            Arc::new(BackgroundSubagentHost::new(detached, Arc::clone(&refused)));
+        let namespace = crate::tools::workspace_tools::current_memory_namespace();
+        let tool = Arc::clone(self);
+        let scope_ctx = Arc::clone(&task_ctx);
+        let task_session = session.clone();
+        let task_id = id.clone();
+        let task_namespace = namespace.clone();
+        let run = async move {
+            // A panic in a tool or the provider must still complete the
+            // task, or it would hold a cap slot and keep the session
+            // waiting on it until a restart. Caught inside the spawned
+            // task, so the attached abort handle still targets it.
+            let result = std::panic::AssertUnwindSafe(tool.run_and_store(
+                &task_ctx,
+                &def,
+                &handle,
+                created_at,
+                &mut history,
+                over_cap_reason,
+                progress,
+                task_namespace,
+            ))
+            .catch_unwind()
+            .await;
+            // Free the handle before the completion lands, so a resume
+            // that the completion prompts is not refused as busy.
+            drop(guard);
+            let outcome = match result {
+                Ok(Ok(text)) => crate::background::Outcome::Finished {
+                    text,
+                    refused: std::mem::take(
+                        &mut *refused.lock().unwrap_or_else(|e| e.into_inner()),
+                    ),
+                },
+                Ok(Err(e)) => crate::background::Outcome::Failed {
+                    message: e.to_string(),
+                },
+                Err(payload) => crate::background::Outcome::Failed {
+                    message: panic_message(payload.as_ref()),
+                },
+            };
+            // `false` when the task was cancelled meanwhile: the
+            // `Cancelled` completion already stands, and this one is
+            // dropped.
+            if task_ctx
+                .state
+                .background
+                .complete(&task_session, &task_id, outcome.clone())
+            {
+                let completion = crate::background::Completion {
+                    task_id,
+                    kind,
+                    outcome,
+                    finished_at: chrono::Utc::now(),
+                };
+                let resumable = crate::background::resumable(
+                    task_ctx.state.subagent_cache.as_deref(),
+                    &completion,
+                );
+                let report = crate::background::render(&completion, resumable);
+                task_ctx.progress.background_finished(&report).await;
+            }
+        };
+        let task = tokio::spawn(scope_background(scope_ctx, namespace, run));
+        ctx.state
+            .background
+            .attach(&session, &id, task.abort_handle());
+        Ok(started)
+    }
+
+    /// Everything a child run needs before its turn starts, resolved
+    /// from a dispatch or a resume — with the handle already claimed.
+    ///
+    /// Each branch looks things up in the order its errors should win,
+    /// which is why the turn context is fetched inside rather than
+    /// passed in: a dispatch names an unknown agent before it complains
+    /// that there is no turn, a resume the other way round.
+    fn prepare(
+        &self,
+        target: Target<'_>,
+        prompt: &str,
+    ) -> anyhow::Result<(Arc<crate::serve::TurnContext>, Prepared)> {
+        match target {
+            Target::Dispatch(name) => self.prepare_dispatch(name, prompt),
+            Target::Resume(handle) => self.prepare_resume(handle, prompt),
+        }
+    }
+
+    /// A fresh child conversation with `def`, under a freshly generated
+    /// handle.
+    fn prepare_dispatch(
+        &self,
+        name: &str,
+        prompt: &str,
+    ) -> anyhow::Result<(Arc<crate::serve::TurnContext>, Prepared)> {
         let agents = self.agents();
         let Some(def) = agents.iter().find(|a| a.name == name) else {
             // Recoverable: the parent picked a name that does not
@@ -615,7 +1078,7 @@ impl SubagentTool {
         // tool set to lend. Nothing else can delegate.
         let ctx = crate::serve::current_turn_context().context("no turn to delegate from")?;
 
-        let mut history = vec![ChatMessage::user(prompt)];
+        let history = vec![ChatMessage::user(prompt)];
         // `Uuid::now_v7`'s hyphenated `Display` form is ASCII hex plus
         // `-`, which `SubagentCache::path_for`'s filename guard accepts
         // outright — no reserved-name collision is possible, and
@@ -623,19 +1086,26 @@ impl SubagentTool {
         let handle = uuid::Uuid::now_v7().to_string();
         let created_at = chrono::Utc::now();
 
+        // Nobody else can know a handle this fresh, so the claim always
+        // succeeds; it is taken so a background child holds its handle
+        // the same way a resumed one does.
+        let guard = ResumeGuard::claim(&self.busy_handles, &handle)?;
+
         // Nothing is on disk yet under this fresh handle, so an
         // over-cap `put` here just means the handle never becomes
         // resumable at all — there is no earlier, shorter copy for the
         // model to be misled by (contrast `resume`'s own message).
-        self.run_and_store(
-            &ctx,
-            def,
-            &handle,
-            created_at,
-            &mut history,
-            "history exceeded the cache limit",
-        )
-        .await
+        Ok((
+            ctx,
+            Prepared {
+                def: def.clone(),
+                handle,
+                created_at,
+                history,
+                over_cap_reason: "history exceeded the cache limit",
+                guard,
+            },
+        ))
     }
 
     /// Continue the child conversation stored under `handle`.
@@ -649,15 +1119,19 @@ impl SubagentTool {
     /// letting a resumed child carry forward a list wider than its
     /// current definition allows (or than the current parent turn can
     /// even see).
-    async fn resume(&self, handle: &str, prompt: &str) -> anyhow::Result<String> {
+    fn prepare_resume(
+        &self,
+        handle: &str,
+        prompt: &str,
+    ) -> anyhow::Result<(Arc<crate::serve::TurnContext>, Prepared)> {
         let ctx = crate::serve::current_turn_context().context("no turn to delegate from")?;
 
-        // Claimed before anything else in this method can `.await`, so
-        // a concurrent resume of the same handle always observes it
-        // already held — see `ResumeGuard`'s doc. Released on every
-        // exit path via `Drop`, success, error, or this whole call
+        // Claimed before the child's turn can `.await`, so a concurrent
+        // resume of the same handle always observes it already held —
+        // see `ResumeGuard`'s doc. Released on every exit path via
+        // `Drop`, success, error, or the whole call (or background task)
         // being cancelled mid-flight.
-        let _guard = ResumeGuard::claim(&self.busy_handles, handle)?;
+        let guard = ResumeGuard::claim(&self.busy_handles, handle)?;
 
         // Worded differently from the "no subagent is stored under this
         // handle" miss just below on purpose: that one means a real
@@ -719,17 +1193,19 @@ impl SubagentTool {
         // this prompt and its answer with no signal that anything
         // diverged. Name that explicitly rather than reusing dispatch's
         // message.
-        self.run_and_store(
-            &ctx,
-            def,
-            handle,
-            stored.created_at,
-            &mut history,
-            "this exchange exceeded the cache limit and was not saved; \
-             the stored copy still ends before it, so a later resume \
-             will not include this prompt or its answer",
-        )
-        .await
+        Ok((
+            ctx,
+            Prepared {
+                def: def.clone(),
+                handle: handle.to_string(),
+                created_at: stored.created_at,
+                history,
+                over_cap_reason: "this exchange exceeded the cache limit and was not saved; \
+                     the stored copy still ends before it, so a later resume \
+                     will not include this prompt or its answer",
+                guard,
+            },
+        ))
     }
 
     /// Run `def`'s nested `TurnLoop` to completion on `history`, then
@@ -742,8 +1218,15 @@ impl SubagentTool {
     /// only `resume` risks leaving a stale, shorter copy behind when
     /// `put` refuses.
     ///
-    /// The one `Err` is a turn that outran `[tools.subagent]
-    /// turn_timeout_secs` — see [`timed_out`].
+    /// The `Err`s are a turn that outran `[tools.subagent]
+    /// turn_timeout_secs` — see [`timed_out`] — and a provider failure —
+    /// see [`provider_error`].
+    ///
+    /// `progress` is the host the nested turn runs under and `namespace`
+    /// its memory namespace: the caller's, read inside the parent's
+    /// round for a synchronous run, captured before the spawn for a
+    /// background one.
+    #[allow(clippy::too_many_arguments)]
     async fn run_and_store(
         &self,
         ctx: &crate::serve::TurnContext,
@@ -752,6 +1235,8 @@ impl SubagentTool {
         created_at: chrono::DateTime<chrono::Utc>,
         history: &mut Vec<ChatMessage>,
         over_cap_reason: &'static str,
+        progress: Arc<dyn crate::serve::TurnHost>,
+        namespace: String,
     ) -> anyhow::Result<String> {
         // A typo, a renamed tool, or a name that was never registered
         // yields a subagent silently missing it — no warning at load,
@@ -777,13 +1262,6 @@ impl SubagentTool {
             ctx.state.config.tools.subagent.max_depth,
         );
 
-        // The subagent's own memory-tool calls (if it has any) write
-        // under the same namespace the delegating conversation is in —
-        // a fact about where this deployment's memory lives, not a
-        // personality trait, so it travels through like the date does
-        // rather than being stripped like the workspace files are.
-        let namespace = crate::tools::workspace_tools::current_memory_namespace();
-
         // A definition that pins a profile runs on that profile's provider —
         // resolved through the very same `ProviderRegistry::for_profile` that
         // room/session turns use, so profile-resolution semantics exist in one
@@ -798,16 +1276,6 @@ impl SubagentTool {
             Some(name) => ctx.state.registry.for_profile(&ctx.state.config, name),
             None => std::sync::Arc::clone(&ctx.provider),
         };
-
-        // The parent's host, deliberately: a permission request from a
-        // subagent must reach the same person, judged by the same
-        // origin. A different host here would make delegation a way
-        // around the gate. `turn_error` is the one method NOT forwarded
-        // unchanged — see `SubagentHost`'s doc for why a
-        // subagent's own provider failure must not report itself as
-        // *this request's* terminal outcome.
-        let progress: std::sync::Arc<dyn crate::serve::TurnHost> =
-            std::sync::Arc::new(SubagentHost(std::sync::Arc::clone(&ctx.progress)));
 
         let turn = crate::serve::TurnLoop {
             state: &ctx.state,
@@ -882,6 +1350,71 @@ impl SubagentTool {
             over_cap_reason,
         );
         Ok(prefixed(&def.name, resumability, &answer))
+    }
+}
+
+/// What [`SubagentTool::prepare`] resolves: the definition, the handle
+/// (claimed through `guard`), and the history the child's turn starts
+/// from.
+struct Prepared {
+    def: AgentDef,
+    handle: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    history: Vec<ChatMessage>,
+    over_cap_reason: &'static str,
+    guard: ResumeGuard,
+}
+
+/// The one-line description a background task is listed under: the
+/// agent and the start of its prompt.
+fn background_label(agent: &str, prompt: &str) -> String {
+    let first_line = prompt.lines().next().unwrap_or("");
+    let short: String = first_line.chars().take(80).collect();
+    let more = if short.len() < prompt.trim_end().len() {
+        "\u{2026}"
+    } else {
+        ""
+    };
+    format!("subagent \"{agent}\": {short}{more}")
+}
+
+/// What a background child's caught panic is reported as: the payload
+/// when it is the usual `&str` or `String`, else just the fact.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    let detail = payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned());
+    match detail {
+        Some(d) => format!("subagent panicked: {d}"),
+        None => "subagent panicked".to_string(),
+    }
+}
+
+/// `fut` with the task-locals a tool call reads, re-scoped for a spawned
+/// background child: they do not cross `tokio::spawn`. The same scopes,
+/// in the same order, as `TurnLoop::run`'s tool execution. The avatar
+/// scope is left out: [`BackgroundSubagentHost`] has no avatar, and an
+/// unscoped avatar reads as none.
+async fn scope_background<F: std::future::Future>(
+    ctx: Arc<crate::serve::TurnContext>,
+    namespace: String,
+    fut: F,
+) -> F::Output {
+    let fut = crate::tools::workspace_tools::scope_memory_namespace(namespace, fut);
+    let fut =
+        crate::tools::config_tools::scope_admin_room_profile(ctx.admin_room_profile.clone(), fut);
+    let origin = ctx.timer_origin.clone();
+    let client = ctx.progress.acp_client();
+    let fut = crate::serve::scope_turn_context(ctx, fut);
+    match (origin, client) {
+        (Some(o), Some(c)) => {
+            crate::timer::scope_timer_origin(o, crate::tools::acp_client::scope_acp_client(c, fut))
+                .await
+        }
+        (Some(o), None) => crate::timer::scope_timer_origin(o, fut).await,
+        (None, Some(c)) => crate::tools::acp_client::scope_acp_client(c, fut).await,
+        (None, None) => fut.await,
     }
 }
 
@@ -1081,8 +1614,10 @@ fn answer_text(text: Option<String>, stop: crate::serve::TurnStop) -> String {
     }
 }
 
-/// Holds one resume's exclusive claim on a handle for the duration of
-/// the call.
+/// Holds one run's exclusive claim on a handle: for the duration of the
+/// call, or of a background child's whole turn. It owns its `Arc` to
+/// the busy set, so a background child's guard moves into its spawned
+/// task and is released when that task ends or is aborted.
 ///
 /// A `Drop` guard rather than a remember-to-remove-the-entry pattern,
 /// for the same reason `TerminalReservation` (`src/tools/acp_client.rs`)
@@ -1093,32 +1628,30 @@ fn answer_text(text: Option<String>, stop: crate::serve::TurnStop) -> String {
 /// forever. `claim` does all its work synchronously — a `Mutex` lock,
 /// an insert — before this method's first `.await`, so two concurrent
 /// resumes of the same handle can never both observe it free.
-struct ResumeGuard<'a> {
-    busy: &'a std::sync::Mutex<std::collections::HashSet<String>>,
+struct ResumeGuard {
+    busy: BusyHandles,
     handle: String,
 }
 
-impl<'a> ResumeGuard<'a> {
-    /// Claim `handle`, refusing if another resume already holds it.
-    fn claim(
-        busy: &'a std::sync::Mutex<std::collections::HashSet<String>>,
-        handle: &str,
-    ) -> anyhow::Result<Self> {
+impl ResumeGuard {
+    /// Claim `handle`, refusing if another run already holds it.
+    fn claim(busy: &BusyHandles, handle: &str) -> anyhow::Result<Self> {
         let mut set = busy.lock().unwrap();
         if !set.insert(handle.to_string()) {
             anyhow::bail!(
                 "subagent handle '{handle}' is already in use by another \
-                 resume — wait for it to finish before resuming again"
+                 resume or a background run — wait for it to finish before \
+                 resuming again"
             );
         }
         Ok(Self {
-            busy,
+            busy: Arc::clone(busy),
             handle: handle.to_string(),
         })
     }
 }
 
-impl Drop for ResumeGuard<'_> {
+impl Drop for ResumeGuard {
     fn drop(&mut self) {
         self.busy.lock().unwrap().remove(&self.handle);
     }
@@ -1151,7 +1684,7 @@ mod tests {
     /// so every agent's own description has to reach it.
     #[test]
     fn the_tool_description_lists_every_agent() {
-        let spec = SubagentTool::new(defs()).spec().clone();
+        let spec = SubagentTool::new(defs(), false).spec().clone();
         assert!(
             spec.description.contains("reviewer"),
             "{}",
@@ -1166,7 +1699,7 @@ mod tests {
 
     #[test]
     fn the_kind_is_other() {
-        assert_eq!(SubagentTool::new(defs()).kind(), ToolKind::Other);
+        assert_eq!(SubagentTool::new(defs(), false).kind(), ToolKind::Other);
     }
 
     /// A definition written after the tool was constructed is callable
@@ -1180,7 +1713,7 @@ mod tests {
     /// one that has to track `set_agents`.
     #[tokio::test]
     async fn set_agents_makes_a_new_definition_callable() {
-        let tool = SubagentTool::new(Vec::new());
+        let tool = SubagentTool::new(Vec::new(), false);
         assert!(tool.live_spec().description.contains("none yet"));
         tool.set_agents(vec![crate::agents::AgentDef {
             name: "reviewer".into(),
@@ -1203,7 +1736,7 @@ mod tests {
     /// recover from — list what exists rather than just refusing.
     #[tokio::test]
     async fn an_unknown_agent_names_the_ones_that_exist() {
-        let err = SubagentTool::new(defs())
+        let err = SubagentTool::new(defs(), false)
             .execute(&serde_json::json!({"agent": "nope", "prompt": "x"}))
             .await
             .unwrap_err()
@@ -1216,7 +1749,7 @@ mod tests {
     /// turn.
     #[tokio::test]
     async fn delegating_outside_a_turn_refuses() {
-        let err = SubagentTool::new(defs())
+        let err = SubagentTool::new(defs(), false)
             .execute(&serde_json::json!({"agent": "reviewer", "prompt": "x"}))
             .await
             .unwrap_err()
@@ -1422,7 +1955,7 @@ mod tests {
     /// reported at all.
     #[test]
     fn an_unknown_tool_name_is_reported_once() {
-        let tool = SubagentTool::new(defs());
+        let tool = SubagentTool::new(defs(), false);
         let def = agent(&tool, 0); // tools: Some(["file_read"])
         let parent_visible = [spec_named("file_read")];
 
@@ -1447,11 +1980,14 @@ mod tests {
     /// never show up as an "unknown tool" warning.
     #[test]
     fn subagent_itself_is_never_reported_as_unknown() {
-        let tool = SubagentTool::new(vec![crate::agents::AgentDef {
-            tools: Some(vec![SUBAGENT_TOOL_NAME.to_string()]),
-            profile: None,
-            ..defs()[0].clone()
-        }]);
+        let tool = SubagentTool::new(
+            vec![crate::agents::AgentDef {
+                tools: Some(vec![SUBAGENT_TOOL_NAME.to_string()]),
+                profile: None,
+                ..defs()[0].clone()
+            }],
+            false,
+        );
         let def = agent(&tool, 0);
         assert!(tool.newly_unknown_tools(&def, &[]).is_empty());
     }
@@ -1461,11 +1997,14 @@ mod tests {
     /// typo.
     #[test]
     fn an_unrestricted_definition_has_nothing_to_warn_about() {
-        let tool = SubagentTool::new(vec![crate::agents::AgentDef {
-            tools: None,
-            profile: None,
-            ..defs()[0].clone()
-        }]);
+        let tool = SubagentTool::new(
+            vec![crate::agents::AgentDef {
+                tools: None,
+                profile: None,
+                ..defs()[0].clone()
+            }],
+            false,
+        );
         let def = agent(&tool, 0);
         assert!(tool.newly_unknown_tools(&def, &[]).is_empty());
     }
@@ -1646,6 +2185,192 @@ mod tests {
         assert!(
             reaches_editor,
             "a delegated child's tool call must reach the editor, not the agent's own disk"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Background subagents
+    // -----------------------------------------------------------------
+
+    /// A parent host whose `approve` would say yes to anything, so a
+    /// background host that reached it would let the call run. Its
+    /// `standing_approval` answers whatever the test sets.
+    struct StandingParent {
+        standing: Option<crate::tools::policy::Approval>,
+        tool_starts: std::sync::Mutex<Vec<String>>,
+        asked: std::sync::atomic::AtomicBool,
+    }
+
+    impl StandingParent {
+        fn new(standing: Option<crate::tools::policy::Approval>) -> Self {
+            Self {
+                standing,
+                tool_starts: std::sync::Mutex::new(Vec::new()),
+                asked: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl crate::serve::TurnHost for StandingParent {
+        async fn tool_start(&self, id: &str, _name: &str, _input: &serde_json::Value) {
+            self.tool_starts.lock().unwrap().push(id.to_string());
+        }
+        async fn tool_end(&self, _id: &str, _name: &str) {}
+        async fn turn_error(&self, _message: &str) {}
+        fn origin(&self) -> crate::tools::policy::Origin {
+            crate::tools::policy::Origin::Acp(crate::tools::policy::SessionMode::Default)
+        }
+        async fn standing_approval(
+            &self,
+            _call: &crate::provider::ToolCall,
+            _kind: ToolKind,
+        ) -> Option<crate::tools::policy::Approval> {
+            self.standing
+        }
+        async fn approve(
+            &self,
+            _call: &crate::provider::ToolCall,
+            _kind: ToolKind,
+        ) -> crate::tools::policy::Approval {
+            self.asked.store(true, std::sync::atomic::Ordering::SeqCst);
+            crate::tools::policy::Approval::AllowOnce
+        }
+    }
+
+    fn background_host(
+        parent: std::sync::Arc<StandingParent>,
+    ) -> (
+        BackgroundSubagentHost,
+        std::sync::Arc<std::sync::Mutex<Vec<crate::background::RefusedCall>>>,
+    ) {
+        let refused = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let host = BackgroundSubagentHost::new(
+            parent as std::sync::Arc<dyn crate::serve::TurnHost>,
+            std::sync::Arc::clone(&refused),
+        );
+        (host, refused)
+    }
+
+    fn shell_call() -> crate::provider::ToolCall {
+        crate::provider::ToolCall {
+            id: "bg-call-1".to_string(),
+            name: "shell".to_string(),
+            input: json!({"command": "rm -rf build"}),
+        }
+    }
+
+    /// Nobody can answer a dialog for a background task, so a call with
+    /// no standing answer is refused — without asking the parent, whose
+    /// `approve` would put a prompt in front of the user (or here, say
+    /// yes) — and kept for the completion report.
+    #[tokio::test]
+    async fn background_host_refuses_an_ask_and_records_it() {
+        let parent = std::sync::Arc::new(StandingParent::new(None));
+        let (host, refused) = background_host(std::sync::Arc::clone(&parent));
+
+        let answer = crate::serve::TurnHost::approve(&host, &shell_call(), ToolKind::Execute).await;
+
+        assert_eq!(answer, crate::tools::policy::Approval::RejectOnce);
+        assert!(
+            !parent.asked.load(std::sync::atomic::Ordering::SeqCst),
+            "a background host must never fall through to the parent's dialog"
+        );
+        assert_eq!(
+            refused.lock().unwrap().as_slice(),
+            [crate::background::RefusedCall {
+                name: "shell".to_string(),
+                input: json!({"command": "rm -rf build"}),
+            }]
+        );
+        assert_eq!(
+            crate::serve::TurnHost::declined_refusal(&host, answer),
+            crate::tools::policy::Refusal::NeedsApproval
+        );
+    }
+
+    /// A standing "always reject" is the user's own answer, already
+    /// given: the call does not run, and it is neither reported as
+    /// waiting on them nor explained to the child as "needs approval" —
+    /// inviting an approval the user chose never to give would
+    /// contradict that choice.
+    #[tokio::test]
+    async fn background_host_refuses_a_standing_reject() {
+        let parent = std::sync::Arc::new(StandingParent::new(Some(
+            crate::tools::policy::Approval::RejectAlways,
+        )));
+        let (host, refused) = background_host(std::sync::Arc::clone(&parent));
+
+        let answer = crate::serve::TurnHost::approve(&host, &shell_call(), ToolKind::Execute).await;
+
+        assert_eq!(answer, crate::tools::policy::Approval::RejectAlways);
+        assert!(!parent.asked.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(refused.lock().unwrap().is_empty());
+        assert_eq!(
+            crate::serve::TurnHost::declined_refusal(&host, answer),
+            crate::tools::policy::Refusal::UserDeclined
+        );
+    }
+
+    /// A background child's own synchronous delegation wraps the
+    /// background host in a `SubagentHost`; the grandchild's unstored
+    /// `Ask` must still read "needs approval", not "the user declined".
+    #[tokio::test]
+    async fn a_subagent_host_over_a_background_host_reads_needs_approval() {
+        use crate::tools::policy::{Refusal, refusal_message};
+        let parent = std::sync::Arc::new(StandingParent::new(None));
+        let (host, refused) = background_host(std::sync::Arc::clone(&parent));
+        let nested = SubagentHost(std::sync::Arc::new(host));
+
+        let answer =
+            crate::serve::TurnHost::approve(&nested, &shell_call(), ToolKind::Execute).await;
+
+        assert_eq!(
+            refusal_message(
+                "shell",
+                crate::serve::TurnHost::declined_refusal(&nested, answer)
+            ),
+            refusal_message("shell", Refusal::NeedsApproval)
+        );
+        assert_eq!(refused.lock().unwrap().len(), 1);
+    }
+
+    /// What the user already told the editor to always allow runs in the
+    /// background as it would in the foreground, and is not reported.
+    #[tokio::test]
+    async fn background_host_runs_a_standing_allow() {
+        let parent = std::sync::Arc::new(StandingParent::new(Some(
+            crate::tools::policy::Approval::AllowAlways,
+        )));
+        let (host, refused) = background_host(std::sync::Arc::clone(&parent));
+
+        let answer = crate::serve::TurnHost::approve(&host, &shell_call(), ToolKind::Execute).await;
+
+        assert!(answer.allows());
+        assert!(!parent.asked.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(refused.lock().unwrap().is_empty());
+    }
+
+    /// The permission table is the parent's own, but the parent's tool
+    /// events are not: a background child's calls are not part of the
+    /// turn the editor is showing.
+    #[tokio::test]
+    async fn background_host_forwards_origin_but_not_tool_events() {
+        let parent = std::sync::Arc::new(StandingParent::new(None));
+        let (host, _refused) = background_host(std::sync::Arc::clone(&parent));
+
+        assert_eq!(
+            crate::serve::TurnHost::origin(&host),
+            crate::tools::policy::Origin::Acp(crate::tools::policy::SessionMode::Default)
+        );
+        crate::serve::TurnHost::tool_start(&host, "bg-call-1", "shell", &json!({})).await;
+        assert!(
+            parent.tool_starts.lock().unwrap().is_empty(),
+            "tool_start must not reach the parent's host"
+        );
+        assert_eq!(
+            crate::serve::TurnHost::round_budget(&host),
+            crate::serve::RoundBudget::Unattended
         );
     }
 
@@ -1853,7 +2578,7 @@ mod tests {
     /// *subagent's own nested* `TurnLoop` sees, not this boundary).
     #[tokio::test]
     async fn a_resumed_child_continues_its_own_history() {
-        let tool = SubagentTool::new(resumable_defs());
+        let tool = SubagentTool::new(resumable_defs(), false);
         let state = crate::serve::ServeState::for_test(false);
         state.sessions.lock().await.insert(
             "parent-session".to_string(),
@@ -1929,7 +2654,7 @@ mod tests {
     /// check just as easily.
     #[tokio::test]
     async fn resume_recomputes_the_tool_list_so_the_depth_cap_still_holds() {
-        let tool = SubagentTool::new(resumable_defs());
+        let tool = SubagentTool::new(resumable_defs(), false);
         let mut state = crate::serve::ServeState::for_test(false);
         // Pin the cap to 1 (the pre-recursion "never nest" behaviour) so
         // the recomputed list has no `subagent` in it and any widening at
@@ -1992,7 +2717,7 @@ mod tests {
     /// told what to do instead, not just refused.
     #[tokio::test]
     async fn an_unknown_handle_is_recoverable_and_says_what_to_do() {
-        let tool = SubagentTool::new(defs());
+        let tool = SubagentTool::new(defs(), false);
         let state = crate::serve::ServeState::for_test(false);
         let provider = ScriptedProvider::new(Vec::new());
         let input = serde_json::json!({"resume": "nosuchhandle", "prompt": "x"});
@@ -2024,7 +2749,7 @@ mod tests {
             .expect("uniquely owned immediately after construction")
             .subagent_cache = None;
 
-        let tool = SubagentTool::new(defs());
+        let tool = SubagentTool::new(defs(), false);
         let provider = ScriptedProvider::new(Vec::new());
         let input = serde_json::json!({"resume": "some-handle", "prompt": "x"});
 
@@ -2050,7 +2775,7 @@ mod tests {
     /// rather than depending on scheduler luck.
     #[tokio::test]
     async fn a_busy_handle_is_refused() {
-        let tool = SubagentTool::new(defs());
+        let tool = SubagentTool::new(defs(), false);
         let state = crate::serve::ServeState::for_test(false);
 
         let dispatch_provider = ScriptedProvider::new(vec![text_response("dispatch answer")]);
@@ -2109,14 +2834,17 @@ mod tests {
     async fn an_agent_definition_that_disappeared_is_reported() {
         let state = crate::serve::ServeState::for_test(false);
 
-        let dispatching_tool = SubagentTool::new(vec![crate::agents::AgentDef {
-            name: "impl".to_string(),
-            description: "Implements a task.".to_string(),
-            tools: None,
-            subagents: None,
-            prompt: "You are impl.".to_string(),
-            profile: None,
-        }]);
+        let dispatching_tool = SubagentTool::new(
+            vec![crate::agents::AgentDef {
+                name: "impl".to_string(),
+                description: "Implements a task.".to_string(),
+                tools: None,
+                subagents: None,
+                prompt: "You are impl.".to_string(),
+                profile: None,
+            }],
+            false,
+        );
         let dispatch_provider = ScriptedProvider::new(vec![text_response("dispatch answer")]);
         let dispatch_input = serde_json::json!({"agent": "impl", "prompt": "go"});
         let dispatched = crate::serve::scope_turn_context(
@@ -2135,7 +2863,7 @@ mod tests {
         // A `SubagentTool` whose agent list no longer has "impl" —
         // reloaded, per the module doc, from the current list, not from
         // anything stored.
-        let resuming_tool = SubagentTool::new(Vec::new());
+        let resuming_tool = SubagentTool::new(Vec::new(), false);
         let resume_provider = ScriptedProvider::new(Vec::new());
         let resume_input = serde_json::json!({"resume": handle, "prompt": "x"});
         let err = crate::serve::scope_turn_context(
@@ -2168,7 +2896,7 @@ mod tests {
             .expect("uniquely owned immediately after construction")
             .subagent_cache = Some(tiny_cache);
 
-        let tool = SubagentTool::new(defs());
+        let tool = SubagentTool::new(defs(), false);
         let big_answer = format!("the answer is {}", "x".repeat(10_000));
         let provider = ScriptedProvider::new(vec![text_response(&big_answer)]);
         let input = serde_json::json!({"agent": "reviewer", "prompt": "go"});
@@ -2205,7 +2933,7 @@ mod tests {
             .expect("uniquely owned immediately after construction")
             .subagent_cache = Some(tiny_cache);
 
-        let tool = SubagentTool::new(defs());
+        let tool = SubagentTool::new(defs(), false);
 
         // Small enough that the dispatch itself fits comfortably under
         // the 1,000-byte cap.
@@ -2261,7 +2989,7 @@ mod tests {
     /// `string_field`'s doc.
     #[tokio::test]
     async fn a_non_string_agent_is_a_type_error_not_treated_as_absent() {
-        let tool = SubagentTool::new(defs());
+        let tool = SubagentTool::new(defs(), false);
         let err = tool
             .execute(&serde_json::json!({"agent": 123, "prompt": "x"}))
             .await
@@ -2279,7 +3007,7 @@ mod tests {
     /// instead be reported as a type error before that check ever runs.
     #[tokio::test]
     async fn a_wrong_typed_agent_cannot_smuggle_a_resume_past_the_exclusivity_check() {
-        let tool = SubagentTool::new(defs());
+        let tool = SubagentTool::new(defs(), false);
         let err = tool
             .execute(&serde_json::json!({"agent": 123, "resume": "h", "prompt": "x"}))
             .await
@@ -2304,7 +3032,7 @@ mod tests {
     /// refused forever.
     #[tokio::test]
     async fn a_cancelled_resume_releases_the_busy_guard() {
-        let tool = SubagentTool::new(defs());
+        let tool = SubagentTool::new(defs(), false);
         let state = crate::serve::ServeState::for_test(false);
 
         let dispatch_provider = ScriptedProvider::new(vec![text_response("dispatch answer")]);
@@ -2357,14 +3085,17 @@ mod tests {
     /// separate record-only double whose log must stay empty.
     #[tokio::test]
     async fn a_definition_with_a_profile_runs_on_that_profiles_provider() {
-        let tool = SubagentTool::new(vec![crate::agents::AgentDef {
-            name: "impl".to_string(),
-            description: "Implements a task.".to_string(),
-            tools: Some(vec![]),
-            subagents: None,
-            prompt: "You are impl.".to_string(),
-            profile: Some("dev".to_string()),
-        }]);
+        let tool = SubagentTool::new(
+            vec![crate::agents::AgentDef {
+                name: "impl".to_string(),
+                description: "Implements a task.".to_string(),
+                tools: Some(vec![]),
+                subagents: None,
+                prompt: "You are impl.".to_string(),
+                profile: Some("dev".to_string()),
+            }],
+            false,
+        );
         let state = crate::serve::ServeState::for_test_scripted(
             false,
             vec![text_response("profile answer")],
@@ -2395,7 +3126,7 @@ mod tests {
     /// provider IS the one that must receive the call.
     #[tokio::test]
     async fn a_definition_without_a_profile_runs_on_the_parents_provider() {
-        let tool = SubagentTool::new(resumable_defs()); // profile: None
+        let tool = SubagentTool::new(resumable_defs(), false); // profile: None
         let state = crate::serve::ServeState::for_test(false);
         let parent_provider = ScriptedProvider::new(vec![text_response("parent answer")]);
         let out = crate::serve::scope_turn_context(
@@ -2445,7 +3176,7 @@ mod tests {
                 state.registry.default_provider(),
                 Vec::new(),
             ),
-            SubagentTool::new(vec![base.clone()])
+            SubagentTool::new(vec![base.clone()], false)
                 .execute(&serde_json::json!({"agent": "impl", "prompt": "first task"})),
         )
         .await
@@ -2462,7 +3193,7 @@ mod tests {
                 state.registry.default_provider(),
                 Vec::new(),
             ),
-            SubagentTool::new(vec![resumed_def])
+            SubagentTool::new(vec![resumed_def], false)
                 .execute(&serde_json::json!({"resume": handle, "prompt": "second instruction"})),
         )
         .await
@@ -2519,14 +3250,17 @@ mod tests {
 
         // Unrestricted, so `hang` is actually offered — `defs()`' reviewer
         // would refuse it as not in its `tools:` list and never hang at all.
-        let tool = SubagentTool::new(vec![crate::agents::AgentDef {
-            name: "worker".to_string(),
-            description: "Works.".to_string(),
-            tools: None,
-            subagents: None,
-            prompt: "You are a worker.".to_string(),
-            profile: None,
-        }]);
+        let tool = SubagentTool::new(
+            vec![crate::agents::AgentDef {
+                name: "worker".to_string(),
+                description: "Works.".to_string(),
+                tools: None,
+                subagents: None,
+                prompt: "You are a worker.".to_string(),
+                profile: None,
+            }],
+            false,
+        );
         let provider = ScriptedProvider::new(vec![crate::provider::ChatResponse {
             prompt_usage: None,
             text: None,
@@ -2634,7 +3368,7 @@ mod tests {
     #[tokio::test]
     async fn a_providers_error_reaches_the_parent_as_a_tool_error_and_stays_resumable() {
         let state = crate::serve::ServeState::for_test(false);
-        let tool = SubagentTool::new(defs());
+        let tool = SubagentTool::new(defs(), false);
         let provider = std::sync::Arc::new(FailingProvider {
             message: "insufficient credits",
         });
@@ -2688,5 +3422,731 @@ mod tests {
             "the resumed call must still see the original dispatch prompt, \
              unlost by the failed first attempt: {texts:?}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // `background: true`
+    // -----------------------------------------------------------------
+
+    /// A provider that announces each `chat()` call on `entered` and then
+    /// waits on `gate`, so a test can hold a background child mid-turn
+    /// and know it got there. `Notify::notify_one` keeps a permit when
+    /// nobody is waiting yet, so neither side can miss the other.
+    struct GatedProvider {
+        inner: std::sync::Arc<ScriptedProvider>,
+        entered: tokio::sync::Notify,
+        gate: tokio::sync::Notify,
+    }
+
+    impl GatedProvider {
+        fn new(script: Vec<crate::provider::ChatResponse>) -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                inner: ScriptedProvider::new(script),
+                entered: tokio::sync::Notify::new(),
+                gate: tokio::sync::Notify::new(),
+            })
+        }
+
+        async fn wait_entered(&self) {
+            tokio::time::timeout(std::time::Duration::from_secs(10), self.entered.notified())
+                .await
+                .expect("the background child never reached its provider");
+        }
+    }
+
+    #[async_trait]
+    impl crate::provider::Provider for GatedProvider {
+        fn name(&self) -> &str {
+            "gated"
+        }
+
+        async fn chat(
+            &self,
+            system: Option<&str>,
+            messages: &[ChatMessage],
+            tools: Option<&[ToolSpec]>,
+        ) -> anyhow::Result<crate::provider::ChatResponse> {
+            self.entered.notify_one();
+            self.gate.notified().await;
+            self.inner.chat(system, messages, tools).await
+        }
+    }
+
+    /// One provider for a whole parent turn and the child it starts,
+    /// split by system prompt: a call whose system prompt is the child's
+    /// definition body goes to `child`, anything else to `parent`. Without
+    /// it the two would race for one script.
+    struct ByPromptProvider {
+        child_prompt: String,
+        child: std::sync::Arc<dyn crate::provider::Provider>,
+        parent: std::sync::Arc<dyn crate::provider::Provider>,
+    }
+
+    #[async_trait]
+    impl crate::provider::Provider for ByPromptProvider {
+        fn name(&self) -> &str {
+            "by-prompt"
+        }
+
+        async fn chat(
+            &self,
+            system: Option<&str>,
+            messages: &[ChatMessage],
+            tools: Option<&[ToolSpec]>,
+        ) -> anyhow::Result<crate::provider::ChatResponse> {
+            if system == Some(self.child_prompt.as_str()) {
+                self.child.chat(system, messages, tools).await
+            } else {
+                self.parent.chat(system, messages, tools).await
+            }
+        }
+    }
+
+    /// A tool of kind `Other`, which `Acp(Default)` sends to `approve`.
+    struct OtherTool(ToolSpec);
+
+    #[async_trait]
+    impl Tool for OtherTool {
+        fn spec(&self) -> &ToolSpec {
+            &self.0
+        }
+
+        fn kind(&self) -> ToolKind {
+            ToolKind::Other
+        }
+
+        async fn execute(&self, _input: &serde_json::Value) -> anyhow::Result<String> {
+            Ok("ran".to_string())
+        }
+    }
+
+    fn worker_defs() -> Vec<crate::agents::AgentDef> {
+        vec![crate::agents::AgentDef {
+            name: "worker".to_string(),
+            description: "Works.".to_string(),
+            tools: None,
+            subagents: None,
+            prompt: "You are a worker.".to_string(),
+            profile: None,
+        }]
+    }
+
+    /// [`turn_context_with_host`] with the session and depth supplied:
+    /// background runs only on a main turn (`session_id` set, depth 0).
+    fn background_context(
+        state: std::sync::Arc<crate::serve::ServeState>,
+        provider: std::sync::Arc<dyn crate::provider::Provider>,
+        visible_specs: Vec<ToolSpec>,
+        progress: std::sync::Arc<dyn crate::serve::TurnHost>,
+        session_id: Option<&str>,
+        subagent_depth: u32,
+    ) -> std::sync::Arc<crate::serve::TurnContext> {
+        std::sync::Arc::new(crate::serve::TurnContext {
+            state,
+            provider,
+            progress,
+            visible_specs: visible_specs.into(),
+            timer_origin: None,
+            session_id: session_id.map(str::to_string),
+            subagent_depth,
+            admin_room_profile: None,
+        })
+    }
+
+    fn bg_input(agent: &str, prompt: &str) -> serde_json::Value {
+        json!({"agent": agent, "prompt": prompt, "background": true})
+    }
+
+    /// The handle out of a "Started background task …" result.
+    fn started_handle(started: &str) -> String {
+        started
+            .split("(handle ")
+            .nth(1)
+            .and_then(|rest| rest.split(')').next())
+            .unwrap_or_else(|| panic!("no handle in: {started}"))
+            .to_string()
+    }
+
+    /// The session's next completion, waiting for it to arrive.
+    async fn next_completion(
+        state: &crate::serve::ServeState,
+        session: &str,
+    ) -> crate::background::Completion {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(c) = state.background.drain(session).pop() {
+                return c;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no background completion arrived for {session}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn background_dispatch_returns_at_once_and_completes_later() {
+        let state = crate::serve::ServeState::for_test(false);
+        let provider = GatedProvider::new(vec![text_response("child answer")]);
+        let tool = std::sync::Arc::new(SubagentTool::new(defs(), true));
+
+        let started = crate::serve::scope_turn_context(
+            background_context(
+                std::sync::Arc::clone(&state),
+                std::sync::Arc::clone(&provider) as std::sync::Arc<dyn crate::provider::Provider>,
+                Vec::new(),
+                std::sync::Arc::new(crate::serve::NullProgress),
+                Some("s-bg"),
+                0,
+            ),
+            Tool::execute(&tool, &bg_input("reviewer", "go")),
+        )
+        .await
+        .unwrap();
+        assert!(
+            started.starts_with("Started background task bg-"),
+            "{started}"
+        );
+        assert!(started.contains("subagent \"reviewer\""), "{started}");
+        assert!(
+            started
+                .ends_with("Its result will be delivered to this conversation when it finishes."),
+            "{started}"
+        );
+        let handle = started_handle(&started);
+
+        provider.wait_entered().await;
+        assert!(state.background.drain("s-bg").is_empty());
+        assert_eq!(state.background.pending("s-bg").len(), 1);
+
+        provider.gate.notify_one();
+        let done = next_completion(&state, "s-bg").await;
+        assert_eq!(
+            done.kind,
+            crate::background::TaskKind::Subagent {
+                agent: "reviewer".to_string(),
+                handle: handle.clone(),
+            }
+        );
+        match done.outcome {
+            crate::background::Outcome::Finished { text, refused } => {
+                assert!(text.contains("child answer"), "{text}");
+                assert!(refused.is_empty());
+            }
+            other => panic!("expected Finished, got {other:?}"),
+        }
+        assert!(
+            state
+                .subagent_cache
+                .as_ref()
+                .unwrap()
+                .get(&handle)
+                .is_some(),
+            "the background child's history is stored under its handle"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_completion_carries_refused_calls() {
+        let state = crate::serve::ServeState::for_test(false);
+        let other = spec_named("dangerous");
+        state
+            .tools
+            .register_tool(Box::new(OtherTool(other.clone())))
+            .await;
+        let provider = ScriptedProvider::new(vec![
+            crate::provider::ChatResponse {
+                prompt_usage: None,
+                text: None,
+                tool_calls: vec![crate::provider::ToolCall {
+                    id: "call-d".to_string(),
+                    name: "dangerous".to_string(),
+                    input: json!({"x": 1}),
+                }],
+                stop_reason: None,
+            },
+            text_response("could not do it"),
+        ]);
+        let parent = std::sync::Arc::new(StandingParent::new(None));
+        let tool = std::sync::Arc::new(SubagentTool::new(worker_defs(), true));
+
+        crate::serve::scope_turn_context(
+            background_context(
+                std::sync::Arc::clone(&state),
+                provider as std::sync::Arc<dyn crate::provider::Provider>,
+                vec![other],
+                std::sync::Arc::clone(&parent) as std::sync::Arc<dyn crate::serve::TurnHost>,
+                Some("s-bg-refused"),
+                0,
+            ),
+            Tool::execute(&tool, &bg_input("worker", "go")),
+        )
+        .await
+        .unwrap();
+
+        let done = next_completion(&state, "s-bg-refused").await;
+        match done.outcome {
+            crate::background::Outcome::Finished { refused, .. } => assert_eq!(
+                refused,
+                vec![crate::background::RefusedCall {
+                    name: "dangerous".to_string(),
+                    input: json!({"x": 1}),
+                }]
+            ),
+            other => panic!("expected Finished, got {other:?}"),
+        }
+        assert!(!parent.asked.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    async fn refused_background(session_id: Option<&str>, depth: u32) -> String {
+        let state = crate::serve::ServeState::for_test(false);
+        let provider = ScriptedProvider::new(vec![text_response("never")]);
+        let tool = std::sync::Arc::new(SubagentTool::new(defs(), true));
+        let err = crate::serve::scope_turn_context(
+            background_context(
+                std::sync::Arc::clone(&state),
+                std::sync::Arc::clone(&provider) as std::sync::Arc<dyn crate::provider::Provider>,
+                Vec::new(),
+                std::sync::Arc::new(crate::serve::NullProgress),
+                session_id,
+                depth,
+            ),
+            Tool::execute(&tool, &bg_input("reviewer", "go")),
+        )
+        .await
+        .expect_err("background must be refused here")
+        .to_string();
+        assert_eq!(provider.call_count(), 0, "no child may start");
+        err
+    }
+
+    #[tokio::test]
+    async fn background_is_refused_without_a_session() {
+        let err = refused_background(None, 0).await;
+        assert!(err.contains("main conversation"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn background_is_refused_at_depth_one() {
+        let err = refused_background(Some("s-bg-depth"), 1).await;
+        assert!(err.contains("main conversation"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn background_is_refused_past_the_cap() {
+        let state = crate::serve::ServeState::for_test(false);
+        for i in 0..4 {
+            state
+                .background
+                .register(
+                    "s-bg-cap",
+                    crate::background::TaskKind::Subagent {
+                        agent: "reviewer".to_string(),
+                        handle: format!("h-{i}"),
+                    },
+                    "held".to_string(),
+                )
+                .unwrap();
+        }
+        let provider = ScriptedProvider::new(vec![text_response("never")]);
+        let tool = std::sync::Arc::new(SubagentTool::new(defs(), true));
+        let err = crate::serve::scope_turn_context(
+            background_context(
+                std::sync::Arc::clone(&state),
+                std::sync::Arc::clone(&provider) as std::sync::Arc<dyn crate::provider::Provider>,
+                Vec::new(),
+                std::sync::Arc::new(crate::serve::NullProgress),
+                Some("s-bg-cap"),
+                0,
+            ),
+            Tool::execute(&tool, &bg_input("reviewer", "go")),
+        )
+        .await
+        .expect_err("a fifth task is over the cap")
+        .to_string();
+        assert!(err.contains("background_task"), "{err}");
+        assert_eq!(provider.call_count(), 0);
+        assert_eq!(state.background.pending("s-bg-cap").len(), 4);
+    }
+
+    #[tokio::test]
+    async fn resuming_a_handle_running_in_background_is_refused() {
+        let state = crate::serve::ServeState::for_test(false);
+        let provider = GatedProvider::new(vec![text_response("child answer")]);
+        let tool = std::sync::Arc::new(SubagentTool::new(defs(), true));
+        let started = crate::serve::scope_turn_context(
+            background_context(
+                std::sync::Arc::clone(&state),
+                std::sync::Arc::clone(&provider) as std::sync::Arc<dyn crate::provider::Provider>,
+                Vec::new(),
+                std::sync::Arc::new(crate::serve::NullProgress),
+                Some("s-bg-busy"),
+                0,
+            ),
+            Tool::execute(&tool, &bg_input("reviewer", "go")),
+        )
+        .await
+        .unwrap();
+        let handle = started_handle(&started);
+        provider.wait_entered().await;
+
+        let resume = json!({"resume": handle, "prompt": "more"});
+        let resume_provider = ScriptedProvider::new(vec![text_response("resumed")]);
+        let err = crate::serve::scope_turn_context(
+            turn_context(
+                std::sync::Arc::clone(&state),
+                std::sync::Arc::clone(&resume_provider)
+                    as std::sync::Arc<dyn crate::provider::Provider>,
+                Vec::new(),
+            ),
+            Tool::execute(&tool, &resume),
+        )
+        .await
+        .expect_err("the handle is still running in the background")
+        .to_string();
+        assert!(err.contains("already in use"), "{err}");
+
+        // Once the child finishes the handle is free again.
+        provider.gate.notify_one();
+        next_completion(&state, "s-bg-busy").await;
+        let resumed = crate::serve::scope_turn_context(
+            turn_context(
+                std::sync::Arc::clone(&state),
+                resume_provider as std::sync::Arc<dyn crate::provider::Provider>,
+                Vec::new(),
+            ),
+            Tool::execute(&tool, &resume),
+        )
+        .await
+        .unwrap();
+        assert!(resumed.contains("resumed"), "{resumed}");
+    }
+
+    #[tokio::test]
+    async fn a_background_timeout_completes_as_failed_with_the_handle() {
+        let mut state = crate::serve::ServeState::for_test(false);
+        std::sync::Arc::get_mut(&mut state)
+            .expect("uniquely owned immediately after construction")
+            .config
+            .tools
+            .subagent
+            .turn_timeout_secs = 1;
+        // Never let through: the child's turn outlives its deadline.
+        let provider = GatedProvider::new(vec![text_response("never")]);
+        let tool = std::sync::Arc::new(SubagentTool::new(defs(), true));
+        let started = crate::serve::scope_turn_context(
+            background_context(
+                std::sync::Arc::clone(&state),
+                provider as std::sync::Arc<dyn crate::provider::Provider>,
+                Vec::new(),
+                std::sync::Arc::new(crate::serve::NullProgress),
+                Some("s-bg-timeout"),
+                0,
+            ),
+            Tool::execute(&tool, &bg_input("reviewer", "go")),
+        )
+        .await
+        .unwrap();
+        let handle = started_handle(&started);
+
+        let done = next_completion(&state, "s-bg-timeout").await;
+        match done.outcome {
+            crate::background::Outcome::Failed { message } => {
+                assert!(message.contains("timed out"), "{message}");
+                assert!(message.contains(&handle), "{message}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    fn has_background(spec: &ToolSpec) -> bool {
+        spec.input_schema["properties"].get("background").is_some()
+    }
+
+    #[test]
+    fn the_nested_spec_never_offers_background() {
+        let main = SubagentTool::new(defs(), true);
+        assert!(has_background(main.spec()));
+        assert!(has_background(&main.live_spec()));
+        let off = SubagentTool::new(defs(), false);
+        assert!(!has_background(off.spec()));
+        assert!(!has_background(&off.live_spec()));
+
+        let parent_visible = vec![main.spec().clone()];
+        for subagents in [None, Some(vec!["reviewer".to_string()])] {
+            let def = crate::agents::AgentDef {
+                name: "lead".to_string(),
+                description: "Leads.".to_string(),
+                tools: None,
+                subagents: subagents.clone(),
+                prompt: "You lead.".to_string(),
+                profile: None,
+            };
+            let specs = subagent_tool_specs(&def, &parent_visible, &defs(), 0, 3);
+            let nested = specs
+                .iter()
+                .find(|s| s.name.as_ref() == SUBAGENT_TOOL_NAME)
+                .unwrap_or_else(|| panic!("nested subagent offered ({subagents:?})"));
+            assert!(
+                !has_background(nested),
+                "a nested turn is never offered background ({subagents:?})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn background_survives_the_parent_turn_ending() {
+        let mut state = crate::serve::ServeState::for_test(false);
+        let parent = ScriptedProvider::new(vec![
+            crate::provider::ChatResponse {
+                prompt_usage: None,
+                text: None,
+                tool_calls: vec![crate::provider::ToolCall {
+                    id: "call-bg".to_string(),
+                    name: SUBAGENT_TOOL_NAME.to_string(),
+                    input: bg_input("worker", "go"),
+                }],
+                stop_reason: None,
+            },
+            text_response("parent done"),
+        ]);
+        let child = GatedProvider::new(vec![text_response("child done")]);
+        let provider = std::sync::Arc::new(ByPromptProvider {
+            child_prompt: "You are a worker.".to_string(),
+            child: std::sync::Arc::clone(&child) as std::sync::Arc<dyn crate::provider::Provider>,
+            parent: std::sync::Arc::clone(&parent) as std::sync::Arc<dyn crate::provider::Provider>,
+        });
+        std::sync::Arc::get_mut(&mut state)
+            .expect("uniquely owned immediately after construction")
+            .registry = std::sync::Arc::new(crate::provider::registry::ProviderRegistry::for_test(
+            &["anthropic", "stub"],
+            provider,
+        ));
+        state
+            .tools
+            .register_tool(Box::new(std::sync::Arc::new(SubagentTool::new(
+                worker_defs(),
+                true,
+            ))))
+            .await;
+
+        let outcome = crate::serve::run_llm_turn(
+            std::sync::Arc::clone(&state),
+            "s-bg-parent".to_string(),
+            ChatMessage::user("delegate it"),
+            std::sync::Arc::new(crate::serve::NullProgress),
+            None,
+        )
+        .await;
+        assert_eq!(outcome.text.as_deref(), Some("parent done"));
+
+        child.wait_entered().await;
+        assert_eq!(state.background.pending("s-bg-parent").len(), 1);
+        child.gate.notify_one();
+        let done = next_completion(&state, "s-bg-parent").await;
+        match done.outcome {
+            crate::background::Outcome::Finished { text, .. } => {
+                assert!(text.contains("child done"), "{text}")
+            }
+            other => panic!("expected Finished, got {other:?}"),
+        }
+    }
+
+    /// The request that starts a background child must be able to end
+    /// before the child does. An HTTP turn's SSE stream closes only once
+    /// every `Sender` is dropped, so a child that kept the parent's
+    /// `SseProgress` would hold `/chat`'s response open until it finished.
+    #[tokio::test]
+    async fn a_background_child_does_not_hold_the_parents_stream_open() {
+        let state = crate::serve::ServeState::for_test(false);
+        let provider = GatedProvider::new(vec![text_response("child answer")]);
+        let tool = std::sync::Arc::new(SubagentTool::new(defs(), true));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let parent: std::sync::Arc<dyn crate::serve::TurnHost> =
+            std::sync::Arc::new(crate::serve::SseProgress::new(tx, json!(1)));
+
+        crate::serve::scope_turn_context(
+            background_context(
+                std::sync::Arc::clone(&state),
+                std::sync::Arc::clone(&provider) as std::sync::Arc<dyn crate::provider::Provider>,
+                Vec::new(),
+                std::sync::Arc::clone(&parent),
+                Some("s-bg-sse"),
+                0,
+            ),
+            Tool::execute(&tool, &bg_input("reviewer", "go")),
+        )
+        .await
+        .unwrap();
+        provider.wait_entered().await;
+        // The parent turn ends: its context went with the scope above,
+        // and this is its host.
+        drop(parent);
+
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the parent's stream must close while the child still runs");
+        assert!(closed.is_none(), "nothing is sent to an ended request");
+        assert_eq!(state.background.pending("s-bg-sse").len(), 1);
+
+        provider.gate.notify_one();
+        let done = next_completion(&state, "s-bg-sse").await;
+        assert!(matches!(
+            done.outcome,
+            crate::background::Outcome::Finished { .. }
+        ));
+    }
+
+    /// What a background task keeps by default is the permission row and
+    /// nothing else.
+    #[test]
+    fn the_default_detached_host_keeps_only_the_origin() {
+        let parent = StandingParent::new(Some(crate::tools::policy::Approval::AllowAlways));
+        let detached = crate::serve::TurnHost::detached(&parent);
+        assert_eq!(
+            detached.origin(),
+            crate::tools::policy::Origin::Acp(crate::tools::policy::SessionMode::Default)
+        );
+        assert!(detached.acp_client().is_none());
+    }
+
+    /// A provider whose `chat` panics, standing in for a panicking tool
+    /// or provider inside a background child's turn.
+    struct PanickingProvider;
+
+    #[async_trait]
+    impl crate::provider::Provider for PanickingProvider {
+        fn name(&self) -> &str {
+            "panicking"
+        }
+
+        async fn chat(
+            &self,
+            _system: Option<&str>,
+            _messages: &[ChatMessage],
+            _tools: Option<&[ToolSpec]>,
+        ) -> anyhow::Result<crate::provider::ChatResponse> {
+            panic!("boom");
+        }
+    }
+
+    /// A panic inside the child still completes its task: as `Failed`,
+    /// with the panic's message, the handle released and the session's
+    /// registry able to drain to empty. Without it the task would hold a
+    /// cap slot and keep a suspended autonomous session waiting forever.
+    #[tokio::test]
+    async fn a_panicking_background_child_completes_as_failed() {
+        let state = crate::serve::ServeState::for_test(false);
+        let tool = std::sync::Arc::new(SubagentTool::new(defs(), true));
+        let started = crate::serve::scope_turn_context(
+            background_context(
+                std::sync::Arc::clone(&state),
+                std::sync::Arc::new(PanickingProvider),
+                Vec::new(),
+                std::sync::Arc::new(crate::serve::NullProgress),
+                Some("s-bg-panic"),
+                0,
+            ),
+            Tool::execute(&tool, &bg_input("reviewer", "go")),
+        )
+        .await
+        .unwrap();
+        let handle = started_handle(&started);
+
+        let done = next_completion(&state, "s-bg-panic").await;
+        match done.outcome {
+            crate::background::Outcome::Failed { message } => {
+                assert_eq!(message, "subagent panicked: boom")
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        state.background.commit_delivery("s-bg-panic");
+        assert!(!state.background.has_pending_or_inbox("s-bg-panic"));
+        assert!(
+            !tool.busy_handles.lock().unwrap().contains(&handle),
+            "the panicked child's handle is released"
+        );
+    }
+
+    /// Start a background dispatch of `reviewer` whose child never gets
+    /// past its first provider call, then cancel it. Returns its handle
+    /// and the rendered completion, as delivery renders it.
+    async fn cancelled_dispatch(
+        state: &std::sync::Arc<crate::serve::ServeState>,
+        session: &str,
+    ) -> (String, String) {
+        let provider = GatedProvider::new(vec![text_response("never")]);
+        let tool = std::sync::Arc::new(SubagentTool::new(defs(), true));
+        let started = crate::serve::scope_turn_context(
+            background_context(
+                std::sync::Arc::clone(state),
+                std::sync::Arc::clone(&provider) as std::sync::Arc<dyn crate::provider::Provider>,
+                Vec::new(),
+                std::sync::Arc::new(crate::serve::NullProgress),
+                Some(session),
+                0,
+            ),
+            Tool::execute(&tool, &bg_input("reviewer", "go")),
+        )
+        .await
+        .unwrap();
+        let handle = started_handle(&started);
+        provider.wait_entered().await;
+        let id = state.background.pending(session)[0].id.clone();
+        state.background.cancel(session, &id).unwrap();
+        let done = next_completion(state, session).await;
+        let resumable = crate::background::resumable(state.subagent_cache.as_deref(), &done);
+        (handle, crate::background::render(&done, resumable))
+    }
+
+    /// A fresh background dispatch stores its prompt before it runs, so a
+    /// child cancelled (or cut off by a restart) before it finished can
+    /// still be resumed, and its completion says so.
+    #[tokio::test]
+    async fn an_unfinished_background_dispatch_is_resumable_from_its_prompt() {
+        let state = crate::serve::ServeState::for_test(false);
+        let (handle, text) = cancelled_dispatch(&state, "s-bg-stub").await;
+        let stored = state
+            .subagent_cache
+            .as_ref()
+            .unwrap()
+            .get(&handle)
+            .expect("the stub is stored under the handle");
+        assert_eq!(stored.agent, "reviewer");
+        assert_eq!(stored.history.len(), 1);
+        assert_eq!(stored.history[0].role, crate::provider::Role::User);
+        assert!(
+            text.contains(&format!("pass handle {handle} as `resume`")),
+            "{text}"
+        );
+
+        let interrupted = crate::background::Completion {
+            task_id: "bg-1".to_string(),
+            kind: crate::background::TaskKind::Subagent {
+                agent: "reviewer".to_string(),
+                handle: handle.clone(),
+            },
+            outcome: crate::background::Outcome::Interrupted,
+            finished_at: chrono::Utc::now(),
+        };
+        let resumable = crate::background::resumable(state.subagent_cache.as_deref(), &interrupted);
+        assert!(
+            crate::background::render(&interrupted, resumable)
+                .contains(&format!("pass handle {handle} as `resume`"))
+        );
+    }
+
+    /// With no resume cache nothing can be resumed, so no completion
+    /// offers it.
+    #[tokio::test]
+    async fn without_a_cache_no_completion_offers_resume() {
+        let mut state = crate::serve::ServeState::for_test(false);
+        std::sync::Arc::get_mut(&mut state)
+            .expect("uniquely owned immediately after construction")
+            .subagent_cache = None;
+        let (_, text) = cancelled_dispatch(&state, "s-bg-nocache").await;
+        assert!(text.contains("was cancelled"), "{text}");
+        assert!(!text.contains("`resume`"), "{text}");
     }
 }
