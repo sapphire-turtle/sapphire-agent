@@ -24,12 +24,20 @@ const NOTE_DEADLINE: &str = "No answer by the deadline; the session will decide 
 const NOTE_WITHDRAWN: &str = "This question was withdrawn.";
 const NOTE_IMAGE: &str = "(an image was attached but not forwarded)";
 
+/// The longest `consult_timeout_hours` honoured (a year); `lib.rs` clamps
+/// the configured value to `1..=MAX_TIMEOUT_HOURS`, and a deadline that
+/// would overflow falls back to it.
+pub(crate) const MAX_TIMEOUT_HOURS: u64 = 8760;
+
 /// The consult room and the questions waiting in it.
 pub(crate) struct Consult {
     channels: Arc<Channels>,
     background: Arc<BackgroundTasks>,
     room: String,
     timeout: Duration,
+    /// Held across check, post and register in [`Consult::ask`], so asks
+    /// running in one round can't all pass the cap and then all post.
+    ask_lock: tokio::sync::Mutex<()>,
 }
 
 impl Consult {
@@ -44,6 +52,7 @@ impl Consult {
             background,
             room,
             timeout,
+            ask_lock: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -60,6 +69,7 @@ impl Consult {
         asked_by: Option<&str>,
         question: &str,
     ) -> Result<TaskId> {
+        let _serial = self.ask_lock.lock().await;
         if !self.channels.serves(&self.room).await {
             bail!("consult room {} is not served on this host", self.room);
         }
@@ -76,9 +86,11 @@ impl Consult {
             );
         }
 
-        let deadline = Utc::now()
-            + chrono::Duration::from_std(self.timeout)
-                .unwrap_or_else(|_| chrono::Duration::days(1));
+        let now = Utc::now();
+        let deadline = chrono::Duration::from_std(self.timeout)
+            .ok()
+            .and_then(|timeout| now.checked_add_signed(timeout))
+            .unwrap_or_else(|| now + chrono::Duration::hours(MAX_TIMEOUT_HOURS as i64));
         let who = asked_by
             .map(|h| format!(" question from subagent {h}"))
             .unwrap_or_default();
@@ -192,6 +204,33 @@ impl Consult {
     }
 }
 
+/// With no [`Consult`] on this host (no `consult_room`, or no channel to
+/// serve it), questions that survived a restart would wait forever and keep
+/// their sessions suspended. Expire each one at its deadline instead; there
+/// is no room to post the deadline note in.
+pub(crate) fn arm_deadlines_without_room(background: Arc<BackgroundTasks>) {
+    let pending = background.pending_questions();
+    if pending.is_empty() {
+        return;
+    }
+    warn!(
+        "consult room unavailable; {} pending question(s) will expire without a note",
+        pending.len()
+    );
+    for (session, task) in pending {
+        let TaskKind::Question { deadline, .. } = &task.kind else {
+            continue;
+        };
+        let deadline = *deadline;
+        let background = Arc::clone(&background);
+        tokio::spawn(async move {
+            let wait = (deadline - Utc::now()).to_std().unwrap_or_default();
+            tokio::time::sleep(wait).await;
+            background.expire(&session, &task.id);
+        });
+    }
+}
+
 /// What a reply delivers: its text, plus a note when images came along.
 /// `None` for an empty message.
 fn answer_text(msg: &IncomingMessage) -> Option<String> {
@@ -241,6 +280,8 @@ pub(crate) mod test_support {
         }
 
         async fn send(&self, message: &OutgoingMessage) -> Result<Vec<String>> {
+            // Yield like a real network send, so concurrent callers interleave.
+            tokio::task::yield_now().await;
             self.posts.lock().unwrap().push(message.clone());
             let parts = if message.content.contains("<split>") {
                 2
@@ -542,6 +583,61 @@ mod tests {
         assert_eq!(inbox[0].outcome, Outcome::NoAnswer);
         assert_eq!(f.channel.posts().len(), 1);
         assert_eq!(f.channel.posts()[0].content, NOTE_DEADLINE);
+    }
+
+    #[tokio::test]
+    async fn without_a_room_past_deadlines_still_expire() {
+        let background = BackgroundTasks::in_memory(4);
+        background
+            .register_question(
+                "s",
+                TaskKind::Question {
+                    room: "gone".into(),
+                    message_ids: vec!["m1".into()],
+                    question: "why?".into(),
+                    asked_by: None,
+                    deadline: chrono::Utc::now() - chrono::Duration::hours(1),
+                },
+                "why?".into(),
+            )
+            .unwrap();
+        arm_deadlines_without_room(background.clone());
+        wait_for(|| background.has_inbox("s")).await;
+        let inbox = background.drain("s");
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].outcome, Outcome::NoAnswer);
+    }
+
+    #[tokio::test]
+    async fn a_huge_timeout_does_not_panic() {
+        let f = Fixture::with_timeout(Duration::from_secs(1_000_000_000_000 * 3600));
+        f.consult.ask("s", "t", None, "why?").await.unwrap();
+        let posts = f.channel.posts();
+        assert_eq!(posts.len(), 1);
+        assert!(posts[0].content.contains("Waiting until "));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_asks_respect_the_cap() {
+        let f = Fixture::new();
+        let asks = (0..4).map(|i| {
+            let consult = f.consult.clone();
+            async move { consult.ask("s", "t", None, &format!("q{i}")).await }
+        });
+        let results = futures_util::future::join_all(asks).await;
+        let errors: Vec<String> = results
+            .iter()
+            .filter_map(|r| r.as_ref().err().map(|e| e.to_string()))
+            .collect();
+        assert_eq!(
+            errors,
+            vec![
+                "You already have 3 questions waiting for an answer. Wait for one, or withdraw one with background_task."
+                    .to_string()
+            ]
+        );
+        assert_eq!(f.channel.posts().len(), 3);
+        assert_eq!(f.background.pending_questions().len(), 3);
     }
 
     #[tokio::test]

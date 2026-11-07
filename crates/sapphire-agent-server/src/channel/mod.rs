@@ -211,6 +211,16 @@ impl Channels {
         None
     }
 
+    /// Route `room_id` to the channel named `channel`, as if a message had
+    /// arrived there. For a room the seed from `Config` can't know, such as
+    /// a Discord consult room when `channel_ids` is empty (listen to all).
+    pub async fn seed_room(&self, room_id: &str, channel: &str) {
+        self.routing
+            .write()
+            .await
+            .insert(room_id.to_string(), channel.to_string());
+    }
+
     /// Whether a channel serves `room_id` (no single-channel fallback).
     pub async fn serves(&self, room_id: &str) -> bool {
         self.channel_for_room(room_id).await.is_some()
@@ -360,6 +370,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ids, vec!["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn a_seeded_room_is_served() {
+        let ch: Arc<dyn Channel> = Arc::new(FakeChannel);
+        let channels = Channels::new(vec![("fake".to_string(), ch)], HashMap::new());
+        assert!(!channels.serves("42").await);
+        channels.seed_room("42", "fake").await;
+        assert!(channels.serves("42").await);
+        assert_eq!(channels.supports_replies("42").await, Some(true));
     }
 
     #[test]

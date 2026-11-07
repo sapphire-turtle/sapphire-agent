@@ -176,8 +176,10 @@ impl BackgroundTasks {
     }
 
     /// Open the registry backed by `dir` (or in memory for `None`), loading
-    /// what a previous run left. Unreadable files count as absent. Tasks that
-    /// were pending become `Interrupted` completions and the file is rewritten.
+    /// what a previous run left. Unreadable files count as absent. Pending
+    /// questions stay pending (the caller re-arms their deadlines, with
+    /// `Consult::rearm` or `consult::arm_deadlines_without_room`); every other
+    /// pending task becomes an `Interrupted` completion. The file is rewritten.
     pub(crate) fn open(dir: Option<PathBuf>, max_per_session: usize) -> Arc<Self> {
         let mut sessions = HashMap::new();
         if let Some(d) = &dir {
@@ -880,6 +882,37 @@ mod tests {
             .unwrap_or_default();
         v.sort();
         v
+    }
+
+    /// A session file exactly as main (e7deabd, before questions existed)
+    /// writes it: no `closed_questions` field.
+    const PRE_QUESTIONS_FILE: &str = r#"{"pending":[{"id":"bg-1","kind":{"Subagent":{"agent":"reviewer","handle":"h1"}},"label":"reviewer: go","started_at":"2026-11-01T10:00:00Z"}],"inbox":[{"task_id":"bg-0","kind":{"Subagent":{"agent":"reviewer","handle":"h0"}},"outcome":{"Finished":{"text":"done","refused":[]}},"finished_at":"2026-11-01T09:00:00Z"}]}"#;
+
+    #[test]
+    fn a_file_from_before_questions_still_loads() {
+        let td = tempfile::tempdir().unwrap();
+        std::fs::write(td.path().join("s.json"), PRE_QUESTIONS_FILE).unwrap();
+        let t = BackgroundTasks::open(Some(td.path().to_path_buf()), 4);
+        assert!(t.pending("s").is_empty());
+        let inbox = t.drain("s");
+        assert_eq!(inbox.len(), 2, "{inbox:?}");
+        assert_eq!(inbox[0].task_id, "bg-0");
+        assert_eq!(
+            inbox[0].outcome,
+            Outcome::Finished {
+                text: "done".into(),
+                refused: Vec::new()
+            }
+        );
+        assert_eq!(inbox[1].task_id, "bg-1");
+        assert_eq!(inbox[1].outcome, Outcome::Interrupted);
+        assert_eq!(
+            inbox[1].kind,
+            TaskKind::Subagent {
+                agent: "reviewer".into(),
+                handle: "h1".into()
+            }
+        );
     }
 
     #[test]

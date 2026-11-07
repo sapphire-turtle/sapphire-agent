@@ -191,11 +191,6 @@ fn group_unknown_keys<'a>(
     by_file.into_iter().collect()
 }
 
-/// `verify`'s API key section: the keys of the workspace the agent serves
-/// and the room profile each runs under, so a key that would be refused
-/// shows up before a request is. Also the `[room_profile.<n>].devices`
-/// fallback for keys from before profiles, and any entry of it naming no
-/// key. Reads the key files without changing them.
 /// `verify`'s consult room warnings, one line each: a room no channel lists
 /// (`ask_human` would refuse), and a room set while autonomous sessions are
 /// off (nothing would ever ask).
@@ -211,7 +206,8 @@ fn consult_room_warnings(config: &config::Config) -> Vec<String> {
         || config
             .matrix
             .as_ref()
-            .is_some_and(|m| m.room_ids.iter().any(|r| r == room));
+            .is_some_and(|m| m.room_ids.iter().any(|r| r == room))
+        || discord_listens_to_room(config, room);
     if !listed {
         lines.push(format!(
             "  Consult room      : {room} is in neither discord.channel_ids nor \
@@ -227,6 +223,33 @@ fn consult_room_warnings(config: &config::Config) -> Vec<String> {
     lines
 }
 
+/// Whether Discord listens in `room` without listing it: an empty
+/// `channel_ids` means every channel, and a Discord channel ID is numeric.
+fn discord_listens_to_room(config: &config::Config, room: &str) -> bool {
+    config
+        .discord
+        .as_ref()
+        .is_some_and(|d| d.channel_ids.is_empty())
+        && room.parse::<u64>().is_ok()
+}
+
+/// `consult_timeout_hours` as a duration, clamped to
+/// `1..=consult::MAX_TIMEOUT_HOURS` hours.
+fn consult_timeout(hours: u64) -> std::time::Duration {
+    let clamped = hours.clamp(1, consult::MAX_TIMEOUT_HOURS);
+    if clamped != hours {
+        tracing::warn!(
+            "[autonomous] consult_timeout_hours = {hours} is out of range; using {clamped}"
+        );
+    }
+    std::time::Duration::from_secs(clamped * 3600)
+}
+
+/// `verify`'s API key section: the keys of the workspace the agent serves
+/// and the room profile each runs under, so a key that would be refused
+/// shows up before a request is. Also the `[room_profile.<n>].devices`
+/// fallback for keys from before profiles, and any entry of it naming no
+/// key. Reads the key files without changing them.
 fn verify_api_keys(auth: &device_auth::DeviceAuth, root: Option<&std::path::Path>) {
     use sapphire_framework::keys::{KeyStore, MIGRATED, store_dir};
 
@@ -1078,6 +1101,7 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
 
             // ── Channel + Agent (Matrix and/or Discord, if configured) ──────
             let mut channel_agent: Option<Arc<Agent>> = None;
+            let mut consult_built = false;
             if config.matrix.is_some() || config.discord.is_some() {
                 let mut channel_list: Vec<(String, Arc<dyn channel::Channel>)> = Vec::new();
                 if let Some(m) = &config.matrix {
@@ -1109,25 +1133,29 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
                     image_cache.clone(),
                 ));
                 // ── Consult room ────────────────────────────────────────────
+                // Built whenever a room is set, served or not, so the agent
+                // always keeps the room's messages out of chat; `ask` checks
+                // `serves` again at call time.
                 if let Some(room) = config.autonomous.consult_room.clone() {
-                    if channels.serves(&room).await {
-                        let consult = consult::Consult::new(
-                            Arc::clone(&channels),
-                            Arc::clone(&serve_state.background),
-                            room,
-                            std::time::Duration::from_secs(
-                                config.autonomous.consult_timeout_hours.saturating_mul(3600),
-                            ),
-                        );
-                        serve_state.set_consult(Arc::clone(&consult));
-                        agent.set_consult(Arc::clone(&consult));
-                        // Questions that outlived a restart get their timers back.
-                        consult.rearm();
-                    } else {
+                    if !channels.serves(&room).await && discord_listens_to_room(&config, &room) {
+                        channels.seed_room(&room, "discord").await;
+                    }
+                    if !channels.serves(&room).await {
                         tracing::warn!(
                             "consult room {room} is not served on this host; ask_human will refuse"
                         );
                     }
+                    let consult = consult::Consult::new(
+                        Arc::clone(&channels),
+                        Arc::clone(&serve_state.background),
+                        room,
+                        consult_timeout(config.autonomous.consult_timeout_hours),
+                    );
+                    serve_state.set_consult(Arc::clone(&consult));
+                    agent.set_consult(Arc::clone(&consult));
+                    // Questions that outlived a restart get their timers back.
+                    consult.rearm();
+                    consult_built = true;
                 }
                 // Wire the agent into the timer dispatcher so chat-origin
                 // timers are announced through `Agent::trigger`.
@@ -1187,12 +1215,15 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
                 }));
             }
 
-            if channel_agent.is_none()
-                && let Some(room) = &config.autonomous.consult_room
-            {
-                tracing::warn!(
-                    "consult room {room} is not served on this host; ask_human will refuse"
-                );
+            if !consult_built {
+                if let Some(room) = &config.autonomous.consult_room {
+                    tracing::warn!(
+                        "consult room {room} is not served on this host; ask_human will refuse"
+                    );
+                }
+                // No room to answer in: questions that outlived a restart
+                // still end at their deadlines rather than wedge a session.
+                consult::arm_deadlines_without_room(Arc::clone(&serve_state.background));
             }
 
             // ── Catch-up and heartbeat ──────────────────────────────────────
@@ -1918,6 +1949,36 @@ mod tests {
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].contains("not enabled"));
         assert!(consult_room_warnings(&consult_config("")).is_empty());
+    }
+
+    #[test]
+    fn verify_accepts_a_numeric_room_when_discord_listens_everywhere() {
+        let cfg = consult_config(
+            "[autonomous]\nenabled = true\nconsult_room = \"123\"\n\
+             [discord]\nbot_token = \"x\"\nchannel_ids = []\nallowed_users = []\n",
+        );
+        assert!(consult_room_warnings(&cfg).is_empty());
+        assert!(discord_listens_to_room(&cfg, "123"));
+        // A non-numeric room can't be a Discord channel.
+        let cfg = consult_config(
+            "[autonomous]\nenabled = true\nconsult_room = \"!r:x\"\n\
+             [discord]\nbot_token = \"x\"\nchannel_ids = []\nallowed_users = []\n",
+        );
+        assert_eq!(consult_room_warnings(&cfg).len(), 1);
+        assert!(!discord_listens_to_room(&cfg, "!r:x"));
+    }
+
+    #[test]
+    fn consult_timeout_is_clamped() {
+        assert_eq!(consult_timeout(0), std::time::Duration::from_secs(3600));
+        assert_eq!(
+            consult_timeout(24),
+            std::time::Duration::from_secs(24 * 3600)
+        );
+        assert_eq!(
+            consult_timeout(1_000_000_000_000),
+            std::time::Duration::from_secs(8760 * 3600)
+        );
     }
 
     fn acp_meta(namespace: &str) -> session::SessionMeta {
