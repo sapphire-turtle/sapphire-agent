@@ -2306,6 +2306,37 @@ pub(crate) struct LlmTurnOutcome {
     pub(crate) stop: TurnStop,
 }
 
+/// `run_llm_turn`'s tool filter: `base`, with the two per-turn exceptions
+/// it hides (the avatar tools, `ask_human`) decided by what the turn's host
+/// declared, and the skill tools by the namespace switch.
+fn turn_tool_predicate(
+    base: impl Fn(&str) -> bool,
+    has_avatar: bool,
+    has_consult: bool,
+    skills_enabled: bool,
+) -> impl Fn(&str) -> bool {
+    move |name: &str| {
+        if crate::tools::avatar_tools::is_avatar_tool(name) {
+            return has_avatar;
+        }
+        if name == crate::tools::ask_human::NAME {
+            return has_consult;
+        }
+        if !base(name) {
+            return false;
+        }
+        if !skills_enabled
+            && matches!(
+                name,
+                "skill" | "skill_install" | "skill_update" | "skill_uninstall"
+            )
+        {
+            return false;
+        }
+        true
+    }
+}
+
 /// Which tools a turn's model may see.
 ///
 /// The one function that decides this — `run_llm_turn` and its
@@ -3328,26 +3359,12 @@ pub(crate) async fn run_llm_turn(
     let has_consult = progress.consult_identity().is_some();
     let mut tool_specs = state
         .tools
-        .specs_filtered(move |name: &str| {
-            if crate::tools::avatar_tools::is_avatar_tool(name) {
-                return has_avatar;
-            }
-            if name == crate::tools::ask_human::NAME {
-                return has_consult;
-            }
-            if !base(name) {
-                return false;
-            }
-            if !skills_enabled
-                && matches!(
-                    name,
-                    "skill" | "skill_install" | "skill_update" | "skill_uninstall"
-                )
-            {
-                return false;
-            }
-            true
-        })
+        .specs_filtered(turn_tool_predicate(
+            base,
+            has_avatar,
+            has_consult,
+            skills_enabled,
+        ))
         .await;
     crate::tools::avatar_tools::specialize_specs(
         &mut tool_specs,
@@ -6976,24 +6993,18 @@ mod tests {
                 .tools
                 .register_tool(Box::new(crate::tools::ask_human::AskHumanTool::new()))
                 .await;
-            let seen = state.tools.specs_filtered(|_| true).await;
-            assert!(seen.iter().any(|t| t.name == "ask_human"));
-            let host = AutonomousHost {
+            let progress: Arc<dyn TurnHost> = Arc::new(AutonomousHost {
                 origin: crate::tools::policy::Origin::Trusted,
                 consult,
-            };
-            let progress: Arc<dyn TurnHost> = Arc::new(host);
-            let has_consult = progress.consult_identity().is_some();
-            // The same closure shape `run_llm_turn` builds.
-            let base = visible_tool_predicate(false, false, false, false, false);
+            });
             let specs = state
                 .tools
-                .specs_filtered(move |name: &str| {
-                    if name == crate::tools::ask_human::NAME {
-                        return has_consult;
-                    }
-                    base(name)
-                })
+                .specs_filtered(turn_tool_predicate(
+                    visible_tool_predicate(false, false, false, false, false),
+                    false,
+                    progress.consult_identity().is_some(),
+                    false,
+                ))
                 .await;
             specs.iter().any(|t| t.name == "ask_human")
         }

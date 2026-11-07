@@ -166,7 +166,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refuses_when_the_room_is_not_served() {
+    async fn no_room_configured_reads_as_not_autonomous() {
         let state = ServeState::for_test(false);
         let err = run(
             &state,
@@ -199,7 +199,6 @@ mod tests {
     async fn posts_and_answers_for_a_session() {
         let state = ServeState::for_test(false);
         let f = Fixture::new();
-        // Share the fixture's task registry with the state's.
         state.set_consult(f.consult.clone());
         let out = run(
             &state,
