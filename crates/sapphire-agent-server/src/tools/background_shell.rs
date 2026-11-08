@@ -1,4 +1,4 @@
-//! Background shell commands on the agent's own machine.
+//! Background shell commands, on the agent's own machine or the editor's.
 //!
 //! [`start_on_agent`] spawns the command in a process group of its own and
 //! hands a watcher task to the background layer. The watcher keeps the
@@ -10,7 +10,12 @@
 //! layer aborting it on `cancel` / `cancel_all` — its [`GroupGuard`] kills
 //! the whole process group on the way out, so nothing the command started
 //! outlives it.
-#![allow(dead_code)] // Tasks 3-5 wire this into the shell tool.
+//!
+//! [`start_on_editor`] runs the command in an ACP terminal instead, which
+//! counts toward the session's terminal cap. Its watcher waits for the
+//! editor to report the exit, and its [`EditorGuard`] kills and releases
+//! the terminal when the watcher ends any other way.
+#![allow(dead_code)] // Task 4 wires this into the shell tool.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -21,11 +26,14 @@ use anyhow::Context;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Child;
 use tokio::task::AbortHandle;
+use tracing::warn;
 
 use crate::background::{BackgroundTasks, Outcome, TaskId};
 use crate::tools::OUTPUT_CAP_BYTES;
-use crate::tools::acp_client::{AcpClient, TerminalHandle};
+use crate::tools::acp_client::{AcpClient, TerminalHandle, TerminalOutput};
 use crate::tools::builtin_tools::push_command_line;
+use crate::tools::client_exec::CLIENT_SHELL;
+use crate::tools::client_tools::cap_error;
 
 /// Put before the text once the head of the output had to be dropped.
 const DROPPED_MARKER: &str = "[… earlier output dropped]\n";
@@ -122,10 +130,9 @@ impl ShellRuns {
         let run = self.lock().get(id).cloned()?;
         Some(match run {
             LiveRun::Agent(buf) => Ok(buf.lock().unwrap_or_else(|e| e.into_inner()).text()),
-            LiveRun::Editor { client, terminal } => client
-                .terminal_output(&terminal)
-                .await
-                .map(|out| out.output),
+            LiveRun::Editor { client, terminal } => {
+                client.terminal_output(&terminal).await.map(editor_text)
+            }
         })
     }
 }
@@ -264,8 +271,10 @@ pub(crate) fn start_on_agent(
         // Whatever the command left running goes too, which also closes
         // the pipes it held so the readers end.
         guard.kill_group();
+        // One deadline for all of them, not a grace period each.
+        let deadline = tokio::time::Instant::now() + READER_GRACE;
         for r in readers {
-            let _ = tokio::time::timeout(READER_GRACE, r).await;
+            let _ = tokio::time::timeout_at(deadline, r).await;
         }
         let output = buf.lock().unwrap_or_else(|e| e.into_inner()).text();
         let exit_code = if timed_out {
@@ -285,14 +294,208 @@ pub(crate) fn start_on_agent(
             },
         );
     };
+    spawn_and_attach(watcher, &background, &session, &id);
+    Ok(())
+}
+
+/// Spawn `watcher` and hand it to the layer as task `id`'s.
+fn spawn_and_attach(
+    watcher: impl std::future::Future<Output = ()> + Send + 'static,
+    background: &BackgroundTasks,
+    session: &str,
+    id: &TaskId,
+) {
     let task = tokio::spawn(watcher);
-    background.attach(&session, &id, task.abort_handle());
+    background.attach(session, id, task.abort_handle());
     // A cancel that landed between `register` and `attach` found no handle
     // to abort; abort it now. If the task completed instead, this is a
     // no-op on a finished task.
-    if !background.pending(&session).iter().any(|t| t.id == id) {
+    if !background.pending(session).iter().any(|t| &t.id == id) {
         task.abort();
     }
+}
+
+/// The editor's output as text, marked like [`TailBuffer::text`] when the
+/// editor cut its head to stay under the byte limit.
+fn editor_text(out: TerminalOutput) -> String {
+    if out.truncated {
+        format!("{DROPPED_MARKER}{}", out.output)
+    } else {
+        out.output
+    }
+}
+
+/// Release `terminal` and stop counting it against the session's cap.
+/// The untrack happens even when the release fails: a terminal the editor
+/// no longer answers for must not hold a slot forever, and the editor
+/// releases its terminals with the session anyway.
+async fn release_and_untrack(client: &dyn AcpClient, terminal: &TerminalHandle) {
+    if let Err(e) = client.release_terminal(terminal).await {
+        warn!("background command: releasing terminal {terminal} failed: {e:#}");
+    }
+    client.untrack_terminal(terminal).await;
+}
+
+/// Kill the command in `terminal`; a failure is only logged.
+async fn kill(client: &dyn AcpClient, terminal: &TerminalHandle) {
+    if let Err(e) = client.kill_terminal(terminal).await {
+        warn!("background command: killing terminal {terminal} failed: {e:#}");
+    }
+}
+
+/// Stops the editor's terminal when the watcher ends without doing so
+/// itself — the layer aborting it on `cancel` / `cancel_all`, the runtime
+/// dropping it, or the editor failing to answer the wait.
+///
+/// `Drop` cannot await, so while armed it spawns the kill, release and
+/// untrack. The watcher's own exit and time-out paths make those calls
+/// inline and disarm it. Either way it takes the run out of [`ShellRuns`].
+struct EditorGuard {
+    client: Arc<dyn AcpClient>,
+    terminal: TerminalHandle,
+    armed: bool,
+    runs: Arc<ShellRuns>,
+    id: TaskId,
+}
+
+impl EditorGuard {
+    /// The watcher stops the terminal itself from here on; the run is no
+    /// longer peekable, since the handle is about to be released.
+    fn disarm(&mut self) {
+        self.armed = false;
+        self.runs.remove(&self.id);
+    }
+}
+
+impl Drop for EditorGuard {
+    fn drop(&mut self) {
+        self.runs.remove(&self.id);
+        if !self.armed {
+            return;
+        }
+        let client = Arc::clone(&self.client);
+        let terminal = self.terminal.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => {
+                rt.spawn(async move {
+                    kill(client.as_ref(), &terminal).await;
+                    release_and_untrack(client.as_ref(), &terminal).await;
+                });
+            }
+            Err(_) => warn!(
+                "background command: no runtime to stop terminal {} with",
+                self.terminal
+            ),
+        }
+    }
+}
+
+/// Start `command` on the editor's machine through `client` as the
+/// registered task `id` of `session`. The terminal is reserved, created
+/// and tracked before this returns, so the cap refusal and a create error
+/// are returned here (the caller then `discard`s the task); everything
+/// after it ends in the task's completion.
+///
+/// `client` is taken by the caller from the task-local scope, which does
+/// not reach the spawned watcher.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn start_on_editor(
+    client: Arc<dyn AcpClient>,
+    command: String,
+    workdir: Option<String>,
+    run_time: Duration,
+    background: Arc<BackgroundTasks>,
+    runs: Arc<ShellRuns>,
+    session: String,
+    id: TaskId,
+) -> anyhow::Result<()> {
+    // As in `run_client_command`: reserve atomically, and a dropped
+    // reservation (create failing or this call cancelled) frees itself.
+    let reservation = client
+        .try_reserve_terminal_slot()
+        .await
+        .map_err(|held| cap_error(&held))?;
+    let args = ["-c".to_string(), command];
+    let terminal = client
+        .create_terminal(
+            CLIENT_SHELL,
+            &args,
+            workdir.as_deref(),
+            Some(OUTPUT_CAP_BYTES as u64),
+        )
+        .await?;
+    client.track_terminal(reservation, terminal.clone()).await;
+    runs.insert(
+        id.clone(),
+        LiveRun::Editor {
+            client: Arc::clone(&client),
+            terminal: terminal.clone(),
+        },
+    );
+
+    let mut guard = EditorGuard {
+        client,
+        terminal,
+        armed: true,
+        runs,
+        id: id.clone(),
+    };
+    let task_background = Arc::clone(&background);
+    let task_session = session.clone();
+    let task_id = id.clone();
+    let watcher = async move {
+        let client = Arc::clone(&guard.client);
+        let terminal = guard.terminal.clone();
+        let waited = tokio::time::timeout(run_time, client.wait_for_terminal_exit(&terminal)).await;
+        let (status, timed_out) = match waited {
+            Ok(Ok(status)) => (Some(status), false),
+            Ok(Err(e)) => {
+                // Still armed: the guard tries to stop the terminal in
+                // the background, so an editor that no longer answers
+                // does not hold up the completion.
+                drop(guard);
+                task_background.complete(
+                    &task_session,
+                    &task_id,
+                    Outcome::Failed {
+                        message: format!(
+                            "the editor stopped answering while the command ran: {e:#}"
+                        ),
+                    },
+                );
+                return;
+            }
+            Err(_elapsed) => {
+                kill(client.as_ref(), &terminal).await;
+                (None, true)
+            }
+        };
+        let output = match client.terminal_output(&terminal).await {
+            Ok(out) => editor_text(out),
+            Err(e) => format!("[the editor did not return the output: {e:#}]"),
+        };
+        guard.disarm();
+        drop(guard);
+        // On a task of its own so a `cancel` landing now, which aborts
+        // this watcher, cannot cut it off between release and untrack.
+        let _ = tokio::spawn(async move {
+            release_and_untrack(client.as_ref(), &terminal).await;
+        })
+        .await;
+        let exit_code = status
+            .and_then(|s| s.exit_code)
+            .and_then(|c| i32::try_from(c).ok());
+        task_background.complete(
+            &task_session,
+            &task_id,
+            Outcome::Exited {
+                exit_code,
+                output,
+                timed_out,
+            },
+        );
+    };
+    spawn_and_attach(watcher, &background, &session, &id);
     Ok(())
 }
 
@@ -301,6 +504,18 @@ mod tests {
     use super::*;
 
     const MARKER: &str = "[… earlier output dropped]\n";
+
+    /// Poll `cond` every 20 ms for up to `bound`.
+    async fn wait_until(bound: Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + bound;
+        while std::time::Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        cond()
+    }
 
     #[test]
     fn tail_buffer_keeps_the_tail_and_marks_the_cut() {
@@ -311,10 +526,10 @@ mod tests {
 
     #[test]
     fn tail_buffer_cuts_at_a_char_boundary() {
-        // "aaaé€" is a a a C3 A9 E2 82 AC: cap 4 and 6 cut inside a
-        // character, cap 5 on a boundary.
+        // "aaaé€" is a a a C3 A9 E2 82 AC: cap 4 (A9 …) and cap 2
+        // (82 AC) cut inside a character, cap 3 on a boundary.
         let input = "aaaé€";
-        for cap in [5, 4, 6] {
+        for cap in [3, 4, 2] {
             let mut b = TailBuffer::new(cap);
             b.push(input.as_bytes());
             let text = b.text();
@@ -375,18 +590,6 @@ mod tests {
                 runs,
                 id,
             })
-        }
-
-        /// Poll `cond` every 20 ms for up to `bound`.
-        async fn wait_until(bound: Duration, mut cond: impl FnMut() -> bool) -> bool {
-            let deadline = Instant::now() + bound;
-            while Instant::now() < deadline {
-                if cond() {
-                    return true;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            cond()
         }
 
         async fn completion(s: &Started) -> Completion {
@@ -503,6 +706,196 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let missing = dir.path().join("nope");
             assert!(start("true", &missing, Duration::from_secs(60)).is_err());
+        }
+    }
+
+    mod on_editor {
+        use super::*;
+        use crate::background::{Completion, ShellHost, TaskKind};
+        use crate::tools::acp_client::tests::FakeClient;
+        use crate::tools::client_tools::MAX_TERMINALS_PER_SESSION;
+
+        const SESSION: &str = "s";
+
+        struct Started {
+            background: Arc<BackgroundTasks>,
+            runs: Arc<ShellRuns>,
+            fake: Arc<FakeClient>,
+            id: TaskId,
+        }
+
+        async fn start(fake: Arc<FakeClient>, run_time: Duration) -> anyhow::Result<Started> {
+            let background = BackgroundTasks::in_memory(4);
+            let runs = Arc::new(ShellRuns::new());
+            let command = "make";
+            let id = background.register(
+                SESSION,
+                TaskKind::Shell {
+                    command: command.into(),
+                    on: ShellHost::Editor,
+                    timeout_secs: run_time.as_secs(),
+                },
+                command.into(),
+            )?;
+            let client: Arc<dyn AcpClient> = Arc::clone(&fake) as Arc<dyn AcpClient>;
+            start_on_editor(
+                client,
+                command.into(),
+                Some("/work".into()),
+                run_time,
+                Arc::clone(&background),
+                Arc::clone(&runs),
+                SESSION.into(),
+                id.clone(),
+            )
+            .await?;
+            Ok(Started {
+                background,
+                runs,
+                fake,
+                id,
+            })
+        }
+
+        async fn completion(s: &Started) -> Completion {
+            assert!(
+                wait_until(Duration::from_secs(10), || s.background.has_inbox(SESSION)).await,
+                "no completion within 10 s"
+            );
+            let mut drained = s.background.drain(SESSION);
+            assert_eq!(drained.len(), 1, "{drained:?}");
+            drained.remove(0)
+        }
+
+        fn released(fake: &FakeClient) -> usize {
+            fake.released.lock().unwrap().len()
+        }
+
+        fn killed(fake: &FakeClient) -> usize {
+            fake.killed.lock().unwrap().len()
+        }
+
+        #[tokio::test]
+        async fn an_editor_exit_delivers_and_releases() {
+            let fake = Arc::new(FakeClient::default());
+            fake.queue_terminal_result("built", Some(0));
+            let s = start(Arc::clone(&fake), Duration::from_secs(60))
+                .await
+                .unwrap();
+            let c = completion(&s).await;
+            assert_eq!(c.task_id, s.id);
+            match c.outcome {
+                Outcome::Exited {
+                    exit_code: Some(0),
+                    timed_out: false,
+                    output,
+                } => assert!(output.contains("built"), "{output:?}"),
+                other => panic!("{other:?}"),
+            }
+            assert_eq!(
+                fake.last_terminal_command().unwrap(),
+                vec!["bash".to_string(), "-c".into(), "make".into()]
+            );
+            assert_eq!(released(&s.fake), 1);
+            assert_eq!(s.fake.tracked_count(), 0);
+            assert!(s.runs.peek(&s.id).await.is_none());
+        }
+
+        #[tokio::test]
+        async fn time_out_kills_and_releases_the_terminal() {
+            let fake = Arc::new(FakeClient::default());
+            fake.make_exit_never_return();
+            let s = start(Arc::clone(&fake), Duration::from_secs(1))
+                .await
+                .unwrap();
+            let c = completion(&s).await;
+            assert!(
+                matches!(
+                    c.outcome,
+                    Outcome::Exited {
+                        timed_out: true,
+                        exit_code: None,
+                        ..
+                    }
+                ),
+                "{:?}",
+                c.outcome
+            );
+            assert_eq!(killed(&fake), 1);
+            assert_eq!(released(&fake), 1);
+            assert_eq!(fake.tracked_count(), 0);
+        }
+
+        #[tokio::test]
+        async fn cancel_kills_and_releases() {
+            let fake = Arc::new(FakeClient::default());
+            fake.make_exit_never_return();
+            let s = start(Arc::clone(&fake), Duration::from_secs(600))
+                .await
+                .unwrap();
+            assert_eq!(fake.tracked_count(), 1);
+            s.background.cancel(SESSION, &s.id).unwrap();
+            assert!(
+                wait_until(Duration::from_secs(5), || {
+                    killed(&fake) == 1 && released(&fake) == 1 && fake.tracked_count() == 0
+                })
+                .await,
+                "killed {}, released {}, tracked {}",
+                killed(&fake),
+                released(&fake),
+                fake.tracked_count()
+            );
+            assert!(s.runs.peek(&s.id).await.is_none());
+        }
+
+        #[tokio::test]
+        async fn a_failed_wait_is_failed() {
+            let fake = Arc::new(FakeClient::default());
+            fake.make_wait_fail_with("gone");
+            let s = start(Arc::clone(&fake), Duration::from_secs(60))
+                .await
+                .unwrap();
+            match completion(&s).await.outcome {
+                Outcome::Failed { message } => assert_eq!(
+                    message,
+                    "the editor stopped answering while the command ran: gone"
+                ),
+                other => panic!("{other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn the_terminal_cap_refuses_before_spawning() {
+            let fake = Arc::new(FakeClient::default());
+            fake.hand_out_distinct_handles();
+            for _ in 0..MAX_TERMINALS_PER_SESSION {
+                let reservation = fake.try_reserve_terminal_slot().await.ok().unwrap();
+                let handle = fake.create_terminal("x", &[], None, None).await.unwrap();
+                fake.track_terminal(reservation, handle).await;
+            }
+            assert_eq!(fake.tracked_count(), MAX_TERMINALS_PER_SESSION);
+            let err = start(Arc::clone(&fake), Duration::from_secs(60))
+                .await
+                .err()
+                .expect("the cap refuses");
+            assert!(err.to_string().contains("maximum"), "{err}");
+            assert_eq!(fake.tracked_count(), MAX_TERMINALS_PER_SESSION);
+            assert_eq!(fake.terminal_count(), MAX_TERMINALS_PER_SESSION);
+        }
+
+        #[tokio::test]
+        async fn peek_reads_the_terminal() {
+            let fake = Arc::new(FakeClient::default());
+            fake.queue_terminal_stdout("partial");
+            fake.make_exit_never_return();
+            let s = start(Arc::clone(&fake), Duration::from_secs(600))
+                .await
+                .unwrap();
+            match s.runs.peek(&s.id).await {
+                Some(Ok(text)) => assert!(text.contains("partial"), "{text:?}"),
+                other => panic!("{other:?}"),
+            }
+            s.background.cancel(SESSION, &s.id).unwrap();
         }
     }
 }

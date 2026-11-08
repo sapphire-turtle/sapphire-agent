@@ -490,6 +490,19 @@ pub(crate) mod tests {
             self.creates.lock().unwrap().len()
         }
 
+        /// How many terminals (and reservations) this client's session
+        /// holds in its registry right now — what a test checks to see
+        /// that a terminal was untracked, as opposed to
+        /// [`terminal_count`](Self::terminal_count), which counts the
+        /// terminals ever created.
+        pub(crate) fn tracked_count(&self) -> usize {
+            self.terminals
+                .lock()
+                .unwrap()
+                .get(&self.terminal_session)
+                .map_or(0, Vec::len)
+        }
+
         /// The command and argv of the most recent `terminal/create`, or
         /// `None` if there has not been one. Used by `client_tools`'s
         /// terminal-routed tests, which assert on the *shape* of the
