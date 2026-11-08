@@ -4143,7 +4143,8 @@ impl ServeState {
     /// [`Self::for_test_scripted`] on a deployment with
     /// `[tools.host_access]` on and autonomous sessions `Trusted`, so the
     /// agent's own `shell` is offered to, and allowed in, an autonomous
-    /// turn.
+    /// turn. Unix only, like its one caller.
+    #[cfg(unix)]
     pub(crate) fn for_test_scripted_host_access(
         responses: Vec<crate::provider::ChatResponse>,
     ) -> Arc<Self> {
