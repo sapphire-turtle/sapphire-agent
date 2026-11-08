@@ -23,7 +23,7 @@ pub(crate) const REACHES_SENTENCE: &str = "Reaches whichever machine this \
     conversation is about: inside an ACP session, the machine the connected \
     editor is running on; otherwise this agent's own machine. ";
 
-fn expand_path(path_str: &str) -> PathBuf {
+pub(crate) fn expand_path(path_str: &str) -> PathBuf {
     PathBuf::from(shellexpand::tilde(path_str).as_ref())
 }
 
@@ -967,7 +967,7 @@ const DEFAULT_SHELL_DOC: &str = "Windows PowerShell (`powershell`)";
 
 /// The shell to run a command with: the `shell` parameter, else `$SHELL`
 /// (not on Windows — see [`FALLBACK_SHELL`]), else the fallback.
-fn resolve_shell(requested: Option<&str>) -> String {
+pub(crate) fn resolve_shell(requested: Option<&str>) -> String {
     let from_env = if cfg!(windows) {
         None
     } else {
@@ -983,7 +983,7 @@ fn resolve_shell(requested: Option<&str>) -> String {
 /// Hand `command` to `shell` as one command line. POSIX shells take `-c`;
 /// PowerShell and `cmd` spell it their own way, and are matched by file
 /// stem so `pwsh.exe` or a full path to `cmd.exe` is recognised too.
-fn push_command_line(cmd: &mut tokio::process::Command, shell: &str, command: &str) {
+pub(crate) fn push_command_line(cmd: &mut tokio::process::Command, shell: &str, command: &str) {
     let stem = Path::new(shell)
         .file_stem()
         .and_then(|s| s.to_str())

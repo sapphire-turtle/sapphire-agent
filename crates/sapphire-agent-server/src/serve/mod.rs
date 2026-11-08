@@ -155,6 +155,10 @@ pub struct ServeState {
     pub(crate) subagent_cache: Option<Arc<SubagentCache>>,
     /// Background tasks started by sessions and their undelivered results.
     pub(crate) background: Arc<crate::background::BackgroundTasks>,
+    /// Background shell commands still running, for peeking at their
+    /// output (`background_task output`).
+    #[allow(dead_code)] // Read by the shell tool and `background_task` (later tasks).
+    pub(crate) shell_runs: Arc<crate::tools::background_shell::ShellRuns>,
     /// Terminals the model started and has not cleaned up, per agent
     /// session id.
     ///
@@ -228,6 +232,7 @@ impl ServeState {
             acp_sessions: tokio::sync::Mutex::new(HashSet::new()),
             subagent_cache,
             background,
+            shell_runs: Arc::new(crate::tools::background_shell::ShellRuns::new()),
             acp_terminals: Arc::new(std::sync::Mutex::new(HashMap::new())),
             consult: std::sync::OnceLock::new(),
         }
@@ -4246,6 +4251,7 @@ rooms    = []
             acp_sessions: Default::default(),
             subagent_cache,
             background: crate::background::BackgroundTasks::in_memory(4),
+            shell_runs: Default::default(),
             acp_terminals: Default::default(),
             consult: Default::default(),
         })

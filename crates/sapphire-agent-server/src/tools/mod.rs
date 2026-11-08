@@ -2,6 +2,7 @@ pub mod acp_client;
 pub mod ambient_tools;
 pub mod ask_human;
 pub mod avatar_tools;
+pub(crate) mod background_shell;
 pub mod background_tools;
 pub mod builtin_tools;
 pub mod client_exec;
