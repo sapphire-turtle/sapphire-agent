@@ -972,6 +972,74 @@ mod tests {
         );
     }
 
+    /// `shell { background: true }` from an autonomous turn: the turn
+    /// replies `WAIT`, and the command's exit resumes the same session
+    /// with its output.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_background_command_resumes_the_session() {
+        let shell_call = ChatResponse {
+            prompt_usage: None,
+            text: None,
+            tool_calls: vec![crate::provider::ToolCall {
+                id: "call-1".to_string(),
+                name: "shell".to_string(),
+                input: serde_json::json!({
+                    "command": "sleep 1; echo done-marker",
+                    "background": true
+                }),
+            }],
+            stop_reason: None,
+        };
+        let state = crate::serve::ServeState::for_test_scripted_host_access(vec![
+            shell_call,
+            response("WAIT"),
+            response("DONE"),
+        ]);
+        state
+            .tools
+            .register_tool(Box::new(crate::tools::builtin_tools::ShellTool::new(
+                std::env::temp_dir(),
+            )))
+            .await;
+        state
+            .tools
+            .replace_spec("shell", crate::tools::builtin_tools::shell_spec(true))
+            .await;
+        write_task(&state, "a", "max_turns: 5");
+        let mut lp = AutonomousLoop::new(Arc::clone(&state), None);
+        lp.run_cycle().await.unwrap();
+        assert!(!rows_for(&state, "a")[0].is_closed, "suspended on WAIT");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            lp.run_cycle().await.unwrap();
+            if rows_for(&state, "a")[0].is_closed {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the session never resumed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let rows = rows_for(&state, "a");
+        assert_eq!(rows.len(), 1, "resumed, not started afresh");
+        let history = state
+            .autonomous_session_store
+            .load_session(&rows[0].meta.session_id)
+            .unwrap();
+        let resumed: Vec<String> = history.iter().flat_map(texts).collect();
+        assert!(
+            resumed.iter().any(|t| t.contains("[Command ")),
+            "the exit is delivered: {resumed:?}"
+        );
+        assert!(
+            resumed.iter().any(|t| t.contains("done-marker")),
+            "the output is delivered: {resumed:?}"
+        );
+    }
+
     fn ask_call(question: &str) -> ChatResponse {
         ChatResponse {
             prompt_usage: None,

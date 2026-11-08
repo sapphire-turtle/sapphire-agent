@@ -4140,11 +4140,40 @@ impl ServeState {
         )
     }
 
+    /// [`Self::for_test_scripted`] on a deployment with
+    /// `[tools.host_access]` on and autonomous sessions `Trusted`, so the
+    /// agent's own `shell` is offered to, and allowed in, an autonomous
+    /// turn.
+    pub(crate) fn for_test_scripted_host_access(
+        responses: Vec<crate::provider::ChatResponse>,
+    ) -> Arc<Self> {
+        Self::build_for_test_with_config(
+            false,
+            StubProvider::new(responses),
+            crate::config::ToolRounds::default(),
+            DEFAULT_TEST_ACP_KEEPALIVE_SECS,
+            |config| {
+                config.tools.host_access.enabled = true;
+                config.autonomous.origin = crate::config::AutonomousOrigin::Trusted;
+            },
+        )
+    }
+
     fn build_for_test_with(
         acp_enabled: bool,
         provider: StubProvider,
         rounds: crate::config::ToolRounds,
         acp_keepalive_secs: u64,
+    ) -> Arc<Self> {
+        Self::build_for_test_with_config(acp_enabled, provider, rounds, acp_keepalive_secs, |_| {})
+    }
+
+    fn build_for_test_with_config(
+        acp_enabled: bool,
+        provider: StubProvider,
+        rounds: crate::config::ToolRounds,
+        acp_keepalive_secs: u64,
+        tweak: impl FnOnce(&mut Config),
     ) -> Arc<Self> {
         // Leak the TempDir guard on purpose: this is a test binary and the
         // OS reclaims the directory when it exits.
@@ -4179,6 +4208,7 @@ rooms    = []
             room_profile: Some("developer".to_string()),
         });
         config.tools.tool_rounds = rounds;
+        tweak(&mut config);
         config.room_profiles.get_mut("developer").unwrap().devices =
             vec!["developer-device".to_string()];
 
