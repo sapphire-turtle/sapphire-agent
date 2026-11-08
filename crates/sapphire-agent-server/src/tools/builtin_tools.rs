@@ -1124,7 +1124,8 @@ fn background_run_time(input: &serde_json::Value) -> std::time::Duration {
         input["timeout"]
             .as_u64()
             .unwrap_or(BACKGROUND_DEFAULT_SECS)
-            .min(BACKGROUND_MAX_SECS),
+            // At least a second: zero would kill the command at once.
+            .clamp(1, BACKGROUND_MAX_SECS),
     )
 }
 
@@ -3267,6 +3268,11 @@ mod background_shell_tests {
         assert_eq!(
             background_run_time(&json!({"timeout": 5})),
             Duration::from_secs(5)
+        );
+        // Zero would kill the command the moment it started.
+        assert_eq!(
+            background_run_time(&json!({"timeout": 0})),
+            Duration::from_secs(1)
         );
         assert_eq!(foreground_timeout_secs(&json!({})), 60);
         assert_eq!(foreground_timeout_secs(&json!({"timeout": 999999})), 600);
