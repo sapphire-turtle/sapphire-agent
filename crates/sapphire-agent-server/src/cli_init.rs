@@ -217,6 +217,25 @@ mod tests {
         assert!(report.skipped.is_empty());
     }
 
+    /// The first conversation's steps live only in BOOTSTRAP.md's prose; a
+    /// rewrite that drops one would go unnoticed. Cheap check that each file
+    /// the ritual reads or writes is still named, and the fallback too.
+    #[test]
+    fn the_bootstrap_names_every_file_its_ritual_touches() {
+        let body = TEMPLATES
+            .iter()
+            .find(|(rel, _)| *rel == "BOOTSTRAP.md")
+            .map(|(_, body)| *body)
+            .unwrap();
+        for name in ["CHARACTER.md", "IDENTITY.md", "SOUL.md", "USER.md"] {
+            assert!(body.contains(name), "BOOTSTRAP.md never mentions {name}");
+        }
+        assert!(
+            body.contains("no `CHARACTER.md`"),
+            "BOOTSTRAP.md must say what to do without CHARACTER.md"
+        );
+    }
+
     #[test]
     fn a_workspace_with_an_identity_gets_no_bootstrap() {
         let d = tempfile::tempdir().unwrap();
