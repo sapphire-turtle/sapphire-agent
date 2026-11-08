@@ -1079,6 +1079,16 @@ pub(crate) fn shell_spec(background: bool) -> ToolSpec {
             "required": ["command"]
         }),
     };
+    if background {
+        spec.description = format!(
+            "{} With `background`, `timeout` is instead the most it may run before it is \
+             killed (default {} min, max {} h).",
+            spec.description,
+            BACKGROUND_DEFAULT_SECS / 60,
+            BACKGROUND_MAX_SECS / 3600
+        )
+        .into();
+    }
     if background && let Some(properties) = spec.input_schema["properties"].as_object_mut() {
         properties.insert(
             "background".to_string(),
@@ -3121,6 +3131,12 @@ mod background_shell_tests {
         let plain = shell_spec(false);
         assert!(plain.input_schema["properties"].get("background").is_none());
         let bg = shell_spec(true);
+        assert!(
+            bg.description.contains("default 30 min, max 24 h"),
+            "{}",
+            bg.description
+        );
+        assert!(!plain.description.contains("With `background`"));
         let prop = &bg.input_schema["properties"]["background"];
         assert_eq!(prop["type"], "boolean");
         assert_eq!(
@@ -3214,6 +3230,7 @@ mod background_shell_tests {
             "background runs are turned off on this deployment ([tools.background] \
              max_per_session = 0); call shell without background"
         );
+        assert!(!state.background.has_pending_or_inbox(SESSION));
     }
 
     #[tokio::test]
@@ -3230,8 +3247,12 @@ mod background_shell_tests {
                 "workdir": missing.to_str().unwrap(),
             }),
         )
-        .await;
-        assert!(err.is_err(), "{err:?}");
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("Failed to spawn shell"),
+            "the spawn error comes through: {err:#}"
+        );
         assert!(state.background.pending(SESSION).is_empty());
         assert!(!state.background.has_pending_or_inbox(SESSION));
     }

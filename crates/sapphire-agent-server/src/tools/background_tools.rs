@@ -125,8 +125,13 @@ impl Tool for BackgroundTaskTool {
                     bail!("`output` needs an `id`; use `list` to see the running ids");
                 };
                 let (session, ctx) = session_turn()?;
+                let finished =
+                    format!("{id} has already exited; its result is in this conversation.");
                 let pending = ctx.state.background.pending(&session);
                 let Some(task) = pending.iter().find(|t| t.id == id) else {
+                    if ctx.state.background.finished_command(&session, id) {
+                        return Ok(finished);
+                    }
                     let held: Vec<&str> = pending.iter().map(|t| t.id.as_str()).collect();
                     bail!(
                         "no running background task {id}; running: {}",
@@ -153,9 +158,7 @@ impl Tool for BackgroundTaskTool {
                     }
                     // Pending but no longer running: it exited between the
                     // two looks, and its completion is on the way.
-                    None => Ok(format!(
-                        "{id} has already exited; its result is in this conversation."
-                    )),
+                    None => Ok(finished),
                 }
             }
             "cancel" => {
@@ -304,19 +307,71 @@ mod tests {
 
     #[tokio::test]
     async fn output_on_a_finished_command() {
-        // Still pending but no longer running: the peek raced the exit.
         let state = ServeState::for_test(false);
         let id = state
             .background
             .register("s", shell_kind(), "cargo test".into())
             .unwrap();
-        let out = run(&state, Some("s"), json!({"action": "output", "id": id}))
+        let finished = format!("{id} has already exited; its result is in this conversation.");
+
+        // Still pending but no longer running: the peek raced the exit.
+        let out = run(&state, Some("s"), json!({"action": "output", "id": &id}))
+            .await
+            .unwrap();
+        assert_eq!(out, finished);
+
+        // Completed and delivered: no longer pending at all.
+        assert!(state.background.complete(
+            "s",
+            &id,
+            crate::background::Outcome::Exited {
+                exit_code: Some(0),
+                output: "ok".into(),
+                timed_out: false,
+            },
+        ));
+        assert_eq!(state.background.drain("s").len(), 1);
+        state.background.commit_delivery("s");
+        assert!(state.background.pending("s").is_empty());
+        let out = run(&state, Some("s"), json!({"action": "output", "id": &id}))
+            .await
+            .unwrap();
+        assert_eq!(out, finished);
+
+        // Only the session that owns it knows it.
+        let err = run(
+            &state,
+            Some("other"),
+            json!({"action": "output", "id": &id}),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(&format!("no running background task {id}")),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn output_on_a_cancelled_command() {
+        let state = ServeState::for_test(false);
+        let id = state
+            .background
+            .register("s", shell_kind(), "cargo test".into())
+            .unwrap();
+        state.background.cancel("s", &id).unwrap();
+        let out = run(&state, Some("s"), json!({"action": "output", "id": &id}))
             .await
             .unwrap();
         assert_eq!(
             out,
             format!("{id} has already exited; its result is in this conversation.")
         );
+
+        // Teardown forgets it with the session.
+        state.background.cancel_all("s");
+        assert!(!state.background.finished_command("s", &id));
     }
 
     #[tokio::test]
@@ -339,7 +394,11 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("id"), "{err}");
+    }
 
+    #[tokio::test]
+    async fn output_on_an_unknown_id_is_an_error() {
+        let state = ServeState::for_test(false);
         let err = run(&state, Some("s"), json!({"action": "output", "id": "nope"}))
             .await
             .unwrap_err();

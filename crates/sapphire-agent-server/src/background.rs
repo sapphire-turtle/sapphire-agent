@@ -16,7 +16,7 @@
 //! allowance until then.
 #![allow(dead_code)] // Tasks 3-7 wire this into the agent.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -168,6 +168,27 @@ struct SessionTasks {
     in_flight: Vec<Completion>,
     /// Questions that ended but can still be replied to (follow-ups).
     closed_questions: Vec<PendingTask>,
+    /// Ids of shell commands that ended, newest last and at most
+    /// [`MAX_FINISHED_COMMANDS`], so `background_task output` can tell a
+    /// finished command from an unknown id. Not persisted: rebuilt from
+    /// the inbox on open.
+    finished_commands: VecDeque<TaskId>,
+}
+
+/// How many finished command ids one session remembers.
+const MAX_FINISHED_COMMANDS: usize = 64;
+
+impl SessionTasks {
+    /// Remember `task` as finished when it is a shell command.
+    fn note_finished(&mut self, id: &str, kind: &TaskKind) {
+        if !matches!(kind, TaskKind::Shell { .. }) {
+            return;
+        }
+        if self.finished_commands.len() >= MAX_FINISHED_COMMANDS {
+            self.finished_commands.pop_front();
+        }
+        self.finished_commands.push_back(id.to_string());
+    }
 }
 
 /// `bg-` and 8 hex digits from the random tail of a v7 UUID. Its head is a
@@ -259,6 +280,14 @@ impl BackgroundTasks {
                         outcome: Outcome::Interrupted,
                         finished_at: now,
                     });
+                }
+                let finished: Vec<(TaskId, TaskKind)> = s
+                    .inbox
+                    .iter()
+                    .map(|c| (c.task_id.clone(), c.kind.clone()))
+                    .collect();
+                for (id, kind) in finished {
+                    s.note_finished(&id, &kind);
                 }
                 sessions.insert(session.to_string(), s);
             }
@@ -542,6 +571,7 @@ impl BackgroundTasks {
             return false;
         };
         let r = s.running.remove(pos);
+        s.note_finished(&r.task.id, &r.task.kind);
         s.inbox.push(Completion {
             task_id: r.task.id,
             kind: r.task.kind,
@@ -605,6 +635,15 @@ impl BackgroundTasks {
         })
     }
 
+    /// Whether `id` is a shell command of `session` that has ended (one of
+    /// the most recent [`MAX_FINISHED_COMMANDS`]). Teardown (`cancel_all`)
+    /// forgets them with the session.
+    pub(crate) fn finished_command(&self, session: &str, id: &str) -> bool {
+        self.lock()
+            .get(session)
+            .is_some_and(|s| s.finished_commands.iter().any(|f| f == id))
+    }
+
     /// Abort one task and queue a `Cancelled` completion for it.
     pub(crate) fn cancel(&self, session: &str, id: &str) -> Result<PendingTask> {
         let mut map = self.lock();
@@ -664,6 +703,7 @@ impl BackgroundTasks {
         if let Some(a) = r.abort {
             a.abort();
         }
+        s.note_finished(&r.task.id, &r.task.kind);
         s.inbox.push(Completion {
             task_id: r.task.id,
             kind: r.task.kind,
