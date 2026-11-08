@@ -195,7 +195,15 @@ pub(crate) fn subagent_tool_specs(
             Some(allowed) => allowed.iter().any(|a| a == s.name.as_ref()),
             None => true,
         })
-        .cloned()
+        // A nested turn has no session to deliver a background command
+        // into, so its `shell` is the one without `background`.
+        .map(|s| {
+            if s.name.as_ref() == "shell" {
+                crate::tools::builtin_tools::shell_spec(false)
+            } else {
+                s.clone()
+            }
+        })
         .collect();
     if nested_allowed {
         let nested = match &def.subagents {
@@ -1967,6 +1975,28 @@ mod tests {
         };
         let parent_visible = [spec_named("file_read")];
         assert!(subagent_tool_specs(&toolless, &parent_visible, &defs(), 0, 2).is_empty());
+    }
+
+    /// A nested turn has no session to deliver a background command
+    /// into, so the `shell` it inherits has no `background`.
+    #[test]
+    fn a_nested_shell_spec_has_no_background() {
+        let unrestricted = crate::agents::AgentDef {
+            tools: None,
+            ..defs()[0].clone()
+        };
+        let parent_visible = [crate::tools::builtin_tools::shell_spec(true)];
+        let inherited = subagent_tool_specs(&unrestricted, &parent_visible, &defs(), 0, 2);
+        let shell = inherited
+            .iter()
+            .find(|s| s.name == "shell")
+            .expect("`shell` is inherited");
+        assert!(
+            shell.input_schema["properties"].get("background").is_none(),
+            "{}",
+            shell.input_schema
+        );
+        assert!(shell.input_schema["properties"].get("command").is_some());
     }
 
     fn spec_named(name: &str) -> crate::provider::ToolSpec {

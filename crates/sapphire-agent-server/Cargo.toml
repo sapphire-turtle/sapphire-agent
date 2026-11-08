@@ -207,6 +207,10 @@ agent-client-protocol = "3.3.0"
 # with sapphire-agent-desktop.
 sapphire-agent-core = { path = "../sapphire-agent-core", version = "0.12.0" }
 
+# `killpg` for background shell commands' process groups.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"
 filetime = "0.2"

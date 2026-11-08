@@ -355,6 +355,11 @@ pub(crate) mod tests {
         /// pick exactly one of the two `wait_for_terminal_exit`
         /// behaviours.
         wait_error: Mutex<Option<String>>,
+        /// Set by [`FakeClient::make_editor_stop_answering`]: once true,
+        /// `terminal_output`, `kill_terminal` and `release_terminal`
+        /// record the call and then never resolve, simulating an editor
+        /// that is still connected but no longer answers.
+        rpcs_never_return: Mutex<bool>,
         /// The session id this fake's terminal tracking is keyed
         /// under, and the registry it tracks in. Plain fields rather
         /// than `Mutex`-wrapped: both are set once, by direct field
@@ -441,6 +446,21 @@ pub(crate) mod tests {
             *self.wait_error.lock().unwrap() = Some(message.to_string());
         }
 
+        /// Make every future `terminal_output`, `kill_terminal` and
+        /// `release_terminal` call hang forever (after recording it), as
+        /// an editor that is connected but no longer answering would.
+        pub(crate) fn make_editor_stop_answering(&self) {
+            *self.rpcs_never_return.lock().unwrap() = true;
+        }
+
+        /// Hang forever when [`make_editor_stop_answering`](Self::make_editor_stop_answering)
+        /// is set.
+        async fn hang_if_unanswering(&self) {
+            if *self.rpcs_never_return.lock().unwrap() {
+                std::future::pending::<()>().await;
+            }
+        }
+
         /// Queue `text` as the stdout the next `create_terminal` call's
         /// terminal will report via `terminal_output`, with a
         /// successful exit code (`Some(0)`) — the common case, where a
@@ -488,6 +508,19 @@ pub(crate) mod tests {
         /// call.
         pub(crate) fn terminal_count(&self) -> usize {
             self.creates.lock().unwrap().len()
+        }
+
+        /// How many terminals (and reservations) this client's session
+        /// holds in its registry right now — what a test checks to see
+        /// that a terminal was untracked, as opposed to
+        /// [`terminal_count`](Self::terminal_count), which counts the
+        /// terminals ever created.
+        pub(crate) fn tracked_count(&self) -> usize {
+            self.terminals
+                .lock()
+                .unwrap()
+                .get(&self.terminal_session)
+                .map_or(0, Vec::len)
         }
 
         /// The command and argv of the most recent `terminal/create`, or
@@ -576,6 +609,7 @@ pub(crate) mod tests {
             Ok(TerminalHandle(id))
         }
         async fn terminal_output(&self, t: &TerminalHandle) -> anyhow::Result<TerminalOutput> {
+            self.hang_if_unanswering().await;
             if let Some(message) = self.output_error.lock().unwrap().clone() {
                 return Err(anyhow::anyhow!(message));
             }
@@ -606,6 +640,7 @@ pub(crate) mod tests {
         }
         async fn kill_terminal(&self, t: &TerminalHandle) -> anyhow::Result<()> {
             self.killed.lock().unwrap().push(t.clone());
+            self.hang_if_unanswering().await;
             if let Some(message) = self.kill_error.lock().unwrap().clone() {
                 return Err(anyhow::anyhow!(message));
             }
@@ -613,6 +648,7 @@ pub(crate) mod tests {
         }
         async fn release_terminal(&self, t: &TerminalHandle) -> anyhow::Result<()> {
             self.released.lock().unwrap().push(t.clone());
+            self.hang_if_unanswering().await;
             if let Some(message) = self.kill_error.lock().unwrap().clone() {
                 return Err(anyhow::anyhow!(message));
             }

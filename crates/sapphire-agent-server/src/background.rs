@@ -16,7 +16,7 @@
 //! allowance until then.
 #![allow(dead_code)] // Tasks 3-7 wire this into the agent.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -47,6 +47,27 @@ pub(crate) enum TaskKind {
         asked_by: Option<String>,
         deadline: DateTime<Utc>,
     },
+    /// A shell command run in the background. `timeout_secs` is its run time
+    /// limit; `on` says whose machine it runs on.
+    Shell {
+        command: String,
+        on: ShellHost,
+        timeout_secs: u64,
+    },
+}
+
+/// Where a background shell command runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum ShellHost {
+    /// The agent's own host.
+    Agent,
+    /// The connected editor's machine (ACP).
+    Editor,
+}
+
+/// The first line of `s`, or `""` when it is empty.
+pub(crate) fn first_line(s: &str) -> &str {
+    s.lines().next().unwrap_or_default()
 }
 
 /// Most questions one session may have waiting at once. They do not count
@@ -106,6 +127,13 @@ pub(crate) enum Outcome {
         text: String,
         from: String,
     },
+    /// A background shell command ended on its own or at its time limit.
+    /// `exit_code` is `None` when it was killed by a signal or timed out.
+    Exited {
+        exit_code: Option<i32>,
+        output: String,
+        timed_out: bool,
+    },
 }
 
 /// A task's result, waiting to be shown to the model.
@@ -140,6 +168,27 @@ struct SessionTasks {
     in_flight: Vec<Completion>,
     /// Questions that ended but can still be replied to (follow-ups).
     closed_questions: Vec<PendingTask>,
+    /// Ids of shell commands that ended, newest last and at most
+    /// [`MAX_FINISHED_COMMANDS`], so `background_task output` can tell a
+    /// finished command from an unknown id. Not persisted: rebuilt from
+    /// the inbox on open.
+    finished_commands: VecDeque<TaskId>,
+}
+
+/// How many finished command ids one session remembers.
+const MAX_FINISHED_COMMANDS: usize = 64;
+
+impl SessionTasks {
+    /// Remember `task` as finished when it is a shell command.
+    fn note_finished(&mut self, id: &str, kind: &TaskKind) {
+        if !matches!(kind, TaskKind::Shell { .. }) {
+            return;
+        }
+        if self.finished_commands.len() >= MAX_FINISHED_COMMANDS {
+            self.finished_commands.pop_front();
+        }
+        self.finished_commands.push_back(id.to_string());
+    }
 }
 
 /// `bg-` and 8 hex digits from the random tail of a v7 UUID. Its head is a
@@ -231,6 +280,14 @@ impl BackgroundTasks {
                         outcome: Outcome::Interrupted,
                         finished_at: now,
                     });
+                }
+                let finished: Vec<(TaskId, TaskKind)> = s
+                    .inbox
+                    .iter()
+                    .map(|c| (c.task_id.clone(), c.kind.clone()))
+                    .collect();
+                for (id, kind) in finished {
+                    s.note_finished(&id, &kind);
                 }
                 sessions.insert(session.to_string(), s);
             }
@@ -370,6 +427,22 @@ impl BackgroundTasks {
         Ok(id)
     }
 
+    /// Forget a running task without queuing a completion, for a start that
+    /// failed after `register` (the caller reports the failure itself).
+    /// `false` when `id` is not running in `session`.
+    pub(crate) fn discard(&self, session: &str, id: &str) -> bool {
+        let mut map = self.lock();
+        let Some(s) = map.get_mut(session) else {
+            return false;
+        };
+        let Some(pos) = s.running.iter().position(|r| r.task.id == id) else {
+            return false;
+        };
+        s.running.remove(pos);
+        self.persist(session, s);
+        true
+    }
+
     /// Which question a reply to `reply_to` in `room` belongs to.
     pub(crate) fn route_reply(&self, room: &str, reply_to: &str) -> Route {
         let matches = |t: &PendingTask| {
@@ -498,6 +571,7 @@ impl BackgroundTasks {
             return false;
         };
         let r = s.running.remove(pos);
+        s.note_finished(&r.task.id, &r.task.kind);
         s.inbox.push(Completion {
             task_id: r.task.id,
             kind: r.task.kind,
@@ -561,6 +635,15 @@ impl BackgroundTasks {
         })
     }
 
+    /// Whether `id` is a shell command of `session` that has ended (one of
+    /// the most recent [`MAX_FINISHED_COMMANDS`]). Teardown (`cancel_all`)
+    /// forgets them with the session.
+    pub(crate) fn finished_command(&self, session: &str, id: &str) -> bool {
+        self.lock()
+            .get(session)
+            .is_some_and(|s| s.finished_commands.iter().any(|f| f == id))
+    }
+
     /// Abort one task and queue a `Cancelled` completion for it.
     pub(crate) fn cancel(&self, session: &str, id: &str) -> Result<PendingTask> {
         let mut map = self.lock();
@@ -620,6 +703,7 @@ impl BackgroundTasks {
         if let Some(a) = r.abort {
             a.abort();
         }
+        s.note_finished(&r.task.id, &r.task.kind);
         s.inbox.push(Completion {
             task_id: r.task.id,
             kind: r.task.kind,
@@ -637,7 +721,7 @@ pub(crate) fn resumable(
     c: &Completion,
 ) -> bool {
     let TaskKind::Subagent { handle, .. } = &c.kind else {
-        return false; // a question has no conversation to resume
+        return false; // a question or a command has no conversation to resume
     };
     cache.is_some_and(|cache| cache.get(handle).is_some())
 }
@@ -650,6 +734,7 @@ pub(crate) fn render(c: &Completion, resumable: bool) -> String {
     let (agent, handle) = match &c.kind {
         TaskKind::Subagent { agent, handle } => (agent, handle),
         TaskKind::Question { .. } => return render_question(c),
+        TaskKind::Shell { .. } => return render_shell(c),
     };
     let verb = match &c.outcome {
         Outcome::Finished { .. } => "finished",
@@ -657,7 +742,10 @@ pub(crate) fn render(c: &Completion, resumable: bool) -> String {
         Outcome::Interrupted => "was interrupted by a restart",
         Outcome::Cancelled => "was cancelled",
         // Only questions end this way; see `render_question`.
-        Outcome::Answered { .. } | Outcome::NoAnswer | Outcome::FollowUp { .. } => "ended",
+        Outcome::Answered { .. }
+        | Outcome::NoAnswer
+        | Outcome::FollowUp { .. }
+        | Outcome::Exited { .. } => "ended",
     };
     let mut out = format!(
         "[Background task {} {verb}: subagent \"{agent}\" (handle {handle})]",
@@ -682,7 +770,8 @@ pub(crate) fn render(c: &Completion, resumable: bool) -> String {
         | Outcome::Cancelled
         | Outcome::Answered { .. }
         | Outcome::NoAnswer
-        | Outcome::FollowUp { .. } => {}
+        | Outcome::FollowUp { .. }
+        | Outcome::Exited { .. } => {}
     }
     if resumable && !matches!(c.outcome, Outcome::Finished { .. }) {
         out.push_str(&format!(
@@ -721,6 +810,7 @@ fn render_question(c: &Completion) -> String {
         // A question never finishes or fails like a subagent; keep it total.
         Outcome::Finished { text, .. } => format!("[Question {id} ended: \"{first}\"]\n{text}"),
         Outcome::Failed { message } => format!("[Question {id} ended: \"{first}\"]\n{message}"),
+        Outcome::Exited { .. } => format!("[Question {id} ended: \"{first}\"]"),
     };
     if let Some(h) = asked_by {
         out.push_str(&format!(
@@ -728,6 +818,52 @@ fn render_question(c: &Completion) -> String {
         ));
     }
     out
+}
+
+/// A background shell command's completion, shown to the model.
+fn render_shell(c: &Completion) -> String {
+    let TaskKind::Shell {
+        command,
+        timeout_secs,
+        ..
+    } = &c.kind
+    else {
+        unreachable!("render_shell is called for shell commands only");
+    };
+    let id = &c.task_id;
+    let first = first_line(command);
+    match &c.outcome {
+        Outcome::Exited {
+            exit_code,
+            output,
+            timed_out,
+        } => {
+            let how = if *timed_out {
+                format!("timed out after {timeout_secs}s and was killed")
+            } else if let Some(code) = exit_code {
+                format!("exited {code}")
+            } else {
+                "exited without a code".to_string()
+            };
+            let mut out = format!("[Command {id} {how}: \"{first}\"]");
+            if !output.is_empty() {
+                out.push('\n');
+                out.push_str(output);
+            }
+            out
+        }
+        Outcome::Interrupted => format!(
+            "[Command {id} was interrupted by a restart: \"{first}\"]\n\
+             It was stopped; re-run it if you still need it."
+        ),
+        Outcome::Cancelled => format!("[Command {id} was cancelled: \"{first}\"]"),
+        Outcome::Failed { message } => format!("[Command {id} failed: \"{first}\"]\n{message}"),
+        // A command yields no subagent or question outcome; keep it total.
+        Outcome::Finished { text, .. } => format!("[Command {id} ended: \"{first}\"]\n{text}"),
+        Outcome::Answered { .. } | Outcome::NoAnswer | Outcome::FollowUp { .. } => {
+            format!("[Command {id} ended: \"{first}\"]")
+        }
+    }
 }
 
 #[cfg(test)]
@@ -913,6 +1049,102 @@ mod tests {
                 handle: "h1".into()
             }
         );
+    }
+
+    fn shell(cmd: &str) -> TaskKind {
+        TaskKind::Shell {
+            command: cmd.into(),
+            on: ShellHost::Agent,
+            timeout_secs: 1800,
+        }
+    }
+
+    #[test]
+    fn shell_counts_toward_max_per_session() {
+        let t = BackgroundTasks::in_memory(1);
+        let id = t.register("s", shell("sleep 5"), "sleep".into()).unwrap();
+        let e = t
+            .register("s", kind("h"), "a".into())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains(&id), "{e}");
+    }
+
+    #[test]
+    fn open_interrupts_a_pending_shell() {
+        let td = tempfile::tempdir().unwrap();
+        let t = BackgroundTasks::open(Some(td.path().to_path_buf()), 4);
+        t.register("s", shell("sleep 5"), "sleep".into()).unwrap();
+        let t2 = BackgroundTasks::open(Some(td.path().to_path_buf()), 4);
+        assert!(t2.pending("s").is_empty());
+        let d = t2.drain("s");
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].outcome, Outcome::Interrupted);
+        assert_eq!(d[0].kind, shell("sleep 5"));
+    }
+
+    #[test]
+    fn discard_removes_without_a_completion() {
+        let t = BackgroundTasks::in_memory(2);
+        let id = t.register("s", shell("ls"), "ls".into()).unwrap();
+        assert!(t.discard("s", &id));
+        assert!(t.pending("s").is_empty());
+        assert!(t.drain("s").is_empty());
+        assert!(!t.has_pending_or_inbox("s"));
+        assert!(!t.discard("s", &id));
+    }
+
+    #[test]
+    fn render_shell_outcomes() {
+        let mk = |outcome| Completion {
+            task_id: "bg-1".into(),
+            kind: shell("cargo test\n--workspace"),
+            outcome,
+            finished_at: Utc::now(),
+        };
+        let exited = |exit_code, timed_out| Outcome::Exited {
+            exit_code,
+            output: "line one\nline two".into(),
+            timed_out,
+        };
+        assert_eq!(
+            render(&mk(exited(Some(0), false)), false),
+            "[Command bg-1 exited 0: \"cargo test\"]\nline one\nline two"
+        );
+        assert_eq!(
+            render(&mk(exited(None, false)), false),
+            "[Command bg-1 exited without a code: \"cargo test\"]\nline one\nline two"
+        );
+        assert_eq!(
+            render(&mk(exited(None, true)), false),
+            "[Command bg-1 timed out after 1800s and was killed: \"cargo test\"]\nline one\nline two"
+        );
+        assert_eq!(
+            render(&mk(Outcome::Interrupted), false),
+            "[Command bg-1 was interrupted by a restart: \"cargo test\"]\n\
+             It was stopped; re-run it if you still need it."
+        );
+        assert_eq!(
+            render(&mk(Outcome::Cancelled), false),
+            "[Command bg-1 was cancelled: \"cargo test\"]"
+        );
+        assert_eq!(
+            render(
+                &mk(Outcome::Failed {
+                    message: "boom".into()
+                }),
+                false
+            ),
+            "[Command bg-1 failed: \"cargo test\"]\nboom"
+        );
+    }
+
+    #[test]
+    fn old_state_without_shell_still_loads() {
+        let td = tempfile::tempdir().unwrap();
+        std::fs::write(td.path().join("s.json"), PRE_QUESTIONS_FILE).unwrap();
+        let t = BackgroundTasks::open(Some(td.path().to_path_buf()), 4);
+        assert_eq!(t.drain("s").len(), 2);
     }
 
     #[test]

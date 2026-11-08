@@ -23,7 +23,7 @@ pub(crate) const REACHES_SENTENCE: &str = "Reaches whichever machine this \
     conversation is about: inside an ACP session, the machine the connected \
     editor is running on; otherwise this agent's own machine. ";
 
-fn expand_path(path_str: &str) -> PathBuf {
+pub(crate) fn expand_path(path_str: &str) -> PathBuf {
     PathBuf::from(shellexpand::tilde(path_str).as_ref())
 }
 
@@ -967,7 +967,7 @@ const DEFAULT_SHELL_DOC: &str = "Windows PowerShell (`powershell`)";
 
 /// The shell to run a command with: the `shell` parameter, else `$SHELL`
 /// (not on Windows — see [`FALLBACK_SHELL`]), else the fallback.
-fn resolve_shell(requested: Option<&str>) -> String {
+pub(crate) fn resolve_shell(requested: Option<&str>) -> String {
     let from_env = if cfg!(windows) {
         None
     } else {
@@ -983,7 +983,7 @@ fn resolve_shell(requested: Option<&str>) -> String {
 /// Hand `command` to `shell` as one command line. POSIX shells take `-c`;
 /// PowerShell and `cmd` spell it their own way, and are matched by file
 /// stem so `pwsh.exe` or a full path to `cmd.exe` is recognised too.
-fn push_command_line(cmd: &mut tokio::process::Command, shell: &str, command: &str) {
+pub(crate) fn push_command_line(cmd: &mut tokio::process::Command, shell: &str, command: &str) {
     let stem = Path::new(shell)
         .file_stem()
         .and_then(|s| s.to_str())
@@ -1015,6 +1015,137 @@ fn push_command_line(cmd: &mut tokio::process::Command, shell: &str, command: &s
     }
 }
 
+/// The `background` argument's description, which only the main turn's
+/// spec carries.
+const BACKGROUND_DOC: &str = "Run it in the background and return at once; its output is \
+    delivered to this conversation when it exits. Main conversation only.";
+
+/// Run time of a background command: default 30 min, max 24 h.
+const BACKGROUND_DEFAULT_SECS: u64 = 1800;
+const BACKGROUND_MAX_SECS: u64 = 86400;
+
+/// The refusal for `background` from a nested turn or one without a session.
+const BACKGROUND_MAIN_ONLY: &str = "background commands can only be started from the main \
+    conversation; call shell without background";
+
+/// The refusal for `background` on a deployment that turned it off.
+const BACKGROUND_DISABLED: &str = "background runs are turned off on this deployment \
+    ([tools.background] max_per_session = 0); call shell without background";
+
+/// The `shell` spec. `background` adds the `background` argument and lets
+/// `timeout` mean its run time; only the main turn's spec carries it, and
+/// only while `[tools.background] max_per_session` is above zero (see the
+/// registration in `lib.rs` and `subagent_tool_specs`).
+pub(crate) fn shell_spec(background: bool) -> ToolSpec {
+    let mut spec = ToolSpec {
+        name: "shell".into(),
+        description: format!(
+            "{REACHES_SENTENCE}Execute a shell command and return its output. \
+            Returns stdout, stderr, and exit code. \
+            The default working directory is the workspace root. \
+            By default the command runs under {DEFAULT_SHELL_DOC}; \
+            override per call with the `shell` parameter (e.g. `bash`, \
+            `zsh`, `fish`, `pwsh`, `cmd`, or an absolute path). \
+            Inside an ACP session the command always runs under `bash` \
+            on the editor's machine (Git Bash on Windows), and the \
+            `shell` parameter is ignored. \
+            Use the timeout parameter for long-running commands (default 60 s, max 600 s). \
+            Not suitable for interactive commands or persistent daemons.",
+        )
+        .into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "The shell command to execute (run via `<shell> -c`, or the shell's own equivalent for PowerShell and `cmd`)."
+                },
+                "shell": {
+                    "type": "string",
+                    "description": format!("Shell executable to run the command with — a name resolved via PATH (e.g. `bash`, `zsh`, `fish`, `pwsh`, `cmd`) or an absolute path. Defaults to {DEFAULT_SHELL_DOC}.")
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Max seconds to wait before killing the process (default: 60, max: 600).",
+                    "default": 60,
+                    "minimum": 1,
+                    "maximum": 600
+                },
+                "workdir": {
+                    "type": "string",
+                    "description": "Working directory (absolute or ~/... path). Defaults to the workspace root."
+                }
+            },
+            "required": ["command"]
+        }),
+    };
+    if background {
+        spec.description = format!(
+            "{} With `background`, `timeout` is instead the most it may run before it is \
+             killed (default {} min, max {} h).",
+            spec.description,
+            BACKGROUND_DEFAULT_SECS / 60,
+            BACKGROUND_MAX_SECS / 3600
+        )
+        .into();
+    }
+    if background && let Some(properties) = spec.input_schema["properties"].as_object_mut() {
+        properties.insert(
+            "background".to_string(),
+            json!({ "type": "boolean", "description": BACKGROUND_DOC }),
+        );
+        // With `background` the limit is the run time, which goes far
+        // higher; the schema's own default would otherwise pin it to 60.
+        properties.insert(
+            "timeout".to_string(),
+            json!({
+                "type": "integer",
+                "description": format!(
+                    "Max seconds to wait before killing the process (default: 60, max: 600). \
+                     With `background`, the most it may run before it is killed \
+                     (default: {BACKGROUND_DEFAULT_SECS}, max: {BACKGROUND_MAX_SECS})."
+                ),
+                "minimum": 1,
+                "maximum": BACKGROUND_MAX_SECS
+            }),
+        );
+    }
+    spec
+}
+
+/// `timeout` without `background`, on the agent's machine.
+fn foreground_timeout_secs(input: &serde_json::Value) -> u64 {
+    input["timeout"].as_u64().unwrap_or(60).min(600)
+}
+
+/// `timeout` with `background`: the command's run time.
+fn background_run_time(input: &serde_json::Value) -> std::time::Duration {
+    std::time::Duration::from_secs(
+        input["timeout"]
+            .as_u64()
+            .unwrap_or(BACKGROUND_DEFAULT_SECS)
+            // At least a second: zero would kill the command at once.
+            .clamp(1, BACKGROUND_MAX_SECS),
+    )
+}
+
+/// Forgets a registered task unless disarmed, so a start that fails — or
+/// whose turn is dropped mid-start — leaves nothing registered.
+struct DiscardOnDrop<'a> {
+    background: &'a crate::background::BackgroundTasks,
+    session: &'a str,
+    id: &'a str,
+    armed: bool,
+}
+
+impl Drop for DiscardOnDrop<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.background.discard(self.session, self.id);
+        }
+    }
+}
+
 pub struct ShellTool {
     workspace_root: PathBuf,
     spec: ToolSpec,
@@ -1024,49 +1155,97 @@ impl ShellTool {
     pub fn new(workspace_root: PathBuf) -> Self {
         Self {
             workspace_root,
-            spec: ToolSpec {
-                name: "shell".into(),
-                description: format!(
-                    "{REACHES_SENTENCE}Execute a shell command and return its output. \
-                    Returns stdout, stderr, and exit code. \
-                    The default working directory is the workspace root. \
-                    By default the command runs under {DEFAULT_SHELL_DOC}; \
-                    override per call with the `shell` parameter (e.g. `bash`, \
-                    `zsh`, `fish`, `pwsh`, `cmd`, or an absolute path). \
-                    Inside an ACP session the command always runs under `bash` \
-                    on the editor's machine (Git Bash on Windows), and the \
-                    `shell` parameter is ignored. \
-                    Use the timeout parameter for long-running commands (default 60 s, max 600 s). \
-                    Not suitable for interactive commands or persistent daemons.",
-                )
-                .into(),
-                input_schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "command": {
-                            "type": "string",
-                            "description": "The shell command to execute (run via `<shell> -c`, or the shell's own equivalent for PowerShell and `cmd`)."
-                        },
-                        "shell": {
-                            "type": "string",
-                            "description": format!("Shell executable to run the command with — a name resolved via PATH (e.g. `bash`, `zsh`, `fish`, `pwsh`, `cmd`) or an absolute path. Defaults to {DEFAULT_SHELL_DOC}.")
-                        },
-                        "timeout": {
-                            "type": "integer",
-                            "description": "Max seconds to wait before killing the process (default: 60, max: 600).",
-                            "default": 60,
-                            "minimum": 1,
-                            "maximum": 600
-                        },
-                        "workdir": {
-                            "type": "string",
-                            "description": "Working directory (absolute or ~/... path). Defaults to the workspace root."
-                        }
-                    },
-                    "required": ["command"]
-                }),
-            },
+            spec: shell_spec(false),
         }
+    }
+
+    /// The working directory on the agent's machine.
+    fn agent_workdir(&self, input: &serde_json::Value) -> PathBuf {
+        input["workdir"]
+            .as_str()
+            .map(expand_path)
+            .unwrap_or_else(|| self.workspace_root.clone())
+    }
+
+    /// `shell` with `background`: register the command as a task of this
+    /// session, start it on the editor's machine inside an ACP session and
+    /// on this one otherwise, and return at once. Its watcher delivers the
+    /// result; a start that fails is discarded and its error returned.
+    async fn start_background(&self, input: &serde_json::Value) -> Result<String> {
+        use crate::background::{ShellHost, TaskKind};
+        use crate::tools::background_shell::{HostCommand, start_on_agent, start_on_editor};
+
+        let command = input["command"].as_str().context("missing 'command'")?;
+        let Some(ctx) = crate::serve::current_turn_context() else {
+            anyhow::bail!(BACKGROUND_MAIN_ONLY);
+        };
+        let session = match (&ctx.session_id, ctx.subagent_depth) {
+            (Some(session), 0) => session.clone(),
+            _ => anyhow::bail!(BACKGROUND_MAIN_ONLY),
+        };
+        let background = Arc::clone(&ctx.state.background);
+        if !background.enabled() {
+            anyhow::bail!(BACKGROUND_DISABLED);
+        }
+        let run_time = background_run_time(input);
+        let client = crate::tools::acp_client::current_acp_client();
+        let on = if client.is_some() {
+            ShellHost::Editor
+        } else {
+            ShellHost::Agent
+        };
+        let id = background.register(
+            &session,
+            TaskKind::Shell {
+                command: command.to_string(),
+                on,
+                timeout_secs: run_time.as_secs(),
+            },
+            crate::background::first_line(command).to_string(),
+        )?;
+        let mut registered = DiscardOnDrop {
+            background: &background,
+            session: &session,
+            id: &id,
+            armed: true,
+        };
+        let runs = Arc::clone(&ctx.state.shell_runs);
+        match client {
+            // The editor runs it under `bash` whatever `shell` says, and
+            // its `workdir` is a path on the editor's machine, passed as
+            // written.
+            Some(client) => {
+                start_on_editor(
+                    client,
+                    command.to_string(),
+                    input["workdir"].as_str().map(str::to_string),
+                    run_time,
+                    Arc::clone(&background),
+                    runs,
+                    session.clone(),
+                    id.clone(),
+                )
+                .await?
+            }
+            None => start_on_agent(
+                HostCommand {
+                    command: command.to_string(),
+                    shell: resolve_shell(input["shell"].as_str()),
+                    workdir: self.agent_workdir(input),
+                    run_time,
+                },
+                Arc::clone(&background),
+                runs,
+                session.clone(),
+                id.clone(),
+            )?,
+        }
+        registered.armed = false;
+        Ok(format!(
+            "Command {id} started in the background. Its output will be delivered to this \
+             conversation when it exits; check it with background_task output, stop it with \
+             background_task cancel."
+        ))
     }
 }
 
@@ -1081,6 +1260,9 @@ impl Tool for ShellTool {
     }
 
     async fn execute(&self, input: &serde_json::Value) -> Result<String> {
+        if input["background"].as_bool() == Some(true) {
+            return self.start_background(input).await;
+        }
         // The editor's machine when a client is scoped to this turn, this
         // one otherwise. Same one-shot contract either way: wait up to
         // `timeout`, and on timeout hand back a *running* handle rather than
@@ -1130,11 +1312,8 @@ impl Tool for ShellTool {
         use tokio::process::Command;
 
         let command = input["command"].as_str().context("missing 'command'")?;
-        let timeout_secs = input["timeout"].as_u64().unwrap_or(60).min(600);
-        let workdir = input["workdir"]
-            .as_str()
-            .map(expand_path)
-            .unwrap_or_else(|| self.workspace_root.clone());
+        let timeout_secs = foreground_timeout_secs(input);
+        let workdir = self.agent_workdir(input);
 
         let shell = resolve_shell(input["shell"].as_str());
 
@@ -2892,5 +3071,249 @@ mod session_routing_tests {
         );
 
         std::fs::remove_dir_all(&home).ok();
+    }
+}
+
+#[cfg(test)]
+mod background_shell_tests {
+    use super::*;
+    use crate::background::BackgroundTasks;
+    use crate::serve::{NullProgress, ServeState, TurnContext};
+    use crate::tools::acp_client::{AcpClient, scope_acp_client, tests::FakeClient};
+    use std::time::Duration;
+
+    const SESSION: &str = "s";
+
+    fn ctx(state: &Arc<ServeState>, session: Option<&str>, depth: u32) -> Arc<TurnContext> {
+        Arc::new(TurnContext {
+            state: Arc::clone(state),
+            provider: Arc::new(crate::serve::StubProvider::new(Vec::new())),
+            progress: Arc::new(NullProgress),
+            visible_specs: Vec::<ToolSpec>::new().into(),
+            timer_origin: None,
+            session_id: session.map(str::to_string),
+            subagent_depth: depth,
+            admin_room_profile: None,
+        })
+    }
+
+    async fn run(
+        state: &Arc<ServeState>,
+        session: Option<&str>,
+        depth: u32,
+        input: serde_json::Value,
+    ) -> Result<String> {
+        let tool = ShellTool::new(std::env::temp_dir());
+        crate::serve::scope_turn_context(ctx(state, session, depth), tool.execute(&input)).await
+    }
+
+    /// The id in a success text, which is the only `bg-` word in it.
+    fn started_id(out: &str) -> String {
+        out.split_whitespace()
+            .find(|w| w.starts_with("bg-"))
+            .unwrap_or_else(|| panic!("no id in {out:?}"))
+            .to_string()
+    }
+
+    #[cfg(unix)]
+    fn success_text(id: &str) -> String {
+        format!(
+            "Command {id} started in the background. Its output will be delivered to this \
+             conversation when it exits; check it with background_task output, stop it with \
+             background_task cancel."
+        )
+    }
+
+    const NESTED: &str = "background commands can only be started from the main conversation; \
+        call shell without background";
+
+    #[test]
+    fn shell_spec_offers_background_only_when_asked() {
+        let plain = shell_spec(false);
+        assert!(plain.input_schema["properties"].get("background").is_none());
+        let bg = shell_spec(true);
+        assert!(
+            bg.description.contains("default 30 min, max 24 h"),
+            "{}",
+            bg.description
+        );
+        assert!(!plain.description.contains("With `background`"));
+        let prop = &bg.input_schema["properties"]["background"];
+        assert_eq!(prop["type"], "boolean");
+        assert_eq!(
+            prop["description"],
+            "Run it in the background and return at once; its output is delivered to this \
+             conversation when it exits. Main conversation only."
+        );
+        assert_eq!(
+            ShellTool::new(PathBuf::from("/")).spec.input_schema,
+            plain.input_schema,
+            "the registered tool starts without `background`"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_background_shell_returns_at_once_and_delivers() {
+        let state = ServeState::for_test(false);
+        let out = run(
+            &state,
+            Some(SESSION),
+            0,
+            json!({"command": "echo hi", "background": true}),
+        )
+        .await
+        .unwrap();
+        let id = started_id(&out);
+        assert_eq!(out, success_text(&id));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !state.background.has_inbox(SESSION) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let done = state.background.drain(SESSION);
+        assert_eq!(done.len(), 1, "{done:?}");
+        assert_eq!(done[0].task_id, id);
+        match &done[0].outcome {
+            crate::background::Outcome::Exited {
+                exit_code: Some(0),
+                output,
+                ..
+            } => assert!(output.contains("hi"), "{output}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn background_is_refused_from_a_nested_turn() {
+        let state = ServeState::for_test(false);
+        let err = run(
+            &state,
+            Some(SESSION),
+            1,
+            json!({"command": "echo hi", "background": true}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.to_string(), NESTED);
+        assert!(!state.background.has_pending_or_inbox(SESSION));
+    }
+
+    #[tokio::test]
+    async fn background_is_refused_without_a_session() {
+        let state = ServeState::for_test(false);
+        let err = run(
+            &state,
+            None,
+            0,
+            json!({"command": "echo hi", "background": true}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.to_string(), NESTED);
+        assert!(!state.background.has_pending_or_inbox(SESSION));
+    }
+
+    #[tokio::test]
+    async fn background_is_refused_when_disabled() {
+        let mut state = ServeState::for_test(false);
+        Arc::get_mut(&mut state).unwrap().background = BackgroundTasks::in_memory(0);
+        let err = run(
+            &state,
+            Some(SESSION),
+            0,
+            json!({"command": "echo hi", "background": true}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "background runs are turned off on this deployment ([tools.background] \
+             max_per_session = 0); call shell without background"
+        );
+        assert!(!state.background.has_pending_or_inbox(SESSION));
+    }
+
+    #[tokio::test]
+    async fn a_failed_start_leaves_nothing_registered() {
+        let state = ServeState::for_test(false);
+        let missing = std::env::temp_dir().join("sapphire-agent-no-such-dir-for-shell-test");
+        let err = run(
+            &state,
+            Some(SESSION),
+            0,
+            json!({
+                "command": "echo hi",
+                "background": true,
+                "workdir": missing.to_str().unwrap(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("Failed to spawn shell"),
+            "the spawn error comes through: {err:#}"
+        );
+        assert!(state.background.pending(SESSION).is_empty());
+        assert!(!state.background.has_pending_or_inbox(SESSION));
+    }
+
+    #[test]
+    fn background_run_time_defaults_and_caps() {
+        assert_eq!(background_run_time(&json!({})), Duration::from_secs(1800));
+        assert_eq!(
+            background_run_time(&json!({"timeout": 999999})),
+            Duration::from_secs(86400)
+        );
+        assert_eq!(
+            background_run_time(&json!({"timeout": 5})),
+            Duration::from_secs(5)
+        );
+        // Zero would kill the command the moment it started.
+        assert_eq!(
+            background_run_time(&json!({"timeout": 0})),
+            Duration::from_secs(1)
+        );
+        assert_eq!(foreground_timeout_secs(&json!({})), 60);
+        assert_eq!(foreground_timeout_secs(&json!({"timeout": 999999})), 600);
+    }
+
+    #[tokio::test]
+    async fn a_background_shell_in_an_acp_session_runs_in_an_editor_terminal() {
+        let state = ServeState::for_test(false);
+        let client = Arc::new(FakeClient::default());
+        client.make_exit_never_return();
+        let out = scope_acp_client(
+            Arc::clone(&client) as Arc<dyn AcpClient>,
+            run(
+                &state,
+                Some(SESSION),
+                0,
+                json!({"command": "cargo test", "background": true, "workdir": "~/p"}),
+            ),
+        )
+        .await
+        .unwrap();
+        let id = started_id(&out);
+        assert_eq!(
+            client.last_terminal_command(),
+            Some(vec!["bash".into(), "-c".into(), "cargo test".into()])
+        );
+        assert_eq!(
+            client.creates.lock().unwrap()[0].2.as_deref(),
+            Some("~/p"),
+            "the editor's workdir is passed as written"
+        );
+        let pending = state.background.pending(SESSION);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, id);
+        assert!(matches!(
+            pending[0].kind,
+            crate::background::TaskKind::Shell {
+                on: crate::background::ShellHost::Editor,
+                ..
+            }
+        ));
+        state.background.cancel(SESSION, &id).unwrap();
     }
 }
