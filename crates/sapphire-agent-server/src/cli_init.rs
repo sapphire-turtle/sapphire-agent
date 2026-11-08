@@ -78,12 +78,18 @@ pub struct SeedReport {
 
 /// Create every workspace file that is missing under `root`, leaving every
 /// existing one untouched.
+///
+/// `BOOTSTRAP.md` is the one exception: it is seeded only into a workspace
+/// that has no `IDENTITY.md` yet. The first conversation deletes it when it
+/// is done, and re-running `init` must not bring it back to introduce the
+/// default character to an agent that already knows who it is.
 pub fn seed_workspace(root: &Path) -> Result<SeedReport> {
     let mut report = SeedReport::default();
+    let has_identity = root.join("IDENTITY.md").exists();
 
     for (rel, body) in TEMPLATES {
         let path = root.join(rel);
-        if path.exists() {
+        if path.exists() || (*rel == "BOOTSTRAP.md" && has_identity) {
             report.skipped.push((*rel).to_string());
             continue;
         }
@@ -156,9 +162,10 @@ pub fn run(path: Option<PathBuf>) -> Result<()> {
 
     if report.created.iter().any(|r| r == "BOOTSTRAP.md") {
         println!();
-        println!("BOOTSTRAP.md drives the first conversation: the agent asks what to");
-        println!("call it, writes its answers into IDENTITY.md and SOUL.md, then");
-        println!("deletes the file. The other templates are yours to fill in.");
+        println!("BOOTSTRAP.md drives the first conversation: the default character");
+        println!("introduces herself and asks whether to keep her or make a new one,");
+        println!("writes the answer into IDENTITY.md and SOUL.md, then deletes the file.");
+        println!("The other templates are yours to fill in.");
     }
 
     println!();
@@ -208,6 +215,56 @@ mod tests {
             );
         }
         assert!(report.skipped.is_empty());
+    }
+
+    /// The first conversation's steps live only in BOOTSTRAP.md's prose; a
+    /// rewrite that drops one would go unnoticed. Cheap check that each file
+    /// the ritual reads or writes is still named, and the fallback too.
+    #[test]
+    fn the_bootstrap_names_every_file_its_ritual_touches() {
+        let body = TEMPLATES
+            .iter()
+            .find(|(rel, _)| *rel == "BOOTSTRAP.md")
+            .map(|(_, body)| *body)
+            .unwrap();
+        for name in ["CHARACTER.md", "IDENTITY.md", "SOUL.md", "USER.md"] {
+            assert!(body.contains(name), "BOOTSTRAP.md never mentions {name}");
+        }
+        assert!(
+            body.contains("no `CHARACTER.md`"),
+            "BOOTSTRAP.md must say what to do without CHARACTER.md"
+        );
+        assert!(
+            body.contains("Drop her voice"),
+            "a new character must not be named in the suggested one's voice"
+        );
+        assert!(
+            body.contains("when you start a conversation"),
+            "the language directive must not override the language the user writes in"
+        );
+    }
+
+    #[test]
+    fn a_workspace_with_an_identity_gets_no_bootstrap() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("IDENTITY.md"), "- **Name:** Kit\n").unwrap();
+
+        let report = seed_workspace(d.path()).unwrap();
+
+        assert!(!d.path().join("BOOTSTRAP.md").exists());
+        assert!(report.skipped.iter().any(|r| r == "BOOTSTRAP.md"));
+        assert!(!report.created.iter().any(|r| r == "BOOTSTRAP.md"));
+    }
+
+    #[test]
+    fn a_finished_bootstrap_does_not_come_back() {
+        let d = tempfile::tempdir().unwrap();
+        seed_workspace(d.path()).unwrap();
+        std::fs::remove_file(d.path().join("BOOTSTRAP.md")).unwrap();
+
+        seed_workspace(d.path()).unwrap();
+
+        assert!(!d.path().join("BOOTSTRAP.md").exists());
     }
 
     /// Seeding is how a *new* file reaches an *old* workspace, so `init` has
@@ -303,7 +360,9 @@ mod tests {
 
     /// Seeding a file the prompt builder does not read would be busywork, and
     /// a heading it reads from a file we do not seed is a gap. This asserts
-    /// the two lists agree.
+    /// the two lists agree. `CHARACTER.md` is the one seeded file the prompt
+    /// does not read: it is a suggestion, which the first conversation reads
+    /// with `file_read`.
     #[tokio::test]
     async fn every_seeded_file_reaches_the_system_prompt() {
         let d = tempfile::tempdir().unwrap();

@@ -11,6 +11,7 @@ use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use bevy_egui::{EguiContexts, egui};
 use sapphire_agent_core::ClientCaps;
+use sapphire_framework_gui::i18n::Message;
 
 use super::bubble::{self, Absence, BubbleContent};
 use super::{CompanionPrefs, CompanionRequest, Gesture, Overlay, OverlayInput, Speech};
@@ -213,7 +214,9 @@ pub(crate) fn ui(
                         let edit = ui.add(
                             egui::TextEdit::singleline(&mut chat.draft)
                                 .desired_width(INPUT_WIDTH)
-                                .hint_text("Type a message…"),
+                                .hint_text(
+                                    Message::new("agent-companion-input-hint").text(ui.ctx()),
+                                ),
                         );
                         if !*input_was_open {
                             edit.request_focus();

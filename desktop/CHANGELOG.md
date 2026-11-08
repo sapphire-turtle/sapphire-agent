@@ -14,6 +14,10 @@ and predate any user-facing release of this binary.
 
 ## [Unreleased]
 
+### Changed
+
+- The message box's hint greets in the app's language: "Hello", or 「こんにちは」 in Japanese
+
 ## [0.13.0](https://github.com/sapphire-turtle/sapphire-agent/compare/v0.12.1...v0.13.0) - 2026-11-06
 
 ### Changed
