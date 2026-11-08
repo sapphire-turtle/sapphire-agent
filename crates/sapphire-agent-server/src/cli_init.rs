@@ -234,6 +234,14 @@ mod tests {
             body.contains("no `CHARACTER.md`"),
             "BOOTSTRAP.md must say what to do without CHARACTER.md"
         );
+        assert!(
+            body.contains("Drop her voice"),
+            "a new character must not be named in the suggested one's voice"
+        );
+        assert!(
+            body.contains("when you start a conversation"),
+            "the language directive must not override the language the user writes in"
+        );
     }
 
     #[test]

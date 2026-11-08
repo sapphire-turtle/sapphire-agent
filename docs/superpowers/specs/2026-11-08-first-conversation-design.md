@@ -72,7 +72,7 @@
      ことを一言伝える。
    - どちらでも、テンプレートの書きかけのまま残すと決めたことが消える、という今の注意を残す。
 3. **言語を `USER.md` に書く**。`USER.md` の指示の形式（命令形で始め、観察した日付と `active` を
-   付ける）で、例えば `- Prefer replying in Japanese.`。
+   付ける）で、例えば `- Prefer Japanese when you start a conversation yourself; otherwise answer in the language the user writes in.`。自分から話しかけるときの既定にとどめ、ユーザーが書いた言語で答えるという §1 の決まりを上書きしない書き方にする。
 4. **安全についての一言**。今と同じ。
 5. **`BOOTSTRAP.md` を消す**。`CHARACTER.md` は消さない（あとで見返す案として残る）。
 
