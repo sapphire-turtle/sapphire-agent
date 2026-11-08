@@ -649,7 +649,8 @@ impl ClientShellStart {
                     Check on it with shell_output and stop it with shell_kill. \
                     A session may hold at most {MAX_TERMINALS_PER_SESSION} terminals at \
                     once; starting one more than that is refused, naming the handles \
-                    already held, until one is freed. "
+                    already held, until one is freed. \
+                    To be told when a command finishes, use shell with background instead."
                 )
                 .into(),
                 input_schema: json!({
@@ -984,6 +985,20 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("no editor")
+        );
+    }
+
+    /// `shell_start` says nothing comes back on its own, and points at
+    /// what does.
+    #[test]
+    fn shell_start_points_at_background_shell() {
+        let spec = ClientShellStart::new();
+        assert!(
+            spec.spec()
+                .description
+                .contains("To be told when a command finishes, use shell with background instead."),
+            "{}",
+            spec.spec().description
         );
     }
 

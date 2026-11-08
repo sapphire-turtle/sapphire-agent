@@ -157,7 +157,6 @@ pub struct ServeState {
     pub(crate) background: Arc<crate::background::BackgroundTasks>,
     /// Background shell commands still running, for peeking at their
     /// output (`background_task output`).
-    #[allow(dead_code)] // Read by the shell tool and `background_task` (later tasks).
     pub(crate) shell_runs: Arc<crate::tools::background_shell::ShellRuns>,
     /// Terminals the model started and has not cleaned up, per agent
     /// session id.

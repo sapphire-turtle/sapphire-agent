@@ -15,7 +15,6 @@
 //! counts toward the session's terminal cap. Its watcher waits for the
 //! editor to report the exit, and its [`EditorGuard`] kills and releases
 //! the terminal when the watcher ends any other way.
-#![allow(dead_code)] // Task 4 wires this into the shell tool.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;

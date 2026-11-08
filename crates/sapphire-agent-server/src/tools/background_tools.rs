@@ -1,5 +1,6 @@
 //! `background_task`: lets the model see and stop the background tasks
-//! the current session started (e.g. subagents run with `background`).
+//! the current session started (e.g. subagents and shell commands run
+//! with `background`), and peek at a running command's output.
 //!
 //! The registry is [`crate::background::BackgroundTasks`], reached through
 //! the turn context like `subagent` does, so a session only ever sees and
@@ -13,7 +14,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::json;
 
-/// List or cancel this session's running background tasks.
+/// List, peek at or cancel this session's running background tasks.
 pub struct BackgroundTaskTool {
     spec: ToolSpec,
 }
@@ -29,23 +30,24 @@ impl BackgroundTaskTool {
         Self {
             spec: ToolSpec {
                 name: "background_task".into(),
-                description: "List or cancel the background tasks this session has \
-                    running (for example subagents started with `background`). \
-                    `list` shows each task's id, what it runs and how long ago it \
-                    started; `cancel` stops one by id. A cancelled task still \
-                    reports back as cancelled on a later turn."
+                description: "List, peek at or cancel the background tasks this \
+                    session has running (for example subagents and shell commands \
+                    started with `background`). `list` shows each task's id, what it \
+                    runs and how long ago it started; `output` shows a running \
+                    command's output so far; `cancel` stops one by id. A cancelled \
+                    task still reports back as cancelled on a later turn."
                     .into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
                         "action": {
                             "type": "string",
-                            "enum": ["list", "cancel"],
-                            "description": "`list` running tasks or `cancel` one."
+                            "enum": ["list", "output", "cancel"],
+                            "description": "`list` running tasks, show a running command's `output` so far, or `cancel` one."
                         },
                         "id": {
                             "type": "string",
-                            "description": "Task id from `list`; required for `cancel`."
+                            "description": "Task id from `list`; required for `output` and `cancel`."
                         }
                     },
                     "required": ["action"]
@@ -55,15 +57,21 @@ impl BackgroundTaskTool {
     }
 }
 
-/// The caller's session and its task registry, or an error when the turn
+/// The caller's session and its turn context, or an error when the turn
 /// has no session to scope tasks to.
-fn session_tasks() -> Result<(String, std::sync::Arc<BackgroundTasks>)> {
+fn session_turn() -> Result<(String, std::sync::Arc<crate::serve::TurnContext>)> {
     let Some(ctx) = crate::serve::current_turn_context() else {
         bail!("background_task is only available inside a conversation turn");
     };
     let Some(session) = ctx.session_id.clone() else {
         bail!("background_task needs a session; this turn has none");
     };
+    Ok((session, ctx))
+}
+
+/// The caller's session and its task registry.
+fn session_tasks() -> Result<(String, std::sync::Arc<BackgroundTasks>)> {
+    let (session, ctx) = session_turn()?;
     Ok((session, std::sync::Arc::clone(&ctx.state.background)))
 }
 
@@ -112,6 +120,44 @@ impl Tool for BackgroundTaskTool {
                     .collect();
                 Ok(rows.join("\n"))
             }
+            "output" => {
+                let Some(id) = input["id"].as_str().filter(|s| !s.is_empty()) else {
+                    bail!("`output` needs an `id`; use `list` to see the running ids");
+                };
+                let (session, ctx) = session_turn()?;
+                let pending = ctx.state.background.pending(&session);
+                let Some(task) = pending.iter().find(|t| t.id == id) else {
+                    let held: Vec<&str> = pending.iter().map(|t| t.id.as_str()).collect();
+                    bail!(
+                        "no running background task {id}; running: {}",
+                        if held.is_empty() {
+                            "none".to_string()
+                        } else {
+                            held.join(", ")
+                        }
+                    );
+                };
+                if !matches!(task.kind, TaskKind::Shell { .. }) {
+                    return Ok(format!(
+                        "{id} is not a command; output works only on background shell commands."
+                    ));
+                }
+                match ctx.state.shell_runs.peek(id).await {
+                    Some(text) => {
+                        let mut text = text?;
+                        if !text.is_empty() && !text.ends_with('\n') {
+                            text.push('\n');
+                        }
+                        text.push_str("(still running)");
+                        Ok(text)
+                    }
+                    // Pending but no longer running: it exited between the
+                    // two looks, and its completion is on the way.
+                    None => Ok(format!(
+                        "{id} has already exited; its result is in this conversation."
+                    )),
+                }
+            }
             "cancel" => {
                 let Some(id) = input["id"].as_str().filter(|s| !s.is_empty()) else {
                     bail!("`cancel` needs an `id`; use `list` to see the running ids");
@@ -126,7 +172,7 @@ impl Tool for BackgroundTaskTool {
                 }
                 Ok(format!("Cancelled background task {id}."))
             }
-            other => bail!("unknown action {other:?}; use \"list\" or \"cancel\""),
+            other => bail!("unknown action {other:?}; use \"list\", \"output\" or \"cancel\""),
         }
     }
 }
@@ -225,6 +271,81 @@ mod tests {
         assert_eq!(
             f.background.route_reply("room", "m1"),
             crate::background::Route::Unknown
+        );
+    }
+
+    fn shell_kind() -> TaskKind {
+        TaskKind::Shell {
+            command: "cargo test".into(),
+            on: ShellHost::Agent,
+            timeout_secs: 1800,
+        }
+    }
+
+    #[tokio::test]
+    async fn output_peeks_a_running_command() {
+        use crate::tools::background_shell::{LiveRun, TailBuffer};
+        let state = ServeState::for_test(false);
+        let id = state
+            .background
+            .register("s", shell_kind(), "cargo test".into())
+            .unwrap();
+        let mut buf = TailBuffer::new(1000);
+        buf.push(b"Compiling foo\n");
+        state.shell_runs.insert(
+            id.clone(),
+            LiveRun::Agent(Arc::new(std::sync::Mutex::new(buf))),
+        );
+        let out = run(&state, Some("s"), json!({"action": "output", "id": id}))
+            .await
+            .unwrap();
+        assert_eq!(out, "Compiling foo\n(still running)");
+    }
+
+    #[tokio::test]
+    async fn output_on_a_finished_command() {
+        // Still pending but no longer running: the peek raced the exit.
+        let state = ServeState::for_test(false);
+        let id = state
+            .background
+            .register("s", shell_kind(), "cargo test".into())
+            .unwrap();
+        let out = run(&state, Some("s"), json!({"action": "output", "id": id}))
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            format!("{id} has already exited; its result is in this conversation.")
+        );
+    }
+
+    #[tokio::test]
+    async fn output_on_a_subagent_task() {
+        let state = ServeState::for_test(false);
+        let id = state.background.register("s", kind(), "x".into()).unwrap();
+        let out = run(&state, Some("s"), json!({"action": "output", "id": id}))
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            format!("{id} is not a command; output works only on background shell commands.")
+        );
+    }
+
+    #[tokio::test]
+    async fn output_needs_an_id() {
+        let state = ServeState::for_test(false);
+        let err = run(&state, Some("s"), json!({"action": "output"}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("id"), "{err}");
+
+        let err = run(&state, Some("s"), json!({"action": "output", "id": "nope"}))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("no running background task nope"),
+            "{err}"
         );
     }
 

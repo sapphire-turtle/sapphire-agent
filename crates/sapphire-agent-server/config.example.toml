@@ -368,7 +368,12 @@ system_prompt = "You are a helpful personal assistant."
 #     table already allows run normally; calls it would ask about run only
 #     with a standing "always allow", and the others are refused and listed
 #     in the result. A standing "always reject" is refused and not listed.
-#     The `background_task` tool lists and cancels running tasks.
+#     `shell` with `background: true` runs a command the same way: it
+#     returns at once and the command's output is delivered when it exits.
+#     Its `timeout` is then the run time (default 30 min, max 24 h), after
+#     which it is killed, and it counts toward `max_per_session` too.
+#     The `background_task` tool lists and cancels running tasks, and
+#     `output` shows a running command's output so far.
 #     `0` disables all of this.
 #   - `[[tools.mcp_servers]]` — outbound MCP client. Connects to
 #     external MCP servers and exposes their tools to the agent as
