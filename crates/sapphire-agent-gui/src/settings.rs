@@ -146,6 +146,7 @@ pub(crate) fn follow(mut contexts: EguiContexts, settings: Option<NonSendMut<Gui
         return;
     };
     sapphire_framework_gui::i18n::register(ctx, sapphire_framework_gui::RESOURCES);
+    sapphire_framework_gui::i18n::register(ctx, crate::i18n::RESOURCES);
     let Some(mut settings) = settings else {
         return;
     };

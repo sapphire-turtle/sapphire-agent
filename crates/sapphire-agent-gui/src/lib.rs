@@ -17,6 +17,7 @@ mod app;
 pub mod avatar;
 pub mod chat;
 pub mod companion;
+mod i18n;
 pub mod settings;
 
 use bevy::prelude::*;
