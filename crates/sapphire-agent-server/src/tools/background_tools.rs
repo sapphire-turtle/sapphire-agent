@@ -5,7 +5,7 @@
 //! the turn context like `subagent` does, so a session only ever sees and
 //! cancels its own tasks.
 
-use crate::background::{BackgroundTasks, TaskKind};
+use crate::background::{BackgroundTasks, ShellHost, TaskKind};
 use crate::provider::ToolSpec;
 use crate::tools::{Tool, ToolKind};
 use anyhow::{Result, bail};
@@ -94,6 +94,16 @@ impl Tool for BackgroundTaskTool {
                             TaskKind::Subagent { agent, .. } => format!("subagent {agent}"),
                             TaskKind::Question { question, .. } => {
                                 format!("question \"{}\"", question.lines().next().unwrap_or(""))
+                            }
+                            TaskKind::Shell { command, on, .. } => {
+                                let on = match on {
+                                    ShellHost::Agent => "agent",
+                                    ShellHost::Editor => "editor",
+                                };
+                                format!(
+                                    "command \"{}\" on {on}",
+                                    crate::background::first_line(command)
+                                )
                             }
                         };
                         let secs = (now - t.started_at).num_seconds().max(0);
