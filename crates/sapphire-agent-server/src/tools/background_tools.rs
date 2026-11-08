@@ -297,7 +297,10 @@ mod tests {
         buf.push(b"Compiling foo\n");
         state.shell_runs.insert(
             id.clone(),
-            LiveRun::Agent(Arc::new(std::sync::Mutex::new(buf))),
+            LiveRun::Agent {
+                output: Arc::new(std::sync::Mutex::new(buf)),
+                pgid: None,
+            },
         );
         let out = run(&state, Some("s"), json!({"action": "output", "id": id}))
             .await

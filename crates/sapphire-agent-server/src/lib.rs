@@ -1397,6 +1397,11 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
             {
                 tracing::warn!("Agent task did not finish cleanly: {e}");
             }
+            // Background commands, each in a process group of its own,
+            // would outlive the process: the restart below exits with the
+            // runtime alive, so no watcher's guard is dropped to kill them.
+            // A normal return stops them here too, before anything else.
+            serve_state.shell_runs.stop_all();
             served?;
 
             if restart.load(Ordering::SeqCst) {

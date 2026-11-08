@@ -42,6 +42,28 @@ const DROPPED_MARKER: &str = "[… earlier output dropped]\n";
 /// unless something escaped it.
 const READER_GRACE: Duration = Duration::from_secs(2);
 
+/// How long one editor call after the wait — kill, output, release, or a
+/// peek — may take. An editor that is connected but no longer answering
+/// must not leave the task pending forever. Short in tests, so the
+/// hung-editor tests stay fast.
+#[cfg(not(test))]
+const EDITOR_RPC_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const EDITOR_RPC_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// `call`, or an error once [`EDITOR_RPC_TIMEOUT`] passes without an answer.
+async fn bounded<T>(
+    call: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    tokio::time::timeout(EDITOR_RPC_TIMEOUT, call)
+        .await
+        .unwrap_or_else(|_| {
+            Err(anyhow::anyhow!(
+                "the editor did not answer within {EDITOR_RPC_TIMEOUT:?}"
+            ))
+        })
+}
+
 /// The last `cap` bytes of a command's output.
 pub(crate) struct TailBuffer {
     cap: usize,
@@ -90,8 +112,13 @@ impl TailBuffer {
 /// concerned.
 #[derive(Clone)]
 pub(crate) enum LiveRun {
-    /// On the agent's machine: the watcher fills this buffer.
-    Agent(Arc<Mutex<TailBuffer>>),
+    /// On the agent's machine: the watcher fills `output`. `pgid` is the
+    /// command's process group (unix; `None` elsewhere), for
+    /// [`ShellRuns::stop_all`].
+    Agent {
+        output: Arc<Mutex<TailBuffer>>,
+        pgid: Option<i32>,
+    },
     /// On the editor's machine: the editor holds the output.
     Editor {
         client: Arc<dyn AcpClient>,
@@ -122,16 +149,46 @@ impl ShellRuns {
         self.lock().remove(id);
     }
 
+    /// Kill the process group of every command still running on the
+    /// agent's machine, for a shutdown or restart that exits the process
+    /// while the runtime is alive: no watcher is dropped then, so no
+    /// [`GroupGuard`] kills its group, and each command, in a group of its
+    /// own, would outlive the agent. Editor terminals are left to the
+    /// editor, which releases them with the session.
+    ///
+    /// A run leaves the map only when its guard drops, so a group whose
+    /// leader was just reaped can still be listed for a moment; the same
+    /// wraparound-only pgid reuse window [`GroupGuard`] accepts.
+    pub(crate) fn stop_all(&self) {
+        for run in self.lock().values() {
+            if let LiveRun::Agent {
+                pgid: Some(pgid), ..
+            } = run
+            {
+                #[cfg(unix)]
+                // SAFETY: killpg only sends a signal; ESRCH (the group is
+                // already gone) is the expected failure and is ignored.
+                unsafe {
+                    libc::killpg(*pgid, libc::SIGKILL);
+                }
+                #[cfg(not(unix))]
+                let _ = pgid;
+            }
+        }
+    }
+
     /// The output so far of the running command `id`; `None` when no such
     /// command is running.
     pub(crate) async fn peek(&self, id: &str) -> Option<anyhow::Result<String>> {
         // Cloned out so the lock is not held across the editor's answer.
         let run = self.lock().get(id).cloned()?;
         Some(match run {
-            LiveRun::Agent(buf) => Ok(buf.lock().unwrap_or_else(|e| e.into_inner()).text()),
-            LiveRun::Editor { client, terminal } => {
-                client.terminal_output(&terminal).await.map(editor_text)
+            LiveRun::Agent { output, .. } => {
+                Ok(output.lock().unwrap_or_else(|e| e.into_inner()).text())
             }
+            LiveRun::Editor { client, terminal } => bounded(client.terminal_output(&terminal))
+                .await
+                .map(editor_text),
         })
     }
 }
@@ -243,7 +300,19 @@ pub(crate) fn start_on_agent(
     if let Some(err) = child.stderr.take() {
         readers.push(tokio::spawn(pump(err, Arc::clone(&buf))));
     }
-    runs.insert(id.clone(), LiveRun::Agent(Arc::clone(&buf)));
+    // With `process_group(0)` the group id is the leader's pid.
+    let pgid = if cfg!(unix) {
+        child.id().and_then(|p| i32::try_from(p).ok())
+    } else {
+        None
+    };
+    runs.insert(
+        id.clone(),
+        LiveRun::Agent {
+            output: Arc::clone(&buf),
+            pgid,
+        },
+    );
 
     let mut guard = GroupGuard {
         pgid: child.id().and_then(|p| i32::try_from(p).ok()),
@@ -325,19 +394,19 @@ fn editor_text(out: TerminalOutput) -> String {
 }
 
 /// Release `terminal` and stop counting it against the session's cap.
-/// The untrack happens even when the release fails: a terminal the editor
-/// no longer answers for must not hold a slot forever, and the editor
-/// releases its terminals with the session anyway.
+/// The untrack happens even when the release fails or times out: a
+/// terminal the editor no longer answers for must not hold a slot
+/// forever, and the editor releases its terminals with the session anyway.
 async fn release_and_untrack(client: &dyn AcpClient, terminal: &TerminalHandle) {
-    if let Err(e) = client.release_terminal(terminal).await {
+    if let Err(e) = bounded(client.release_terminal(terminal)).await {
         warn!("background command: releasing terminal {terminal} failed: {e:#}");
     }
     client.untrack_terminal(terminal).await;
 }
 
-/// Kill the command in `terminal`; a failure is only logged.
+/// Kill the command in `terminal`; a failure or time-out is only logged.
 async fn kill(client: &dyn AcpClient, terminal: &TerminalHandle) {
-    if let Err(e) = client.kill_terminal(terminal).await {
+    if let Err(e) = bounded(client.kill_terminal(terminal)).await {
         warn!("background command: killing terminal {terminal} failed: {e:#}");
     }
 }
@@ -469,7 +538,7 @@ pub(crate) async fn start_on_editor(
                 (None, true)
             }
         };
-        let output = match client.terminal_output(&terminal).await {
+        let output = match bounded(client.terminal_output(&terminal)).await {
             Ok(out) => editor_text(out),
             Err(e) => format!("[the editor did not return the output: {e:#}]"),
         };
@@ -679,6 +748,31 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn stop_all_kills_every_process_group() {
+            let dir = tempfile::tempdir().unwrap();
+            let pid_file = dir.path().join("pid");
+            let command = format!("sleep 300 & echo $! > {}; wait", pid_file.display());
+            let s = start(&command, dir.path(), Duration::from_secs(600)).unwrap();
+            let read_pid = || {
+                std::fs::read_to_string(&pid_file)
+                    .ok()
+                    .and_then(|t| t.trim().parse::<i32>().ok())
+            };
+            assert!(
+                wait_until(Duration::from_secs(10), || read_pid().is_some()).await,
+                "the pid file never appeared"
+            );
+            let pid = read_pid().unwrap();
+            assert!(alive(pid));
+            // As on shutdown: nothing aborts the watcher, only the kill.
+            s.runs.stop_all();
+            assert!(
+                wait_until(Duration::from_secs(5), || !alive(pid)).await,
+                "the grandchild {pid} survived stop_all"
+            );
+        }
+
+        #[tokio::test]
         async fn peek_returns_output_so_far() {
             let dir = tempfile::tempdir().unwrap();
             let s = start("echo first; sleep 30", dir.path(), Duration::from_secs(60)).unwrap();
@@ -880,6 +974,63 @@ mod tests {
             assert!(err.to_string().contains("maximum"), "{err}");
             assert_eq!(fake.tracked_count(), MAX_TERMINALS_PER_SESSION);
             assert_eq!(fake.terminal_count(), MAX_TERMINALS_PER_SESSION);
+        }
+
+        #[tokio::test]
+        async fn a_hung_editor_still_completes_and_frees_the_slot() {
+            let fake = Arc::new(FakeClient::default());
+            fake.make_exit_never_return();
+            fake.make_editor_stop_answering();
+            let s = start(Arc::clone(&fake), Duration::from_secs(1))
+                .await
+                .unwrap();
+            match completion(&s).await.outcome {
+                Outcome::Exited {
+                    timed_out: true,
+                    exit_code: None,
+                    output,
+                } => assert!(
+                    output.starts_with("[the editor did not return the output: "),
+                    "{output:?}"
+                ),
+                other => panic!("{other:?}"),
+            }
+            assert_eq!(killed(&fake), 1);
+            assert_eq!(released(&fake), 1);
+            assert_eq!(fake.tracked_count(), 0);
+        }
+
+        #[tokio::test]
+        async fn a_cancel_on_a_hung_editor_frees_the_slot() {
+            let fake = Arc::new(FakeClient::default());
+            fake.make_exit_never_return();
+            fake.make_editor_stop_answering();
+            let s = start(Arc::clone(&fake), Duration::from_secs(600))
+                .await
+                .unwrap();
+            s.background.cancel(SESSION, &s.id).unwrap();
+            assert!(
+                wait_until(Duration::from_secs(5), || fake.tracked_count() == 0).await,
+                "killed {}, released {}, tracked {}",
+                killed(&fake),
+                released(&fake),
+                fake.tracked_count()
+            );
+        }
+
+        #[tokio::test]
+        async fn peek_on_a_hung_editor_is_an_error() {
+            let fake = Arc::new(FakeClient::default());
+            fake.make_exit_never_return();
+            fake.make_editor_stop_answering();
+            let s = start(Arc::clone(&fake), Duration::from_secs(600))
+                .await
+                .unwrap();
+            let peeked = tokio::time::timeout(Duration::from_secs(5), s.runs.peek(&s.id))
+                .await
+                .expect("peek must not hang");
+            assert!(matches!(peeked, Some(Err(_))), "{peeked:?}");
+            s.background.cancel(SESSION, &s.id).unwrap();
         }
 
         #[tokio::test]
