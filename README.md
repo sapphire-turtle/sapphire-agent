@@ -1242,6 +1242,7 @@ This repository contains components under different licenses:
 | `sapphire-agent-server` | MIT OR Apache-2.0 |
 | `sapphire-agent-desktop` | GPL-3.0-or-later, with [App Store marketplace exception](desktop/LICENSE.App-Store-Exception) |
 | `sapphire-agent-gui` | GPL-3.0-or-later, with [App Store marketplace exception](crates/sapphire-agent-gui/LICENSE.App-Store-Exception) |
+| The suggested character, [`CHARACTER.md`](crates/sapphire-agent-server/templates/workspace/CHARACTER.md) | CC0 1.0 |
 
 The desktop app's binary includes the MIT/Apache-2.0 code of the command line and the
 server, so the binary as a whole is distributed under GPL-3.0-or-later (with the same

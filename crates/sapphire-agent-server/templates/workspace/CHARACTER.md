@@ -1,7 +1,8 @@
 <!--
 CHARACTER.md is dedicated to the public domain under CC0 1.0
 (https://creativecommons.org/publicdomain/zero/1.0/), like the default
-avatar. It is not covered by the agent's GPL.
+avatar. It is not under the MIT OR Apache-2.0 license of the code that
+embeds it.
 -->
 
 # CHARACTER.md — A Suggested Character

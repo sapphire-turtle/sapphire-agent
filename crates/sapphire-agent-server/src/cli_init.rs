@@ -34,6 +34,10 @@ const TEMPLATES: &[(&str, &str)] = &[
         include_str!("../templates/workspace/BOOTSTRAP.md"),
     ),
     (
+        "CHARACTER.md",
+        include_str!("../templates/workspace/CHARACTER.md"),
+    ),
+    (
         "memory/default/MEMORY.md",
         include_str!("../templates/workspace/MEMORY.md"),
     ),
@@ -182,6 +186,7 @@ mod tests {
         "USER.md",
         "TOOLS.md",
         "BOOTSTRAP.md",
+        "CHARACTER.md",
         "memory/default/MEMORY.md",
         ".sapphire-agent/config.toml",
         "agents/example-reviewer.md",
