@@ -1,0 +1,167 @@
+name: Install scripts
+
+# install/install.sh and install.ps1 download real releases, so they can break
+# without a change here (a renamed release file, a new tag prefix): besides
+# pull requests that touch them, run them weekly against the live releases.
+#
+# Made from sapphire-turtle/.github's templates/install/install.yml: change only
+# the env block below.
+on:
+  pull_request:
+    paths:
+      - "install/**"
+      - ".github/workflows/install.yml"
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+env:
+  # Every app the scripts install, and what the tests pass them: nothing, to
+  # install the repository's one app.
+  APPS: agent
+  ARGS: ""
+  # An app installed by another repository's script, if the scripts know one.
+  MOVED: ""
+  # An app with a desktop package, and the name of its macOS bundle.
+  DESKTOP: agent
+  DESKTOP_NAME: Sapphire Agent
+  # The runners share the unauthenticated API rate limit.
+  GITHUB_TOKEN: ${{ github.token }}
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: shellcheck install/install.sh
+
+  install-sh:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Without minisign, --require-signature refuses to install
+        run: |
+          if command -v minisign; then echo 'minisign is on PATH already'; exit 1; fi
+          # shellcheck disable=SC2086
+          if sh install/install.sh --require-signature --dir "$RUNNER_TEMP/req" $ARGS 2>err; then exit 1; fi
+          grep -q 'minisign is required' err
+          test ! -e "$RUNNER_TEMP/req"
+      - name: Without minisign, the SHA-256 alone is checked
+        run: |
+          # shellcheck disable=SC2086
+          sh install/install.sh --dir "$RUNNER_TEMP/sha" $ARGS 2>err
+          grep -q 'minisign is not on PATH' err
+          for app in $APPS; do "$RUNNER_TEMP/sha/sapphire-$app" --version; done
+      - name: Install minisign
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then brew install minisign; else sudo apt-get install -y minisign; fi
+      - name: Install, checking each signature
+        run: |
+          # shellcheck disable=SC2086
+          sh install/install.sh --require-signature --dir "$RUNNER_TEMP/bin" $ARGS | tee out
+          # shellcheck disable=SC2086
+          test "$(grep -c 'Signature verified' out)" -eq "$(echo $APPS | wc -w)"
+      - name: The installed binaries run
+        run: |
+          for app in $APPS; do "$RUNNER_TEMP/bin/sapphire-$app" --version; done
+      - name: An app of another repository points to its script
+        if: env.MOVED != ''
+        run: |
+          if sh install/install.sh --dir "$RUNNER_TEMP/bin" "$MOVED" 2>err; then exit 1; fi
+          grep -q "sapphire-$MOVED/main/install/install.sh" err
+      - name: A desktop app points to its installer
+        run: |
+          if sh install/install.sh --dir "$RUNNER_TEMP/bin" "$DESKTOP-desktop" 2>err; then exit 1; fi
+          grep -q "$GITHUB_REPOSITORY/releases/latest" err
+      - name: An app whose desktop package is installed is skipped
+        run: |
+          # As the desktop package lays itself out on each OS.
+          if [ "$RUNNER_OS" = macOS ]; then
+            mkdir -p "$HOME/Applications/$DESKTOP_NAME.app"
+          else
+            mkdir -p "$HOME/.local/bin" "$RUNNER_TEMP/apps"
+            touch "$RUNNER_TEMP/apps/app.AppImage"
+            ln -sf "$RUNNER_TEMP/apps/app.AppImage" "$HOME/.local/bin/sapphire-$DESKTOP"
+          fi
+          sh install/install.sh --dir "$RUNNER_TEMP/skip" "$DESKTOP" > out
+          grep -q "Skipping sapphire-$DESKTOP" out
+          test ! -e "$RUNNER_TEMP/skip/sapphire-$DESKTOP"
+
+  install-ps1:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Without minisign, -RequireSignature refuses to install
+        shell: pwsh
+        run: |
+          if (Get-Command minisign.exe -ErrorAction SilentlyContinue) { throw 'minisign is on PATH already' }
+          $appArgs = @($env:ARGS -split ' ' | Where-Object { $_ })
+          try { ./install/install.ps1 -RequireSignature -Dir "$env:RUNNER_TEMP\req" @appArgs; exit 1 }
+          catch { if ("$_" -notmatch 'minisign is required') { throw } }
+          if (Test-Path "$env:RUNNER_TEMP\req") { throw 'installed anyway' }
+      - name: Without minisign, the SHA-256 alone is checked
+        shell: pwsh
+        run: |
+          $appArgs = @($env:ARGS -split ' ' | Where-Object { $_ })
+          $out = ./install/install.ps1 -Dir "$env:RUNNER_TEMP\sha" @appArgs 3>&1 | Out-String
+          if ($out -notmatch 'minisign is not on PATH') { throw "no warning: $out" }
+          foreach ($app in $env:APPS -split ' ') {
+            & "$env:RUNNER_TEMP\sha\sapphire-$app.exe" --version
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          }
+      - name: Install minisign
+        shell: pwsh
+        run: |
+          # minisign 0.12, whose zip jedisct1 signs; pinned by its SHA-256 here.
+          $zip = "$env:RUNNER_TEMP\minisign.zip"
+          Invoke-WebRequest -Uri https://github.com/jedisct1/minisign/releases/download/0.12/minisign-0.12-win64.zip -OutFile $zip
+          if ((Get-FileHash -Algorithm SHA256 $zip).Hash -ne '37B600344E20C19314B2E82813DB2BFDCC408B77B876F7727889DBD46D539479') { throw 'minisign.zip does not match' }
+          Expand-Archive $zip "$env:RUNNER_TEMP\minisign"
+          "$env:RUNNER_TEMP\minisign\minisign-win64\x86_64" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+      - name: Install, checking each signature
+        shell: pwsh
+        run: |
+          $appArgs = @($env:ARGS -split ' ' | Where-Object { $_ })
+          $out = ./install/install.ps1 -RequireSignature -Dir "$env:RUNNER_TEMP\bin" @appArgs 6>&1 | Out-String
+          Write-Host $out
+          $want = @($env:APPS -split ' ').Count
+          if (([regex]::Matches($out, 'Signature verified')).Count -ne $want) { throw 'not every signature was verified' }
+      - name: The installed binaries run
+        shell: pwsh
+        run: |
+          foreach ($app in $env:APPS -split ' ') {
+            & "$env:RUNNER_TEMP\bin\sapphire-$app.exe" --version
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          }
+      - name: An app of another repository points to its script
+        if: env.MOVED != ''
+        shell: pwsh
+        run: |
+          try { ./install/install.ps1 -Dir "$env:RUNNER_TEMP\bin" $env:MOVED; exit 1 }
+          catch { if ("$_" -notmatch "sapphire-$env:MOVED/main/install/install.ps1") { throw } }
+      - name: A desktop app points to its installer
+        shell: pwsh
+        run: |
+          try { ./install/install.ps1 -Dir "$env:RUNNER_TEMP\bin" "$env:DESKTOP-desktop"; exit 1 }
+          catch { if ("$_" -notmatch "$env:GITHUB_REPOSITORY/releases/latest") { throw } }
+      - name: An app whose desktop package is installed is skipped
+        shell: pwsh
+        run: |
+          $base = "sapphire-$env:DESKTOP"
+          # The app's data directory is not its package: a CLI-only host has it too.
+          New-Item -ItemType Directory -Force "$env:LOCALAPPDATA\$base" | Out-Null
+          New-Item -ItemType File -Force "$env:LOCALAPPDATA\$base\Update.exe" | Out-Null
+          $out = ./install/install.ps1 -Dir "$env:RUNNER_TEMP\data" $env:DESKTOP 6>&1 | Out-String
+          if ($out -match "Skipping $base") { throw "skipped for its data directory: $out" }
+          Remove-Item -Recurse -Force "$env:LOCALAPPDATA\$base"
+          # As the Velopack package lays itself out: %LocalAppData%\<packId>, and the packId
+          # is <app>-desktop (corundum-framework#57).
+          New-Item -ItemType Directory -Force "$env:LOCALAPPDATA\$base-desktop" | Out-Null
+          New-Item -ItemType File -Force "$env:LOCALAPPDATA\$base-desktop\Update.exe" | Out-Null
+          $out = ./install/install.ps1 -Dir "$env:RUNNER_TEMP\skip" $env:DESKTOP 6>&1 | Out-String
+          if ($out -notmatch "Skipping $base") { throw "not skipped: $out" }
+          if (Test-Path "$env:RUNNER_TEMP\skip\$base.exe") { throw 'installed anyway' }

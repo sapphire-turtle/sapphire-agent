@@ -9,8 +9,8 @@ desktop app's binary runs the same commands and is put on PATH under the same na
 ## Installation
 
 ```sh
-# Install script (Linux, macOS), with sapphire-bridge
-curl -fsSL https://raw.githubusercontent.com/sapphire-turtle/sapphire-framework/main/install/install.sh | sh -s -- agent
+# Install script (Linux, macOS)
+curl -fsSL https://raw.githubusercontent.com/sapphire-turtle/sapphire-agent/main/install/install.sh | sh
 
 cargo binstall sapphire-agent-headless   # the release file
 cargo install sapphire-agent-headless    # or build it
