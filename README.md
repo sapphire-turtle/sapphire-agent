@@ -51,15 +51,19 @@ when the one on PATH is not the one you ran.
 ### Headless: install script
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/sapphire-turtle/sapphire-framework/main/install/install.sh | sh -s -- agent
+curl -fsSL https://raw.githubusercontent.com/sapphire-turtle/sapphire-agent/main/install/install.sh | sh
 ```
 
 ```powershell
 # Windows
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/sapphire-turtle/sapphire-framework/main/install/install.ps1))) agent
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/sapphire-turtle/sapphire-agent/main/install/install.ps1)))
 ```
 
-This installs `sapphire-agent` into `~/.local/bin` together with `sapphire-bridge`, which it syncs through. See the [install script's README](https://github.com/sapphire-turtle/sapphire-framework/tree/main/install) for the options.
+This installs `sapphire-agent` into `~/.local/bin`, after checking the download against its
+SHA-256 and, when [minisign](https://jedisct1.github.io/minisign/) is on `PATH`, its signature.
+It does not install `sapphire-bridge`, which the app syncs through: on a host that syncs,
+install it with [sapphire-framework's script](https://github.com/sapphire-turtle/sapphire-framework/tree/main/install) as well. The options are the same as
+that script's.
 
 ### Headless: cargo-binstall or cargo
 

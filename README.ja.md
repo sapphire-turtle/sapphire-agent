@@ -50,15 +50,18 @@
 ### ヘッドレス版：インストールスクリプト
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/sapphire-turtle/sapphire-framework/main/install/install.sh | sh -s -- agent
+curl -fsSL https://raw.githubusercontent.com/sapphire-turtle/sapphire-agent/main/install/install.sh | sh
 ```
 
 ```powershell
 # Windows
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/sapphire-turtle/sapphire-framework/main/install/install.ps1))) agent
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/sapphire-turtle/sapphire-agent/main/install/install.ps1)))
 ```
 
-`sapphire-agent` と、同期に使う `sapphire-bridge` が一緒に `~/.local/bin` へ入ります。オプションは[インストールスクリプトの README](https://github.com/sapphire-turtle/sapphire-framework/tree/main/install)を参照してください。
+`sapphire-agent` を `~/.local/bin` にインストールします。ダウンロードしたファイルは、SHA-256 と、
+[minisign](https://jedisct1.github.io/minisign/) が `PATH` にあれば署名も確認してから入れます。
+同期に使う `sapphire-bridge` は入らないので、同期するホストでは [sapphire-framework のスクリプト](https://github.com/sapphire-turtle/sapphire-framework/tree/main/install/README.ja.md)で
+あわせて入れてください。オプションはそちらと同じです。
 
 ### ヘッドレス版：cargo-binstall か cargo
 
