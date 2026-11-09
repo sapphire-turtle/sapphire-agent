@@ -3,7 +3,7 @@ name = "sapphire-agent-server"
 # Released together with the editions that run it (release-plz.toml). The
 # server binary was published under this name up to 0.8.0, so it resumes at
 # 0.12.0.
-version = "0.13.0"
+version = "0.13.1"
 edition.workspace = true
 description = "sapphire-agent's app server: the agent itself, with its channels, tools, memory and IPC, which `sapphire-agent serve` runs"
 license.workspace = true
