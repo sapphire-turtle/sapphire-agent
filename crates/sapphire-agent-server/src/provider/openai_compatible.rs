@@ -56,6 +56,14 @@ pub struct OpenAICompatibleConfig {
     /// before the call fails. `0` disables. See `crate::provider::retry`.
     #[serde(default = "crate::provider::retry::default_incomplete_retries")]
     pub incomplete_retries: u32,
+    /// How hard a reasoning model thinks before it answers, sent as the
+    /// request's top-level `reasoning_effort` (OpenAI's chat completions
+    /// parameter, which OpenRouter, vLLM and Ollama accept too). Passed
+    /// through as written — servers differ in the values they take
+    /// (`none`, `minimal`, `low`, `medium`, `high`, …) and reject one they
+    /// don't know. Unset leaves the field out and the server's default applies.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 fn default_max_tokens() -> u32 {
@@ -68,6 +76,7 @@ pub struct OpenAICompatibleProvider {
     model: String,
     name: String,
     max_tokens: u32,
+    reasoning_effort: Option<String>,
     client: Client,
     stream_idle_timeout: Option<Duration>,
 }
@@ -84,6 +93,7 @@ impl OpenAICompatibleProvider {
                 .clone()
                 .unwrap_or_else(|| "openai_compatible".to_string()),
             max_tokens: cfg.max_tokens,
+            reasoning_effort: cfg.reasoning_effort.clone(),
             client: http::client(http::secs(cfg.connect_timeout_secs)),
             stream_idle_timeout: http::secs(cfg.stream_idle_timeout_secs),
         }
@@ -111,6 +121,8 @@ struct Request<'a> {
     stream_options: StreamOptions,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<ApiToolSpec<'a>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'a str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -461,6 +473,7 @@ impl Provider for OpenAICompatibleProvider {
                 include_usage: true,
             },
             tools: api_tools,
+            reasoning_effort: self.reasoning_effort.as_deref(),
         };
 
         let url = self.endpoint();
@@ -691,6 +704,26 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_effort_is_sent_only_when_set() {
+        let body = |effort: Option<&str>| {
+            serde_json::to_value(Request {
+                model: "m",
+                messages: Vec::new(),
+                max_tokens: 1,
+                stream: true,
+                stream_options: StreamOptions {
+                    include_usage: true,
+                },
+                tools: None,
+                reasoning_effort: effort,
+            })
+            .unwrap()
+        };
+        assert_eq!(body(Some("low"))["reasoning_effort"], json!("low"));
+        assert!(body(None).get("reasoning_effort").is_none());
+    }
+
+    #[test]
     fn endpoint_strips_trailing_slash() {
         let p = OpenAICompatibleProvider::new(&OpenAICompatibleConfig {
             base_url: "http://localhost:8080/v1/".to_string(),
@@ -701,6 +734,7 @@ mod tests {
             connect_timeout_secs: 15,
             stream_idle_timeout_secs: 300,
             incomplete_retries: 2,
+            reasoning_effort: None,
         });
         assert_eq!(p.endpoint(), "http://localhost:8080/v1/chat/completions");
     }
@@ -716,6 +750,7 @@ mod tests {
             connect_timeout_secs: 15,
             stream_idle_timeout_secs: 300,
             incomplete_retries: 2,
+            reasoning_effort: None,
         });
         assert_eq!(default.name(), "openai_compatible");
 
@@ -728,6 +763,7 @@ mod tests {
             connect_timeout_secs: 15,
             stream_idle_timeout_secs: 300,
             incomplete_retries: 2,
+            reasoning_effort: None,
         });
         assert_eq!(custom.name(), "llama_cpp");
     }
@@ -773,6 +809,7 @@ mod tests {
                 include_usage: true,
             },
             tools: api_tools(Some(empty)),
+            reasoning_effort: None,
         };
         let json = serde_json::to_value(&body).unwrap();
         assert!(
@@ -808,6 +845,7 @@ mod tests {
                 include_usage: true,
             },
             tools: None,
+            reasoning_effort: None,
         };
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(json["stream_options"]["include_usage"], true);
@@ -832,6 +870,7 @@ mod tests {
             connect_timeout_secs: 15,
             stream_idle_timeout_secs: 300,
             incomplete_retries: 2,
+            reasoning_effort: None,
         });
         p.stream_idle_timeout = Some(Duration::from_millis(200));
         p

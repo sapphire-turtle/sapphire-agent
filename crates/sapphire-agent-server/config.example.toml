@@ -181,6 +181,14 @@ system_prompt = "You are a helpful personal assistant."
 #                                        # bounds how long a request may
 #                                        # wait in its queue.
 # incomplete_retries = 2                 # see [anthropic]; 0 disables
+# reasoning_effort = "low"               # optional; sent as the request's
+#                                        # `reasoning_effort` to reasoning
+#                                        # models (OpenAI, OpenRouter, vLLM,
+#                                        # Ollama). Lower spends fewer
+#                                        # reasoning tokens. Passed through
+#                                        # as written; the server decides
+#                                        # which values it accepts. Unset
+#                                        # leaves the server's default.
 
 # ── Profiles (LLM presets) ──────────────────────────────────────────────
 # A profile is a *pure* LLM preset: a provider plus an optional

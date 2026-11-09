@@ -3306,14 +3306,23 @@ api_key = "test"
 type = "openai_compatible"
 base_url = "http://127.0.0.1:8080/v1"
 model = "gemma-4-31b-it"
+
+[providers.router]
+type = "openai_compatible"
+base_url = "https://openrouter.ai/api/v1"
+model = "some/model"
+reasoning_effort = "low"
 "#,
         );
+        let ProviderConfig::OpenAiCompatible(router) = &cfg.providers["router"];
+        assert_eq!(router.reasoning_effort.as_deref(), Some("low"));
         let local = cfg.providers.get("local").expect("local provider present");
         match local {
             ProviderConfig::OpenAiCompatible(c) => {
                 assert_eq!(c.base_url, "http://127.0.0.1:8080/v1");
                 assert_eq!(c.model, "gemma-4-31b-it");
                 assert!(c.api_key.is_none());
+                assert!(c.reasoning_effort.is_none());
             }
         }
     }
