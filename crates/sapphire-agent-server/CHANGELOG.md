@@ -10,6 +10,19 @@ Changes up to `0.8.0`, when this crate was a binary of its own, are recorded in
 
 ## [Unreleased]
 
+## [0.13.1](https://github.com/sapphire-turtle/sapphire-agent/compare/sapphire-agent-server-v0.13.0...sapphire-agent-server-v0.13.1) - 2026-11-09
+
+### Added
+
+- *(tools)* Background tasks and background subagents ([#380](https://github.com/sapphire-turtle/sapphire-agent/pull/380))
+- *(autonomous)* A consult room where autonomous sessions ask a person (ask_human) ([#381](https://github.com/sapphire-turtle/sapphire-agent/pull/381))
+- *(workspace)* Init seeds a suggested character, CHARACTER.md ([#382](https://github.com/sapphire-turtle/sapphire-agent/pull/382))
+- The first conversation introduces the default character ([#383](https://github.com/sapphire-turtle/sapphire-agent/pull/383))
+- *(tools)* Run shell commands in the background ([#384](https://github.com/sapphire-turtle/sapphire-agent/pull/384))
+- *(api)* Reasoning_effort setting for openai_compatible providers
+
+
+
 ## [0.13.0](https://github.com/sapphire-turtle/sapphire-agent/compare/sapphire-agent-server-v0.12.1...sapphire-agent-server-v0.13.0) - 2026-11-06
 
 ### Added
