@@ -196,15 +196,27 @@ impl ToolSet {
         output
     }
 
-    /// Add `tools` to the set. For a set filled after it was handed out:
-    /// an ACP session's client tools arrive server by server, in the
-    /// background (`serve::acp_mcp::ClientMcp`).
-    pub async fn extend(&self, tools: Vec<Box<dyn Tool>>) {
+    /// Install `client`'s listed tools, replacing any it already has
+    /// here (everything under its `tool_prefix`). The one way a client's
+    /// tools get in: a refresh and a listing that race — an ACP session's
+    /// initial listing (`serve::acp_mcp::ClientMcp`) and a turn's
+    /// `refresh_if_needed` — must leave one copy, not two, or the provider
+    /// is sent duplicate tool names.
+    pub async fn install_client_tools(
+        &self,
+        client: &Arc<McpClient>,
+        remote_tools: Vec<mcp_client::RemoteToolSpec>,
+    ) -> usize {
+        let new_tools = build_tools_for_client(client, remote_tools);
+        let prefix = client.tool_prefix();
         let mut inner = self.inner.write().await;
-        for tool in tools {
+        inner.tools.retain(|t| !t.spec().name.starts_with(&prefix));
+        inner.specs.retain(|s| !s.name.starts_with(&prefix));
+        for tool in new_tools {
             inner.specs.push(tool.spec().clone());
             inner.tools.push(Arc::from(tool));
         }
+        inner.tools.len()
     }
 
     /// Check all MCP clients for `tools_changed` flags and refresh their
@@ -224,20 +236,10 @@ impl ToolSet {
     async fn refresh_client_tools(&self, client: &Arc<McpClient>) -> Result<()> {
         info!("MCP '{}': refreshing tool list", client.name());
         let remote_tools = client.list_tools().await?;
-        let new_tools = build_tools_for_client(client, remote_tools);
-        let prefix = client.tool_prefix();
-
-        let mut inner = self.inner.write().await;
-        inner.tools.retain(|t| !t.spec().name.starts_with(&prefix));
-        inner.specs.retain(|s| !s.name.starts_with(&prefix));
-        for tool in new_tools {
-            inner.specs.push(tool.spec().clone());
-            inner.tools.push(Arc::from(tool));
-        }
+        let total = self.install_client_tools(client, remote_tools).await;
         info!(
-            "MCP '{}': tool list refreshed ({} total tools)",
+            "MCP '{}': tool list refreshed ({total} total tools)",
             client.name(),
-            inner.tools.len()
         );
         Ok(())
     }

@@ -16,7 +16,7 @@
 //!   background. A prompt waits for that listing, but only so long.
 
 use crate::mcp_client::acp_transport::{McpCarrier, McpOverAcpError, McpOverAcpPeer};
-use crate::mcp_client::{McpClient, build_tools_for_client, sanitize_tool_segment};
+use crate::mcp_client::{McpClient, sanitize_tool_segment};
 use crate::tools::ToolSet;
 use agent_client_protocol::schema::MaybeUndefined;
 use agent_client_protocol::v1::ConnectionTo;
@@ -26,6 +26,7 @@ use agent_client_protocol::v1::schema::{
 use agent_client_protocol::{Client, is_connection_terminated, is_incoming_transport_closed};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
@@ -207,6 +208,10 @@ impl McpOverAcpPeer for AcpMcpPeer {
 pub(crate) struct ClientMcp {
     tools: Arc<ToolSet>,
     ready: watch::Receiver<bool>,
+    /// Set once a `tools()` call has waited (to the end of the listing or
+    /// to the timeout). Only the first turn waits; later ones take the set
+    /// as it stands, and tools that arrive late join the turns after.
+    waited: AtomicBool,
     /// The listing task, stopped when the session lets go of this — a
     /// `session/load` replacing it, or the connection ending.
     listing: Option<AbortHandle>,
@@ -267,6 +272,7 @@ impl ClientMcp {
             return Self {
                 tools,
                 ready,
+                waited: AtomicBool::new(true),
                 listing: None,
             };
         }
@@ -282,7 +288,9 @@ impl ClientMcp {
                     let session_id = session_id.as_str();
                     async move {
                         match client.list_tools().await {
-                            Ok(specs) => tools.extend(build_tools_for_client(client, specs)).await,
+                            Ok(specs) => {
+                                tools.install_client_tools(client, specs).await;
+                            }
                             Err(e) => warn!("{}", listing_failure(offered_name, session_id, &e)),
                         }
                     }
@@ -294,18 +302,24 @@ impl ClientMcp {
         Self {
             tools,
             ready,
+            waited: AtomicBool::new(false),
             listing: Some(task.abort_handle()),
         }
     }
 
     /// The tool set once ready, or after [`CLIENT_MCP_READY_TIMEOUT`] with
-    /// whatever arrived.
+    /// whatever arrived. Only the first call waits: every later one
+    /// returns the set as it stands at once, so a client that never
+    /// answers stalls one turn, not each of them.
     pub(crate) async fn tools(&self) -> Arc<ToolSet> {
-        let mut ready = self.ready.clone();
-        // An `Err` from either is "stop waiting" too: the listing task is
-        // gone (aborted, or panicked) and nothing more will arrive.
-        let _ =
-            tokio::time::timeout(CLIENT_MCP_READY_TIMEOUT, ready.wait_for(|ready| *ready)).await;
+        if !self.waited.load(Ordering::Acquire) {
+            let mut ready = self.ready.clone();
+            // An `Err` from either is "stop waiting" too: the listing task
+            // is gone (aborted, or panicked) and nothing more will arrive.
+            let _ = tokio::time::timeout(CLIENT_MCP_READY_TIMEOUT, ready.wait_for(|ready| *ready))
+                .await;
+            self.waited.store(true, Ordering::Release);
+        }
         Arc::clone(&self.tools)
     }
 }
@@ -491,6 +505,59 @@ mod tests {
             "{waited:?}"
         );
         assert!(tool_names(&tools).await.is_empty());
+    }
+
+    /// Only the first turn waits: once one `tools()` has timed out, the
+    /// next returns at once, and a late listing still lands in the set.
+    #[tokio::test(start_paused = true)]
+    async fn only_the_first_prompt_waits_for_the_listing() {
+        let peer = FakePeer::new();
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let listed = McpCarrier::Result(json!({
+            "tools": [{
+                "name": "poke",
+                "inputSchema": {"type": "object"},
+                "annotations": {"readOnlyHint": true}
+            }]
+        }));
+        peer.script("tools/list", FakeReply::Held(Arc::clone(&gate), listed));
+        let client = ClientMcp::start(&[acp("game", "game:1")], peer.clone(), "/work", "s-1");
+
+        let first = client.tools().await;
+        assert!(tool_names(&first).await.is_empty());
+
+        let started = tokio::time::Instant::now();
+        let second = client.tools().await;
+        assert_eq!(started.elapsed(), Duration::ZERO, "the second call waited");
+        assert!(tool_names(&second).await.is_empty());
+
+        // The listing finishes later; the same set picks its tools up.
+        gate.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while tool_names(&second).await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the late listing lands in the set");
+        assert_eq!(
+            tool_names(&*client.tools().await).await,
+            vec!["acp__game__poke"]
+        );
+    }
+
+    /// A refresh and the initial listing racing each other install the
+    /// same client's tools twice; one copy of each must remain.
+    #[tokio::test]
+    async fn installing_a_clients_tools_twice_leaves_one_copy() {
+        let peer = FakePeer::new();
+        let client = Arc::new(McpClient::over_acp("game", "game:1", peer.clone(), "/work"));
+        let set = ToolSet::new(Vec::new(), vec![Arc::clone(&client)]);
+        for _ in 0..2 {
+            let specs = client.list_tools().await.unwrap();
+            set.install_client_tools(&client, specs).await;
+        }
+        assert_eq!(tool_names(&set).await, vec!["acp__game__poke"]);
     }
 
     #[tokio::test]
