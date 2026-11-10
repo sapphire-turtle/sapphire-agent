@@ -17,7 +17,7 @@ pub mod workspace_tools;
 use crate::config::McpServerConfig;
 use crate::mcp_client::{self, McpClient, build_tools_for_client};
 use crate::provider::{ToolCall, ToolSpec};
-pub use agent_client_protocol::schema::v1::ToolKind;
+pub use agent_client_protocol::v1::schema::ToolKind;
 use anyhow::Result;
 use async_trait::async_trait;
 use std::sync::Arc;

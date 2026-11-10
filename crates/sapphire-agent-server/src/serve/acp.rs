@@ -59,9 +59,10 @@
 
 use super::{ServeState, extract_bearer};
 use agent_client_protocol::schema::ProtocolVersion;
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::ConnectionTo;
+use agent_client_protocol::v1::schema::{
     AgentCapabilities, CancelNotification, ClientCapabilities, ContentBlock, ContentChunk,
-    CreateTerminalRequest, CurrentModeUpdate, Error, Implementation, InitializeRequest,
+    CreateTerminalRequest, CurrentModeUpdate, Implementation, InitializeRequest,
     InitializeResponse, KillTerminalRequest, ListSessionsRequest, ListSessionsResponse,
     LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse,
     PermissionOption, PermissionOptionKind, PromptRequest, PromptResponse, ReadTextFileRequest,
@@ -74,7 +75,7 @@ use agent_client_protocol::schema::v1::{
     WriteTextFileRequest,
 };
 use agent_client_protocol::{
-    Agent, Client, ConnectionTo, Lines, on_receive_notification, on_receive_request,
+    Agent, Client, Error, Lines, on_receive_notification, on_receive_request,
 };
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -1341,7 +1342,7 @@ pub(crate) async fn serve_connection<O, I>(
     let connection_cancel = CancellationToken::new();
 
     let result = Agent
-        .builder()
+        .v1()
         .name("sapphire-agent")
         .on_receive_request(
             {
@@ -2045,7 +2046,7 @@ mod tests {
     // builds a `FileSystemCapabilities` directly; production code in
     // this file only ever reads `.fs` off an already-built
     // `ClientCapabilities`.
-    use agent_client_protocol::schema::v1::FileSystemCapabilities;
+    use agent_client_protocol::v1::schema::FileSystemCapabilities;
     use futures_util::{SinkExt, StreamExt};
     use tokio::net::TcpListener;
     use tokio_tungstenite::tungstenite::Message;
@@ -2425,15 +2426,17 @@ mod tests {
 
         let addr = spawn(ServeState::for_test(true)).await;
 
+        // SDK 5 refuses every request but `initialize` until initialization
+        // has completed (as ACP v1 agents SHOULD), so before it the answer is
+        // "invalid request", not "method not found".
         let before = roundtrip(&addr, unknown_method_request(0)).await;
         assert_eq!(before["id"], 0);
         assert_eq!(
-            before["error"]["code"], -32601,
-            "no handler is registered for it, got {before}"
+            before["error"]["code"], -32600,
+            "the SDK's initialization gate answers first, got {before}"
         );
 
-        // Initializing first changes nothing: the rejection is about the
-        // missing handler, not about the connection's state.
+        // Once initialized, the missing handler is what rejects it.
         let after = conversation(
             &addr,
             vec![initialize_request(0), unknown_method_request(1)],
@@ -4821,7 +4824,7 @@ mod tests {
             futures_util::sink::drain().sink_map_err(|e: std::convert::Infallible| match e {});
         let incoming = futures_util::stream::pending::<std::io::Result<String>>();
         Agent
-            .builder()
+            .v1()
             .connect_with(
                 Lines::new(outgoing, incoming),
                 async |connection: ConnectionTo<Client>| {

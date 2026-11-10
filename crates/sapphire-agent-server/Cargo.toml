@@ -199,9 +199,10 @@ rmcp = { version = "3.5", default-features = false, features = [
 
 # Agent Client Protocol SDK (Zed's official Rust SDK). Backs `GET /acp`: the
 # JSON-RPC dispatch loop, the v1 schema types, and the `Lines` transport the
-# WebSocket is wrapped in. Default features only — `unstable_protocol_v2`
-# stays off, which is what pins this build to ACP v1.
-agent-client-protocol = "3.3.0"
+# WebSocket is wrapped in. Only `unstable_mcp_over_acp` is enabled (MCP
+# servers the client exposes over ACP itself); `unstable_protocol_v2` stays
+# off, which is what pins this build to ACP v1.
+agent-client-protocol = { version = "5.1", features = ["unstable_mcp_over_acp"] }
 
 # The local chat protocol (method names, APP_API) and its client, shared
 # with sapphire-agent-desktop.
