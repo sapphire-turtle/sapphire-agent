@@ -185,6 +185,9 @@ pub(crate) fn subagent_tool_specs(
     let mut specs: Vec<ToolSpec> = parent_visible
         .iter()
         .filter(|s| s.name.as_ref() != SUBAGENT_TOOL_NAME)
+        // The client's per-session tools (MCP over ACP) belong to the main
+        // turn; a delegate's loop has no session set to run them against.
+        .filter(|s| !s.name.starts_with(crate::serve::SESSION_TOOL_PREFIX))
         // A delegate is not the character speaking, so it gets no avatar:
         // `SubagentHost` answers `avatar()` with `None` rather than share
         // the parent's (and with it the turn's one gesture), and a tool

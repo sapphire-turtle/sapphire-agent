@@ -1910,6 +1910,16 @@ pub(crate) struct ConsultIdentity {
 /// neither and keeps behaving exactly as it did.
 #[async_trait::async_trait]
 pub(crate) trait TurnHost: Send + Sync {
+    /// Tools the ACP client provided for this session (`acp__…`).
+    /// `None` everywhere else.
+    ///
+    /// Synchronous on purpose: whatever has to be awaited to build the set
+    /// is awaited before the host is constructed. A main turn merges these
+    /// into its tool list and runs them; a subagent's loop never asks.
+    fn session_tools(&self) -> Option<Arc<crate::tools::ToolSet>> {
+        None
+    }
+
     /// A tool call is about to run, carrying the arguments the model
     /// asked for.
     ///
@@ -2600,6 +2610,11 @@ pub(crate) fn current_turn_context() -> Option<Arc<TurnContext>> {
     TURN_CONTEXT_TL.try_with(Arc::clone).ok()
 }
 
+/// Prefix of every tool a client provides for one session (MCP over ACP):
+/// `acp__<server>__<tool>`. The shared `ToolSet` never holds such a name, so
+/// the prefix alone says which set a call belongs to.
+pub(crate) const SESSION_TOOL_PREFIX: &str = "acp__";
+
 /// One model conversation run to completion: call the model, run the
 /// tools it asks for, repeat until it stops asking.
 ///
@@ -2647,6 +2662,15 @@ impl TurnLoop<'_> {
         // is what keeps the client-side tools refusing there rather
         // than reaching for a connection that does not exist.
         let host_access_enabled = state.config.tools.host_access.enabled;
+        // The tools the ACP client provided for this session. A subagent's
+        // loop never sees them: its tool list is cut from the parent's by
+        // `subagent_tool_specs`, which drops them, and its calls would not
+        // be judged by a session the delegate is not part of.
+        let session_tools = if self.subagent_depth == 0 {
+            progress.session_tools()
+        } else {
+            None
+        };
         // Read once per turn, beside the switch and for the same reason it
         // is: this is what decides whether that switch speaks for this
         // turn at all. #270's core meaning change — an ACP turn's calls go
@@ -2817,7 +2841,10 @@ impl TurnLoop<'_> {
                     // the ordinary (non-subagent) path.
                     let offered: std::collections::HashSet<&str> =
                         tool_specs.iter().map(|s| s.name.as_ref()).collect();
-                    let kinds = self.state.tools.kinds().await;
+                    let mut kinds = self.state.tools.kinds().await;
+                    if let Some(session) = &session_tools {
+                        kinds.extend(session.kinds().await);
+                    }
                     let origin = progress.origin();
                     let mut permitted: Vec<crate::provider::ToolCall> = Vec::new();
                     let mut refused: Vec<(String, String)> = Vec::new();
@@ -2902,6 +2929,7 @@ impl TurnLoop<'_> {
                     // the session's memory namespace (task_local) so the
                     // memory tool writes under `memory/<namespace>/...`.
                     let tools = Arc::clone(&self.state.tools);
+                    let session_tools = session_tools.clone();
                     let ns = namespace.clone();
                     let timer_origin = self.timer_origin.clone();
                     let admin_room_profile = self.admin_room_profile.clone();
@@ -2936,6 +2964,7 @@ impl TurnLoop<'_> {
                     let mut results: Vec<(String, crate::tools::ToolOutput)> =
                         futures_util::future::join_all(permitted.into_iter().map(|c| {
                             let tools = Arc::clone(&tools);
+                            let session_tools = session_tools.clone();
                             let ns = ns.clone();
                             let origin = timer_origin.clone();
                             let client = acp_client.clone();
@@ -2947,7 +2976,18 @@ impl TurnLoop<'_> {
                                     ns,
                                     async move {
                                         info!("Executing tool: {} (id={})", c.name, c.id);
-                                        let output = tools.execute(&c).await;
+                                        // `acp__…` names live only in the
+                                        // session's set; without one they
+                                        // fall through to the shared set's
+                                        // own "Unknown tool".
+                                        let output = match &session_tools {
+                                            Some(session)
+                                                if c.name.starts_with(SESSION_TOOL_PREFIX) =>
+                                            {
+                                                session.execute(&c).await
+                                            }
+                                            _ => tools.execute(&c).await,
+                                        };
                                         info!("Tool {} done", c.name);
                                         (c.id, output)
                                     },
@@ -3373,6 +3413,17 @@ pub(crate) async fn run_llm_turn(
         &mut tool_specs,
         avatar.as_ref().map(|a| a.caps()),
     );
+    // The client's own tools for this session go after the shared ones, and
+    // are not subject to `visible_tool_predicate`, which is about the
+    // shared set's host tools.
+    if let Some(session) = progress.session_tools() {
+        session.refresh_if_needed().await;
+        tool_specs.extend(
+            session
+                .specs_filtered(|n| n.starts_with(SESSION_TOOL_PREFIX))
+                .await,
+        );
+    }
     let persistence = TurnPersistence {
         store: Arc::clone(&store),
         acp_store: Arc::clone(&state.acp_session_store),
@@ -7065,6 +7116,208 @@ mod tests {
         };
         assert_eq!(host.detached().consult_identity(), Some(id));
         assert_eq!(NullProgress.detached().consult_identity(), None);
+    }
+
+    /// A per-session tool (`acp__game__echo`) of a chosen kind, echoing its
+    /// `text` input.
+    struct SessionEcho {
+        spec: crate::provider::ToolSpec,
+        kind: crate::tools::ToolKind,
+    }
+
+    impl SessionEcho {
+        fn new(kind: crate::tools::ToolKind) -> Self {
+            Self {
+                spec: crate::provider::ToolSpec {
+                    name: "acp__game__echo".into(),
+                    description: "Echo the given text back.".into(),
+                    input_schema: json!({"type": "object", "properties": {}}),
+                },
+                kind,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for SessionEcho {
+        fn spec(&self) -> &crate::provider::ToolSpec {
+            &self.spec
+        }
+        fn kind(&self) -> crate::tools::ToolKind {
+            self.kind
+        }
+        async fn execute(&self, input: &Value) -> anyhow::Result<String> {
+            Ok(input["text"].as_str().unwrap_or_default().to_string())
+        }
+    }
+
+    /// A host that may carry a session `ToolSet`, under `origin`, and
+    /// counts the permission prompts it was asked.
+    struct SessionToolsHost {
+        tools: Option<Arc<crate::tools::ToolSet>>,
+        origin: crate::tools::policy::Origin,
+        asked: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl SessionToolsHost {
+        fn new(
+            kind: Option<crate::tools::ToolKind>,
+            origin: crate::tools::policy::Origin,
+        ) -> (Self, Arc<std::sync::atomic::AtomicUsize>) {
+            let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let tools = kind.map(|k| {
+                Arc::new(crate::tools::ToolSet::new(
+                    vec![Box::new(SessionEcho::new(k))],
+                    Vec::new(),
+                ))
+            });
+            (
+                Self {
+                    tools,
+                    origin,
+                    asked: Arc::clone(&asked),
+                },
+                asked,
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TurnHost for SessionToolsHost {
+        async fn tool_start(&self, _id: &str, _name: &str, _input: &Value) {}
+        async fn tool_end(&self, _id: &str, _name: &str) {}
+        async fn turn_error(&self, _message: &str) {}
+        fn session_tools(&self) -> Option<Arc<crate::tools::ToolSet>> {
+            self.tools.clone()
+        }
+        fn origin(&self) -> crate::tools::policy::Origin {
+            self.origin
+        }
+        async fn approve(
+            &self,
+            _call: &crate::provider::ToolCall,
+            _kind: crate::tools::ToolKind,
+        ) -> crate::tools::policy::Approval {
+            self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            crate::tools::policy::Approval::AllowOnce
+        }
+    }
+
+    fn session_tool_call() -> crate::provider::ChatResponse {
+        crate::provider::ChatResponse {
+            prompt_usage: None,
+            text: None,
+            tool_calls: vec![crate::provider::ToolCall {
+                id: "call-1".to_string(),
+                name: "acp__game__echo".to_string(),
+                input: json!({"text": "hello"}),
+            }],
+            stop_reason: None,
+        }
+    }
+
+    fn tool_result_texts(history_msgs: &[ChatMessage]) -> Vec<String> {
+        history_msgs
+            .iter()
+            .flat_map(|m| m.parts.iter())
+            .filter_map(|p| match p {
+                ContentPart::ToolResult { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn session_tools_are_offered_and_executed() {
+        let (state, log) = ServeState::for_test_scripted_with_log(
+            true,
+            vec![session_tool_call(), final_round("done")],
+        );
+        let (host, _) = SessionToolsHost::new(
+            Some(crate::tools::ToolKind::Read),
+            crate::tools::policy::Origin::Trusted,
+        );
+        let sid = "s-session-tools".to_string();
+        let outcome = run_llm_turn(
+            Arc::clone(&state),
+            sid.clone(),
+            ChatMessage::user("go"),
+            Arc::new(host) as Arc<dyn TurnHost>,
+            None,
+        )
+        .await;
+
+        assert_eq!(outcome.text.as_deref(), Some("done"));
+        let calls = log.calls();
+        assert!(
+            calls[0].1.iter().any(|n| n == "acp__game__echo"),
+            "offered: {:?}",
+            calls[0].1
+        );
+        let history = state.sessions.lock().await.get(&sid).cloned().unwrap();
+        assert_eq!(tool_result_texts(&history), vec!["hello".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn session_tools_are_invisible_without_a_session_tool_set() {
+        let (state, log) = ServeState::for_test_scripted_with_log(
+            true,
+            vec![session_tool_call(), final_round("done")],
+        );
+        let (host, _) = SessionToolsHost::new(None, crate::tools::policy::Origin::Trusted);
+        let sid = "s-no-session-tools".to_string();
+        let outcome = run_llm_turn(
+            Arc::clone(&state),
+            sid.clone(),
+            ChatMessage::user("go"),
+            Arc::new(host) as Arc<dyn TurnHost>,
+            None,
+        )
+        .await;
+
+        assert_eq!(outcome.text.as_deref(), Some("done"));
+        assert!(
+            log.calls()[0].1.iter().all(|n| n != "acp__game__echo"),
+            "offered: {:?}",
+            log.calls()[0].1
+        );
+        // Refused as not offered (the gate runs before the set's own
+        // "Unknown tool"), and in any case never executed.
+        let history = state.sessions.lock().await.get(&sid).cloned().unwrap();
+        let results = tool_result_texts(&history);
+        assert_eq!(results.len(), 1, "got {results:?}");
+        assert!(
+            results[0].contains("acp__game__echo") && results[0].contains("not available"),
+            "got {results:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_tool_kind_drives_the_permission_decision() {
+        use crate::tools::policy::{Origin, SessionMode};
+        for (kind, expect_asked) in [
+            (crate::tools::ToolKind::Other, 1),
+            (crate::tools::ToolKind::Read, 0),
+        ] {
+            let state =
+                ServeState::for_test_scripted(true, vec![session_tool_call(), final_round("done")]);
+            let (host, asked) =
+                SessionToolsHost::new(Some(kind), Origin::Acp(SessionMode::Default));
+            let outcome = run_llm_turn(
+                Arc::clone(&state),
+                "s-session-tool-kind".to_string(),
+                ChatMessage::user("go"),
+                Arc::new(host) as Arc<dyn TurnHost>,
+                None,
+            )
+            .await;
+            assert_eq!(outcome.text.as_deref(), Some("done"));
+            assert_eq!(
+                asked.load(std::sync::atomic::Ordering::SeqCst),
+                expect_asked,
+                "{kind:?}"
+            );
+        }
     }
 
     /// A turn with an editor on the other end, for the two tests below.
