@@ -170,6 +170,7 @@ dependencies = [
  "futures",
  "futures-concurrency",
  "rustc-hash 2.1.2",
+ "schemars 1.2.1",
  "serde",
  "serde_json",
  "tracing",
@@ -187,6 +188,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-client-protocol-rmcp"
+version = "5.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ff2782c3149972b965fe766839332570bd8791103ec5665793d9e436bf1e392"
+dependencies = [
+ "agent-client-protocol",
+ "futures",
+ "futures-concurrency",
+ "rmcp",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "agent-client-protocol-schema"
 version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -194,6 +212,7 @@ checksum = "e20d2c4af6eb08f6a4f562520bdd939a4af803255fec461dd523638c22f5b265"
 dependencies = [
  "anyhow",
  "derive_more 2.1.1",
+ "schemars 1.2.1",
  "serde",
  "serde_json",
  "serde_with",
@@ -8320,6 +8339,7 @@ version = "0.13.0"
 dependencies = [
  "a2a-lf",
  "agent-client-protocol",
+ "agent-client-protocol-rmcp",
  "anyhow",
  "async-trait",
  "axum",
@@ -10105,7 +10125,9 @@ checksum = "e464cf451ba96ebfc6f9b6542f17ee8b8956e33f1e40d9690624e59d7a7f8a4b"
 dependencies = [
  "bytes",
  "futures-core",
+ "futures-io",
  "futures-sink",
+ "futures-util",
  "libc",
  "pin-project-lite",
  "tokio",

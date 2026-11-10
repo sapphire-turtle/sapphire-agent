@@ -5244,4 +5244,183 @@ mod tests {
             .unwrap();
         client.abort();
     }
+
+    /// The provider's side of [`client_provided_mcp_tool_round_trip`]: an
+    /// rmcp service with one tool, `poke`, that only reads — so the
+    /// agent never asks before running it — and answers `"poked"`.
+    ///
+    /// Written as a plain `ServerHandler` rather than with the SDK's
+    /// `McpServerBuilder`, whose `tool_fn` has no way to set annotations.
+    struct PokeServer;
+
+    impl rmcp::ServerHandler for PokeServer {
+        fn get_info(&self) -> rmcp::model::ServerConfig {
+            rmcp::model::ServerConfig::new(
+                rmcp::model::ServerCapabilities::builder()
+                    .enable_tools()
+                    .build(),
+            )
+        }
+
+        async fn list_tools(
+            &self,
+            _request: Option<rmcp::model::PaginatedRequestParams>,
+            _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
+            let schema = serde_json::json!({ "type": "object" });
+            let poke = rmcp::model::Tool::new(
+                "poke",
+                "Poke the game",
+                Arc::new(schema.as_object().unwrap().clone()),
+            )
+            .with_annotations(rmcp::model::ToolAnnotations::new().read_only(true));
+            Ok(rmcp::model::ListToolsResult::with_all_items(vec![poke]))
+        }
+
+        async fn call_tool(
+            &self,
+            request: rmcp::model::CallToolRequestParams,
+            _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+            assert_eq!(request.name.as_ref(), "poke");
+            Ok(
+                rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(
+                    "poked",
+                )])
+                .into(),
+            )
+        }
+    }
+
+    /// A client-provided MCP tool, end to end — and the example to follow
+    /// when a game (or any ACP client) offers the agent its own tools.
+    ///
+    /// The client side is the ACP SDK's own: `Client.v1()`, an rmcp service
+    /// turned into an MCP server with `McpServer::from_rmcp`, attached to
+    /// the session with `with_mcp_server`. That is all a client needs: the
+    /// SDK declares the server in `session/new`'s `mcpServers` as an `acp`
+    /// entry and answers the agent's `mcp/message` requests with it. The
+    /// agent offers the tool to the model as `acp__<server>__<tool>`, and
+    /// because `poke` says it only reads (`readOnlyHint: true`) it runs
+    /// without a `session/request_permission`.
+    #[tokio::test]
+    async fn client_provided_mcp_tool_round_trip() {
+        use agent_client_protocol::mcp_server::McpServer;
+        use agent_client_protocol::v1::SessionMessage;
+        use agent_client_protocol_rmcp::rmcp_3::McpServerExt;
+
+        let (state, log) = ServeState::for_test_scripted_with_log(
+            true,
+            vec![
+                crate::provider::ChatResponse {
+                    prompt_usage: None,
+                    text: None,
+                    tool_calls: vec![crate::provider::ToolCall {
+                        id: "call-1".to_string(),
+                        name: "acp__game__poke".to_string(),
+                        input: serde_json::json!({}),
+                    }],
+                    stop_reason: None,
+                },
+                crate::provider::ChatResponse {
+                    prompt_usage: None,
+                    text: Some("ok".to_string()),
+                    tool_calls: Vec::new(),
+                    stop_reason: None,
+                },
+            ],
+        );
+
+        // The wire between the two, one JSON-RPC message per line.
+        let (to_client, from_agent) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (to_agent, from_client) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let lines_out = |tx: tokio::sync::mpsc::UnboundedSender<String>| {
+            futures_util::sink::unfold(tx, |tx, line: String| async move {
+                tx.send(line)
+                    .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?;
+                Ok::<_, std::io::Error>(tx)
+            })
+        };
+        let lines_in = |rx: tokio::sync::mpsc::UnboundedReceiver<String>| {
+            futures_util::stream::unfold(rx, |mut rx| async move {
+                rx.recv()
+                    .await
+                    .map(|line| (Ok::<_, std::io::Error>(line), rx))
+            })
+        };
+        let agent = tokio::spawn(serve_connection(
+            lines_out(to_client),
+            lines_in(from_client),
+            Arc::clone(&state),
+            "default".to_string(),
+        ));
+
+        let client = Client.v1().name("game").connect_with(
+            Lines::new(lines_out(to_agent), lines_in(from_agent)),
+            async |connection: ConnectionTo<Agent>| {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                connection
+                    .build_session(test_cwd())
+                    .with_mcp_server(McpServer::from_rmcp("game", || PokeServer))?
+                    .block_task()
+                    .run_until(async |setup| {
+                        let mut session = setup.session;
+                        session.send_prompt("poke the game")?;
+                        let mut asked = Vec::new();
+                        let stop = loop {
+                            match session.read_update().await? {
+                                SessionMessage::Message(message) => {
+                                    if message.method() == "session/request_permission" {
+                                        // Recorded, not answered: the
+                                        // assertion below fails the test.
+                                        asked.push(message.method().to_string());
+                                        break None;
+                                    }
+                                }
+                                SessionMessage::PromptResponse(response) => {
+                                    break Some(response?.stop_reason);
+                                }
+                                _ => {}
+                            }
+                        };
+                        Ok((stop, asked))
+                    })
+                    .await
+            },
+        );
+        let (stop, asked) = tokio::time::timeout(std::time::Duration::from_secs(20), client)
+            .await
+            .expect("the round trip finishes")
+            .expect("the client side succeeds");
+        agent.abort();
+
+        assert!(
+            asked.is_empty(),
+            "a read-only tool was asked about: {asked:?}"
+        );
+        assert_eq!(stop, Some(StopReason::EndTurn));
+
+        let calls = log.calls();
+        assert_eq!(calls.len(), 2, "the provider is called twice");
+        assert!(
+            calls[0].1.iter().any(|n| n == "acp__game__poke"),
+            "offered: {:?}",
+            calls[0].1
+        );
+        let results: Vec<String> = log.messages()[1]
+            .iter()
+            .flat_map(|m| m.parts.iter())
+            .filter_map(|p| match p {
+                crate::provider::ContentPart::ToolResult { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            results.iter().any(|r| r.contains("poked")),
+            "results: {results:?}"
+        );
+    }
 }

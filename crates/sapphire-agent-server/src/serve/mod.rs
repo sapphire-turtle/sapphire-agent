@@ -3908,7 +3908,12 @@ impl crate::tools::Tool for Arc<AdminProfileProbe> {
 /// moved into a `ProviderRegistry` can still be read afterwards.
 #[cfg(test)]
 #[derive(Clone, Default)]
-pub(crate) struct ChatLog(Arc<std::sync::Mutex<Vec<ChatCall>>>);
+pub(crate) struct ChatLog(
+    Arc<std::sync::Mutex<Vec<ChatCall>>>,
+    /// The messages each call was given, in the same order as the calls:
+    /// what a test reads to see that a tool's result reached the model.
+    Arc<std::sync::Mutex<Vec<Vec<ChatMessage>>>>,
+);
 
 /// One recorded call: its system prompt and the names of the tools it offered.
 #[cfg(test)]
@@ -3919,6 +3924,11 @@ impl ChatLog {
     /// A snapshot of every call recorded so far, in order.
     pub(crate) fn calls(&self) -> Vec<ChatCall> {
         self.0.lock().unwrap().clone()
+    }
+
+    /// A snapshot of the messages each call recorded so far was given.
+    pub(crate) fn messages(&self) -> Vec<Vec<ChatMessage>> {
+        self.1.lock().unwrap().clone()
     }
 }
 
@@ -4046,9 +4056,10 @@ impl Provider for StubProvider {
     async fn chat(
         &self,
         system: Option<&str>,
-        _messages: &[ChatMessage],
+        messages: &[ChatMessage],
         tools: Option<&[crate::provider::ToolSpec]>,
     ) -> anyhow::Result<crate::provider::ChatResponse> {
+        self.calls.1.lock().unwrap().push(messages.to_vec());
         self.calls.0.lock().unwrap().push((
             system.map(|s| s.to_string()),
             tools

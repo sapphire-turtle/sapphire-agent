@@ -228,3 +228,7 @@ rmcp = { version = "3.5", default-features = false, features = [
     "server",
     "transport-streamable-http-server",
 ] }
+
+# The provider's side of MCP over ACP, for the round trip a game client makes
+# with a tool it offers: an rmcp service attached to an ACP session.
+agent-client-protocol-rmcp = { version = "5.1", features = ["rmcp_3", "unstable_mcp_over_acp"] }
