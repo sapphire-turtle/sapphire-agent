@@ -542,6 +542,17 @@ fn the_client_declares_roots_and_elicitation_but_not_sampling() {
     assert!(!sampling);
 }
 
+/// The workspace root becomes a well-formed `file:` URI on any platform,
+/// a Windows path (an ACP client's cwd may be one) included.
+#[test]
+fn workspace_roots_become_file_uris() {
+    assert_eq!(file_uri("/srv/ws"), "file:///srv/ws");
+    assert_eq!(file_uri(r"C:\work"), "file:///C:/work");
+    assert_eq!(file_uri("C:/work/my game"), "file:///C:/work/my%20game");
+    assert_eq!(file_uri(r"\\host\share\ws"), "file://host/share/ws");
+    assert_eq!(file_uri("/a#b?c%d"), "file:///a%23b%3Fc%25d");
+}
+
 // ---------------------------------------------------------------------------
 // Servers the ACP client provides
 // ---------------------------------------------------------------------------
@@ -609,7 +620,6 @@ async fn acp_tool_names_are_sanitized_but_config_names_are_not() {
     ));
     let tools = build_tools_for_client(&acp, vec![remote("do it.now")]);
     assert_eq!(tools[0].spec().name, "acp__game__do_it_now");
-    // The call still goes out under the server's own name.
     let cfg = client_with(McpTrust::None);
     let tools = build_tools_for_client(&cfg, vec![remote("do it.now")]);
     assert_eq!(tools[0].spec().name, "mcp__ledger__do it.now");
@@ -627,4 +637,122 @@ async fn acp_client_does_not_reopen_after_the_peer_closes() {
         format!("{err:#}").contains("ACP connection closed"),
         "got: {err:#}"
     );
+}
+
+/// The name of every `tools/call` the peer was asked for, in order.
+fn called_names(peer: &super::acp_transport::test_support::FakePeer) -> Vec<String> {
+    peer.params()
+        .into_iter()
+        .filter(|(m, _)| m == "tools/call")
+        .filter_map(|(_, p)| p.get("name").and_then(Value::as_str).map(str::to_owned))
+        .collect()
+}
+
+/// Two remote names that sanitize alike get distinct tool names, and each
+/// call still goes out under the server's own name for the tool.
+#[tokio::test]
+async fn acp_tool_names_that_sanitize_alike_are_deduped() {
+    use super::acp_transport::McpCarrier;
+    use super::acp_transport::test_support::{FakePeer, FakeReply};
+    let peer = FakePeer::new();
+    let done = rmcp::model::CallToolResult::success(vec![ContentBlock::text("done")]);
+    peer.script(
+        "tools/call",
+        FakeReply::Carrier(McpCarrier::Result(serde_json::to_value(done).unwrap())),
+    );
+    let client = Arc::new(McpClient::over_acp("srv", "srv:1", peer.clone(), "/tmp"));
+    let tools = build_tools_for_client(
+        &client,
+        vec![remote("a.b"), remote("a_b"), remote("a_b_2"), remote("a b")],
+    );
+    let names: Vec<_> = tools.iter().map(|t| t.spec().name.to_string()).collect();
+    assert_eq!(
+        names,
+        vec![
+            "acp__srv__a_b",
+            "acp__srv__a_b_2",
+            "acp__srv__a_b_2_2",
+            "acp__srv__a_b_3"
+        ]
+    );
+    for tool in &tools {
+        tool.execute(&json!({})).await.expect("the call succeeds");
+    }
+    assert_eq!(called_names(&peer), vec!["a.b", "a_b", "a_b_2", "a b"]);
+
+    // A configured server's names are left alone, collisions and all.
+    let cfg = client_with(McpTrust::None);
+    let tools = build_tools_for_client(&cfg, vec![remote("a.b"), remote("a_b")]);
+    let names: Vec<_> = tools.iter().map(|t| t.spec().name.to_string()).collect();
+    assert_eq!(names, vec!["mcp__ledger__a.b", "mcp__ledger__a_b"]);
+}
+
+/// The `subscriptions/listen` request a 2026-07-28 server pushes
+/// `tools/list_changed` on is meant to stay open, so the per-request
+/// timeout must not end it: a change long past that timeout still raises
+/// the flag, and the session's tool set re-lists on its next refresh.
+#[tokio::test(start_paused = true)]
+async fn an_acp_tool_list_subscription_outlives_the_request_timeout() {
+    use super::acp_transport::test_support::{FakePeer, FakeReply};
+    use super::acp_transport::{ACP_MCP_REQUEST_TIMEOUT, McpCarrier};
+    let peer = FakePeer::new();
+    let discover = rmcp::model::DiscoverResult::new(
+        vec![ProtocolVersion::LATEST],
+        ServerCapabilities::builder()
+            .enable_tools()
+            .enable_tool_list_changed()
+            .build(),
+    );
+    peer.script(
+        "server/discover",
+        FakeReply::Carrier(McpCarrier::Result(serde_json::to_value(discover).unwrap())),
+    );
+    peer.script("subscriptions/listen", FakeReply::Hang);
+    let client = Arc::new(McpClient::over_acp("game", "game:1", peer.clone(), "/tmp"));
+    let set = crate::tools::ToolSet::new(Vec::new(), vec![Arc::clone(&client)]);
+    set.install_client_tools(&client, client.list_tools().await.unwrap())
+        .await;
+
+    // The client's server knows only the outer request id, and says
+    // nothing about rmcp's: the transport ties the two together.
+    let listen = peer.wait_for_request("subscriptions/listen").await;
+    assert!(peer.notify(
+        &listen,
+        "notifications/subscriptions/acknowledged",
+        json!({"notifications": {"toolsListChanged": true}}),
+    ));
+    tokio::time::sleep(ACP_MCP_REQUEST_TIMEOUT + Duration::from_secs(30)).await;
+    assert!(
+        !peer.dropped().contains(&listen),
+        "the subscription was cancelled"
+    );
+
+    peer.script(
+        "tools/list",
+        FakeReply::Carrier(McpCarrier::Result(json!({
+            "tools": [
+                {"name": "poke", "inputSchema": {"type": "object"}},
+                {"name": "prod", "inputSchema": {"type": "object"}}
+            ]
+        }))),
+    );
+    assert!(peer.notify(&listen, "notifications/tools/list_changed", json!({})));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !client.tools_changed.load(Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the change raises tools_changed");
+
+    set.refresh_if_needed().await;
+    assert!(!client.take_tools_changed(), "the refresh took the flag");
+    let mut names: Vec<_> = set
+        .specs_filtered(|_| true)
+        .await
+        .into_iter()
+        .map(|s| s.name.to_string())
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["acp__game__poke", "acp__game__prod"]);
 }

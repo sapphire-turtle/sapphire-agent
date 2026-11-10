@@ -355,13 +355,18 @@ fn listing_failure(name: &str, session_id: &str, error: &anyhow::Error) -> Strin
 }
 
 /// The agent's names for the client's servers: each sanitized into a tool
-/// name segment, a repeat suffixed `_2`, `_3`, …, order kept.
+/// name segment with runs of `_` collapsed to one (and none at either
+/// end), a repeat suffixed `_2`, `_3`, …, order kept.
 pub(crate) fn client_server_names(names: &[&str]) -> Vec<String> {
     let mut taken = HashSet::new();
     names
         .iter()
         .map(|name| {
-            let base = sanitize_tool_segment(name);
+            // No `__` in a server name, nor a `_` at either end: `__`
+            // separates the server from the tool, so `a` + `b__c` and
+            // `a__b` + `c` would meet as `acp__a__b__c` (and `a` + `_c`
+            // with `a_` + `c`), and `acp__a__` would own `a__b`'s tools.
+            let base = server_segment(name);
             let mut candidate = base.clone();
             let mut n = 2;
             while !taken.insert(candidate.clone()) {
@@ -371,6 +376,23 @@ pub(crate) fn client_server_names(names: &[&str]) -> Vec<String> {
             candidate
         })
         .collect()
+}
+
+/// `name` sanitized, every run of `_` cut to one and any `_` at either end
+/// dropped; `server` if nothing is left.
+fn server_segment(name: &str) -> String {
+    let mut out = String::new();
+    for c in sanitize_tool_segment(name).chars() {
+        if !(c == '_' && out.ends_with('_')) {
+            out.push(c);
+        }
+    }
+    let trimmed = out.trim_matches('_');
+    if trimmed.is_empty() {
+        "server".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -457,6 +479,49 @@ mod tests {
             client_server_names(&["game", "game", "my game", "game"]),
             vec!["game", "game_2", "my_game", "game_3"]
         );
+    }
+
+    /// No server's prefix is another's, so no tool name can be two
+    /// servers' at once, and installing one server's tools (which drops
+    /// whatever its prefix owns) leaves the others' alone.
+    #[test]
+    fn no_server_prefix_owns_another_servers_tools() {
+        let names = client_server_names(&["a", "a__b", "a_", "_a", "___", "a.-.b"]);
+        assert_eq!(names, vec!["a", "a_b", "a_2", "a_3", "server", "a_-_b"]);
+        for (i, x) in names.iter().enumerate() {
+            assert!(!x.contains("__") && !x.starts_with('_') && !x.ends_with('_'));
+            for (j, y) in names.iter().enumerate() {
+                if i != j {
+                    assert!(
+                        !format!("acp__{y}__").starts_with(&format!("acp__{x}__")),
+                        "{x} owns {y}'s tools"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn installing_one_servers_tools_leaves_anothers() {
+        let names = client_server_names(&["a", "a__b"]);
+        let peer = FakePeer::new();
+        let a = Arc::new(McpClient::over_acp(&names[0], "a:1", peer.clone(), "/work"));
+        let ab = Arc::new(McpClient::over_acp(
+            &names[1],
+            "ab:1",
+            peer.clone(),
+            "/work",
+        ));
+        let set = ToolSet::new(Vec::new(), vec![Arc::clone(&a), Arc::clone(&ab)]);
+        set.install_client_tools(&ab, ab.list_tools().await.unwrap())
+            .await;
+        set.install_client_tools(&a, a.list_tools().await.unwrap())
+            .await;
+        set.install_client_tools(&a, a.list_tools().await.unwrap())
+            .await;
+        let mut listed = tool_names(&set).await;
+        listed.sort();
+        assert_eq!(listed, vec!["acp__a__poke", "acp__a_b__poke"]);
     }
 
     #[tokio::test]

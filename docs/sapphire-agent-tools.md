@@ -40,8 +40,16 @@ is the entry's `name` and `<tool>` the MCP tool's name.
 - Both parts are made safe for a tool name: every character other than ASCII
   letters, digits, `_` and `-` becomes `_` (`my game` → `my_game`). Names are
   not shortened, the same as `mcp__…` tools.
+- In `<server>`, a run of `_` is then cut to one and a `_` at either end is
+  dropped (`a__b` → `a_b`, `game_` → `game`), so a server name never holds
+  `__`, the separator: no two servers' tools can end up with one name, and
+  refreshing one server's tools never touches another's.
 - When two servers in one session end up with the same name, the later ones
   get `_2`, `_3`, … (`game`, `game_2`, `game_3`).
+- When two tools of one server end up with the same name (`a.b` and `a_b`
+  both become `a_b`), the first keeps it and the later ones get `_2`, `_3`, …
+  (`acp__srv__a_b`, `acp__srv__a_b_2`), with a warning in the log. The call
+  still reaches the tool under its own name (`a.b`, `a_b`).
 
 ### Permission comes from the tool's annotations
 
@@ -57,6 +65,10 @@ the agent asks before running it, as for any other tool in an ACP session:
 A tool with no annotations is unclassified, the strictest bucket. A game whose
 tools only look at or harmlessly change its own state can annotate them and
 have them run without a prompt.
+
+An "always allow" granted for an `acp__…` tool is kept like any other: per
+room profile, by tool name, in the agent's ACP permissions store. So it also
+covers a later session whose client offers a tool of the same name.
 
 This trusts annotations that the outbound MCP servers do not get trusted
 with (see "Trusting an outbound MCP server" in the README). Here the

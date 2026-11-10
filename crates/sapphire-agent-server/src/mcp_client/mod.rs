@@ -93,7 +93,7 @@ impl ClientHandler for AgentClientHandler {
         _context: RequestContext<RoleClient>,
     ) -> Result<ListRootsResult, ErrorData> {
         Ok(ListRootsResult::new(vec![
-            Root::new(format!("file://{}", self.workspace_root)).with_name("workspace"),
+            Root::new(file_uri(&self.workspace_root)).with_name("workspace"),
         ]))
     }
 
@@ -626,6 +626,33 @@ impl McpClient {
     }
 }
 
+/// `path` as a `file:` URI, whichever platform it is a path of: `\` turns
+/// into `/`, a drive path (`C:\work`) becomes `file:///C:/work`, a UNC path
+/// (`\\host\share`) `file://host/share`, and the characters a URI
+/// path cannot carry as they are (`%`, space, `#`, `?`) are escaped. A pure
+/// string conversion: the workspace root of an ACP-sourced client is the
+/// client's cwd, which need not be a path of the agent's own platform.
+fn file_uri(path: &str) -> String {
+    let path = path.replace('\\', "/");
+    let mut escaped = String::with_capacity(path.len());
+    for c in path.chars() {
+        match c {
+            '%' => escaped.push_str("%25"),
+            ' ' => escaped.push_str("%20"),
+            '#' => escaped.push_str("%23"),
+            '?' => escaped.push_str("%3F"),
+            c => escaped.push(c),
+        }
+    }
+    if let Some(unc) = escaped.strip_prefix("//") {
+        format!("file://{unc}")
+    } else if escaped.starts_with('/') {
+        format!("file://{escaped}")
+    } else {
+        format!("file:///{escaped}")
+    }
+}
+
 /// Log a stdio server's stderr line by line instead of letting it write
 /// over the terminal the agent may be drawing on.
 fn forward_stderr(name: String, stderr: tokio::process::ChildStderr) {
@@ -784,20 +811,37 @@ pub(crate) fn sanitize_tool_segment(s: &str) -> String {
 }
 
 /// Build `McpTool` instances from a connected client's tool list.
+///
+/// A configured server's tools keep their names as they are. A server the
+/// ACP client provides has each name sanitized, and two names that
+/// sanitize alike (`a.b`, `a_b`) would then collide — a duplicate tool name
+/// fails every request to the provider — so the first keeps it and later
+/// ones get `_2`, `_3`… Either way the call goes out under the remote name.
 pub fn build_tools_for_client(
     client: &Arc<McpClient>,
     remote_tools: Vec<RemoteToolSpec>,
 ) -> Vec<Box<dyn Tool>> {
     let acp = matches!(client.source, McpSource::Acp { .. });
     let trust_kind = kind_for_trust(client.trust());
+    let mut taken = std::collections::HashSet::new();
     remote_tools
         .into_iter()
         .map(|rt| {
             let (segment, kind) = if acp {
-                (
-                    sanitize_tool_segment(&rt.name),
-                    kind_for_annotations(rt.annotations.as_ref()),
-                )
+                let base = sanitize_tool_segment(&rt.name);
+                let mut segment = base.clone();
+                let mut n = 2;
+                while !taken.insert(segment.clone()) {
+                    segment = format!("{base}_{n}");
+                    n += 1;
+                }
+                if segment != base {
+                    warn!(
+                        "MCP '{}': tool '{}' sanitizes to a name already taken; listed as '{segment}'",
+                        client.name, rt.name
+                    );
+                }
+                (segment, kind_for_annotations(rt.annotations.as_ref()))
             } else {
                 (rt.name.clone(), trust_kind)
             };

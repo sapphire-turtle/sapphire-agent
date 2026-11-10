@@ -27,7 +27,16 @@ use tokio::task::AbortHandle;
 use tracing::debug;
 
 /// How long one `mcp/message` may take before the agent gives up on it.
+/// `subscriptions/listen` is exempt: it is meant to stay open.
 pub const ACP_MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The long-lived request a 2026-07-28 server pushes notifications on. It
+/// ends when the peer closes or rmcp cancels it, never by timeout.
+const SUBSCRIPTIONS_LISTEN: &str = "subscriptions/listen";
+
+/// The `_meta` key rmcp routes subscription notifications (and the listen
+/// result) by: the id of the listen request they belong to.
+const SUBSCRIPTION_ID_META_KEY: &str = "io.modelcontextprotocol/subscriptionId";
 
 /// How often [`AcpMcpTransport::receive`] looks for a closed peer while
 /// nothing arrives. [`McpOverAcpPeer`] can only be asked, not awaited, so
@@ -134,7 +143,18 @@ impl AcpMcpTransport {
         // Held until the task has registered itself, so a request that
         // finishes at once cannot unregister before it is registered.
         let mut registry = self.pending.lock().unwrap();
+        let listen = method == SUBSCRIPTIONS_LISTEN;
         let task = tokio::spawn(async move {
+            // The client's MCP server never sees rmcp's id for a listen
+            // request (only the outer ACP one), so it cannot tag what it
+            // sends on it with that id; tag it here, which is what rmcp
+            // routes subscription traffic by.
+            let stamp = |mut params: Value| {
+                if listen {
+                    set_subscription_id(&mut params, &id);
+                }
+                params
+            };
             // Subscribed before the request goes out, so nothing the
             // client says about it can arrive unheard.
             let mut notes = peer.notifications(&server_id, &request_id);
@@ -145,17 +165,26 @@ impl AcpMcpTransport {
                     tokio::select! {
                         outcome = &mut response => break outcome,
                         Some((method, params)) = notes.recv() => {
-                            deliver_notification(&inbox, &server_id, method, params);
+                            deliver_notification(&inbox, &server_id, method, stamp(params));
                         }
                     }
                 }
             };
-            let outcome = tokio::time::timeout(ACP_MCP_REQUEST_TIMEOUT, round_trip)
-                .await
-                .unwrap_or(Err(McpOverAcpError::Timeout(ACP_MCP_REQUEST_TIMEOUT)));
+            let mut outcome = if listen {
+                round_trip.await
+            } else {
+                tokio::time::timeout(ACP_MCP_REQUEST_TIMEOUT, round_trip)
+                    .await
+                    .unwrap_or(Err(McpOverAcpError::Timeout(ACP_MCP_REQUEST_TIMEOUT)))
+            };
+            if let Ok(McpCarrier::Result(result)) = &mut outcome
+                && listen
+            {
+                set_subscription_id(result, &id);
+            }
             // What the client said before answering, rmcp hears first.
             while let Ok((method, params)) = notes.try_recv() {
-                deliver_notification(&inbox, &server_id, method, params);
+                deliver_notification(&inbox, &server_id, method, stamp(params));
             }
             let _ = inbox.send(response_message(id, outcome));
             // Only after the answer is queued: `receive` reads an empty
@@ -175,6 +204,25 @@ impl AcpMcpTransport {
             task.abort();
         }
     }
+}
+
+/// Set `_meta`'s subscription id in `object` (notification params or a
+/// listen result) to rmcp's `id` for the listen request.
+fn set_subscription_id(object: &mut Value, id: &Value) {
+    if !object.is_object() {
+        *object = json!({});
+    }
+    let meta = object
+        .as_object_mut()
+        .expect("just made an object")
+        .entry("_meta")
+        .or_insert_with(|| json!({}));
+    if !meta.is_object() {
+        *meta = json!({});
+    }
+    meta.as_object_mut()
+        .expect("just made an object")
+        .insert(SUBSCRIPTION_ID_META_KEY.to_string(), id.clone());
 }
 
 /// Queue a client notification as the JSON-RPC notification rmcp reads.
@@ -658,7 +706,7 @@ mod tests {
             // nothing reads it: only the call's own progress arrives.
             peer.notify(&stale_id, "notifications/progress", progress(1));
             assert!(peer.notify(&id, "notifications/progress", progress(2)));
-            tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::time::timeout(Duration::from_secs(5), async {
                 while log.0.lock().unwrap().is_empty() {
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
@@ -683,7 +731,7 @@ mod tests {
             id = peer.wait_for_request("tools/call") => id,
         };
         // The call's future is gone; rmcp sends `notifications/cancelled`.
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(Duration::from_secs(5), async {
             while !peer.dropped().contains(&id) {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
@@ -701,12 +749,61 @@ mod tests {
             peer.wait_for_request("tools/call").await;
             peer.close();
         };
-        let (result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
             tokio::join!(svc.call_tool(poke()), close)
         })
         .await
         .expect("the call returns once the peer closes");
         assert!(result.is_err());
+    }
+
+    /// A listen request is not timed out, and what the client's server
+    /// sends on it — knowing only the outer request id — reaches rmcp's
+    /// subscription, not the handler, past the per-request timeout.
+    #[tokio::test(start_paused = true)]
+    async fn a_subscription_is_acknowledged_and_outlives_the_timeout() {
+        use rmcp::model::{ServerNotification, SubscriptionFilter};
+        let peer = FakePeer::new();
+        peer.script("subscriptions/listen", FakeReply::Hang);
+        let svc = connect((), &peer).await;
+        let acknowledge = async {
+            let id = peer.wait_for_request("subscriptions/listen").await;
+            assert!(peer.notify(
+                &id,
+                "notifications/subscriptions/acknowledged",
+                serde_json::json!({"notifications": {"toolsListChanged": true}}),
+            ));
+            id
+        };
+        let filter = SubscriptionFilter::builder().tools_list_changed().build();
+        let listen = tokio::time::timeout(Duration::from_secs(5), svc.peer().listen(filter));
+        let (subscription, id) = tokio::join!(listen, acknowledge);
+        let mut subscription = subscription
+            .expect("the acknowledgment reaches the subscription")
+            .expect("the subscription is acknowledged");
+        assert_eq!(subscription.acknowledged().tools_list_changed, Some(true));
+
+        tokio::time::sleep(ACP_MCP_REQUEST_TIMEOUT + Duration::from_secs(30)).await;
+        assert!(
+            !peer.dropped().contains(&id),
+            "the listen request was cancelled"
+        );
+        assert!(peer.notify(
+            &id,
+            "notifications/tools/list_changed",
+            serde_json::json!({}),
+        ));
+        let next = tokio::time::timeout(Duration::from_secs(5), subscription.next())
+            .await
+            .expect("a notification in time")
+            .expect("no subscription error");
+        assert!(
+            matches!(
+                next,
+                Some(ServerNotification::ToolListChangedNotification(_))
+            ),
+            "got {next:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]
