@@ -213,6 +213,8 @@ sapphire-agent-core = { path = "../sapphire-agent-core", version = "0.12.0" }
 libc = "0.2"
 
 [dev-dependencies]
+# `start_paused` for tests that wait out a timeout without the wall clock.
+tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"
 filetime = "0.2"
 tokio-tungstenite = "0.30.0"

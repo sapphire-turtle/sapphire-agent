@@ -10,6 +10,8 @@
 //! dead connection is replaced, and how a remote tool becomes a local
 //! [`Tool`].
 
+pub mod acp_transport;
+
 use crate::config::{McpServerConfig, McpTransportConfig, McpTrust};
 use crate::provider::ToolSpec;
 use crate::tools::{Tool, ToolKind};
