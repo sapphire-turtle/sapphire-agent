@@ -40,6 +40,7 @@ fn remote(name: &str) -> RemoteToolSpec {
         name: name.to_string(),
         description: "a remote tool".to_string(),
         input_schema: json!({"type": "object"}),
+        annotations: None,
     }
 }
 
@@ -539,4 +540,91 @@ fn the_client_declares_roots_and_elicitation_but_not_sampling() {
     assert!(roots);
     assert!(info.capabilities.elicitation.is_some());
     assert!(!sampling);
+}
+
+// ---------------------------------------------------------------------------
+// Servers the ACP client provides
+// ---------------------------------------------------------------------------
+
+#[test]
+fn annotations_choose_the_tool_kind() {
+    use rmcp::model::ToolAnnotations as A;
+    // `ToolAnnotations` is non-exhaustive: build from the default.
+    let hints = |read_only: Option<bool>, destructive: Option<bool>| {
+        let mut a = A::default();
+        a.read_only_hint = read_only;
+        a.destructive_hint = destructive;
+        a
+    };
+    let ro = hints(Some(true), None);
+    let nd = hints(None, Some(false));
+    let ro_and_destructive = hints(Some(true), Some(true));
+    let d = hints(None, Some(true));
+    assert_eq!(kind_for_annotations(Some(&ro)), ToolKind::Read);
+    assert_eq!(
+        kind_for_annotations(Some(&ro_and_destructive)),
+        ToolKind::Read
+    );
+    assert_eq!(kind_for_annotations(Some(&nd)), ToolKind::Edit);
+    assert_eq!(kind_for_annotations(Some(&d)), ToolKind::Other);
+    assert_eq!(kind_for_annotations(Some(&A::default())), ToolKind::Other);
+    assert_eq!(kind_for_annotations(None), ToolKind::Other);
+}
+
+#[test]
+fn tool_segments_are_sanitized() {
+    assert_eq!(
+        sanitize_tool_segment("my game.v2/tools"),
+        "my_game_v2_tools"
+    );
+    assert_eq!(sanitize_tool_segment("ok-name_1"), "ok-name_1");
+}
+
+#[tokio::test]
+async fn acp_client_tools_are_prefixed_and_classified() {
+    use super::acp_transport::test_support::FakePeer;
+    let peer = FakePeer::new();
+    let client = Arc::new(McpClient::over_acp("game", "game:1", peer.clone(), "/tmp"));
+    assert_eq!(client.tool_prefix(), "acp__game__");
+
+    let remote_tools = client.list_tools().await.unwrap();
+    let tools = build_tools_for_client(&client, remote_tools);
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].spec().name, "acp__game__poke");
+    assert_eq!(tools[0].kind(), ToolKind::Read);
+    assert!(
+        peer.seen()
+            .iter()
+            .all(|(server_id, _)| server_id == "game:1")
+    );
+}
+
+#[tokio::test]
+async fn acp_tool_names_are_sanitized_but_config_names_are_not() {
+    let acp = Arc::new(McpClient::over_acp(
+        "game",
+        "game:1",
+        super::acp_transport::test_support::FakePeer::new(),
+        "/tmp",
+    ));
+    let tools = build_tools_for_client(&acp, vec![remote("do it.now")]);
+    assert_eq!(tools[0].spec().name, "acp__game__do_it_now");
+    // The call still goes out under the server's own name.
+    let cfg = client_with(McpTrust::None);
+    let tools = build_tools_for_client(&cfg, vec![remote("do it.now")]);
+    assert_eq!(tools[0].spec().name, "mcp__ledger__do it.now");
+}
+
+#[tokio::test]
+async fn acp_client_does_not_reopen_after_the_peer_closes() {
+    use super::acp_transport::test_support::FakePeer;
+    let peer = FakePeer::new();
+    let client = McpClient::over_acp("game", "game:1", peer.clone(), "/tmp");
+    client.list_tools().await.unwrap();
+    peer.close();
+    let err = client.list_tools().await.unwrap_err();
+    assert!(
+        format!("{err:#}").contains("ACP connection closed"),
+        "got: {err:#}"
+    );
 }

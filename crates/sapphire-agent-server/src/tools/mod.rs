@@ -214,7 +214,7 @@ impl ToolSet {
         info!("MCP '{}': refreshing tool list", client.name());
         let remote_tools = client.list_tools().await?;
         let new_tools = build_tools_for_client(client, remote_tools);
-        let prefix = format!("mcp__{}__", client.name());
+        let prefix = client.tool_prefix();
 
         let mut inner = self.inner.write().await;
         inner.tools.retain(|t| !t.spec().name.starts_with(&prefix));
