@@ -416,6 +416,10 @@ There are two ways in. On a machine where the agent runs — every synced host
 runs one — the editor starts `sapphire-agent acp` itself. From a machine that
 does not, it connects to `/acp` over the network.
 
+An ACP client can also offer the agent tools of its own, as MCP servers it
+runs over the ACP connection (MCP over ACP); they appear as `acp__…` and need
+no config. See [Tools a client provides](docs/sapphire-agent-tools.md).
+
 ### On the agent's machine: `sapphire-agent acp`
 
 `sapphire-agent acp` speaks ACP on stdio, which is the transport editors

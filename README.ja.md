@@ -127,6 +127,7 @@ WARN Ignoring 1 unrecognised key(s) in /home/you/.config/sapphire-agent/config.t
 - Subagents — サブエージェントの定義・委譲・ネスト・再開
 - Zed / ACP — ACPエンドポイント、権限とモード、シェル・ファイルツール、過去セッションの読み込み
 - Skills — スキルの読み込み元ディレクトリ、有効化、4つのツール
+- クライアントが出すツール — ACP クライアントが MCP over ACP で渡すツール（`acp__…`）、名前の付け方と annotations による権限（[docs/sapphire-agent-tools.md](docs/sapphire-agent-tools.md)）
 - エージェント自身の定義編集 — heartbeat / autonomous / agents の定義ファイルを読み書きする4ツールと `[tools.admin].room_profiles` の room_profile 許可リスト（ACP セッションからも使えます）
 
 ## ライセンス
