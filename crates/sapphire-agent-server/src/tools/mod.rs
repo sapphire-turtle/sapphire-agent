@@ -196,6 +196,17 @@ impl ToolSet {
         output
     }
 
+    /// Add `tools` to the set. For a set filled after it was handed out:
+    /// an ACP session's client tools arrive server by server, in the
+    /// background (`serve::acp_mcp::ClientMcp`).
+    pub async fn extend(&self, tools: Vec<Box<dyn Tool>>) {
+        let mut inner = self.inner.write().await;
+        for tool in tools {
+            inner.specs.push(tool.spec().clone());
+            inner.tools.push(Arc::from(tool));
+        }
+    }
+
     /// Check all MCP clients for `tools_changed` flags and refresh their
     /// tools if needed.  Should be called before each LLM turn.
     pub async fn refresh_if_needed(&self) {

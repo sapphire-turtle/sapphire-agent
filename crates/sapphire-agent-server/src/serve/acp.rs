@@ -57,6 +57,7 @@
 //!   next turn's model context but present in `list_sessions` and after a
 //!   restart. See the drop note on [`super::run_llm_turn`] itself.
 
+use super::acp_mcp::{AcpMcpPeer, ClientMcp};
 use super::{ServeState, extract_bearer};
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::v1::ConnectionTo;
@@ -64,15 +65,15 @@ use agent_client_protocol::v1::schema::{
     AgentCapabilities, CancelNotification, ClientCapabilities, ContentBlock, ContentChunk,
     CreateTerminalRequest, CurrentModeUpdate, Implementation, InitializeRequest,
     InitializeResponse, KillTerminalRequest, ListSessionsRequest, ListSessionsResponse,
-    LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse,
-    PermissionOption, PermissionOptionKind, PromptRequest, PromptResponse, ReadTextFileRequest,
-    ReleaseTerminalRequest, RequestPermissionOutcome, RequestPermissionRequest,
-    ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities, SessionId, SessionInfo,
-    SessionListCapabilities, SessionMode as AcpSessionMode, SessionModeState, SessionNotification,
-    SessionResumeCapabilities, SessionUpdate, SetSessionModeRequest, SetSessionModeResponse,
-    StopReason, TerminalId, TerminalOutputRequest, TextContent, ToolCall as AcpToolCall,
-    ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, WaitForTerminalExitRequest,
-    WriteTextFileRequest,
+    LoadSessionRequest, LoadSessionResponse, McpCapabilities, McpServer, MessageMcpNotification,
+    NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind, PromptRequest,
+    PromptResponse, ReadTextFileRequest, ReleaseTerminalRequest, RequestPermissionOutcome,
+    RequestPermissionRequest, ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities,
+    SessionId, SessionInfo, SessionListCapabilities, SessionMode as AcpSessionMode,
+    SessionModeState, SessionNotification, SessionResumeCapabilities, SessionUpdate,
+    SetSessionModeRequest, SetSessionModeResponse, StopReason, TerminalId, TerminalOutputRequest,
+    TextContent, ToolCall as AcpToolCall, ToolCallId, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, WaitForTerminalExitRequest, WriteTextFileRequest,
 };
 use agent_client_protocol::{
     Agent, Client, Error, Lines, on_receive_notification, on_receive_request,
@@ -157,6 +158,11 @@ struct AcpSession {
     /// Shared, so a background child started from this session follows a
     /// later `session/set_mode` (see [`AcpProgress::detached`]).
     mode: LiveMode,
+    /// The MCP servers the client provided for this session
+    /// (`"type": "acp"`), and the tools listed from them. Rebuilt from the
+    /// request on every `session/new`, `load` and `resume`: a client names
+    /// its servers anew each time it opens a session.
+    client_mcp: Arc<ClientMcp>,
 }
 
 /// A session's current mode, written by `session/set_mode` and read live
@@ -186,6 +192,28 @@ struct AcpSessions {
     /// connection-wide copy rather than one per session that could
     /// drift from it.
     client_capabilities: std::sync::Mutex<ClientCapabilities>,
+    /// The connection as an MCP-over-ACP peer, shared by every session's
+    /// client MCP servers. Made by the first handler that needs it: the
+    /// `ConnectionTo` it wraps only exists inside the handlers.
+    mcp_peer: std::sync::OnceLock<Arc<AcpMcpPeer>>,
+}
+
+impl AcpSessions {
+    /// This connection's MCP-over-ACP peer.
+    fn mcp_peer(&self, connection: &ConnectionTo<Client>) -> Arc<AcpMcpPeer> {
+        Arc::clone(
+            self.mcp_peer
+                .get_or_init(|| AcpMcpPeer::new(connection.clone())),
+        )
+    }
+
+    /// Part of the connection's teardown: every `mcp/message` still in
+    /// flight fails now, rather than at its 120 s timeout.
+    fn close_client_mcp(&self) {
+        if let Some(peer) = self.mcp_peer.get() {
+            peer.close();
+        }
+    }
 }
 
 /// Reports one prompt turn's progress to an ACP client as `session/update`
@@ -241,6 +269,12 @@ struct AcpProgress {
     /// session without this struct or `AcpClientHandle` holding the
     /// whole `ServeState`.
     terminals: crate::tools::acp_client::TerminalRegistry,
+    /// The tools the client provided for this session (`acp__…`), as
+    /// listed when the turn started. Set by the `session/prompt` handler
+    /// after it has waited for them; `None` from [`Self::new`], and so on
+    /// every [`detached`](super::TurnHost::detached) copy: a background
+    /// child, like a subagent, gets no session tools.
+    session_tools: Option<Arc<crate::tools::ToolSet>>,
 }
 
 /// The `(read, write)` pair `TurnHost::client_fs_caps` reports, pulled
@@ -354,6 +388,7 @@ impl AcpProgress {
             client_capabilities,
             cwd,
             terminals,
+            session_tools: None,
         }
     }
 
@@ -382,6 +417,10 @@ impl AcpProgress {
 
 #[async_trait::async_trait]
 impl super::TurnHost for AcpProgress {
+    fn session_tools(&self) -> Option<Arc<crate::tools::ToolSet>> {
+        self.session_tools.clone()
+    }
+
     /// The provider's own tool-call id becomes ACP's `toolCallId`, so the
     /// completion below can name the call it completes. The tool's name
     /// serves as the title.
@@ -546,7 +585,8 @@ impl super::TurnHost for AcpProgress {
     /// reach; the copy is cheap (clones of handles and `Arc`s).
     ///
     /// Unlike the turn's own host, the copy reads the session's mode live
-    /// (`follow_live`).
+    /// (`follow_live`), and carries no session tools: a background child,
+    /// like a subagent, never calls the client's own MCP servers.
     fn detached(&self) -> Arc<dyn super::TurnHost> {
         let mut host = AcpProgress::new(
             self.session_id.clone(),
@@ -1245,6 +1285,8 @@ async fn adopt_session(
     profile_name: &str,
     session_id: &SessionId,
     cwd: PathBuf,
+    mcp_servers: &[McpServer],
+    connection: &ConnectionTo<Client>,
 ) -> Result<String, Error> {
     let id = session_id.to_string();
     let namespace = state
@@ -1277,6 +1319,14 @@ async fn adopt_session(
         .await
         .insert(id.clone(), profile_name.to_string());
     state.acp_sessions.lock().await.insert(id.clone());
+    // Built afresh from this request's `mcpServers`, replacing whatever the
+    // session had on this connection before; see `session/new`.
+    let client_mcp = Arc::new(ClientMcp::start(
+        mcp_servers,
+        sessions.mcp_peer(connection),
+        &cwd.to_string_lossy(),
+        &id,
+    ));
     let already_held = {
         let mut guard = sessions.inner.lock().await;
         // A re-adopted session starts in `default` like any other, but it
@@ -1301,6 +1351,7 @@ async fn adopt_session(
                     client_capabilities: sessions.client_capabilities.lock().unwrap().clone(),
                     turns: HashMap::new(),
                     mode,
+                    client_mcp,
                 },
             )
             .is_some()
@@ -1400,6 +1451,10 @@ pub(crate) async fn serve_connection<O, I>(
                         InitializeResponse::new(version).agent_capabilities(
                             AgentCapabilities::new()
                                 .load_session(true)
+                                // Only MCP over ACP: the client's stdio
+                                // and http servers are refused (see
+                                // `ClientMcp::start`).
+                                .mcp_capabilities(McpCapabilities::new().acp(true))
                                 .session_capabilities(
                                     SessionCapabilities::new()
                                         .list(SessionListCapabilities::new())
@@ -1416,31 +1471,12 @@ pub(crate) async fn serve_connection<O, I>(
                 let sessions = Arc::clone(&sessions);
                 let state = Arc::clone(&state);
                 let profile_name = profile_name.clone();
-                async move |req: NewSessionRequest, responder, _connection| {
+                async move |req: NewSessionRequest, responder, connection: ConnectionTo<Client>| {
                     // Mint the agent-side session id the same way a
                     // brand-new `/rpc` session gets one in `handle_initialize`
                     // (`src/serve/mod.rs`), rather than inventing a second
                     // convention.
                     let agent_session_id = uuid::Uuid::now_v7().to_string();
-
-                    // `mcp_servers` is not honoured, and silence about that
-                    // would be indistinguishable from a bug: the editor's
-                    // configured servers would simply be absent, with no
-                    // tools from them and nothing said. They are the
-                    // *client's* servers, mostly stdio commands to spawn on
-                    // the client's machine, which an agent reached over a
-                    // socket cannot launch and must not try to — this
-                    // process is not on that machine. MCP servers for this
-                    // agent are configured server-side, in its own config.
-                    if !req.mcp_servers.is_empty() {
-                        warn!(
-                            "ACP: ignoring {} MCP server(s) offered by the client for session {}: \
-                             they are the client's to launch, and this agent runs elsewhere. \
-                             Configure MCP servers in the agent's own config instead.",
-                            req.mcp_servers.len(),
-                            agent_session_id,
-                        );
-                    }
 
                     // Pin the session to the room profile the bearer token
                     // resolved to at connection time. That pin is what gives
@@ -1481,6 +1517,20 @@ pub(crate) async fn serve_connection<O, I>(
                         .await
                         .insert(agent_session_id.clone());
 
+                    // Only the client's MCP-over-ACP servers (`"type":
+                    // "acp"`) are taken; `start` warns about the rest, which
+                    // are the client's to launch or dial on its own machine
+                    // — this agent may not be on it, and must not spawn a
+                    // command it was handed over the wire. Their tools are
+                    // listed in the background: awaiting `mcp/message` here,
+                    // inside the dispatch loop, would deadlock it.
+                    let client_mcp = Arc::new(ClientMcp::start(
+                        &req.mcp_servers,
+                        sessions.mcp_peer(&connection),
+                        &cwd_string,
+                        &agent_session_id,
+                    ));
+
                     let session_id = SessionId::new(agent_session_id.clone());
                     count_session_open(&state, &agent_session_id).await;
                     sessions.inner.lock().await.insert(
@@ -1499,6 +1549,7 @@ pub(crate) async fn serve_connection<O, I>(
                             mode: Arc::new(std::sync::Mutex::new(
                                 crate::tools::policy::SessionMode::Default,
                             )),
+                            client_mcp,
                         },
                     );
 
@@ -1584,6 +1635,8 @@ pub(crate) async fn serve_connection<O, I>(
                         &profile_name,
                         &req.session_id,
                         req.cwd.clone(),
+                        &req.mcp_servers,
+                        &connection,
                     )
                     .await
                     {
@@ -1634,7 +1687,7 @@ pub(crate) async fn serve_connection<O, I>(
                 let sessions = Arc::clone(&sessions);
                 let state = Arc::clone(&state);
                 let profile_name = profile_name.clone();
-                async move |req: ResumeSessionRequest, responder, _connection| {
+                async move |req: ResumeSessionRequest, responder, connection: ConnectionTo<Client>| {
                     // Same adoption as `load`, no replay. The ACP
                     // specification frames `resume` as the fallback for
                     // agents that cannot load at all; offered here so a
@@ -1645,6 +1698,8 @@ pub(crate) async fn serve_connection<O, I>(
                         &profile_name,
                         &req.session_id,
                         req.cwd.clone(),
+                        &req.mcp_servers,
+                        &connection,
                     )
                     .await
                     {
@@ -1683,6 +1738,19 @@ pub(crate) async fn serve_connection<O, I>(
                             notif.session_id
                         ),
                     }
+                    Ok(())
+                }
+            },
+            on_receive_notification!(),
+        )
+        .on_receive_notification(
+            {
+                let sessions = Arc::clone(&sessions);
+                async move |notif: MessageMcpNotification, connection: ConnectionTo<Client>| {
+                    // What a client MCP server says about one of its
+                    // requests still in flight (progress, mostly). The peer
+                    // routes it to that request, or drops it.
+                    sessions.mcp_peer(&connection).deliver(notif);
                     Ok(())
                 }
             },
@@ -1755,11 +1823,18 @@ pub(crate) async fn serve_connection<O, I>(
                                 Arc::clone(&session.mode),
                                 session.client_capabilities.clone(),
                                 session.cwd.clone(),
+                                Arc::clone(&session.client_mcp),
                             )
                         })
                     };
-                    let Some((agent_session_id, turn_cancel, live_mode, client_capabilities, cwd)) =
-                        looked_up
+                    let Some((
+                        agent_session_id,
+                        turn_cancel,
+                        live_mode,
+                        client_capabilities,
+                        cwd,
+                        client_mcp,
+                    )) = looked_up
                     else {
                         // Not created on the fly: a prompt naming a session
                         // this connection never minted is a client bug, and
@@ -1820,17 +1895,6 @@ pub(crate) async fn serve_connection<O, I>(
                     // from `/rpc` and A2A's `SessionStore` — but under the
                     // same memory namespace and system prompt as either.
                     let session_id = req.session_id.clone();
-                    let progress = Arc::new(AcpProgress::new(
-                        session_id.clone(),
-                        connection.clone(),
-                        profile_name.clone(),
-                        read_mode(&live_mode),
-                        live_mode,
-                        Arc::clone(&state.permissions),
-                        client_capabilities,
-                        cwd,
-                        Arc::clone(&state.acp_terminals),
-                    ));
 
                     // The turn runs OUTSIDE the dispatch loop, and the
                     // `Responder` travels with it.
@@ -1854,33 +1918,64 @@ pub(crate) async fn serve_connection<O, I>(
                     connection.spawn({
                         let state = Arc::clone(&state);
                         let sessions = Arc::clone(&sessions);
+                        let connection = connection.clone();
+                        let profile_name = profile_name.clone();
                         async move {
+                            // The client's own tools for this session, once
+                            // listed — or, past `CLIENT_MCP_READY_TIMEOUT`,
+                            // whatever has been. Awaited here, outside the
+                            // dispatch loop, because listing them is an
+                            // `mcp/message` round trip the loop must stay
+                            // free to read. A cancel lands here too.
+                            let session_tools = tokio::select! {
+                                biased;
+                                () = turn_cancel.cancelled() => None,
+                                tools = client_mcp.tools() => Some(tools),
+                            };
+                            let mut progress = AcpProgress::new(
+                                session_id.clone(),
+                                connection,
+                                profile_name,
+                                read_mode(&live_mode),
+                                live_mode,
+                                Arc::clone(&state.permissions),
+                                client_capabilities,
+                                cwd,
+                                Arc::clone(&state.acp_terminals),
+                            );
+                            progress.session_tools = session_tools.clone();
+                            let progress = Arc::new(progress);
+
                             // Bound to a `let` on purpose: that drops the
                             // losing branch's future here, before the answer
                             // goes out, so a client told its turn was
                             // cancelled knows the provider call is already
                             // abandoned rather than merely disowned.
-                            let end = tokio::select! {
-                                // `biased`, so a cancellation that lands in
-                                // the same poll as a finished turn still wins:
-                                // the schema makes `Cancelled` a MUST "even if
-                                // the cancellation causes exceptions in
-                                // underlying operations", which means the
-                                // error path below must be unreachable once
-                                // the token has fired.
-                                biased;
-                                () = turn_cancel.cancelled() => TurnEnd::Cancelled,
-                                outcome = std::panic::AssertUnwindSafe(super::run_llm_turn(
-                                    state,
-                                    agent_session_id,
-                                    crate::provider::ChatMessage::user(&text),
-                                    Arc::clone(&progress) as Arc<dyn super::TurnHost>,
-                                    None,
-                                ))
-                                .catch_unwind() => match outcome {
-                                    Ok(outcome) => TurnEnd::Ran(outcome),
-                                    Err(_) => TurnEnd::Panicked,
-                                },
+                            let end = if session_tools.is_none() {
+                                TurnEnd::Cancelled
+                            } else {
+                                tokio::select! {
+                                    // `biased`, so a cancellation that lands in
+                                    // the same poll as a finished turn still wins:
+                                    // the schema makes `Cancelled` a MUST "even if
+                                    // the cancellation causes exceptions in
+                                    // underlying operations", which means the
+                                    // error path below must be unreachable once
+                                    // the token has fired.
+                                    biased;
+                                    () = turn_cancel.cancelled() => TurnEnd::Cancelled,
+                                    outcome = std::panic::AssertUnwindSafe(super::run_llm_turn(
+                                        state,
+                                        agent_session_id,
+                                        crate::provider::ChatMessage::user(&text),
+                                        Arc::clone(&progress) as Arc<dyn super::TurnHost>,
+                                        None,
+                                    ))
+                                    .catch_unwind() => match outcome {
+                                        Ok(outcome) => TurnEnd::Ran(outcome),
+                                        Err(_) => TurnEnd::Panicked,
+                                    },
+                                }
                             };
 
                             // This turn is no longer an "ongoing operation",
@@ -1993,6 +2088,12 @@ pub(crate) async fn serve_connection<O, I>(
             cancel_when_exhausted(drop_null_id_errors(incoming), connection_cancel.clone()),
         ))
         .await;
+
+    // Fail every `mcp/message` still in flight. A turn's own calls went
+    // with the task actor, but nothing else should wait out a 120 s timeout
+    // on a client that is gone. The sessions' `ClientMcp`s go with
+    // `sessions` itself.
+    sessions.close_client_mcp();
 
     // Release every session this connection held. Missing this would turn
     // `open_acp_sessions` into a leak that warns forever: the next
@@ -4874,5 +4975,273 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    // ── MCP over ACP ────────────────────────────────────────────────
+
+    /// One `mcpServers` entry for a server the client provides itself.
+    fn acp_server(name: &str, server_id: &str) -> serde_json::Value {
+        serde_json::json!({ "type": "acp", "name": name, "serverId": server_id })
+    }
+
+    /// The inner MCP result a test client answers `mcp/message` with:
+    /// a 2026-07-28 server with tools, offering one read-only tool,
+    /// `poke`. `None` (no answer at all) for anything else.
+    fn mcp_answer(message: &serde_json::Value) -> Option<serde_json::Value> {
+        use rmcp::model::{DiscoverResult, ProtocolVersion, ServerCapabilities};
+        match message["params"]["method"].as_str()? {
+            "server/discover" => Some(
+                serde_json::to_value(DiscoverResult::new(
+                    vec![ProtocolVersion::LATEST],
+                    ServerCapabilities::builder().enable_tools().build(),
+                ))
+                .unwrap(),
+            ),
+            "tools/list" => Some(serde_json::json!({
+                "tools": [{
+                    "name": "poke",
+                    "inputSchema": { "type": "object" },
+                    "annotations": { "readOnlyHint": true }
+                }]
+            })),
+            _ => None,
+        }
+    }
+
+    /// The outer `mcp/message` response carrying `result`.
+    fn mcp_response(request: &serde_json::Value, result: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": { "result": result }
+        })
+    }
+
+    #[tokio::test]
+    async fn initialize_advertises_mcp_over_acp() {
+        let addr = spawn(ServeState::for_test(true)).await;
+        let reply = roundtrip(&addr, initialize_request(0)).await;
+        assert_eq!(
+            reply["result"]["agentCapabilities"]["mcpCapabilities"]["acp"], true,
+            "got {reply}"
+        );
+    }
+
+    /// `session/load` brings its own `mcpServers`: the session's client
+    /// tools are rebuilt from them, and the ones `session/new` offered are
+    /// gone.
+    #[tokio::test]
+    async fn load_rebuilds_session_tools_from_the_new_request() {
+        let (state, log) = ServeState::for_test_scripted_with_log(
+            true,
+            vec![crate::provider::ChatResponse {
+                prompt_usage: None,
+                text: Some("done".to_string()),
+                tool_calls: Vec::new(),
+                stop_reason: None,
+            }],
+        );
+        let addr = spawn(state).await;
+        let mut ws = connect(&addr).await;
+        let new_session = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "session/new",
+            "params": { "cwd": test_cwd(), "mcpServers": [acp_server("first", "srv-1")] }
+        });
+        for request in [initialize_request(0), new_session] {
+            ws.send(Message::Text(request.to_string().into()))
+                .await
+                .unwrap();
+        }
+
+        let reply = loop {
+            let Message::Text(t) = next_frame(&mut ws).await else {
+                continue;
+            };
+            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+            if v["method"] == "mcp/message" && !v["id"].is_null() {
+                if let Some(result) = mcp_answer(&v) {
+                    ws.send(Message::Text(mcp_response(&v, result).to_string().into()))
+                        .await
+                        .unwrap();
+                }
+            } else if v["id"] == 1 {
+                let session_id = v["result"]["sessionId"].as_str().unwrap().to_string();
+                let load = serde_json::json!({
+                    "jsonrpc": "2.0", "id": 2, "method": "session/load",
+                    "params": {
+                        "sessionId": session_id,
+                        "cwd": test_cwd(),
+                        "mcpServers": [acp_server("second", "srv-2")]
+                    }
+                });
+                ws.send(Message::Text(load.to_string().into()))
+                    .await
+                    .unwrap();
+                ws.send(Message::Text(
+                    prompt_request(3, &session_id, text_prompt("hi"))
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            } else if v["id"] == 2 {
+                assert!(v["error"].is_null(), "load failed: {v}");
+            } else if v["id"] == 3 {
+                break v;
+            }
+        };
+
+        assert_eq!(reply["result"]["stopReason"], "end_turn", "got {reply}");
+        let offered = &log.calls()[0].1;
+        assert!(
+            offered.iter().any(|n| n == "acp__second__poke"),
+            "offered: {offered:?}"
+        );
+        assert!(
+            offered.iter().all(|n| !n.starts_with("acp__first__")),
+            "offered: {offered:?}"
+        );
+    }
+
+    /// A client that goes away while one of its tools is running: the
+    /// call fails at once with the connection, rather than after the
+    /// 120 s request timeout, and the turn goes on to finish.
+    ///
+    /// Driven on a bare connection rather than over `/acp`, because a
+    /// turn spawned by the `session/prompt` handler is dropped with the
+    /// connection's task actor and can no longer be watched finishing.
+    /// The teardown is the same call `serve_connection` makes.
+    #[tokio::test]
+    async fn closing_the_connection_drops_the_session_tools() {
+        use agent_client_protocol::v1::schema::{McpServer, McpServerAcp};
+        let state = ServeState::for_test_scripted(
+            true,
+            vec![
+                crate::provider::ChatResponse {
+                    prompt_usage: None,
+                    text: None,
+                    tool_calls: vec![crate::provider::ToolCall {
+                        id: "call-1".to_string(),
+                        name: "acp__game__poke".to_string(),
+                        input: serde_json::json!({}),
+                    }],
+                    stop_reason: None,
+                },
+                crate::provider::ChatResponse {
+                    prompt_usage: None,
+                    text: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    stop_reason: None,
+                },
+            ],
+        );
+
+        // The client's side of the wire, as two channels.
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (in_tx, in_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let outgoing = futures_util::sink::unfold(out_tx, |tx, line: String| async move {
+            let _ = tx.send(line);
+            Ok::<_, std::io::Error>(tx)
+        });
+        let incoming = futures_util::stream::unfold(in_rx, |mut rx| async move {
+            rx.recv()
+                .await
+                .map(|line| (Ok::<_, std::io::Error>(line), rx))
+        });
+
+        // Answers the handshake and the listing, and never `tools/call`:
+        // it reports that call's arrival instead.
+        let (call_tx, call_rx) = tokio::sync::oneshot::channel::<()>();
+        let client = tokio::spawn(async move {
+            let mut call_tx = Some(call_tx);
+            while let Some(line) = out_rx.recv().await {
+                let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+                if v["method"] != "mcp/message" || v["id"].is_null() {
+                    continue;
+                }
+                match mcp_answer(&v) {
+                    Some(result) => {
+                        let _ = in_tx.send(mcp_response(&v, result).to_string());
+                    }
+                    None if v["params"]["method"] == "tools/call" => {
+                        if let Some(tx) = call_tx.take() {
+                            let _ = tx.send(());
+                        }
+                    }
+                    None => {}
+                }
+            }
+        });
+
+        Agent
+            .v1()
+            .connect_with(
+                Lines::new(outgoing, incoming),
+                async |connection: ConnectionTo<Client>| {
+                    let sessions = AcpSessions::default();
+                    let client_mcp = super::super::acp_mcp::ClientMcp::start(
+                        &[McpServer::Acp(McpServerAcp::new("game", "srv-1"))],
+                        sessions.mcp_peer(&connection),
+                        "/work",
+                        "s-close",
+                    );
+                    let tools = client_mcp.tools().await;
+
+                    let mut progress = AcpProgress::new(
+                        SessionId::new("s-close"),
+                        connection,
+                        "default".to_string(),
+                        crate::tools::policy::SessionMode::Default,
+                        Arc::new(std::sync::Mutex::new(
+                            crate::tools::policy::SessionMode::Default,
+                        )),
+                        Arc::clone(&state.permissions),
+                        ClientCapabilities::default(),
+                        PathBuf::from("/work"),
+                        Arc::clone(&state.acp_terminals),
+                    );
+                    progress.session_tools = Some(tools);
+                    let turn = tokio::spawn(super::super::run_llm_turn(
+                        Arc::clone(&state),
+                        "s-close".to_string(),
+                        crate::provider::ChatMessage::user("poke it"),
+                        Arc::new(progress) as Arc<dyn TurnHost>,
+                        None,
+                    ));
+
+                    tokio::time::timeout(std::time::Duration::from_secs(10), call_rx)
+                        .await
+                        .expect("the tool call reaches the client")
+                        .unwrap();
+                    // What `serve_connection` does once the client is gone.
+                    sessions.close_client_mcp();
+
+                    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), turn)
+                        .await
+                        .expect("the turn finishes once the connection closes")
+                        .unwrap();
+                    assert_eq!(outcome.text.as_deref(), Some("done"));
+                    let history = state.sessions.lock().await.get("s-close").cloned().unwrap();
+                    let results: Vec<String> = history
+                        .iter()
+                        .flat_map(|m| m.parts.iter())
+                        .filter_map(|p| match p {
+                            crate::provider::ContentPart::ToolResult { content, .. } => {
+                                Some(content.clone())
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    assert_eq!(results.len(), 1, "got {results:?}");
+                    assert!(
+                        results[0].starts_with("Error") && results[0].contains("closed"),
+                        "got {results:?}"
+                    );
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+        client.abort();
     }
 }

@@ -192,7 +192,6 @@ pub trait ToolCallObserver: Send + Sync {
 }
 
 /// Where a client's server comes from, and so how it is reached.
-#[allow(dead_code)] // `Acp` is constructed by the ACP session wiring, not yet in.
 enum McpSource {
     /// An `[[tools.mcp_servers]]` entry: spawned or dialled by the agent.
     Config(McpServerConfig),
@@ -234,7 +233,6 @@ impl McpClient {
     /// A client for a server the ACP client provides. Never respawns its
     /// transport once the peer is closed: `open` fails with "ACP connection
     /// closed".
-    #[allow(dead_code)] // Called by the ACP session wiring, not yet in.
     pub fn over_acp(
         name: &str,
         server_id: &str,

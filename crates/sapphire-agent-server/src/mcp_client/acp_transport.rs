@@ -15,10 +15,6 @@
 //! messages rmcp expects to receive. The ACP side is seen only through
 //! [`McpOverAcpPeer`], as JSON, so this file knows nothing of ACP's types.
 
-// Nothing outside the tests builds one until the ACP session implements
-// `McpOverAcpPeer` and `McpClient` connects over it.
-#![allow(dead_code)]
-
 use rmcp::service::{RoleClient, RxJsonRpcMessage, TxJsonRpcMessage};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -48,7 +44,9 @@ pub trait McpOverAcpPeer: Send + Sync + 'static {
     /// Send one `mcp/message` request and wait for its outer response.
     /// `Ok(McpCarrier)` is the successful outer response; `Err` is an outer
     /// ACP error or a closed connection. Dropping the future cancels the
-    /// outer request (`$/cancel_request`).
+    /// outer request (`$/cancel_request`). Implementations must resolve
+    /// every request in flight with `Err(McpOverAcpError::Closed)` promptly
+    /// when the connection closes, rather than leave it to the timeout.
     async fn request(
         &self,
         server_id: &str,
