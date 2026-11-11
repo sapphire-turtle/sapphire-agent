@@ -2338,6 +2338,27 @@ mod tests {
             .unwrap()
     }
 
+    /// Send `initialize`, wait for its reply, then send `request`. The SDK
+    /// refuses any other request until it has answered `initialize`, so a
+    /// client that pipelines the two loses the race on a slow runner.
+    async fn send_after_initialize(ws: &mut TestSocket, request: serde_json::Value) {
+        ws.send(Message::Text(initialize_request(0).to_string().into()))
+            .await
+            .unwrap();
+        loop {
+            if let Message::Text(t) = next_frame(ws).await {
+                let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+                if v["id"] == 0 {
+                    assert!(v.get("result").is_some(), "initialize failed: {v}");
+                    break;
+                }
+            }
+        }
+        ws.send(Message::Text(request.to_string().into()))
+            .await
+            .unwrap();
+    }
+
     /// Run several requests over ONE connection, in order.
     pub(super) async fn conversation(
         addr: &str,
@@ -2785,11 +2806,7 @@ mod tests {
         prompt: serde_json::Value,
     ) -> (String, Vec<serde_json::Value>, serde_json::Value) {
         let mut ws = connect(addr).await;
-        for request in [initialize_request(0), new_session_request(1)] {
-            ws.send(Message::Text(request.to_string().into()))
-                .await
-                .unwrap();
-        }
+        send_after_initialize(&mut ws, new_session_request(1)).await;
 
         let mut session_id: Option<String> = None;
         let mut updates = Vec::new();
@@ -2840,11 +2857,7 @@ mod tests {
         option_id: &str,
     ) -> (Vec<serde_json::Value>, serde_json::Value, usize) {
         let mut ws = connect(addr).await;
-        for request in [initialize_request(0), new_session_request(1)] {
-            ws.send(Message::Text(request.to_string().into()))
-                .await
-                .unwrap();
-        }
+        send_after_initialize(&mut ws, new_session_request(1)).await;
 
         let mut updates = Vec::new();
         let mut asked = 0usize;
@@ -3404,11 +3417,7 @@ mod tests {
     /// "still in flight" true rather than merely likely.
     async fn prompt_in_flight(addr: &str) -> (TestSocket, String) {
         let mut ws = connect(addr).await;
-        for request in [initialize_request(0), new_session_request(1)] {
-            ws.send(Message::Text(request.to_string().into()))
-                .await
-                .unwrap();
-        }
+        send_after_initialize(&mut ws, new_session_request(1)).await;
 
         loop {
             let Message::Text(t) = next_frame(&mut ws).await else {
@@ -3813,11 +3822,7 @@ mod tests {
         let addr = spawn(state).await;
 
         let mut ws = connect(&addr).await;
-        for request in [initialize_request(0), new_session_request(1)] {
-            ws.send(Message::Text(request.to_string().into()))
-                .await
-                .unwrap();
-        }
+        send_after_initialize(&mut ws, new_session_request(1)).await;
 
         let mut saw_mode_update = false;
         loop {
@@ -3859,11 +3864,7 @@ mod tests {
         let addr = spawn(state).await;
 
         let mut ws = connect(&addr).await;
-        for request in [initialize_request(0), new_session_request(1)] {
-            ws.send(Message::Text(request.to_string().into()))
-                .await
-                .unwrap();
-        }
+        send_after_initialize(&mut ws, new_session_request(1)).await;
 
         loop {
             let Message::Text(t) = next_frame(&mut ws).await else {
@@ -3900,11 +3901,7 @@ mod tests {
         let addr = spawn(state).await;
 
         let mut ws = connect(&addr).await;
-        for request in [initialize_request(0), new_session_request(1)] {
-            ws.send(Message::Text(request.to_string().into()))
-                .await
-                .unwrap();
-        }
+        send_after_initialize(&mut ws, new_session_request(1)).await;
 
         loop {
             let Message::Text(t) = next_frame(&mut ws).await else {
@@ -3951,11 +3948,7 @@ mod tests {
         let addr = spawn(state).await;
 
         let mut ws = connect(&addr).await;
-        for request in [initialize_request(0), new_session_request(1)] {
-            ws.send(Message::Text(request.to_string().into()))
-                .await
-                .unwrap();
-        }
+        send_after_initialize(&mut ws, new_session_request(1)).await;
 
         let mut asked = 0usize;
         loop {
@@ -4302,11 +4295,7 @@ mod tests {
 
         let addr = spawn(state).await;
         let mut ws = connect(&addr).await;
-        for request in [initialize_request(0), load_request(1, &sid)] {
-            ws.send(Message::Text(request.to_string().into()))
-                .await
-                .unwrap();
-        }
+        send_after_initialize(&mut ws, load_request(1, &sid)).await;
 
         let mut replayed: Vec<(String, String)> = Vec::new();
         loop {
@@ -4518,11 +4507,7 @@ mod tests {
 
         let addr = spawn(state).await;
         let mut ws = connect(&addr).await;
-        for request in [initialize_request(0), resume_request(1, &sid)] {
-            ws.send(Message::Text(request.to_string().into()))
-                .await
-                .unwrap();
-        }
+        send_after_initialize(&mut ws, resume_request(1, &sid)).await;
 
         let mut updates_before_reply = 0usize;
         loop {
@@ -4640,11 +4625,7 @@ mod tests {
         let mut a = connect(&addr).await;
         let mut b = connect(&addr).await;
         for ws in [&mut a, &mut b] {
-            for request in [initialize_request(0), load_request(1, &sid)] {
-                ws.send(Message::Text(request.to_string().into()))
-                    .await
-                    .unwrap();
-            }
+            send_after_initialize(ws, load_request(1, &sid)).await;
             loop {
                 let Message::Text(t) = next_frame(ws).await else {
                     continue;
@@ -4753,11 +4734,7 @@ mod tests {
 
         let addr = spawn(state).await;
         let mut ws = connect(&addr).await;
-        for request in [initialize_request(0), load_request(1, &sid)] {
-            ws.send(Message::Text(request.to_string().into()))
-                .await
-                .unwrap();
-        }
+        send_after_initialize(&mut ws, load_request(1, &sid)).await;
         loop {
             let Message::Text(t) = next_frame(&mut ws).await else {
                 continue;
@@ -5047,11 +5024,7 @@ mod tests {
             "jsonrpc": "2.0", "id": 1, "method": "session/new",
             "params": { "cwd": test_cwd(), "mcpServers": [acp_server("first", "srv-1")] }
         });
-        for request in [initialize_request(0), new_session] {
-            ws.send(Message::Text(request.to_string().into()))
-                .await
-                .unwrap();
-        }
+        send_after_initialize(&mut ws, new_session).await;
 
         let reply = loop {
             let Message::Text(t) = next_frame(&mut ws).await else {
