@@ -678,7 +678,65 @@ mod tests {
         assert!(target.is_file());
     }
 
-    #[cfg(unix)]
+    #[test]
+    fn default_dir_hashes_canonical_workspace_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspace-画像");
+        fs::create_dir(&root).unwrap();
+        let actual = AttachmentStore::default_dir(&root.join(".")).unwrap();
+        let canonical = root.canonicalize().unwrap();
+        #[cfg(unix)]
+        let bytes = {
+            use std::os::unix::ffi::OsStrExt;
+            canonical.as_os_str().as_bytes().to_vec()
+        };
+        #[cfg(windows)]
+        let bytes = {
+            use std::os::windows::ffi::OsStrExt;
+            canonical
+                .as_os_str()
+                .encode_wide()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>()
+        };
+        let key: String = Sha256::digest(&bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(
+            actual,
+            dirs::cache_dir()
+                .unwrap()
+                .join("sapphire-agent/attachments")
+                .join(key)
+        );
+        assert_eq!(actual, AttachmentStore::default_dir(&canonical).unwrap());
+        let other = dir.path().join("other");
+        fs::create_dir(&other).unwrap();
+        assert_ne!(actual, AttachmentStore::default_dir(&other).unwrap());
+    }
+
+    #[test]
+    fn canonicalize_failure_prevents_store_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_root = dir.path().join("missing-workspace");
+        // Match startup's fallible resolution/open chain: do not fall back to
+        // hashing a noncanonical path or create a store when resolution fails.
+        let error = AttachmentStore::default_dir(&missing_root)
+            .and_then(AttachmentStore::open)
+            .err()
+            .expect("store startup must fail for a missing workspace");
+        assert_eq!(error.to_string(), "canonicalize workspace root");
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert!(!missing_root.exists());
+    }
+
+    // Linux accepts arbitrary non-NUL filename bytes; macOS can reject these
+    // with EILSEQ before the canonical-path hashing behavior can be tested.
+    #[cfg(target_os = "linux")]
     #[test]
     fn default_dir_hashes_canonical_lossless_workspace_bytes() {
         use std::os::unix::ffi::OsStringExt;
