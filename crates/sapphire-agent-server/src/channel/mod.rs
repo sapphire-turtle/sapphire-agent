@@ -1,6 +1,7 @@
 pub mod discord;
 pub mod matrix;
 
+use crate::attachment_store::{AttachmentOwner, AttachmentStore};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -13,9 +14,7 @@ use tracing::{error, warn};
 /// to fit by [`prepare_image`].
 pub const MAX_ATTACHMENT_BYTES: usize = 5 * 1024 * 1024;
 
-/// Largest image a channel downloads. Anything bigger is turned away before
-/// it is fetched; anything between this and [`MAX_ATTACHMENT_BYTES`] is
-/// shrunk by [`prepare_image`] rather than dropped.
+/// Largest original attachment a channel downloads and caches.
 pub const MAX_DOWNLOAD_BYTES: usize = 32 * 1024 * 1024;
 
 /// Longest side, in pixels, an oversized image is scaled down to. Anthropic
@@ -23,10 +22,104 @@ pub const MAX_DOWNLOAD_BYTES: usize = 32 * 1024 * 1024;
 /// nothing it would have seen.
 const DOWNSCALE_LONG_SIDE: u32 = 1568;
 
-/// MIME types of images forwarded to the LLM. Anthropic accepts these four;
-/// anything else is dropped at the channel layer.
-pub(crate) const SUPPORTED_IMAGE_MIME: &[&str] =
-    &["image/jpeg", "image/png", "image/gif", "image/webp"];
+pub const MAX_RECEIVED_ATTACHMENTS: usize = 8;
+pub const MAX_MESSAGE_ATTACHMENT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Cache original bytes independently of preparing the optional inline image.
+/// Only metadata, never transport URLs or encryption keys, crosses this boundary.
+pub(crate) async fn cache_and_prepare_attachment(
+    store: Option<Arc<AttachmentStore>>,
+    owner: AttachmentOwner,
+    message_id: String,
+    filename: String,
+    declared_mime: Option<String>,
+    bytes: Vec<u8>,
+) -> (Option<Attachment>, Vec<String>) {
+    let received_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let image_bytes = sniff_image_mime(&bytes).map(|_| bytes.clone());
+    let oversized = bytes.len() > MAX_ATTACHMENT_BYTES;
+    let mut notes = Vec::new();
+    let cached = if let Some(store) = store {
+        let stored_filename = filename.clone();
+        let media_type = declared_mime.unwrap_or_else(|| "application/octet-stream".into());
+        match tokio::task::spawn_blocking(move || {
+            store.insert(
+                owner,
+                message_id,
+                stored_filename,
+                media_type,
+                &bytes,
+                received_at_ms,
+            )
+        })
+        .await
+        {
+            Ok(Ok(meta)) => Some(meta),
+            Ok(Err(e)) => {
+                notes.push(dropped_attachment_note(
+                    &filename,
+                    &format!("original not cached ({e})"),
+                ));
+                None
+            }
+            Err(e) => {
+                notes.push(dropped_attachment_note(
+                    &filename,
+                    &format!("original not cached ({e})"),
+                ));
+                None
+            }
+        }
+    } else {
+        notes.push(dropped_attachment_note(
+            &filename,
+            "original not cached (attachment store unavailable)",
+        ));
+        None
+    };
+    let inline = if let Some(bytes) = image_bytes {
+        match tokio::task::spawn_blocking(move || prepare_image(bytes)).await {
+            Ok(Ok(image)) => Some(image),
+            Ok(Err(reason)) => {
+                notes.push(dropped_attachment_note(&filename, &reason));
+                None
+            }
+            Err(e) => {
+                notes.push(dropped_attachment_note(
+                    &filename,
+                    &format!("processing it failed ({e})"),
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(meta) = cached {
+        let status = if inline.is_some() {
+            if oversized {
+                "cached original, image shown inline; inline image may be resized; saved bytes are original"
+            } else {
+                "cached original, image shown inline"
+            }
+        } else {
+            "cached original, not viewed inline"
+        };
+        // Serializing strings to JSON is infallible and keeps control characters
+        // and quotes from changing the fixed note structure.
+        notes.insert(0, format!(
+            "[Attachment id={} filename={} media_type={} bytes={} expires_at_ms={}; {}. Use attachment_save to save it.]",
+            serde_json::to_string(&meta.id).unwrap(),
+            serde_json::to_string(&meta.filename).unwrap(),
+            serde_json::to_string(&meta.media_type).unwrap(),
+            meta.bytes, meta.expires_at_ms, status,
+        ));
+    }
+    (inline, notes)
+}
 
 /// Detect the MIME type of an image from its magic bytes. Returns `None`
 /// when the bytes don't match one of the four types Anthropic accepts.
@@ -455,6 +548,187 @@ pub fn seed_routing_from_config(config: &crate::config::Config) -> HashMap<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn attachment_owner() -> crate::attachment_store::AttachmentOwner {
+        crate::attachment_store::AttachmentOwner {
+            platform: "discord".into(),
+            room_id: "7".into(),
+            thread_id: None,
+        }
+    }
+
+    async fn cached_case(
+        bytes: Vec<u8>,
+        filename: &str,
+        mime: Option<&str>,
+        status: &str,
+        inline: bool,
+    ) {
+        use crate::attachment_store::{AttachmentStore, RETENTION_MS, StoredAttachment};
+        let dir = tempfile::tempdir().unwrap();
+        let store = AttachmentStore::open(dir.path().to_owned()).unwrap();
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let (image, notes) = cache_and_prepare_attachment(
+            Some(store.clone()),
+            attachment_owner(),
+            "message".into(),
+            filename.into(),
+            mime.map(str::to_owned),
+            bytes.clone(),
+        )
+        .await;
+        assert_eq!(image.is_some(), inline);
+        let path = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_some_and(|e| e == "json"))
+            .unwrap();
+        let meta: StoredAttachment = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(meta.filename, filename);
+        assert_eq!(meta.media_type, mime.unwrap_or("application/octet-stream"));
+        assert_eq!(meta.owner, attachment_owner());
+        assert_eq!(meta.message_id, "message");
+        assert!(meta.received_at_ms >= before);
+        assert_eq!(meta.expires_at_ms, meta.received_at_ms + RETENTION_MS);
+        assert_eq!(meta.bytes, bytes.len() as u64);
+        assert_eq!(
+            store
+                .get(&attachment_owner(), &meta.id, meta.received_at_ms)
+                .unwrap()
+                .1,
+            bytes
+        );
+        assert_eq!(
+            notes[0],
+            format!(
+                "[Attachment id={} filename={} media_type={} bytes={} expires_at_ms={}; {}. Use attachment_save to save it.]",
+                serde_json::to_string(&meta.id).unwrap(),
+                serde_json::to_string(&meta.filename).unwrap(),
+                serde_json::to_string(&meta.media_type).unwrap(),
+                meta.bytes,
+                meta.expires_at_ms,
+                status
+            )
+        );
+        if inline && bytes.len() > MAX_ATTACHMENT_BYTES {
+            let image = image.unwrap();
+            assert_ne!(image.data, bytes);
+            assert_eq!(image.media_type, "image/jpeg");
+        }
+        if !inline && sniff_image_mime(&bytes).is_some() {
+            assert_eq!(
+                notes.len(),
+                2,
+                "preparation failure must not replace the saved ID"
+            );
+        } else {
+            assert_eq!(notes.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn pdf_is_cached_but_not_inline() {
+        cached_case(
+            b"%PDF-original".to_vec(),
+            "report.pdf",
+            Some("application/pdf"),
+            "cached original, not viewed inline",
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn cached_png_original_is_not_resized_copy() {
+        cached_case(noise_png(2000, 1500), "large.png", Some("image/png"), "cached original, image shown inline; inline image may be resized; saved bytes are original", true).await;
+    }
+
+    #[tokio::test]
+    async fn success_notes_include_save_contract() {
+        cached_case(
+            b"%PDF".to_vec(),
+            "report.pdf",
+            Some("application/pdf"),
+            "cached original, not viewed inline",
+            false,
+        )
+        .await;
+        cached_case(
+            noise_png(8, 8),
+            "small.png",
+            Some("image/png"),
+            "cached original, image shown inline",
+            true,
+        )
+        .await;
+        cached_case(noise_png(2000, 1500), "large.png", Some("image/png"), "cached original, image shown inline; inline image may be resized; saved bytes are original", true).await;
+        let mut broken = vec![0; MAX_ATTACHMENT_BYTES + 1];
+        broken[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        cached_case(
+            broken,
+            "broken.png",
+            Some("image/png"),
+            "cached original, not viewed inline",
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn notes_escape_newlines_and_quotes() {
+        cached_case(
+            b"file".to_vec(),
+            "quote\"\nfile",
+            Some("mime\"\n"),
+            "cached original, not viewed inline",
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn platform_filenames_are_metadata_not_paths() {
+        #[cfg(windows)]
+        let filename = r"C:\Users\sender\report.pdf";
+        #[cfg(unix)]
+        let filename = "/home/sender/report.pdf";
+        cached_case(
+            b"%PDF".to_vec(),
+            filename,
+            None,
+            "cached original, not viewed inline",
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn cache_failure_still_passes_inline_image() {
+        use crate::attachment_store::AttachmentStore;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store");
+        let store = AttachmentStore::open(path.clone()).unwrap();
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, b"not a directory").unwrap();
+        for store in [None, Some(store)] {
+            let bytes = noise_png(8, 8);
+            let (image, notes) = cache_and_prepare_attachment(
+                store,
+                attachment_owner(),
+                "m".into(),
+                "x.png".into(),
+                None,
+                bytes.clone(),
+            )
+            .await;
+            assert_eq!(image.unwrap().data, bytes);
+            assert!(notes.iter().any(|n| n.contains("not cached")));
+            assert!(!notes.iter().any(|n| n.contains("Attachment id=")));
+        }
+    }
 
     struct FakeChannel;
 
