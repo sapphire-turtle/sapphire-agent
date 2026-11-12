@@ -1216,6 +1216,20 @@ mod tests {
         fail_first: bool,
         custom: Option<(crate::config::Config, Arc<crate::tools::ToolSet>)>,
     ) -> (TestAgentHandles, crate::serve::ChatLog) {
+        let ((handles, log), _) =
+            build_test_agent_with_options(responses, fail_first, custom, None);
+        (handles, log)
+    }
+
+    fn build_test_agent_with_options(
+        responses: Vec<crate::provider::ChatResponse>,
+        fail_first: bool,
+        custom: Option<(crate::config::Config, Arc<crate::tools::ToolSet>)>,
+        image_cache: Option<Arc<crate::image_cache::ImageCache>>,
+    ) -> (
+        (TestAgentHandles, crate::serve::ChatLog),
+        Arc<crate::session::SessionStore>,
+    ) {
         let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
         let base = dir.path().to_path_buf();
 
@@ -1282,11 +1296,14 @@ api_key = "test"
             Arc::new(registry),
             workspace,
             Some(tools),
-            session_store,
-            None,
+            Arc::clone(&session_store),
+            image_cache,
         );
 
-        ((Arc::new(agent), sent, typing_started_after), log)
+        (
+            ((Arc::new(agent), sent, typing_started_after), log),
+            session_store,
+        )
     }
 
     /// Convenience wrapper over `build_test_agent` with a channel that
@@ -1408,6 +1425,224 @@ api_key = "test"
         assert_eq!(parts.iter().filter(|p| matches!(p, ContentPart::ToolResult { tool_use_id, .. } if tool_use_id == call)).count(), 1);
         assert!(result_for(log, call).contains("not available in this conversation"));
         assert!(!parts.iter().any(|p| matches!(p, ContentPart::Image { .. })));
+    }
+
+    struct ImageHistoryFixture {
+        _dir: tempfile::TempDir,
+        agent: Arc<super::Agent>,
+        session_store: Arc<crate::session::SessionStore>,
+        log: crate::serve::ChatLog,
+        cache: Option<Arc<crate::image_cache::ImageCache>>,
+        session_id: String,
+        image_bytes: Vec<u8>,
+        image_base64: String,
+        marker: String,
+    }
+
+    /// Drive the real image_read tool through Agent's production turn loop.
+    /// The second provider call is the same turn; persistence and the final
+    /// in-memory scrub both happen before this helper returns.
+    async fn image_read_history_fixture(cache_enabled: bool) -> ImageHistoryFixture {
+        use crate::provider::ContentPart;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache_enabled
+            .then(|| crate::image_cache::ImageCache::open(dir.path().join("images")).unwrap());
+        let state = test_workspace();
+        let image = image::RgbImage::from_fn(2, 1, |x, _| image::Rgb([x as u8, 40, 80]));
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .unwrap();
+        let image_bytes = encoded.into_inner();
+        std::fs::write(state.workspace.root.join("history.png"), &image_bytes).unwrap();
+        let tools = Arc::new(crate::tools::ToolSet::new(
+            vec![Box::new(
+                crate::tools::attachment_tools::ImageReadTool::new(state),
+            )],
+            vec![],
+        ));
+        let config = crate::config::Config::parse_for_test(
+            "[anthropic]\napi_key = \"test\"\n[tools.host_access]\nenabled = true\n",
+        );
+        let (((agent, _, _), log), session_store) = build_test_agent_with_options(
+            vec![
+                attachment_call("image_read", serde_json::json!({"path": "history.png"})),
+                crate::provider::ChatResponse {
+                    text: Some("seen".into()),
+                    tool_calls: vec![],
+                    prompt_usage: None,
+                    stop_reason: None,
+                },
+            ],
+            false,
+            Some((config, tools)),
+            cache.clone(),
+        );
+        agent
+            .clone()
+            .handle_message(incoming("read the image"))
+            .await
+            .unwrap();
+
+        let recorded = log.messages();
+        let same_turn = recorded[1].last().unwrap();
+        assert!(same_turn.parts.iter().any(|part| matches!(
+            part,
+            ContentPart::ToolResult { tool_use_id, .. } if tool_use_id == "image_read"
+        )));
+        let image_base64 = same_turn
+            .parts
+            .iter()
+            .find_map(|part| match part {
+                ContentPart::Image {
+                    media_type,
+                    data_base64,
+                } if media_type == "image/png" => Some(data_base64.clone()),
+                _ => None,
+            })
+            .expect("the same turn must pass image_read's image to the provider");
+        let sha256 = crate::image_cache::sha256_hex(&image_bytes);
+        let marker = format!("[image: image/png sha256={sha256}]");
+        let session_id = agent
+            .get_or_create_session(&("test-room".into(), None))
+            .await;
+
+        // Agent appends before the end-of-turn scrub, exactly as production
+        // does. Check the actual JSONL and a fresh load, not just its
+        // in-memory representation.
+        let raw = session_store.raw_for_test(&session_id);
+        assert!(!raw.contains(&image_base64));
+        assert!(raw.contains(&marker), "{raw}");
+        let reloaded = session_store.load_session(&session_id).unwrap();
+        assert!(
+            reloaded
+                .iter()
+                .flat_map(|msg| &msg.parts)
+                .any(|part| matches!(part, ContentPart::Text(text) if text == &marker))
+        );
+        assert!(!reloaded.iter().flat_map(|msg| &msg.parts).any(
+            |part| matches!(part, ContentPart::Image { data_base64, .. } if data_base64 == &image_base64)
+        ));
+
+        ImageHistoryFixture {
+            _dir: dir,
+            agent,
+            session_store,
+            log,
+            cache,
+            session_id,
+            image_bytes,
+            image_base64,
+            marker,
+        }
+    }
+
+    #[tokio::test]
+    async fn image_read_history_cache_scrubs_and_hydrates_marker() {
+        use crate::provider::ContentPart;
+
+        let fixture = image_read_history_fixture(true).await;
+        let history = fixture.agent.history.lock().await;
+        let stored =
+            history
+                .get(&("test-room".into(), None))
+                .unwrap()
+                .iter()
+                .find(|msg| {
+                    msg.parts.iter().any(|part| matches!(
+                part,
+                ContentPart::ToolResult { tool_use_id, .. } if tool_use_id == "image_read"
+            ))
+                })
+                .unwrap();
+        let sha256 = crate::image_cache::sha256_hex(&fixture.image_bytes);
+        assert!(stored.parts.iter().any(|part| matches!(
+            part,
+            ContentPart::ImageRef { media_type, sha256: actual }
+                if media_type == "image/png" && actual == &sha256
+        )));
+        assert!(!stored.parts.iter().any(|part| matches!(
+            part,
+            ContentPart::Image { data_base64, .. } if data_base64 == &fixture.image_base64
+        )));
+        assert_eq!(
+            fixture.cache.as_ref().unwrap().get(&sha256).unwrap(),
+            fixture.image_bytes
+        );
+        drop(history);
+
+        // A later turn sees the historical image marker, while the image in
+        // the same turn was already checked by image_read_history_fixture.
+        fixture
+            .agent
+            .clone()
+            .handle_message(incoming("what was that image?"))
+            .await
+            .unwrap();
+        let calls = fixture.log.messages();
+        let next_provider_input =
+            calls[2]
+                .iter()
+                .find(|msg| {
+                    msg.parts.iter().any(|part| matches!(
+                part,
+                ContentPart::ToolResult { tool_use_id, .. } if tool_use_id == "image_read"
+            ))
+                })
+                .unwrap();
+        assert!(
+            next_provider_input
+                .parts
+                .iter()
+                .any(|part| matches!(part, ContentPart::Text(text) if text == &fixture.marker))
+        );
+        assert!(!next_provider_input.parts.iter().any(|part| matches!(
+            part,
+            ContentPart::Image { data_base64, .. } if data_base64 == &fixture.image_base64
+        )));
+
+        // The second turn does not resurrect raw image JSONL either.
+        assert!(
+            !fixture
+                .session_store
+                .raw_for_test(&fixture.session_id)
+                .contains(&fixture.image_base64)
+        );
+    }
+
+    #[tokio::test]
+    async fn image_read_history_without_cache_keeps_persistence_marker() {
+        use crate::provider::ContentPart;
+
+        let fixture = image_read_history_fixture(false).await;
+        assert!(fixture.cache.is_none());
+        let history = fixture.agent.history.lock().await;
+        let stored =
+            history
+                .get(&("test-room".into(), None))
+                .unwrap()
+                .iter()
+                .find(|msg| {
+                    msg.parts.iter().any(|part| matches!(
+                part,
+                ContentPart::ToolResult { tool_use_id, .. } if tool_use_id == "image_read"
+            ))
+                })
+                .unwrap();
+        // With no in-memory cache the current degradation policy remains
+        // unchanged; SessionStore still persisted the marker checked above.
+        assert!(stored.parts.iter().any(|part| matches!(
+            part,
+            ContentPart::Image { media_type, data_base64 }
+                if media_type == "image/png" && data_base64 == &fixture.image_base64
+        )));
+        assert!(
+            !stored
+                .parts
+                .iter()
+                .any(|part| matches!(part, ContentPart::ImageRef { .. }))
+        );
     }
 
     #[tokio::test]

@@ -152,10 +152,10 @@ impl AttachmentStore {
         })();
         if let Err(err) = result {
             for path in created {
-                if let Err(e) = fs::remove_file(&path) {
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        tracing::warn!("failed to clean incomplete attachment file: {e}");
-                    }
+                if let Err(e) = fs::remove_file(&path)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::warn!("failed to clean incomplete attachment file: {e}");
                 }
             }
             return Err(err.context("persist attachment"));

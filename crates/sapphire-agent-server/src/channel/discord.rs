@@ -583,7 +583,7 @@ mod tests {
             for _ in 0..2 {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut request = [0; 4096];
-                socket.read(&mut request).await.unwrap();
+                assert!(socket.read(&mut request).await.unwrap() > 0);
                 socket
                     .write_all(
                         format!(

@@ -601,6 +601,131 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn image_read_regular_file_uses_slash_path() {
+        let state = test_workspace(true);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("image.png");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let bytes = png(2, 1);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let supplied = path.to_str().unwrap();
+        let out = ImageReadTool::new(state)
+            .execute_full(&json!({"path": supplied}))
+            .await
+            .unwrap();
+
+        assert_eq!(out.images.len(), 1);
+        assert_eq!(out.images[0].0, "image/png");
+        assert_eq!(STANDARD.decode(&out.images[0].1).unwrap(), bytes);
+        assert!(
+            out.text
+                .contains(&format!("{} original bytes", bytes.len()))
+        );
+        assert!(
+            out.text
+                .contains(&crate::workspace::slash_path(&path.canonicalize().unwrap()))
+        );
+    }
+
+    #[tokio::test]
+    async fn attachment_save_regular_file_uses_slash_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AttachmentStore::open(dir.path().join("store")).unwrap();
+        let bytes = png(2, 1);
+        let meta = store
+            .insert(
+                owner(),
+                "message".into(),
+                "original.png".into(),
+                "image/png".into(),
+                &bytes,
+                chrono::Utc::now().timestamp_millis().max(0) as u64,
+            )
+            .unwrap();
+        let state = test_workspace(true);
+        let save = AttachmentSaveTool::new(store, state.clone());
+        let path = dir.path().join("nested").join("saved.png");
+        let supplied = path.to_str().unwrap();
+
+        let saved = scope_attachment_owner(
+            Some(owner()),
+            save.execute(&json!({"attachment_id": meta.id, "path": supplied})),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert!(saved.contains(&crate::workspace::slash_path(&path)));
+        assert!(saved.contains(&format!("{} original bytes", bytes.len())));
+        let out = ImageReadTool::new(state)
+            .execute_full(&json!({"path": supplied}))
+            .await
+            .unwrap();
+        assert_eq!(out.images.len(), 1);
+        assert_eq!(out.images[0].0, "image/png");
+        assert_eq!(STANDARD.decode(&out.images[0].1).unwrap(), bytes);
+        assert!(
+            out.text
+                .contains(&crate::workspace::slash_path(&path.canonicalize().unwrap()))
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_absolute_paths_read_and_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("nested").join("source.png");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        let bytes = png(2, 1);
+        std::fs::write(&source, &bytes).unwrap();
+        assert!(source.is_absolute());
+        assert!(matches!(source.components().next(),
+            Some(std::path::Component::Prefix(prefix))
+                if matches!(prefix.kind(), std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_))));
+        let source_input = source.to_str().unwrap();
+        assert!(source_input.contains('\\'));
+
+        let state = test_workspace(true);
+        let read = ImageReadTool::new(state.clone())
+            .execute_full(&json!({"path": source_input}))
+            .await
+            .unwrap();
+        let shown_source = crate::workspace::slash_path(&source.canonicalize().unwrap());
+        assert_eq!(read.images.len(), 1);
+        assert_eq!(read.images[0].0, "image/png");
+        assert_eq!(STANDARD.decode(&read.images[0].1).unwrap(), bytes);
+        assert!(read.text.contains(&shown_source));
+        assert!(!read.text.contains('\\'));
+
+        let store = AttachmentStore::open(dir.path().join("store")).unwrap();
+        let meta = store
+            .insert(
+                owner(),
+                "message".into(),
+                "original.png".into(),
+                "image/png".into(),
+                &bytes,
+                chrono::Utc::now().timestamp_millis().max(0) as u64,
+            )
+            .unwrap();
+        let destination = dir.path().join("nested").join("saved.png");
+        let destination_input = destination.to_str().unwrap();
+        assert!(destination.is_absolute() && destination_input.contains('\\'));
+        let saved = scope_attachment_owner(
+            Some(owner()),
+            AttachmentSaveTool::new(store, state)
+                .execute(&json!({"attachment_id": meta.id, "path": destination_input})),
+        )
+        .await
+        .unwrap();
+        let shown_destination = crate::workspace::slash_path(&destination);
+        assert_eq!(std::fs::read(&destination).unwrap(), bytes);
+        assert!(saved.contains(&shown_destination));
+        assert!(!saved.contains('\\'));
+    }
+
+    #[tokio::test]
     async fn image_read_sniffs_not_extension() {
         let state = test_workspace(false);
         let bytes = png(1, 1);

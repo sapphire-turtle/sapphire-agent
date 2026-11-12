@@ -6693,6 +6693,106 @@ mod tests {
         );
     }
 
+    /// Exercise the actual ToolOutput -> message -> scrub/hydrate boundary
+    /// with the payload-backed SessionStore used by non-ACP transports.
+    #[tokio::test]
+    async fn image_read_rpc_history_retains_tool_text_without_base64() {
+        use crate::image_cache::{ImageCache, hydrate_history, scrub_history_inplace, sha256_hex};
+        use crate::tools::Tool;
+        use sapphire_framework::workspace::{AppContext, Workspace, WorkspaceState};
+
+        static CTX: AppContext = AppContext::new("sapphire-agent");
+        CTX.set_cache_dir(std::env::temp_dir().join("sapphire-agent-serve-image-test-cache"));
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join(".sapphire-agent")).unwrap();
+        let ws =
+            Arc::new(WorkspaceState::open(Workspace::from_root(&CTX, &root).unwrap()).unwrap());
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::RgbImage::new(2, 1)
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .unwrap();
+        let bytes = encoded.into_inner();
+        std::fs::write(root.join("image.png"), &bytes).unwrap();
+        let output = crate::tools::attachment_tools::ImageReadTool::new(ws)
+            .execute_full(&json!({"path": "image.png"}))
+            .await
+            .unwrap();
+        assert_eq!(output.images.len(), 1);
+        let raw_base64 = output.images[0].1.clone();
+        let result_text = output.text.clone();
+        let message = ChatMessage::tool_results_with_images(
+            vec![("read-1".into(), output.text)],
+            output.images,
+        );
+        let sha = sha256_hex(&bytes);
+        let marker = format!("[image: image/png sha256={sha}]");
+
+        for cache_enabled in [true, false] {
+            let base = root.join(if cache_enabled { "on" } else { "off" });
+            let payloads =
+                crate::tool_payload_cache::ToolPayloadCache::open(base.join("payloads")).unwrap();
+            let store = SessionStore::new(base.join("sessions"), "rpc", Some(payloads));
+            store
+                .ensure_session("s1", &("s1".into(), None), "rpc", None, "default")
+                .unwrap();
+            store
+                .append(
+                    "s1",
+                    &ChatMessage::assistant_with_tools(
+                        None,
+                        vec![crate::provider::ToolCall {
+                            id: "read-1".into(),
+                            name: "image_read".into(),
+                            input: json!({"path": "image.png"}),
+                        }],
+                    ),
+                )
+                .unwrap();
+            let mut history = vec![message.clone()];
+            let same_turn = hydrate_history(&history);
+            assert!(matches!(
+                &same_turn[0].parts[0],
+                ContentPart::ToolResult { .. }
+            ));
+            assert!(matches!(&same_turn[0].parts[1],
+                ContentPart::Image { media_type, data_base64 }
+                    if media_type == "image/png" && data_base64 == &raw_base64));
+            // Persist before the final scrub, as the turn loops do.
+            store.append("s1", &history[0]).unwrap();
+            let raw = store.raw_for_test("s1");
+            assert!(!raw.contains(&raw_base64));
+            assert!(!raw.contains("data_base64"));
+            assert!(raw.contains(&marker));
+            let loaded = store.load_session("s1").unwrap();
+            let parts: Vec<_> = loaded.iter().flat_map(|msg| &msg.parts).collect();
+            assert!(parts.iter().any(|p| matches!(p,
+                ContentPart::ToolResult { tool_use_id, content }
+                    if tool_use_id == "read-1" && content == &result_text)));
+            assert!(
+                parts
+                    .iter()
+                    .any(|p| matches!(p, ContentPart::Text(text) if text == &marker))
+            );
+            assert!(!parts.iter().any(|p| matches!(p, ContentPart::Image { .. })));
+
+            let cache = cache_enabled.then(|| ImageCache::open(base.join("images")).unwrap());
+            scrub_history_inplace(&mut history, cache.as_deref());
+            let next_input = hydrate_history(&history);
+            if let Some(cache) = cache {
+                assert!(matches!(&history[0].parts[1],
+                    ContentPart::ImageRef { media_type, sha256 }
+                        if media_type == "image/png" && sha256 == &sha));
+                assert_eq!(cache.get(&sha).unwrap(), bytes);
+                assert!(
+                    matches!(&next_input[0].parts[1], ContentPart::Text(text) if text == &marker)
+                );
+            } else {
+                assert!(matches!(&history[0].parts[1], ContentPart::Image { .. }));
+            }
+        }
+    }
+
     /// The measurement exists to distinguish "many sessions accumulate"
     /// from "one session grows", because only the first is fixed by
     /// dropping idle sessions. A total alone cannot tell them apart, so
