@@ -99,7 +99,7 @@ tracing = "0.1"
 
 # The avatar cache: files are named by their sha256, and the source of the
 # files is a trait object (the agent today, a bundled set later).
-sha2 = "0.10"
+sha2 = "0.11"
 async-trait = "0.1"
 
 # The VRM renderer's blink timing (plan 4-3D).

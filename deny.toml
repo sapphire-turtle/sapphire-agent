@@ -73,6 +73,15 @@ ignore = [
     # itself; RustSec lists no safe upgrade. Re-check on the next bump.
     { id = "RUSTSEC-2026-0319", reason = "anymap2 is unmaintained; a direct dependency of matrix-sdk 0.19. No safe upgrade." },
 
+    # --- libsqlite3-sys 0.38 pinned by matrix-sdk-sqlite (#392) ---
+    # Fixed in libsqlite3-sys 0.39.0 (bundled SQLite), but matrix-sdk-sqlite
+    # 0.19.1 (latest) requires rusqlite 0.40, which requires libsqlite3-sys
+    # 0.38. Only a process that opens a database (and its -wal) a less trusted
+    # party could have written is exposed; matrix-sdk opens just its own store
+    # under the agent's state_dir (channel/matrix.rs). Drop this once
+    # matrix-sdk-sqlite moves to rusqlite >= 0.41.
+    { id = "RUSTSEC-2026-0459", reason = "bundled SQLite in libsqlite3-sys 0.38 (CVE-2026-119375); transitive via matrix-sdk-sqlite 0.19.1 → rusqlite 0.40. Only matrix-sdk's own store under state_dir is opened. Drop once matrix-sdk-sqlite moves to rusqlite >= 0.41 (#392)." },
+
     # --- ruzstd 0.8 pinned by bevy (desktop only) ---
     # Fixed in ruzstd 0.9.1, but bevy_image requires ^0.8 — still so in bevy
     # 0.20 — and bevy_egui turns on its `zstd_rust` feature whenever
