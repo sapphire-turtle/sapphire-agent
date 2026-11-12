@@ -1,5 +1,6 @@
 use crate::channel::{
-    Attachment, Channel, IncomingMessage, MAX_ATTACHMENT_BYTES, OutgoingMessage, RoomInfo,
+    Attachment, Channel, IncomingMessage, MAX_DOWNLOAD_BYTES, OutgoingMessage, RoomInfo,
+    dropped_attachment_note, format_mb, prepare_image, with_attachment_notes,
 };
 use crate::config::MatrixConfig;
 use anyhow::{Context, Result};
@@ -117,28 +118,23 @@ impl MatrixChannel {
     }
 }
 
-/// Result of attempting to download a Matrix image attachment.
-enum ImageDownload {
-    /// Successfully downloaded and format is supported.
-    Ok(Attachment),
-    /// Format could not be identified as one the Anthropic API supports.
-    /// The user should be notified so they can resend in a supported format.
-    UnsupportedFormat,
-    /// Silently skipped (too large, download failure, etc.).
-    Skipped,
-}
-
-/// Download the bytes for a Matrix `m.image` event via the SDK's authenticated
-/// media endpoint.
-async fn download_matrix_image(client: &Client, image: &ImageMessageEventContent) -> ImageDownload {
+/// Download the bytes for a Matrix `m.image` event via the SDK's
+/// authenticated media endpoint, and make them an attachment the provider
+/// takes (see [`prepare_image`]: an image over its limit is shrunk, not
+/// dropped). `Err` says why the image cannot be passed on, for
+/// [`dropped_attachment_note`].
+async fn download_matrix_image(
+    client: &Client,
+    image: &ImageMessageEventContent,
+) -> Result<Attachment, String> {
     if let Some(size) = image.info.as_ref().and_then(|info| info.size) {
         let size: u64 = size.into();
-        if size as usize > MAX_ATTACHMENT_BYTES {
-            warn!(
-                "Matrix image '{}' is {} bytes (>5MB); skipping",
-                image.body, size
-            );
-            return ImageDownload::Skipped;
+        if size as usize > MAX_DOWNLOAD_BYTES {
+            return Err(format!(
+                "it is {}, over the {} download limit",
+                format_mb(size as usize),
+                format_mb(MAX_DOWNLOAD_BYTES)
+            ));
         }
     }
 
@@ -146,56 +142,21 @@ async fn download_matrix_image(client: &Client, image: &ImageMessageEventContent
         source: image.source.clone(),
         format: MediaFormat::File,
     };
-
-    match client.media().get_media_content(&request, true).await {
-        Ok(bytes) if bytes.len() <= MAX_ATTACHMENT_BYTES => {
-            // Always derive the MIME from the actual bytes. Anthropic rejects
-            // requests whose declared `media_type` doesn't match the bytes
-            // (400 invalid_request_error), so the declared MIME is only used
-            // for diagnostic warnings on mismatch.
-            let declared = image
-                .info
-                .as_ref()
-                .and_then(|info| info.mimetype.as_deref());
-            let media_type = match super::sniff_image_mime(&bytes) {
-                Some(t) => {
-                    if let Some(d) = declared
-                        && d != t
-                    {
-                        warn!(
-                            "Matrix image '{}' declared MIME '{}' differs from \
-                             detected '{}'; using detected",
-                            image.body, d, t
-                        );
-                    }
-                    t.to_string()
-                }
-                None => {
-                    warn!(
-                        "Matrix image '{}' has unrecognised format (declared: {:?})",
-                        image.body, declared
-                    );
-                    return ImageDownload::UnsupportedFormat;
-                }
-            };
-            ImageDownload::Ok(Attachment {
-                media_type,
-                data: bytes,
-            })
-        }
-        Ok(bytes) => {
-            warn!(
-                "Matrix image '{}' decoded to {} bytes (>5MB); skipping",
-                image.body,
-                bytes.len()
-            );
-            ImageDownload::Skipped
-        }
-        Err(e) => {
-            warn!("Failed to download Matrix image '{}': {e}", image.body);
-            ImageDownload::Skipped
-        }
+    let bytes = client
+        .media()
+        .get_media_content(&request, true)
+        .await
+        .map_err(|e| format!("downloading it failed ({e})"))?;
+    if bytes.len() > MAX_DOWNLOAD_BYTES {
+        return Err(format!(
+            "it is {}, over the {} download limit",
+            format_mb(bytes.len()),
+            format_mb(MAX_DOWNLOAD_BYTES)
+        ));
     }
+    tokio::task::spawn_blocking(move || prepare_image(bytes))
+        .await
+        .map_err(|e| format!("processing it failed ({e})"))?
 }
 
 #[async_trait]
@@ -280,30 +241,22 @@ impl Channel for MatrixChannel {
                             (body, Vec::new())
                         }
                         MessageType::Image(image_content) => {
-                            let result = download_matrix_image(&room.client(), image_content).await;
-                            // Use the body as a caption fallback (filename or user-supplied text).
+                            // The caption is the user's text; without one,
+                            // the message is the image alone.
                             let caption = image_content
                                 .caption()
                                 .map(str::to_string)
                                 .unwrap_or_default();
-                            match result {
-                                ImageDownload::Ok(att) => (caption, vec![att]),
-                                ImageDownload::UnsupportedFormat => {
-                                    // Forward a synthetic prompt to the agent so it generates
-                                    // a natural-language reply asking the user to resend in a
-                                    // supported format (JPEG / PNG / GIF / WebP).
-                                    let msg = unsupported_image_notice(
-                                        event.event_id.to_string(),
-                                        event.sender.to_string(),
-                                        room_id_str,
-                                        thread_id,
-                                    );
-                                    if let Err(e) = tx.send(msg).await {
-                                        warn!("Failed to forward unsupported-format event: {e}");
-                                    }
-                                    return;
+                            match download_matrix_image(&room.client(), image_content).await {
+                                Ok(att) => (caption, vec![att]),
+                                Err(reason) => {
+                                    // Tell the model, so it can tell the user,
+                                    // rather than answer the caption alone.
+                                    let filename = image_content.filename();
+                                    warn!("Matrix image '{filename}' not passed on: {reason}");
+                                    let note = dropped_attachment_note(filename, &reason);
+                                    (with_attachment_notes(caption, &[note]), Vec::new())
                                 }
-                                ImageDownload::Skipped => return,
                             }
                         }
                         _ => return,
@@ -399,29 +352,6 @@ pub fn reply_target(
     }
 }
 
-/// The synthetic prompt forwarded for an image in an unsupported format.
-/// It carries no `reply_to`: in the consult room it must not become an answer.
-fn unsupported_image_notice(
-    id: String,
-    sender: String,
-    room_id: String,
-    thread_id: Option<String>,
-) -> IncomingMessage {
-    IncomingMessage {
-        id,
-        sender,
-        content: "[system] An image was received in an unsupported format. \
-                  Please inform the user and ask them to resend it \
-                  as JPEG, PNG, GIF, or WebP."
-            .to_string(),
-        room_id,
-        timestamp: 0,
-        thread_id,
-        attachments: Vec::new(),
-        reply_to: None,
-    }
-}
-
 /// Drop the `> ` quoted fallback block that older clients prepend to replies.
 pub fn strip_reply_fallback(body: &str) -> String {
     if !body.starts_with('>') {
@@ -478,13 +408,6 @@ mod tests {
             reply_target(Some(&Relation::Thread(bare))),
             Some("$root:x".to_string())
         );
-    }
-
-    #[test]
-    fn unsupported_image_notice_answers_nothing() {
-        let msg = unsupported_image_notice("$e:x".into(), "@a:x".into(), "!r:x".into(), None);
-        assert_eq!(msg.reply_to, None);
-        assert!(msg.content.starts_with("[system] An image was received"));
     }
 
     #[test]

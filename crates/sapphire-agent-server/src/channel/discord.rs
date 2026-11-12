@@ -1,5 +1,6 @@
 use crate::channel::{
-    Attachment, Channel, IncomingMessage, MAX_ATTACHMENT_BYTES, OutgoingMessage, RoomInfo,
+    Attachment, Channel, IncomingMessage, MAX_DOWNLOAD_BYTES, OutgoingMessage, RoomInfo,
+    dropped_attachment_note, format_mb, prepare_image, with_attachment_notes,
 };
 use crate::config::DiscordConfig;
 use anyhow::{Context, Result};
@@ -49,10 +50,10 @@ impl EventHandler for DiscordHandler {
             return;
         }
 
-        let content = msg.content.trim().to_string();
-        let attachments = download_image_attachments(&msg).await;
+        let (attachments, notes) = download_image_attachments(&msg).await;
+        let content = with_attachment_notes(msg.content.trim().to_string(), &notes);
 
-        // Skip messages that have neither text nor any usable image attachment.
+        // Skip messages with neither text nor any attachment, usable or not.
         if content.is_empty() && attachments.is_empty() {
             return;
         }
@@ -272,68 +273,65 @@ impl Channel for DiscordChannel {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Download every `image/*` attachment on `msg`. Oversized attachments
-/// (>5 MB) and non-image attachments are skipped with a warning so the
-/// conversation continues without them.
+/// Download the image attachments on `msg`, alongside a note for each
+/// attachment that could not be passed on (see [`dropped_attachment_note`]).
 ///
-/// After download, the MIME type is derived from the actual bytes rather
-/// than Discord's declared `content_type`. Discord occasionally labels a
-/// transcoded image with a stale MIME (e.g. claims `image/webp` for what
-/// is in fact PNG bytes), which Anthropic's API rejects with a 400.
-async fn download_image_attachments(msg: &Message) -> Vec<Attachment> {
+/// An image over the provider's limit is shrunk by [`prepare_image`] rather
+/// than dropped; only one over [`MAX_DOWNLOAD_BYTES`] is turned away before
+/// it is fetched. The MIME type of what is passed on comes from the bytes,
+/// not from Discord's `content_type`, which is sometimes stale (a PNG
+/// labelled `image/webp`, which Anthropic rejects with a 400).
+async fn download_image_attachments(msg: &Message) -> (Vec<Attachment>, Vec<String>) {
     let mut out = Vec::new();
+    let mut notes = Vec::new();
     for att in &msg.attachments {
-        let Some(ct) = att.content_type.as_deref() else {
-            continue;
-        };
-        if !super::SUPPORTED_IMAGE_MIME.contains(&ct) {
+        let dropped = |reason: String| {
             warn!(
-                "Discord image '{}' has unsupported MIME type '{}'; skipping",
-                att.filename, ct
-            );
-            continue;
-        }
-        if (att.size as usize) > MAX_ATTACHMENT_BYTES {
-            warn!(
-                "Discord image '{}' is {} bytes (>5MB); skipping",
-                att.filename, att.size
-            );
-            continue;
-        }
-        match att.download().await {
-            Ok(bytes) if bytes.len() <= MAX_ATTACHMENT_BYTES => {
-                match super::sniff_image_mime(&bytes) {
-                    Some(t) => {
-                        if t != ct {
-                            warn!(
-                                "Discord image '{}' declared MIME '{}' differs from \
-                                 detected '{}'; using detected",
-                                att.filename, ct, t
-                            );
-                        }
-                        out.push(Attachment {
-                            media_type: t.to_string(),
-                            data: bytes,
-                        });
-                    }
-                    None => warn!(
-                        "Discord image '{}' has unrecognised format (declared: '{}'); skipping",
-                        att.filename, ct
-                    ),
-                }
-            }
-            Ok(bytes) => warn!(
-                "Discord image '{}' decoded to {} bytes (>5MB); skipping",
-                att.filename,
-                bytes.len()
-            ),
-            Err(e) => warn!(
-                "Failed to download Discord attachment '{}': {e}",
+                "Discord attachment '{}' not passed on: {reason}",
                 att.filename
-            ),
+            );
+            dropped_attachment_note(&att.filename, &reason)
+        };
+        if let Err(reason) = screen_attachment(att.content_type.as_deref(), att.size as usize) {
+            notes.push(dropped(reason));
+            continue;
+        }
+        let bytes = match att.download().await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                notes.push(dropped(format!("downloading it failed ({e})")));
+                continue;
+            }
+        };
+        match tokio::task::spawn_blocking(move || prepare_image(bytes)).await {
+            Ok(Ok(a)) => out.push(a),
+            Ok(Err(reason)) => notes.push(dropped(reason)),
+            Err(e) => notes.push(dropped(format!("processing it failed ({e})"))),
         }
     }
-    out
+    (out, notes)
+}
+
+/// Whether an attachment is worth downloading, judged by what Discord says
+/// of it: an image of a type the provider takes, no larger than
+/// [`MAX_DOWNLOAD_BYTES`]. `Err` says why not.
+fn screen_attachment(content_type: Option<&str>, size: usize) -> Result<(), String> {
+    let only_images = "only images (JPEG, PNG, GIF, WebP) are passed on";
+    match content_type {
+        None => return Err(format!("its type is unknown, and {only_images}")),
+        Some(ct) if !super::SUPPORTED_IMAGE_MIME.contains(&ct) => {
+            return Err(format!("it is {ct}, and {only_images}"));
+        }
+        Some(_) => {}
+    }
+    if size > MAX_DOWNLOAD_BYTES {
+        return Err(format!(
+            "it is {}, over the {} download limit",
+            format_mb(size),
+            format_mb(MAX_DOWNLOAD_BYTES)
+        ));
+    }
+    Ok(())
 }
 
 /// Split content into chunks that fit within Discord's 2000-character limit.
@@ -378,6 +376,22 @@ pub fn reply_target(msg: &Message) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_image_over_the_provider_limit_is_still_downloaded() {
+        // 5.3 MB: over the 5 MB the provider takes, so it is shrunk, not dropped.
+        assert_eq!(screen_attachment(Some("image/png"), 5_539_085), Ok(()));
+    }
+
+    #[test]
+    fn attachments_that_cannot_be_passed_on_say_why() {
+        let too_big = screen_attachment(Some("image/png"), MAX_DOWNLOAD_BYTES + 1).unwrap_err();
+        assert!(too_big.contains("download limit"), "{too_big}");
+        let pdf = screen_attachment(Some("application/pdf"), 1000).unwrap_err();
+        assert!(pdf.contains("application/pdf"), "{pdf}");
+        let unknown = screen_attachment(None, 1000).unwrap_err();
+        assert!(unknown.contains("unknown"), "{unknown}");
+    }
 
     fn message(reference: Option<&str>) -> Message {
         let mut v = serde_json::json!({

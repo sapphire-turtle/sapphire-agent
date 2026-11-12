@@ -9,9 +9,19 @@ use tokio::sync::{RwLock, mpsc};
 use tracing::{error, warn};
 
 /// Maximum size of a single image attachment forwarded to the LLM.
-/// Anthropic's documented limit is 5 MB per image; oversized attachments are
-/// dropped with a warning (the conversation continues without them).
+/// Anthropic's documented limit is 5 MB per image; a larger image is shrunk
+/// to fit by [`prepare_image`].
 pub const MAX_ATTACHMENT_BYTES: usize = 5 * 1024 * 1024;
+
+/// Largest image a channel downloads. Anything bigger is turned away before
+/// it is fetched; anything between this and [`MAX_ATTACHMENT_BYTES`] is
+/// shrunk by [`prepare_image`] rather than dropped.
+pub const MAX_DOWNLOAD_BYTES: usize = 32 * 1024 * 1024;
+
+/// Longest side, in pixels, an oversized image is scaled down to. Anthropic
+/// scales anything larger down to about this itself, so the model loses
+/// nothing it would have seen.
+const DOWNSCALE_LONG_SIDE: u32 = 1568;
 
 /// MIME types of images forwarded to the LLM. Anthropic accepts these four;
 /// anything else is dropped at the channel layer.
@@ -36,6 +46,114 @@ pub(crate) fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
         Some("image/webp")
     } else {
         None
+    }
+}
+
+/// Turn downloaded image bytes into an [`Attachment`] the provider accepts.
+///
+/// The MIME type is taken from the bytes, not from what the platform
+/// declared (see [`sniff_image_mime`]). An image within
+/// [`MAX_ATTACHMENT_BYTES`] passes through untouched; a larger one is scaled
+/// to [`DOWNSCALE_LONG_SIDE`] and re-encoded as JPEG, at falling quality
+/// until it fits. `Err` carries why the image cannot be passed on, worded to
+/// finish the sentence of [`dropped_attachment_note`].
+///
+/// Decoding and encoding are CPU-bound: call it from `spawn_blocking`.
+pub(crate) fn prepare_image(bytes: Vec<u8>) -> Result<Attachment, String> {
+    let Some(media_type) = sniff_image_mime(&bytes) else {
+        return Err("its format is not one of JPEG, PNG, GIF or WebP".to_string());
+    };
+    if bytes.len() <= MAX_ATTACHMENT_BYTES {
+        return Ok(Attachment {
+            media_type: media_type.to_string(),
+            data: bytes,
+        });
+    }
+    let data = shrink_image(&bytes)?;
+    Ok(Attachment {
+        media_type: "image/jpeg".to_string(),
+        data,
+    })
+}
+
+fn shrink_image(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    use image::codecs::jpeg::JpegEncoder;
+    use image::imageops::FilterType;
+
+    let original = bytes.len();
+    let img = image::load_from_memory(bytes).map_err(|e| {
+        format!(
+            "it is {} (over the {} limit) and could not be decoded to shrink it ({e})",
+            format_mb(original),
+            format_mb(MAX_ATTACHMENT_BYTES)
+        )
+    })?;
+    let img = if img.width().max(img.height()) > DOWNSCALE_LONG_SIDE {
+        img.resize(
+            DOWNSCALE_LONG_SIDE,
+            DOWNSCALE_LONG_SIDE,
+            FilterType::Triangle,
+        )
+    } else {
+        img
+    };
+    // JPEG has no alpha: lay the image over white so transparent areas do
+    // not turn into whatever colour their invisible pixels happen to hold.
+    let rgba = img.to_rgba8();
+    let rgb = image::RgbImage::from_fn(rgba.width(), rgba.height(), |x, y| {
+        let [r, g, b, a] = rgba.get_pixel(x, y).0;
+        let over_white = |c: u8| ((c as u16 * a as u16 + 255 * (255 - a as u16)) / 255) as u8;
+        image::Rgb([over_white(r), over_white(g), over_white(b)])
+    });
+    for quality in [85, 70, 50] {
+        let mut out = Vec::new();
+        JpegEncoder::new_with_quality(&mut out, quality)
+            .encode_image(&rgb)
+            .map_err(|e| format!("shrinking it failed ({e})"))?;
+        if out.len() <= MAX_ATTACHMENT_BYTES {
+            tracing::info!(
+                "Shrank a {} image to a {} JPEG ({}x{}, quality {quality})",
+                format_mb(original),
+                format_mb(out.len()),
+                rgb.width(),
+                rgb.height()
+            );
+            return Ok(out);
+        }
+    }
+    Err(format!(
+        "it is {} and is still over the {} limit after shrinking",
+        format_mb(original),
+        format_mb(MAX_ATTACHMENT_BYTES)
+    ))
+}
+
+/// `5_539_085` → `"5.3 MB"` (MiB, as the limits are).
+pub(crate) fn format_mb(bytes: usize) -> String {
+    format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+}
+
+/// The line that tells the model an attachment arrived but was not passed
+/// on, and why. Without it the model sees only the text and can do no
+/// better than tell the user it sees no image.
+pub(crate) fn dropped_attachment_note(filename: &str, reason: &str) -> String {
+    format!(
+        "[Attachment '{filename}' was sent but not passed on to you: {reason}. \
+         Tell the user if it matters.]"
+    )
+}
+
+/// `content` followed by `notes`, a blank line between. The text is left
+/// alone when there are no notes.
+pub(crate) fn with_attachment_notes(content: String, notes: &[String]) -> String {
+    if notes.is_empty() {
+        return content;
+    }
+    let notes = notes.join("\n");
+    if content.is_empty() {
+        notes
+    } else {
+        format!("{content}\n\n{notes}")
     }
 }
 
@@ -380,6 +498,70 @@ mod tests {
         channels.seed_room("42", "fake").await;
         assert!(channels.serves("42").await);
         assert_eq!(channels.supports_replies("42").await, Some(true));
+    }
+
+    /// A PNG of pseudo-random noise: it does not compress, so its size is
+    /// close to `w * h * 3` bytes.
+    fn noise_png(w: u32, h: u32) -> Vec<u8> {
+        let mut state: u32 = 0x1234_5678;
+        let img = image::RgbImage::from_fn(w, h, |_, _| {
+            let mut px = [0u8; 3];
+            for c in &mut px {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *c = (state >> 24) as u8;
+            }
+            image::Rgb(px)
+        });
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+        out.into_inner()
+    }
+
+    #[test]
+    fn a_small_image_passes_through_untouched() {
+        let png = noise_png(32, 32);
+        let att = prepare_image(png.clone()).unwrap();
+        assert_eq!(att.media_type, "image/png");
+        assert_eq!(att.data, png);
+    }
+
+    #[test]
+    fn an_oversized_image_is_shrunk_to_a_jpeg_under_the_limit() {
+        let png = noise_png(2000, 1500);
+        assert!(
+            png.len() > MAX_ATTACHMENT_BYTES,
+            "fixture must be oversized"
+        );
+        let att = prepare_image(png).unwrap();
+        assert_eq!(att.media_type, "image/jpeg");
+        assert!(att.data.len() <= MAX_ATTACHMENT_BYTES);
+        let shrunk = image::load_from_memory(&att.data).unwrap();
+        assert_eq!(shrunk.width(), DOWNSCALE_LONG_SIDE);
+        assert_eq!(shrunk.height(), 1176);
+    }
+
+    #[test]
+    fn unrecognised_bytes_are_refused_with_a_reason() {
+        let reason = prepare_image(b"not an image".to_vec()).unwrap_err();
+        assert!(reason.contains("JPEG, PNG, GIF or WebP"), "{reason}");
+    }
+
+    #[test]
+    fn a_dropped_attachment_is_noted_after_the_text() {
+        let notes = vec![dropped_attachment_note("portrait.png", "it is broken")];
+        let content = with_attachment_notes("look at this".to_string(), &notes);
+        assert!(content.starts_with("look at this\n\n[Attachment 'portrait.png'"));
+        assert!(content.contains("it is broken"));
+        // No text: the note alone.
+        let content = with_attachment_notes(String::new(), &notes);
+        assert!(content.starts_with("[Attachment 'portrait.png'"));
+        // No notes: the text unchanged.
+        assert_eq!(with_attachment_notes("hi".to_string(), &[]), "hi");
+    }
+
+    #[test]
+    fn sizes_read_in_megabytes() {
+        assert_eq!(format_mb(5_539_085), "5.3 MB");
     }
 
     #[test]
