@@ -679,6 +679,33 @@ mod tests {
     }
 
     #[test]
+    fn tool_results_with_images_preserve_tool_then_user_image_on_wire() {
+        let msg = ChatMessage::tool_results_with_images(
+            vec![("call_read_image".to_string(), "Image loaded".to_string())],
+            vec![("image/png".to_string(), "aW1hZ2U=".to_string())],
+        );
+        let wire = serde_json::to_value(chat_message_to_api(&msg)).unwrap();
+
+        assert_eq!(
+            wire,
+            json!([
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_read_image",
+                    "content": "Image loaded"
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,aW1hZ2U="}
+                    }]
+                }
+            ])
+        );
+    }
+
+    #[test]
     fn assistant_with_tool_use_serializes_tool_calls() {
         let msg = ChatMessage::assistant_with_tools(
             Some("I'll check.".to_string()),
