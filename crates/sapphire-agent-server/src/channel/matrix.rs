@@ -267,6 +267,11 @@ impl Channel for MatrixChannel {
                         }
                     });
 
+                    let owner = AttachmentOwner {
+                        platform: "matrix".into(),
+                        room_id: room_id_str.clone(),
+                        thread_id: thread_id.clone(),
+                    };
                     let reply_to = reply_target(event.content.relates_to.as_ref());
 
                     let (content, attachments) = match &event.content.msgtype {
@@ -292,11 +297,7 @@ impl Channel for MatrixChannel {
                                 Ok(bytes) => {
                                     cache_and_prepare_attachment(
                                         attachment_store,
-                                        AttachmentOwner {
-                                            platform: "matrix".into(),
-                                            room_id: room_id_str.clone(),
-                                            thread_id: thread_id.clone(),
-                                        },
+                                        owner.clone(),
                                         event.event_id.to_string(),
                                         media.filename.clone(),
                                         media.mimetype,
@@ -324,6 +325,7 @@ impl Channel for MatrixChannel {
                         timestamp: 0,
                         thread_id,
                         attachments,
+                        attachment_owner: Some(owner),
                         reply_to,
                     };
 

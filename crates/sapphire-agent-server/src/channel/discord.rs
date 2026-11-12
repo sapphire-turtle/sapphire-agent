@@ -71,6 +71,11 @@ impl EventHandler for DiscordHandler {
             timestamp: msg.timestamp.unix_timestamp() as u64 * 1000,
             thread_id: None,
             attachments,
+            attachment_owner: Some(AttachmentOwner {
+                platform: "discord".into(),
+                room_id: msg.channel_id.to_string(),
+                thread_id: None,
+            }),
             reply_to: reply_target(&msg),
         };
 

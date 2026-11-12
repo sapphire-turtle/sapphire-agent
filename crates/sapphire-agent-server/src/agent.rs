@@ -209,6 +209,7 @@ impl Agent {
             timestamp: now_ms,
             thread_id: None,
             attachments: Vec::new(),
+            attachment_owner: None,
             reply_to: None,
         };
         Arc::clone(self).handle_message(incoming).await
@@ -597,15 +598,18 @@ impl Agent {
         // `file_delete`, `dir_list`, `dir_walk`, `shell`, `image_read`), whose
         // agent-side bodies are what this transport runs.
         let host_access_enabled = self.config.tools.host_access.enabled;
+        let can_save = host_access_enabled && incoming.attachment_owner.is_some();
+        let base =
+            crate::serve::visible_tool_predicate(host_access_enabled, false, false, false, false);
         let tool_specs = match &self.tools {
             Some(t) => Some(
-                t.specs_filtered(crate::serve::visible_tool_predicate(
-                    host_access_enabled,
-                    false,
-                    false,
-                    false,
-                    false,
-                ))
+                t.specs_filtered(|name| {
+                    if name == "attachment_save" {
+                        can_save
+                    } else {
+                        base(name)
+                    }
+                })
                 .await,
             ),
             None => None,
@@ -766,7 +770,7 @@ impl Agent {
                     // memory tool writes under `memory/<namespace>/...`.
                     // tokio::spawn does not propagate task_local, so we
                     // re-bind it inside each spawned future.
-                    let tools = Arc::clone(self.tools.as_ref().unwrap());
+                    let tools = self.tools.clone();
                     let ns = self
                         .config
                         .namespace_for_room(&incoming.room_id)
@@ -784,7 +788,28 @@ impl Agent {
                     // message above was built from a clone, so the
                     // tool_use blocks in history keep every call, and
                     // the refusals below supply their tool_results.
-                    let kinds = tools.kinds().await;
+                    // Check the exact list offered on this turn before policy:
+                    // permission to run a kind does not make a hidden name available.
+                    let (offered, not_offered): (Vec<_>, Vec<_>) =
+                        tool_calls.into_iter().partition(|call| {
+                            tool_specs.as_ref().is_some_and(|specs| {
+                                specs.iter().any(|spec| spec.name == call.name)
+                            })
+                        });
+                    let mut refused: Vec<_> = not_offered
+                        .into_iter()
+                        .map(|call| {
+                            let reason = crate::tools::policy::refusal_message(
+                                &call.name,
+                                crate::tools::policy::Refusal::NotOffered,
+                            );
+                            (call.id, reason)
+                        })
+                        .collect();
+                    let kinds = match &tools {
+                        Some(tools) => tools.kinds().await,
+                        None => Vec::new(),
+                    };
                     // `routed_to_client` is `false`, and it is `false`
                     // for the whole channel path rather than a value
                     // read from somewhere: a Matrix/Discord turn never
@@ -792,38 +817,45 @@ impl Agent {
                     // every one of these names here exactly as it always
                     // has. #270 changed the gate's meaning on ACP turns
                     // only; this path is the control case.
-                    let (tool_calls, refused) = crate::tools::policy::partition_without_asking(
-                        crate::tools::policy::Origin::Channel,
-                        &tool_calls,
-                        &kinds,
-                        self.config.tools.host_access.enabled,
-                        false,
-                    );
+                    let (tool_calls, policy_refused) =
+                        crate::tools::policy::partition_without_asking(
+                            crate::tools::policy::Origin::Channel,
+                            &offered,
+                            &kinds,
+                            self.config.tools.host_access.enabled,
+                            false,
+                        );
+                    refused.extend(policy_refused);
                     for (id, reason) in &refused {
                         info!("Refused tool call {id} on the channel path: {reason}");
                     }
 
                     let mut handles = Vec::with_capacity(tool_calls.len());
                     for call in tool_calls {
-                        let tools = Arc::clone(&tools);
+                        // An offered call implies a registered ToolSet.
+                        let tools = Arc::clone(tools.as_ref().expect("offered tool set"));
                         let ns = ns.clone();
+                        let owner = incoming.attachment_owner.clone();
                         let origin = crate::timer::TimerOrigin::Chat {
                             room_id: room_id_for_timer.clone(),
                         };
                         handles.push(tokio::spawn(
-                            crate::tools::workspace_tools::scope_memory_namespace(
-                                ns,
-                                crate::timer::scope_timer_origin(origin, async move {
-                                    info!("Executing tool: {} (id={})", call.name, call.id);
-                                    let output = tools.execute(&call).await;
-                                    info!(
-                                        "Tool {} result ({} image(s) attached): {}",
-                                        call.name,
-                                        output.images.len(),
-                                        output.text
-                                    );
-                                    (call.id, output)
-                                }),
+                            crate::tools::attachment_tools::scope_attachment_owner(
+                                owner,
+                                crate::tools::workspace_tools::scope_memory_namespace(
+                                    ns,
+                                    crate::timer::scope_timer_origin(origin, async move {
+                                        info!("Executing tool: {} (id={})", call.name, call.id);
+                                        let output = tools.execute(&call).await;
+                                        info!(
+                                            "Tool {} result ({} image(s) attached): {}",
+                                            call.name,
+                                            output.images.len(),
+                                            output.text
+                                        );
+                                        (call.id, output)
+                                    }),
+                                ),
                             ),
                         ));
                     }
@@ -1176,6 +1208,14 @@ mod tests {
         responses: Vec<crate::provider::ChatResponse>,
         fail_first: bool,
     ) -> TestAgentHandles {
+        build_test_agent_with_tools(responses, fail_first, None).0
+    }
+
+    fn build_test_agent_with_tools(
+        responses: Vec<crate::provider::ChatResponse>,
+        fail_first: bool,
+        custom: Option<(crate::config::Config, Arc<crate::tools::ToolSet>)>,
+    ) -> (TestAgentHandles, crate::serve::ChatLog) {
         let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
         let base = dir.path().to_path_buf();
 
@@ -1190,6 +1230,7 @@ api_key = "test"
         );
 
         let provider = crate::serve::StubProvider::new(responses);
+        let log = provider.call_log();
         // Registered under both names, as `ServeState::build_for_test_with`
         // does: the fallback path (no room_profile match) resolves the
         // built-in "anthropic" key.
@@ -1228,6 +1269,7 @@ api_key = "test"
             Vec::new(),
         ));
 
+        let (config, tools) = custom.unwrap_or((config, tools));
         let session_store = Arc::new(crate::session::SessionStore::new(
             base.join("sessions"),
             "test",
@@ -1244,7 +1286,7 @@ api_key = "test"
             None,
         );
 
-        (Arc::new(agent), sent, typing_started_after)
+        ((Arc::new(agent), sent, typing_started_after), log)
     }
 
     /// Convenience wrapper over `build_test_agent` with a channel that
@@ -1275,8 +1317,325 @@ api_key = "test"
             timestamp: 0,
             thread_id: None,
             attachments: Vec::new(),
+            attachment_owner: None,
             reply_to: None,
         }
+    }
+
+    fn attachment_owner() -> crate::attachment_store::AttachmentOwner {
+        crate::attachment_store::AttachmentOwner {
+            platform: "matrix".into(),
+            room_id: "test-room".into(),
+            thread_id: None,
+        }
+    }
+
+    fn attachment_call(name: &str, input: serde_json::Value) -> crate::provider::ChatResponse {
+        crate::provider::ChatResponse {
+            text: None,
+            tool_calls: vec![ToolCall {
+                id: name.into(),
+                name: name.into(),
+                input,
+            }],
+            prompt_usage: None,
+            stop_reason: None,
+        }
+    }
+
+    fn attachment_agent(
+        store: Arc<crate::attachment_store::AttachmentStore>,
+        state: Arc<WorkspaceState>,
+        host: bool,
+        mut script: Vec<crate::provider::ChatResponse>,
+    ) -> (Arc<super::Agent>, crate::serve::ChatLog) {
+        script.push(crate::provider::ChatResponse {
+            text: Some("done".into()),
+            tool_calls: vec![],
+            prompt_usage: None,
+            stop_reason: None,
+        });
+        let tools = Arc::new(crate::tools::ToolSet::new(
+            vec![
+                Box::new(crate::tools::attachment_tools::AttachmentSaveTool::new(
+                    store,
+                    state.clone(),
+                )),
+                Box::new(crate::tools::attachment_tools::ImageReadTool::new(state)),
+            ],
+            vec![],
+        ));
+        let config = crate::config::Config::parse_for_test(&format!(
+            "[anthropic]\napi_key = \"test\"\n[tools.host_access]\nenabled = {host}\n"
+        ));
+        let ((agent, _, _), log) =
+            build_test_agent_with_tools(script, false, Some((config, tools)));
+        (agent, log)
+    }
+
+    fn result_for(log: &crate::serve::ChatLog, call: &str) -> String {
+        log.messages()
+            .last()
+            .unwrap()
+            .iter()
+            .flat_map(|m| &m.parts)
+            .find_map(|p| match p {
+                crate::provider::ContentPart::ToolResult {
+                    tool_use_id,
+                    content,
+                } if tool_use_id == call => Some(content.clone()),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    fn assert_paired_refusal(log: &crate::serve::ChatLog, call: &str) {
+        use crate::provider::ContentPart;
+        let messages = log.messages();
+        let parts: Vec<_> = messages
+            .last()
+            .unwrap()
+            .iter()
+            .flat_map(|m| &m.parts)
+            .collect();
+        assert_eq!(
+            parts
+                .iter()
+                .filter(|p| matches!(p, ContentPart::ToolUse { id, .. } if id == call))
+                .count(),
+            1
+        );
+        assert_eq!(parts.iter().filter(|p| matches!(p, ContentPart::ToolResult { tool_use_id, .. } if tool_use_id == call)).count(), 1);
+        assert!(result_for(log, call).contains("not available in this conversation"));
+        assert!(!parts.iter().any(|p| matches!(p, ContentPart::Image { .. })));
+    }
+
+    #[tokio::test]
+    async fn channel_attachment_roundtrip_uses_original() {
+        use crate::provider::ContentPart;
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            crate::attachment_store::AttachmentStore::open(dir.path().join("store")).unwrap();
+        let state = test_workspace();
+        // Incompressible PNG exceeds the inline limit; the saved file must
+        // remain PNG even though the initial inline view is resized JPEG.
+        let mut seed = 0x12345678_u32;
+        let image = image::RgbImage::from_fn(2000, 1200, |_, _| {
+            let mut byte = || {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                seed as u8
+            };
+            image::Rgb([byte(), byte(), byte()])
+        });
+        let mut out = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut out, image::ImageFormat::Png).unwrap();
+        let bytes = out.into_inner();
+        assert!(bytes.len() > crate::channel::MAX_ATTACHMENT_BYTES);
+        let (inline, notes) = crate::channel::cache_and_prepare_attachment(
+            Some(store.clone()),
+            attachment_owner(),
+            "m1".into(),
+            "original.png".into(),
+            Some("image/png".into()),
+            bytes.clone(),
+        )
+        .await;
+        let id: String = serde_json::from_str(
+            notes[0]
+                .split("id=")
+                .nth(1)
+                .unwrap()
+                .split(" filename=")
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        let (agent, log) = attachment_agent(
+            store,
+            state.clone(),
+            true,
+            vec![
+                attachment_call(
+                    "attachment_save",
+                    serde_json::json!({"attachment_id": id, "path": "saved.png"}),
+                ),
+                attachment_call("image_read", serde_json::json!({"path": "saved.png"})),
+            ],
+        );
+        let mut msg = incoming(&crate::channel::with_attachment_notes(
+            "save and view".into(),
+            &notes,
+        ));
+        msg.attachment_owner = Some(attachment_owner());
+        msg.attachments = inline.into_iter().collect();
+        agent.handle_message(msg).await.unwrap();
+        assert_eq!(
+            std::fs::read(state.workspace.root.join("saved.png")).unwrap(),
+            bytes
+        );
+        assert_eq!(log.calls().len(), 3);
+        assert!(log.calls()[0].1.contains(&"attachment_save".into()));
+        assert!(log.calls()[0].1.contains(&"image_read".into()));
+        assert!(result_for(&log, "attachment_save").contains("original bytes"));
+        let messages = log.messages();
+        let last = messages[2].last().unwrap();
+        assert!(last.parts.iter().any(|p| matches!(p, ContentPart::Image { media_type, data_base64 }
+            if media_type == "image/jpeg" && image::load_from_memory(&STANDARD.decode(data_base64).unwrap()).is_ok())));
+        assert!(result_for(&log, "image_read").contains("image/jpeg"));
+    }
+
+    #[tokio::test]
+    async fn channel_with_host_access_off_cannot_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            crate::attachment_store::AttachmentStore::open(dir.path().join("store")).unwrap();
+        let state = test_workspace();
+        let meta = store
+            .insert(
+                attachment_owner(),
+                "m".into(),
+                "a".into(),
+                "text/plain".into(),
+                b"original",
+                chrono::Utc::now().timestamp_millis() as u64,
+            )
+            .unwrap();
+        let mut response = attachment_call(
+            "attachment_save",
+            serde_json::json!({"attachment_id":meta.id,"path":"saved"}),
+        );
+        response
+            .tool_calls
+            .extend(attachment_call("image_read", serde_json::json!({"path":"saved"})).tool_calls);
+        let (agent, log) = attachment_agent(store, state.clone(), false, vec![response]);
+        let mut msg = incoming("save and read");
+        msg.attachment_owner = Some(attachment_owner());
+        agent.handle_message(msg).await.unwrap();
+        for call in ["attachment_save", "image_read"] {
+            assert!(!log.calls()[0].1.contains(&call.into()));
+            assert_paired_refusal(&log, call);
+        }
+        assert!(!state.workspace.root.join("saved").exists());
+    }
+
+    #[tokio::test]
+    async fn foreign_owner_cannot_save_known_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            crate::attachment_store::AttachmentStore::open(dir.path().join("store")).unwrap();
+        let meta = store
+            .insert(
+                attachment_owner(),
+                "m".into(),
+                "a".into(),
+                "text/plain".into(),
+                b"original",
+                chrono::Utc::now().timestamp_millis() as u64,
+            )
+            .unwrap();
+        let mut owners = vec![attachment_owner(); 3];
+        owners[0].room_id = "foreign".into();
+        owners[1].thread_id = Some("foreign".into());
+        owners[2].platform = "discord".into();
+        for owner in owners {
+            let state = test_workspace();
+            let (agent, log) = attachment_agent(
+                store.clone(),
+                state.clone(),
+                true,
+                vec![attachment_call(
+                    "attachment_save",
+                    serde_json::json!({"attachment_id":meta.id,"path":"saved"}),
+                )],
+            );
+            let mut msg = incoming("save");
+            msg.attachment_owner = Some(owner);
+            agent.handle_message(msg).await.unwrap();
+            assert!(
+                result_for(&log, "attachment_save")
+                    .contains("attachment unavailable in this conversation or expired")
+            );
+            assert!(!state.workspace.root.join("saved").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_does_not_offer_attachment_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            crate::attachment_store::AttachmentStore::open(dir.path().join("store")).unwrap();
+        let meta = store
+            .insert(
+                attachment_owner(),
+                "m".into(),
+                "a".into(),
+                "text/plain".into(),
+                b"original",
+                chrono::Utc::now().timestamp_millis() as u64,
+            )
+            .unwrap();
+        let state = test_workspace();
+        let (agent, log) = attachment_agent(
+            store,
+            state.clone(),
+            true,
+            vec![attachment_call(
+                "attachment_save",
+                serde_json::json!({"attachment_id":meta.id,"path":"saved"}),
+            )],
+        );
+        agent
+            .trigger(
+                "test",
+                "owner platform=matrix room_id=test-room; save",
+                "test-room",
+            )
+            .await
+            .unwrap();
+        assert!(!log.calls()[0].1.contains(&"attachment_save".into()));
+        assert!(log.calls()[0].1.contains(&"image_read".into()));
+        assert_paired_refusal(&log, "attachment_save");
+        assert!(!state.workspace.root.join("saved").exists());
+    }
+
+    #[tokio::test]
+    async fn restart_restores_attachment_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store");
+        let store = crate::attachment_store::AttachmentStore::open(path.clone()).unwrap();
+        let meta = store
+            .insert(
+                attachment_owner(),
+                "m".into(),
+                "a".into(),
+                "text/plain".into(),
+                b"original",
+                chrono::Utc::now().timestamp_millis() as u64,
+            )
+            .unwrap();
+        drop(store);
+        let store = crate::attachment_store::AttachmentStore::open(path).unwrap();
+        let state = test_workspace();
+        let (agent, log) = attachment_agent(
+            store,
+            state.clone(),
+            true,
+            vec![attachment_call(
+                "attachment_save",
+                serde_json::json!({"attachment_id":meta.id,"path":"saved"}),
+            )],
+        );
+        let mut msg = incoming("save");
+        msg.attachment_owner = Some(attachment_owner());
+        agent.handle_message(msg).await.unwrap();
+        assert!(result_for(&log, "attachment_save").contains("original bytes"));
+        assert_eq!(
+            std::fs::read(state.workspace.root.join("saved")).unwrap(),
+            b"original"
+        );
     }
 
     fn with_consult(agent: &Arc<super::Agent>) -> Arc<crate::consult::Consult> {

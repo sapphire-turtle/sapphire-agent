@@ -277,6 +277,8 @@ pub struct IncomingMessage {
     pub thread_id: Option<String>,
     /// Image attachments accompanying the message.
     pub attachments: Vec<Attachment>,
+    /// Trusted conversation identity for original attachment lookup.
+    pub attachment_owner: Option<AttachmentOwner>,
     /// ID of the message this one replies to, when the platform says so.
     pub reply_to: Option<String>,
 }

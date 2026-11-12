@@ -361,6 +361,7 @@ pub(crate) mod test_support {
             timestamp: 0,
             thread_id: None,
             attachments: Vec::new(),
+            attachment_owner: None,
             reply_to: reply_to.map(str::to_string),
         }
     }

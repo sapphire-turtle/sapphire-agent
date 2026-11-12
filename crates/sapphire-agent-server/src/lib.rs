@@ -925,6 +925,42 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
                 None
             };
 
+            // Original attachments are independent of the image cache switch.
+            // Resolve, open and sweep on a blocking worker before any channel
+            // can insert entries or attachment_save can look them up.
+            let attachment_root = workspace_dir.clone();
+            let attachment_store =
+                match tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                    let dir = attachment_store::AttachmentStore::default_dir(&attachment_root)?;
+                    let store = attachment_store::AttachmentStore::open(dir)?;
+                    store.sweep(chrono::Utc::now().timestamp_millis().max(0) as u64)?;
+                    Ok(store)
+                })
+                .await
+                {
+                    Ok(Ok(store)) => Some(store),
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            "Attachment store startup failed ({e:#}); original caching disabled"
+                        );
+                        None
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Attachment store startup task failed ({e}); original caching disabled"
+                        );
+                        None
+                    }
+                };
+            if let Some(store) = attachment_store.clone() {
+                tool_set
+                    .register_tool(Box::new(tools::attachment_tools::AttachmentSaveTool::new(
+                        store,
+                        Arc::clone(&ws_state),
+                    )))
+                    .await;
+            }
+
             // Register `recall_image` once the image cache is resolved.
             // Without a cache there's nothing to recall, so skip the
             // tool entirely — the model never sees it advertised.
@@ -1113,14 +1149,20 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
             if config.matrix.is_some() || config.discord.is_some() {
                 let mut channel_list: Vec<(String, Arc<dyn channel::Channel>)> = Vec::new();
                 if let Some(m) = &config.matrix {
-                    channel_list.push(("matrix".to_string(), Arc::new(MatrixChannel::new(m))));
+                    channel_list.push((
+                        "matrix".to_string(),
+                        Arc::new(
+                            MatrixChannel::new(m).with_attachment_store(attachment_store.clone()),
+                        ),
+                    ));
                 }
                 if let Some(d) = &config.discord {
                     channel_list.push((
                         "discord".to_string(),
                         Arc::new(
                             DiscordChannel::new(d)
-                                .context("Failed to initialise Discord channel")?,
+                                .context("Failed to initialise Discord channel")?
+                                .with_attachment_store(attachment_store.clone()),
                         ),
                     ));
                 }
@@ -1381,6 +1423,33 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
                 }
             }
 
+            // Start only once fallible startup has finished so every spawned
+            // sweep task reaches the explicit shutdown-and-join path below.
+            let attachment_sweep_handle = attachment_store.map(|store| {
+                let shutdown = shutdown.clone();
+                tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+                    // Startup already swept; consume interval's immediate tick.
+                    interval.tick().await;
+                    loop {
+                        tokio::select! {
+                            biased;
+                            () = shutdown.cancelled() => break,
+                            _ = interval.tick() => {
+                                let store = store.clone();
+                                match tokio::task::spawn_blocking(move || {
+                                    store.sweep(chrono::Utc::now().timestamp_millis().max(0) as u64)
+                                }).await {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(e)) => tracing::warn!("Attachment sweep failed: {e:#}"),
+                                    Err(e) => tracing::warn!("Attachment sweep task failed: {e}"),
+                                }
+                            }
+                        }
+                    }
+                })
+            });
+
             let served = serve::run(
                 addr,
                 Arc::clone(&serve_state),
@@ -1391,6 +1460,13 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
             // However the HTTP server ended, everything else stops with it.
             shutdown.cancel();
             switch_watch.abort();
+            // This also waits for an in-flight blocking sweep to finish; do
+            // not leave cleanup to runtime destruction (or restart's exit).
+            if let Some(handle) = attachment_sweep_handle
+                && let Err(e) = handle.await
+            {
+                tracing::warn!("Attachment cleanup task did not finish cleanly: {e}");
+            }
 
             // Wait for the agent task's graceful shutdown to finish so its
             // flush_digests_on_shutdown LLM call isn't aborted by runtime drop.
