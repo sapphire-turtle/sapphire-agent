@@ -474,7 +474,11 @@ fn refuse_if_sensitive_in(
 }
 
 /// Production entry point: protect the agent's real config directory.
-fn refuse_if_sensitive(path: &Path, workspace_root: Option<&Path>, verb: &str) -> Result<()> {
+pub(crate) fn refuse_if_sensitive(
+    path: &Path,
+    workspace_root: Option<&Path>,
+    verb: &str,
+) -> Result<()> {
     refuse_if_sensitive_in(path, workspace_root, agent_config_dir().as_deref(), verb)
 }
 

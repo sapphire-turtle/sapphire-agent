@@ -1,6 +1,7 @@
 pub mod acp_client;
 pub mod ambient_tools;
 pub mod ask_human;
+pub mod attachment_tools;
 pub mod avatar_tools;
 pub(crate) mod background_shell;
 pub mod background_tools;
@@ -328,6 +329,7 @@ pub async fn default_tool_set(
     mcp_servers: &[McpServerConfig],
     day_boundary_hour: u8,
 ) -> Arc<ToolSet> {
+    use attachment_tools::ImageReadTool;
     use builtin_tools::*;
     use client_tools::*;
     use session_tools::CurrentTimeTool;
@@ -345,6 +347,7 @@ pub async fn default_tool_set(
         Box::new(WorkspaceSearchTool::new(Arc::clone(&state))),
         Box::new(WorkspaceSyncTool::new(Arc::clone(&state))),
         Box::new(FileReadTool::new(Arc::clone(&state))),
+        Box::new(ImageReadTool::new(Arc::clone(&state))),
         Box::new(FileWriteTool::new(Arc::clone(&state))),
         Box::new(FileAppendTool::new(Arc::clone(&state))),
         Box::new(FileDeleteTool::new(Arc::clone(&state))),
@@ -485,6 +488,7 @@ mod tests {
             ("file_delete", ToolKind::Delete),
             ("file_read", ToolKind::Read),
             ("file_write", ToolKind::Edit),
+            ("image_read", ToolKind::Read),
             ("memory_add", ToolKind::Edit),
             ("memory_append", ToolKind::Edit),
             ("memory_read", ToolKind::Read),
@@ -501,6 +505,44 @@ mod tests {
         ];
 
         assert_eq!(got_refs, want);
+    }
+
+    // Production registers this only after successful store initialization
+    // (Task 5); the shared registry must retain its edit classification.
+    #[tokio::test]
+    async fn attachment_save_can_be_registered_with_store() {
+        let state = test_workspace();
+        let tools = default_tool_set(Arc::clone(&state), None, &[], 4).await;
+        assert!(
+            !tools
+                .specs_filtered(|_| true)
+                .await
+                .iter()
+                .any(|s| s.name == "attachment_save")
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            crate::attachment_store::AttachmentStore::open(dir.path().join("attachments")).unwrap();
+        tools
+            .register_tool(Box::new(attachment_tools::AttachmentSaveTool::new(
+                store, state,
+            )))
+            .await;
+        assert!(
+            tools
+                .kinds()
+                .await
+                .contains(&("attachment_save".into(), ToolKind::Edit))
+        );
+        assert!(
+            !tools
+                .specs_filtered(crate::serve::visible_tool_predicate(
+                    true, false, false, false, false
+                ))
+                .await
+                .iter()
+                .any(|s| s.name == "attachment_save")
+        );
     }
 
     /// `mcp_reconnect` is registered only when an MCP server is

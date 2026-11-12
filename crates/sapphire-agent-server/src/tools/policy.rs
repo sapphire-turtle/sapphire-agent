@@ -200,6 +200,8 @@ pub fn refusal_message(tool: &str, why: Refusal) -> String {
 /// `memory_add` is also an `Edit`, and it is never in question.
 pub const HOST_TOOLS: &[&str] = &[
     "file_read",
+    "image_read",
+    "attachment_save",
     "file_write",
     "file_append",
     "file_delete",
@@ -216,7 +218,7 @@ pub const HOST_TOOLS: &[&str] = &[
 /// reads as one thing.
 ///
 /// `routed_to_client` is what #270 added, and it is what changed this
-/// gate's meaning. The seven names below are "the agent's own filesystem
+/// gate's meaning. The seven routable names are "the agent's own filesystem
 /// and shell" *only when that is where the call is going*: inside an ACP
 /// session the same names reach the editor's machine, which this
 /// deployment's `[tools.host_access]` switch has no business speaking
@@ -226,6 +228,7 @@ pub const HOST_TOOLS: &[&str] = &[
 /// knows this turn has an ACP client passes `true` and the gate declines
 /// to fire; a caller that does not (every non-ACP transport, whose turns
 /// never have one) passes `false` and gets exactly the old behaviour.
+/// `image_read` is host-only: ACP visibility and execution reject it separately.
 pub fn host_tool_denied(name: &str, host_access_enabled: bool, routed_to_client: bool) -> bool {
     !host_access_enabled && !routed_to_client && HOST_TOOLS.contains(&name)
 }
@@ -574,7 +577,7 @@ mod tests {
         assert!(refused.is_empty());
     }
 
-    /// The seven tools that touch the agent's own machine. Off unless
+    /// The eight tools that touch the agent's own machine. Off unless
     /// the operator turned them on — including for `Origin::Trusted`,
     /// which is the voice pipeline and the heartbeat.
     #[test]

@@ -578,6 +578,37 @@ impl Provider for AnthropicProvider {
 mod tests {
     use super::*;
 
+    #[test]
+    fn tool_results_with_images_preserve_result_and_base64_image_on_wire() {
+        let msg = ChatMessage::tool_results_with_images(
+            vec![("call_read_image".to_string(), "Image loaded".to_string())],
+            vec![("image/png".to_string(), "aW1hZ2U=".to_string())],
+        );
+        let wire = serde_json::to_value(chat_message_to_api(&msg)).unwrap();
+
+        assert_eq!(
+            wire,
+            json!({
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call_read_image",
+                        "content": "Image loaded"
+                    },
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": "aW1hZ2U="
+                        }
+                    }
+                ]
+            })
+        );
+    }
+
     /// `tools: []` is a legitimate agent definition (an agent that
     /// answers from its prompt alone), and `Some(&[])` must serialize
     /// exactly like `None`: no `tools` key in the request body at all —

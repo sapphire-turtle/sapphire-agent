@@ -1,6 +1,8 @@
+use crate::attachment_store::{AttachmentOwner, AttachmentStore};
 use crate::channel::{
-    Attachment, Channel, IncomingMessage, MAX_DOWNLOAD_BYTES, OutgoingMessage, RoomInfo,
-    dropped_attachment_note, format_mb, prepare_image, with_attachment_notes,
+    Attachment, Channel, IncomingMessage, MAX_DOWNLOAD_BYTES, MAX_MESSAGE_ATTACHMENT_BYTES,
+    MAX_RECEIVED_ATTACHMENTS, OutgoingMessage, RoomInfo, cache_and_prepare_attachment,
+    dropped_attachment_note, format_mb, with_attachment_notes,
 };
 use crate::config::DiscordConfig;
 use anyhow::{Context, Result};
@@ -24,6 +26,8 @@ struct DiscordHandler {
     tx: mpsc::Sender<IncomingMessage>,
     allowed_channel_ids: HashSet<u64>,
     allowed_user_ids: HashSet<u64>,
+    attachment_store: Option<Arc<AttachmentStore>>,
+    download_client: reqwest::Client,
 }
 
 #[serenity::async_trait]
@@ -50,7 +54,8 @@ impl EventHandler for DiscordHandler {
             return;
         }
 
-        let (attachments, notes) = download_image_attachments(&msg).await;
+        let (attachments, notes) =
+            download_attachments(&msg, &self.download_client, self.attachment_store.clone()).await;
         let content = with_attachment_notes(msg.content.trim().to_string(), &notes);
 
         // Skip messages with neither text nor any attachment, usable or not.
@@ -66,6 +71,11 @@ impl EventHandler for DiscordHandler {
             timestamp: msg.timestamp.unix_timestamp() as u64 * 1000,
             thread_id: None,
             attachments,
+            attachment_owner: Some(AttachmentOwner {
+                platform: "discord".into(),
+                room_id: msg.channel_id.to_string(),
+                thread_id: None,
+            }),
             reply_to: reply_target(&msg),
         };
 
@@ -80,6 +90,7 @@ impl EventHandler for DiscordHandler {
 // ---------------------------------------------------------------------------
 
 pub struct DiscordChannel {
+    attachment_store: Option<Arc<AttachmentStore>>,
     token: String,
     channel_ids: HashSet<u64>,
     allowed_user_ids: HashSet<u64>,
@@ -113,11 +124,17 @@ impl DiscordChannel {
             .collect::<Result<HashSet<_>>>()?;
 
         Ok(Self {
+            attachment_store: None,
             token: cfg.bot_token.clone(),
             channel_ids,
             allowed_user_ids,
             http: Arc::new(OnceCell::new()),
         })
+    }
+
+    pub fn with_attachment_store(mut self, store: Option<Arc<AttachmentStore>>) -> Self {
+        self.attachment_store = store;
+        self
     }
 
     fn get_http_or_new(&self) -> Arc<Http> {
@@ -191,9 +208,12 @@ impl Channel for DiscordChannel {
         let stable_threshold = std::time::Duration::from_secs(60);
         let mut backoff = min_backoff;
 
+        let download_client = reqwest::Client::new();
         loop {
             let handler = DiscordHandler {
                 tx: tx.clone(),
+                attachment_store: self.attachment_store.clone(),
+                download_client: download_client.clone(),
                 allowed_channel_ids: self.channel_ids.clone(),
                 allowed_user_ids: self.allowed_user_ids.clone(),
             };
@@ -273,57 +293,112 @@ impl Channel for DiscordChannel {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Download the image attachments on `msg`, alongside a note for each
-/// attachment that could not be passed on (see [`dropped_attachment_note`]).
-///
-/// An image over the provider's limit is shrunk by [`prepare_image`] rather
-/// than dropped; only one over [`MAX_DOWNLOAD_BYTES`] is turned away before
-/// it is fetched. The MIME type of what is passed on comes from the bytes,
-/// not from Discord's `content_type`, which is sometimes stale (a PNG
-/// labelled `image/webp`, which Anthropic rejects with a 400).
-async fn download_image_attachments(msg: &Message) -> (Vec<Attachment>, Vec<String>) {
+/// Fetch only the event's attachment URLs, in order. Failed entries still
+/// consume one of the first eight slots, but not the successful-byte budget.
+async fn download_attachments(
+    msg: &Message,
+    client: &reqwest::Client,
+    store: Option<Arc<AttachmentStore>>,
+) -> (Vec<Attachment>, Vec<String>) {
     let mut out = Vec::new();
     let mut notes = Vec::new();
-    for att in &msg.attachments {
-        let dropped = |reason: String| {
-            warn!(
-                "Discord attachment '{}' not passed on: {reason}",
-                att.filename
-            );
-            dropped_attachment_note(&att.filename, &reason)
-        };
+    let mut total = 0usize;
+    for (index, att) in msg.attachments.iter().enumerate() {
+        let dropped = |reason: String| dropped_attachment_note(&att.filename, &reason);
+        if index >= MAX_RECEIVED_ATTACHMENTS {
+            notes.push(dropped("over the 8 attachments per message limit".into()));
+            continue;
+        }
         if let Err(reason) = screen_attachment(att.content_type.as_deref(), att.size as usize) {
             notes.push(dropped(reason));
             continue;
         }
-        let bytes = match att.download().await {
+        let remaining = MAX_MESSAGE_ATTACHMENT_BYTES - total;
+        if att.size as usize > remaining {
+            notes.push(dropped("over the remaining message download limit".into()));
+            continue;
+        }
+        let bytes = match download_attachment_bytes(
+            client,
+            &att.url,
+            remaining,
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        {
             Ok(bytes) => bytes,
-            Err(e) => {
-                notes.push(dropped(format!("downloading it failed ({e})")));
+            Err(reason) => {
+                notes.push(dropped(reason));
                 continue;
             }
         };
-        match tokio::task::spawn_blocking(move || prepare_image(bytes)).await {
-            Ok(Ok(a)) => out.push(a),
-            Ok(Err(reason)) => notes.push(dropped(reason)),
-            Err(e) => notes.push(dropped(format!("processing it failed ({e})"))),
-        }
+        // The downloader already checked both limits with checked_add.
+        total = total
+            .checked_add(bytes.len())
+            .expect("bounded message bytes");
+        let owner = AttachmentOwner {
+            platform: "discord".into(),
+            room_id: msg.channel_id.to_string(),
+            thread_id: None,
+        };
+        let (inline, received_notes) = cache_and_prepare_attachment(
+            store.clone(),
+            owner,
+            msg.id.to_string(),
+            att.filename.clone(),
+            att.content_type.clone(),
+            bytes,
+        )
+        .await;
+        out.extend(inline);
+        notes.extend(received_notes);
     }
     (out, notes)
 }
 
-/// Whether an attachment is worth downloading, judged by what Discord says
-/// of it: an image of a type the provider takes, no larger than
-/// [`MAX_DOWNLOAD_BYTES`]. `Err` says why not.
-fn screen_attachment(content_type: Option<&str>, size: usize) -> Result<(), String> {
-    let only_images = "only images (JPEG, PNG, GIF, WebP) are passed on";
-    match content_type {
-        None => return Err(format!("its type is unknown, and {only_images}")),
-        Some(ct) if !super::SUPPORTED_IMAGE_MIME.contains(&ct) => {
-            return Err(format!("it is {ct}, and {only_images}"));
+/// Bound the whole request (headers and every body chunk), not just connect.
+async fn download_attachment_bytes(
+    client: &reqwest::Client,
+    url: &str,
+    remaining: usize,
+    timeout: std::time::Duration,
+) -> Result<Vec<u8>, String> {
+    tokio::time::timeout(timeout, async {
+        let mut response = client
+            .get(url)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .map_err(|e| format!("downloading it failed ({e})"))?;
+        let limit = remaining.min(MAX_DOWNLOAD_BYTES);
+        if response
+            .content_length()
+            .is_some_and(|size| size > limit as u64)
+        {
+            return Err("over the file or remaining message download limit".into());
         }
-        Some(_) => {}
-    }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| format!("downloading it failed ({e})"))?
+        {
+            let next = bytes
+                .len()
+                .checked_add(chunk.len())
+                .filter(|&size| size <= limit)
+                .ok_or_else(|| "over the file or remaining message download limit".to_string())?;
+            bytes.reserve(next - bytes.len());
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(bytes)
+    })
+    .await
+    .map_err(|_| "downloading it timed out".to_string())?
+}
+
+/// MIME is deliberately not a filter: preserve unknown and non-image files.
+fn screen_attachment(_content_type: Option<&str>, size: usize) -> Result<(), String> {
     if size > MAX_DOWNLOAD_BYTES {
         return Err(format!(
             "it is {}, over the {} download limit",
@@ -377,6 +452,180 @@ pub fn reply_target(msg: &Message) -> Option<String> {
 mod tests {
     use super::*;
 
+    async fn local_response(
+        response: Vec<u8>,
+        delay: std::time::Duration,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let _ = socket.read(&mut request).await;
+            tokio::time::sleep(delay).await;
+            // Rejection may close the connection before the server finishes.
+            let _ = socket.write_all(&response).await;
+        });
+        (format!("http://{addr}/file?signature=sentinel"), task)
+    }
+
+    #[tokio::test]
+    async fn downloader_checks_status_length_chunks_and_timeout() {
+        use std::time::Duration;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let cases = [
+            (b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello".to_vec(), 5, None),
+            (b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n".to_vec(), 5, Some("failed")),
+            (b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\n".to_vec(), 5, Some("limit")),
+            (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n3\r\ndef\r\n0\r\n\r\n".to_vec(), 5, Some("limit")),
+        ];
+        for (response, remaining, error) in cases {
+            let (url, server) = local_response(response, Duration::ZERO).await;
+            let result =
+                download_attachment_bytes(&client, &url, remaining, Duration::from_secs(2)).await;
+            if let Some(error) = error {
+                assert!(result.unwrap_err().contains(error));
+            } else {
+                assert_eq!(result.unwrap(), b"hello");
+            }
+            server.await.unwrap();
+        }
+        let (url, server) = local_response(Vec::new(), Duration::from_secs(1)).await;
+        assert!(
+            download_attachment_bytes(&client, &url, 5, Duration::from_millis(20))
+                .await
+                .unwrap_err()
+                .contains("timed out")
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn downloader_rejects_undeclared_oversized_body() {
+        use std::time::Duration;
+        let mut response = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_vec();
+        response.resize(response.len() + MAX_DOWNLOAD_BYTES + 1, b'x');
+        let (url, server) = local_response(response, Duration::ZERO).await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        assert!(
+            download_attachment_bytes(
+                &client,
+                &url,
+                MAX_MESSAGE_ATTACHMENT_BYTES,
+                Duration::from_secs(5)
+            )
+            .await
+            .unwrap_err()
+            .contains("limit")
+        );
+        server.await.unwrap();
+    }
+
+    fn attachment(url: &str, size: usize, filename: &str) -> serenity::all::Attachment {
+        serde_json::from_value(serde_json::json!({
+            "id": "101", "filename": filename, "size": size,
+            "url": url, "proxy_url": url, "content_type": "application/pdf"
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn downloads_only_first_eight_and_preserves_source_free_metadata() {
+        use std::time::Duration;
+        let (url, server) = local_response(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n%PDF".to_vec(),
+            Duration::ZERO,
+        )
+        .await;
+        let mut msg = message(None);
+        // Rejected declarations consume slots, and do not block a later small file.
+        msg.attachments = (0..7)
+            .map(|_| attachment("http://127.0.0.1:1", MAX_DOWNLOAD_BYTES + 1, "large"))
+            .collect();
+        msg.attachments.push(attachment(&url, 4, "report.pdf"));
+        msg.attachments
+            .push(attachment("http://127.0.0.1:1", 1, "ninth"));
+        let dir = tempfile::tempdir().unwrap();
+        let store = AttachmentStore::open(dir.path().to_owned()).unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let (images, notes) = download_attachments(&msg, &client, Some(store)).await;
+        assert!(images.is_empty());
+        assert_eq!(notes.len(), 9);
+        assert!(notes[7].contains("Use attachment_save"));
+        assert!(notes[8].contains("8 attachments"));
+        let json_path = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_some_and(|e| e == "json"))
+            .unwrap();
+        let json = std::fs::read_to_string(json_path).unwrap();
+        assert!(!json.contains(&url));
+        assert!(!json.contains("signature=sentinel"));
+        let meta: crate::attachment_store::StoredAttachment = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            meta.owner,
+            AttachmentOwner {
+                platform: "discord".into(),
+                room_id: "7".into(),
+                thread_id: None
+            }
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn aggregate_budget_counts_successful_originals() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/file", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                assert!(socket.read(&mut request).await.unwrap() > 0);
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+                            MAX_DOWNLOAD_BYTES
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                let block = vec![b'x'; 1024 * 1024];
+                for _ in 0..32 {
+                    socket.write_all(&block).await.unwrap();
+                }
+            }
+        });
+        let mut msg = message(None);
+        msg.attachments = vec![
+            attachment(&url, MAX_DOWNLOAD_BYTES, "a"),
+            attachment(&url, MAX_DOWNLOAD_BYTES, "b"),
+            attachment("http://127.0.0.1:1", 1, "c"),
+        ];
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let (_, notes) = download_attachments(&msg, &client, None).await;
+        assert_eq!(notes.len(), 3);
+        assert!(notes[2].contains("remaining message download limit"));
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn builder_accepts_optional_store() {
+        let cfg = crate::config::DiscordConfig {
+            bot_token: "unused".into(),
+            channel_ids: vec![],
+            allowed_users: vec![],
+        };
+        let channel = DiscordChannel::new(&cfg)
+            .unwrap()
+            .with_attachment_store(None);
+        assert!(channel.attachment_store.is_none());
+    }
+
     #[test]
     fn an_image_over_the_provider_limit_is_still_downloaded() {
         // 5.3 MB: over the 5 MB the provider takes, so it is shrunk, not dropped.
@@ -387,10 +636,8 @@ mod tests {
     fn attachments_that_cannot_be_passed_on_say_why() {
         let too_big = screen_attachment(Some("image/png"), MAX_DOWNLOAD_BYTES + 1).unwrap_err();
         assert!(too_big.contains("download limit"), "{too_big}");
-        let pdf = screen_attachment(Some("application/pdf"), 1000).unwrap_err();
-        assert!(pdf.contains("application/pdf"), "{pdf}");
-        let unknown = screen_attachment(None, 1000).unwrap_err();
-        assert!(unknown.contains("unknown"), "{unknown}");
+        assert_eq!(screen_attachment(Some("application/pdf"), 1000), Ok(()));
+        assert_eq!(screen_attachment(None, 1000), Ok(()));
     }
 
     fn message(reference: Option<&str>) -> Message {

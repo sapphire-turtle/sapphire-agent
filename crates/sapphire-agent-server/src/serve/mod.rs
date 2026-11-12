@@ -2387,6 +2387,15 @@ pub(crate) fn visible_tool_predicate(
     client_terminal: bool,
 ) -> impl Fn(&str) -> bool {
     move |name: &str| {
+        // Only Agent's channel-owner check may let this tool back in.
+        // RPC, ACP, heartbeat and subagents never gain it from these flags.
+        if name == "attachment_save" {
+            return false;
+        }
+        // ACP has no image-read request: never fall back to the host.
+        if has_client && name == "image_read" {
+            return false;
+        }
         // The host gate, and the one place #270 changed its meaning:
         // `has_client` is the `routed_to_client` argument. On an ACP turn
         // these calls are going to the *editor's* machine, which this
@@ -6684,6 +6693,106 @@ mod tests {
         );
     }
 
+    /// Exercise the actual ToolOutput -> message -> scrub/hydrate boundary
+    /// with the payload-backed SessionStore used by non-ACP transports.
+    #[tokio::test]
+    async fn image_read_rpc_history_retains_tool_text_without_base64() {
+        use crate::image_cache::{ImageCache, hydrate_history, scrub_history_inplace, sha256_hex};
+        use crate::tools::Tool;
+        use sapphire_framework::workspace::{AppContext, Workspace, WorkspaceState};
+
+        static CTX: AppContext = AppContext::new("sapphire-agent");
+        CTX.set_cache_dir(std::env::temp_dir().join("sapphire-agent-serve-image-test-cache"));
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join(".sapphire-agent")).unwrap();
+        let ws =
+            Arc::new(WorkspaceState::open(Workspace::from_root(&CTX, &root).unwrap()).unwrap());
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::RgbImage::new(2, 1)
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .unwrap();
+        let bytes = encoded.into_inner();
+        std::fs::write(root.join("image.png"), &bytes).unwrap();
+        let output = crate::tools::attachment_tools::ImageReadTool::new(ws)
+            .execute_full(&json!({"path": "image.png"}))
+            .await
+            .unwrap();
+        assert_eq!(output.images.len(), 1);
+        let raw_base64 = output.images[0].1.clone();
+        let result_text = output.text.clone();
+        let message = ChatMessage::tool_results_with_images(
+            vec![("read-1".into(), output.text)],
+            output.images,
+        );
+        let sha = sha256_hex(&bytes);
+        let marker = format!("[image: image/png sha256={sha}]");
+
+        for cache_enabled in [true, false] {
+            let base = root.join(if cache_enabled { "on" } else { "off" });
+            let payloads =
+                crate::tool_payload_cache::ToolPayloadCache::open(base.join("payloads")).unwrap();
+            let store = SessionStore::new(base.join("sessions"), "rpc", Some(payloads));
+            store
+                .ensure_session("s1", &("s1".into(), None), "rpc", None, "default")
+                .unwrap();
+            store
+                .append(
+                    "s1",
+                    &ChatMessage::assistant_with_tools(
+                        None,
+                        vec![crate::provider::ToolCall {
+                            id: "read-1".into(),
+                            name: "image_read".into(),
+                            input: json!({"path": "image.png"}),
+                        }],
+                    ),
+                )
+                .unwrap();
+            let mut history = vec![message.clone()];
+            let same_turn = hydrate_history(&history);
+            assert!(matches!(
+                &same_turn[0].parts[0],
+                ContentPart::ToolResult { .. }
+            ));
+            assert!(matches!(&same_turn[0].parts[1],
+                ContentPart::Image { media_type, data_base64 }
+                    if media_type == "image/png" && data_base64 == &raw_base64));
+            // Persist before the final scrub, as the turn loops do.
+            store.append("s1", &history[0]).unwrap();
+            let raw = store.raw_for_test("s1");
+            assert!(!raw.contains(&raw_base64));
+            assert!(!raw.contains("data_base64"));
+            assert!(raw.contains(&marker));
+            let loaded = store.load_session("s1").unwrap();
+            let parts: Vec<_> = loaded.iter().flat_map(|msg| &msg.parts).collect();
+            assert!(parts.iter().any(|p| matches!(p,
+                ContentPart::ToolResult { tool_use_id, content }
+                    if tool_use_id == "read-1" && content == &result_text)));
+            assert!(
+                parts
+                    .iter()
+                    .any(|p| matches!(p, ContentPart::Text(text) if text == &marker))
+            );
+            assert!(!parts.iter().any(|p| matches!(p, ContentPart::Image { .. })));
+
+            let cache = cache_enabled.then(|| ImageCache::open(base.join("images")).unwrap());
+            scrub_history_inplace(&mut history, cache.as_deref());
+            let next_input = hydrate_history(&history);
+            if let Some(cache) = cache {
+                assert!(matches!(&history[0].parts[1],
+                    ContentPart::ImageRef { media_type, sha256 }
+                        if media_type == "image/png" && sha256 == &sha));
+                assert_eq!(cache.get(&sha).unwrap(), bytes);
+                assert!(
+                    matches!(&next_input[0].parts[1], ContentPart::Text(text) if text == &marker)
+                );
+            } else {
+                assert!(matches!(&history[0].parts[1], ContentPart::Image { .. }));
+            }
+        }
+    }
+
     /// The measurement exists to distinguish "many sessions accumulate"
     /// from "one session grows", because only the first is fixed by
     /// dropping idle sessions. A total alone cannot tell them apart, so
@@ -6772,6 +6881,8 @@ mod tests {
             "dir_list",
             "dir_walk",
             "shell",
+            "image_read",
+            "attachment_save",
             // Skill tools, gated on the same terminal capability.
             "skill",
             "skill_install",
@@ -6833,12 +6944,40 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn attachment_save_is_hidden_without_channel_override() {
+        for mask in 0..32 {
+            let flag = |bit| mask & (1 << bit) != 0;
+            let visible = visible_tool_predicate(flag(0), flag(1), flag(2), flag(3), flag(4));
+            assert!(!visible("attachment_save"), "flags={mask}");
+        }
+    }
+
+    #[test]
+    fn image_read_visibility_host_and_acp() {
+        for (host, client, expected) in [
+            (false, false, false),
+            (true, false, true),
+            (false, true, false),
+            (true, true, false),
+        ] {
+            for caps in [false, true] {
+                let visible = visible_tool_predicate(host, client, caps, caps, caps);
+                assert_eq!(
+                    visible("image_read"),
+                    expected,
+                    "host={host} client={client} caps={caps}"
+                );
+            }
+        }
+    }
+
     /// A client that says it can read but not write gets exactly one of
     /// the two file tools. Clients implement these independently, so
     /// the two flags are read separately rather than as one "fs" bit.
     ///
     /// `host_access` is off in the helper: the seven names are
-    /// `HOST_TOOLS`, and an ACP turn must offer them regardless — that
+    /// in `HOST_TOOLS`, and an ACP turn must offer them regardless — that
     /// the deployment-wide switch has no say here is the change #270
     /// makes.
     #[tokio::test]
@@ -6941,9 +7080,14 @@ mod tests {
             false,
         )
         .await;
-        for n in crate::tools::policy::HOST_TOOLS {
+        for n in crate::tools::policy::HOST_TOOLS
+            .iter()
+            .filter(|n| !matches!(**n, "image_read" | "attachment_save"))
+        {
             assert!(names.contains(&n.to_string()), "missing {n}: {names:?}");
         }
+        assert!(!names.contains(&"image_read".to_string()));
+        assert!(!names.contains(&"attachment_save".to_string()));
 
         // `fs.read` only: the read half survives, the write half and the
         // terminal-dependent names do not. No fallback to the agent's
@@ -6971,7 +7115,7 @@ mod tests {
         }
     }
 
-    /// Outside an ACP session the same seven names answer to the
+    /// Outside an ACP session all eight host names answer to the
     /// deployment switch and nothing else.
     ///
     /// `dir_list` and `dir_walk` are pinned on their own here because
@@ -6990,7 +7134,7 @@ mod tests {
 
         let on = tool_names_for_turn_without_a_client(true).await;
         for n in crate::tools::policy::HOST_TOOLS {
-            assert!(on.contains(&n.to_string()), "{n} should be present");
+            assert_eq!(on.contains(&n.to_string()), *n != "attachment_save", "{n}");
         }
 
         for n in ["shell_start", "shell_output", "shell_kill"] {

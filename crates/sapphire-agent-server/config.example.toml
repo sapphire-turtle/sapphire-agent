@@ -331,12 +331,22 @@ system_prompt = "You are a helpful personal assistant."
 #
 #   - `[tools.host_access]` — the switch that lets the agent touch its
 #     own filesystem and shell: `file_read`, `file_write`, `file_append`,
-#     `file_delete`, `dir_list`, `dir_walk`, `shell`. `enabled = false`
+#     `file_delete`, `dir_list`, `dir_walk`, `shell`, `image_read`,
+#     `attachment_save`. `enabled = false`
 #     by default, for every origin — `/rpc`, voice, `/a2a`, Matrix/Discord
 #     and ACP alike.
 #
-#     Inside an ACP session these same seven names reach the *editor's*
-#     machine instead, and this switch does not speak for it: what that
+#     `image_read(path)` reads one local JPEG/PNG/GIF/WebP (32 MiB input;
+#     over 5 MiB shrunk for display); `file_read` stays text-only.
+#     `attachment_save(attachment_id, path)` saves the same Discord/Matrix
+#     conversation's original, not the display resize. Both require this
+#     switch and are unavailable in ACP. Non-image attachments are also
+#     auto-fetched: 32 MiB/file, 8/post, 64 MiB/post, 1 GiB temporary store.
+#     Originals expire after 7 days: save before then; saved files are not
+#     auto-deleted. Capacity/download/cache failures become message notes.
+#
+#     Inside an ACP session the seven file/directory/shell names reach the
+#     *editor's* machine instead, and this switch does not speak for it: what that
 #     session may call is decided by the capabilities the connected editor
 #     declared at `initialize` (`fs.read_text_file`, `fs.write_text_file`,
 #     `terminal/*`), and a missing capability hides the tool rather than

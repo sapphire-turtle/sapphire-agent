@@ -1339,6 +1339,9 @@ impl SubagentTool {
             persistence: None,
         }
         .run(history);
+        // Delegation must not inherit its parent's conversation attachments,
+        // even when the entire child is polled in the parent's task.
+        let turn = crate::tools::attachment_tools::scope_attachment_owner(None, turn);
 
         // The whole turn runs under one deadline, on top of the provider's
         // own idle deadline — see `SubagentConfig` for what this catches
@@ -2595,6 +2598,54 @@ mod tests {
                 .pop_front()
                 .ok_or_else(|| anyhow::anyhow!("ScriptedProvider script exhausted"))
         }
+    }
+
+    #[tokio::test]
+    async fn owner_scope_is_cleared_in_child_turn() {
+        use crate::tools::attachment_tools::{current_attachment_owner, scope_attachment_owner};
+        struct OwnerCheckingProvider;
+        #[async_trait]
+        impl crate::provider::Provider for OwnerCheckingProvider {
+            fn name(&self) -> &str {
+                "owner-check"
+            }
+            async fn chat(
+                &self,
+                _: Option<&str>,
+                _: &[ChatMessage],
+                _: Option<&[ToolSpec]>,
+            ) -> anyhow::Result<crate::provider::ChatResponse> {
+                assert_eq!(
+                    current_attachment_owner(),
+                    None,
+                    "the entire child turn must be unprivileged"
+                );
+                Ok(text_response("child answer"))
+            }
+        }
+        let tool = SubagentTool::new(defs(), false);
+        let owner = crate::attachment_store::AttachmentOwner {
+            platform: "matrix".into(),
+            room_id: "!padoc:example.org".into(),
+            thread_id: None,
+        };
+        assert_eq!(current_attachment_owner(), None);
+        scope_attachment_owner(Some(owner.clone()), async {
+            let answer = crate::serve::scope_turn_context(
+                turn_context(
+                    crate::serve::ServeState::for_test(false),
+                    std::sync::Arc::new(OwnerCheckingProvider),
+                    Vec::new(),
+                ),
+                tool.execute(&serde_json::json!({"agent":"reviewer", "prompt":"go"})),
+            )
+            .await
+            .unwrap();
+            assert!(answer.contains("child answer"));
+            assert_eq!(current_attachment_owner(), Some(owner));
+        })
+        .await;
+        assert_eq!(current_attachment_owner(), None);
     }
 
     /// A `TurnContext` built by hand rather than through a real parent

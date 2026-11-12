@@ -3,7 +3,35 @@
 The agent's own tools, and the outbound MCP servers in `[[tools.mcp_servers]]`
 (`mcp__<name>__<tool>`), are configured on the host; see
 `crates/sapphire-agent-server/config.example.toml` and the README's "Zed / ACP"
-section. This page covers the one kind of tool that is not configured there.
+section. This page covers attachment and image tools, plus tools supplied by
+an ACP client.
+
+## Attachments and local images
+
+| Tool | Purpose |
+|---|---|
+| `attachment_save(attachment_id, path)` | Save the original bytes of an attachment received in the same Discord / Matrix conversation (including its thread). |
+| `image_read(path)` | Read one JPEG / PNG / GIF / WebP on the agent's machine and return it as an image to the model. |
+
+Both require `tools.host_access.enabled = true` and are unavailable in ACP
+sessions: they never fall back to the agent's filesystem from ACP. `file_read`
+remains text-only. `image_read` accepts workspace-relative, absolute and `~/…`
+paths, with a 32 MiB input limit; images over 5 MiB are shrunk for display
+without modifying the file. Unsupported formats are reported as text.
+
+Discord / Matrix attachments, including non-image files, are automatically
+fetched on receipt. Limits are **32 MiB per file, 8 attachments per post,
+64 MiB per post**, and **1 GiB for the temporary original store**. Accepted
+originals are retained for **7 days**: use the attachment ID in the message's
+note with `attachment_save` before expiry, and supply an explicit destination.
+Saving overwrites an existing destination; saved files are not automatically
+deleted when the temporary original expires.
+
+Capacity shortages, download failures and missing cached originals are
+reported as notes. The original saved by `attachment_save` is separate from
+any resized image shown to the model. These limits do not guarantee a
+streaming memory bound for Matrix: its SDK buffers the whole download before
+the returned size can be checked.
 
 ## Tools a client provides (`acp__…`)
 

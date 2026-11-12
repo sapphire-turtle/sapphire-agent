@@ -1,6 +1,7 @@
+use crate::attachment_store::{AttachmentOwner, AttachmentStore};
 use crate::channel::{
-    Attachment, Channel, IncomingMessage, MAX_DOWNLOAD_BYTES, OutgoingMessage, RoomInfo,
-    dropped_attachment_note, format_mb, prepare_image, with_attachment_notes,
+    Channel, IncomingMessage, MAX_DOWNLOAD_BYTES, OutgoingMessage, RoomInfo,
+    cache_and_prepare_attachment, dropped_attachment_note, with_attachment_notes,
 };
 use crate::config::MatrixConfig;
 use anyhow::{Context, Result};
@@ -13,9 +14,10 @@ use matrix_sdk::{
     ruma::{
         OwnedEventId, OwnedRoomId, OwnedUserId,
         events::relation::{InReplyTo, Reply, Thread},
+        events::room::MediaSource,
         events::room::message::{
-            ImageMessageEventContent, MessageType, OriginalSyncRoomMessageEvent, Relation,
-            RoomMessageEventContent, RoomMessageEventContentWithoutRelation,
+            MessageType, OriginalSyncRoomMessageEvent, Relation, RoomMessageEventContent,
+            RoomMessageEventContentWithoutRelation,
         },
     },
 };
@@ -26,6 +28,7 @@ use tokio::sync::{OnceCell, mpsc};
 use tracing::{debug, info, warn};
 
 pub struct MatrixChannel {
+    attachment_store: Option<Arc<AttachmentStore>>,
     homeserver: String,
     access_token: String,
     user_id: String,
@@ -50,6 +53,7 @@ impl std::fmt::Debug for MatrixChannel {
 impl MatrixChannel {
     pub fn new(cfg: &MatrixConfig) -> Self {
         Self {
+            attachment_store: None,
             homeserver: cfg.homeserver.clone(),
             access_token: cfg.access_token.clone(),
             user_id: cfg.user_id.clone(),
@@ -60,6 +64,11 @@ impl MatrixChannel {
             state_dir: cfg.resolved_state_dir(),
             client: Arc::new(OnceCell::new()),
         }
+    }
+
+    pub fn with_attachment_store(mut self, store: Option<Arc<AttachmentStore>>) -> Self {
+        self.attachment_store = store;
+        self
     }
 
     async fn get_or_init_client(&self) -> Result<&Client> {
@@ -118,45 +127,72 @@ impl MatrixChannel {
     }
 }
 
-/// Download the bytes for a Matrix `m.image` event via the SDK's
-/// authenticated media endpoint, and make them an attachment the provider
-/// takes (see [`prepare_image`]: an image over its limit is shrunk, not
-/// dropped). `Err` says why the image cannot be passed on, for
-/// [`dropped_attachment_note`].
-async fn download_matrix_image(
-    client: &Client,
-    image: &ImageMessageEventContent,
-) -> Result<Attachment, String> {
-    if let Some(size) = image.info.as_ref().and_then(|info| info.size) {
-        let size: u64 = size.into();
-        if size as usize > MAX_DOWNLOAD_BYTES {
-            return Err(format!(
-                "it is {}, over the {} download limit",
-                format_mb(size as usize),
-                format_mb(MAX_DOWNLOAD_BYTES)
-            ));
-        }
-    }
+/// The transport source is transient and never passed to the attachment store.
+struct MatrixMedia {
+    filename: String,
+    caption: String,
+    source: MediaSource,
+    mimetype: Option<String>,
+    size: Option<u64>,
+}
 
+fn matrix_media(msgtype: &MessageType) -> Option<MatrixMedia> {
+    macro_rules! extract {
+        ($media:expr) => {{
+            let media = $media;
+            MatrixMedia {
+                filename: media.filename().to_owned(),
+                caption: media.caption().unwrap_or_default().to_owned(),
+                source: media.source.clone(),
+                mimetype: media.info.as_ref().and_then(|info| info.mimetype.clone()),
+                size: media
+                    .info
+                    .as_ref()
+                    .and_then(|info| info.size)
+                    .map(u64::from),
+            }
+        }};
+    }
+    Some(match msgtype {
+        MessageType::Image(media) => extract!(media),
+        MessageType::File(media) => extract!(media),
+        MessageType::Audio(media) => extract!(media),
+        MessageType::Video(media) => extract!(media),
+        _ => return None,
+    })
+}
+
+fn check_matrix_media_size(size: u64) -> Result<(), String> {
+    if size > MAX_DOWNLOAD_BYTES as u64 {
+        return Err("over the 32 MiB download limit".into());
+    }
+    Ok(())
+}
+
+async fn download_matrix_media(
+    client: &Client,
+    source: MediaSource,
+    size: Option<u64>,
+) -> Result<Vec<u8>, String> {
+    if let Some(size) = size {
+        check_matrix_media_size(size)?;
+    }
     let request = MediaRequestParameters {
-        source: image.source.clone(),
+        source,
         format: MediaFormat::File,
     };
-    let bytes = client
-        .media()
-        .get_media_content(&request, true)
-        .await
-        .map_err(|e| format!("downloading it failed ({e})"))?;
-    if bytes.len() > MAX_DOWNLOAD_BYTES {
-        return Err(format!(
-            "it is {}, over the {} download limit",
-            format_mb(bytes.len()),
-            format_mb(MAX_DOWNLOAD_BYTES)
-        ));
-    }
-    tokio::task::spawn_blocking(move || prepare_image(bytes))
-        .await
-        .map_err(|e| format!("processing it failed ({e})"))?
+    // One event has one attachment, so the 32 MiB per-file bound also meets
+    // the 64 MiB message bound. The SDK buffers the entire decrypted Vec:
+    // these checks do NOT impose a streaming memory limit inside the SDK.
+    let bytes = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        client.media().get_media_content(&request, false),
+    )
+    .await
+    .map_err(|_| "downloading it timed out".to_string())?
+    .map_err(|e| format!("downloading it failed ({e})"))?;
+    check_matrix_media_size(bytes.len() as u64)?;
+    Ok(bytes)
 }
 
 #[async_trait]
@@ -197,6 +233,7 @@ impl Channel for MatrixChannel {
         let allowed_rooms = self.room_ids.clone();
         let allowed_users = self.allowed_users.clone();
         let bot_user_id = self.user_id.clone();
+        let attachment_store = self.attachment_store.clone();
 
         client.add_event_handler({
             let tx = tx.clone();
@@ -205,6 +242,7 @@ impl Channel for MatrixChannel {
                 let allowed_rooms = allowed_rooms.clone();
                 let allowed_users = allowed_users.clone();
                 let bot_user_id = bot_user_id.clone();
+                let attachment_store = attachment_store.clone();
 
                 async move {
                     let room_id_str = room.room_id().as_str().to_string();
@@ -229,6 +267,11 @@ impl Channel for MatrixChannel {
                         }
                     });
 
+                    let owner = AttachmentOwner {
+                        platform: "matrix".into(),
+                        room_id: room_id_str.clone(),
+                        thread_id: thread_id.clone(),
+                    };
                     let reply_to = reply_target(event.content.relates_to.as_ref());
 
                     let (content, attachments) = match &event.content.msgtype {
@@ -240,26 +283,38 @@ impl Channel for MatrixChannel {
                             };
                             (body, Vec::new())
                         }
-                        MessageType::Image(image_content) => {
-                            // The caption is the user's text; without one,
-                            // the message is the image alone.
-                            let caption = image_content
-                                .caption()
-                                .map(str::to_string)
-                                .unwrap_or_default();
-                            match download_matrix_image(&room.client(), image_content).await {
-                                Ok(att) => (caption, vec![att]),
-                                Err(reason) => {
-                                    // Tell the model, so it can tell the user,
-                                    // rather than answer the caption alone.
-                                    let filename = image_content.filename();
-                                    warn!("Matrix image '{filename}' not passed on: {reason}");
-                                    let note = dropped_attachment_note(filename, &reason);
-                                    (with_attachment_notes(caption, &[note]), Vec::new())
+                        media_type => {
+                            let Some(media) = matrix_media(media_type) else {
+                                return;
+                            };
+                            let (inline, notes) = match download_matrix_media(
+                                &room.client(),
+                                media.source,
+                                media.size,
+                            )
+                            .await
+                            {
+                                Ok(bytes) => {
+                                    cache_and_prepare_attachment(
+                                        attachment_store,
+                                        owner.clone(),
+                                        event.event_id.to_string(),
+                                        media.filename.clone(),
+                                        media.mimetype,
+                                        bytes,
+                                    )
+                                    .await
                                 }
-                            }
+                                Err(reason) => (
+                                    None,
+                                    vec![dropped_attachment_note(&media.filename, &reason)],
+                                ),
+                            };
+                            (
+                                with_attachment_notes(media.caption, &notes),
+                                inline.into_iter().collect(),
+                            )
                         }
-                        _ => return,
                     };
 
                     let msg = IncomingMessage {
@@ -270,6 +325,7 @@ impl Channel for MatrixChannel {
                         timestamp: 0,
                         thread_id,
                         attachments,
+                        attachment_owner: Some(owner),
                         reply_to,
                     };
 
@@ -368,6 +424,113 @@ pub fn strip_reply_fallback(body: &str) -> String {
 mod tests {
     use super::*;
     use matrix_sdk::ruma::EventId;
+
+    #[test]
+    fn extracts_all_media_types_and_caption_fallbacks() {
+        for msgtype in ["m.image", "m.file", "m.audio", "m.video"] {
+            let mut value = serde_json::json!({
+                "msgtype": msgtype, "body": "look at this", "filename": "original.bin",
+                "url": "mxc://example.org/source-sentinel",
+                "info": {"mimetype": "application/octet-stream", "size": 123}
+            });
+            let content: RoomMessageEventContent = serde_json::from_value(value.clone()).unwrap();
+            let media = matrix_media(&content.msgtype).unwrap();
+            assert_eq!(media.filename, "original.bin");
+            assert_eq!(media.caption, "look at this");
+            assert_eq!(media.mimetype.as_deref(), Some("application/octet-stream"));
+            assert_eq!(media.size, Some(123));
+            assert!(
+                matches!(media.source, MediaSource::Plain(ref uri) if uri.as_str() == "mxc://example.org/source-sentinel")
+            );
+            value.as_object_mut().unwrap().remove("filename");
+            value.as_object_mut().unwrap().remove("info");
+            let content: RoomMessageEventContent = serde_json::from_value(value).unwrap();
+            let media = matrix_media(&content.msgtype).unwrap();
+            assert_eq!(media.filename, "look at this");
+            assert!(media.caption.is_empty());
+            assert!(media.size.is_none());
+            assert!(media.mimetype.is_none());
+        }
+        assert!(matrix_media(&MessageType::text_plain("text")).is_none());
+    }
+
+    #[test]
+    fn size_check_never_truncates_u64() {
+        assert!(check_matrix_media_size(MAX_DOWNLOAD_BYTES as u64).is_ok());
+        for size in [MAX_DOWNLOAD_BYTES as u64 + 1, u32::MAX as u64 + 1, u64::MAX] {
+            assert!(check_matrix_media_size(size).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn encrypted_source_keys_never_reach_persisted_metadata() {
+        let key = "bWF0cml4LWtleS1zZW50aW5lbCEhISEhISEhISEhISE";
+        let content: RoomMessageEventContent = serde_json::from_value(serde_json::json!({
+            "msgtype": "m.file", "body": "caption", "filename": "original.bin",
+            "file": {
+                "url": "mxc://example.org/source-sentinel", "v": "v2",
+                "key": {"kty": "oct", "key_ops": ["encrypt", "decrypt"], "alg": "A256CTR", "k": key, "ext": true},
+                "iv": "AAAAAAAAAAAAAAAAAAAAAA", "hashes": {"sha256": "aGFzaC1zZW50aW5lbCEhISEhISEhISEhISEhISEhISE"}
+            }
+        })).unwrap();
+        let media = matrix_media(&content.msgtype).unwrap();
+        assert!(matches!(media.source, MediaSource::Encrypted(_)));
+        let dir = tempfile::tempdir().unwrap();
+        let store = AttachmentStore::open(dir.path().to_owned()).unwrap();
+        let (_, notes) = cache_and_prepare_attachment(
+            Some(store),
+            AttachmentOwner {
+                platform: "matrix".into(),
+                room_id: "!room:example.org".into(),
+                thread_id: Some("$thread:example.org".into()),
+            },
+            "$event:example.org".into(),
+            media.filename,
+            media.mimetype,
+            b"original".to_vec(),
+        )
+        .await;
+        assert!(notes[0].contains("Use attachment_save"));
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|e| e == "json") {
+                let json = std::fs::read_to_string(path).unwrap();
+                for secret in [
+                    key,
+                    "matrix-key-sentinel",
+                    "source-sentinel",
+                    "aGFzaC1zZW50aW5lbCEhISEhISEhISEhISEhISEhISE",
+                    "AAAAAAAAAAAAAAAAAAAAAA",
+                ] {
+                    assert!(!json.contains(secret));
+                }
+                let meta: crate::attachment_store::StoredAttachment =
+                    serde_json::from_str(&json).unwrap();
+                assert_eq!(meta.owner.platform, "matrix");
+                assert_eq!(meta.owner.thread_id.as_deref(), Some("$thread:example.org"));
+            }
+        }
+    }
+
+    #[test]
+    fn builder_accepts_optional_store() {
+        let cfg: crate::config::MatrixConfig = toml::from_str(
+            r#"
+            homeserver = "http://localhost"
+            access_token = "unused"
+            user_id = "@bot:example.org"
+            device_id = "unused"
+            room_ids = []
+        "#,
+        )
+        .unwrap();
+        assert!(
+            MatrixChannel::new(&cfg)
+                .with_attachment_store(None)
+                .attachment_store
+                .is_none()
+        );
+    }
 
     fn eid(s: &str) -> OwnedEventId {
         EventId::parse(s).unwrap()
