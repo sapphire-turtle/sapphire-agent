@@ -4433,15 +4433,14 @@ mod tests {
 
         let addr = spawn(state).await;
         let mut ws = connect(&addr).await;
-        for request in [
-            initialize_request(0),
-            load_request(1, &sid),
-            prompt_request(2, &sid, text_prompt("second")),
-        ] {
-            ws.send(Message::Text(request.to_string().into()))
-                .await
-                .unwrap();
-        }
+        send_after_initialize(&mut ws, load_request(1, &sid)).await;
+        ws.send(Message::Text(
+            prompt_request(2, &sid, text_prompt("second"))
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
         loop {
             let Message::Text(t) = next_frame(&mut ws).await else {
                 continue;
