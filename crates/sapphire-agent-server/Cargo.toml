@@ -148,6 +148,16 @@ tower-http = { version = "0.7", default-features = false, features = ["cors"] }
 # Base64 encoding (image attachments → Anthropic API)
 base64 = "0.23"
 
+# Shrinking an image attachment over the provider's 5 MB limit (scale down,
+# re-encode as JPEG) instead of dropping it. Decoders for the four formats
+# the channels pass on, and the JPEG encoder; nothing else.
+image = { version = "0.25", default-features = false, features = [
+    "jpeg",
+    "png",
+    "gif",
+    "webp",
+] }
+
 # SHA-256 for content-addressing voice/config payloads (so satellites
 # can cache the openWakeWord model by hash instead of re-downloading).
 sha2 = "0.11"
