@@ -18,6 +18,8 @@ mod agent;
 mod agents;
 mod ambient;
 mod app_server;
+#[allow(dead_code)] // Wired into the channel in Task 5.
+mod attachment_store;
 mod autonomous;
 mod autonomous_config;
 mod avatar_store;
