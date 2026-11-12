@@ -17,7 +17,7 @@ pub mod workspace_tools;
 use crate::config::McpServerConfig;
 use crate::mcp_client::{self, McpClient, build_tools_for_client};
 use crate::provider::{ToolCall, ToolSpec};
-pub use agent_client_protocol::schema::v1::ToolKind;
+pub use agent_client_protocol::v1::schema::ToolKind;
 use anyhow::Result;
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -196,6 +196,29 @@ impl ToolSet {
         output
     }
 
+    /// Install `client`'s listed tools, replacing any it already has
+    /// here (everything under its `tool_prefix`). The one way a client's
+    /// tools get in: a refresh and a listing that race — an ACP session's
+    /// initial listing (`serve::acp_mcp::ClientMcp`) and a turn's
+    /// `refresh_if_needed` — must leave one copy, not two, or the provider
+    /// is sent duplicate tool names.
+    pub async fn install_client_tools(
+        &self,
+        client: &Arc<McpClient>,
+        remote_tools: Vec<mcp_client::RemoteToolSpec>,
+    ) -> usize {
+        let new_tools = build_tools_for_client(client, remote_tools);
+        let prefix = client.tool_prefix();
+        let mut inner = self.inner.write().await;
+        inner.tools.retain(|t| !t.spec().name.starts_with(&prefix));
+        inner.specs.retain(|s| !s.name.starts_with(&prefix));
+        for tool in new_tools {
+            inner.specs.push(tool.spec().clone());
+            inner.tools.push(Arc::from(tool));
+        }
+        inner.tools.len()
+    }
+
     /// Check all MCP clients for `tools_changed` flags and refresh their
     /// tools if needed.  Should be called before each LLM turn.
     pub async fn refresh_if_needed(&self) {
@@ -213,20 +236,10 @@ impl ToolSet {
     async fn refresh_client_tools(&self, client: &Arc<McpClient>) -> Result<()> {
         info!("MCP '{}': refreshing tool list", client.name());
         let remote_tools = client.list_tools().await?;
-        let new_tools = build_tools_for_client(client, remote_tools);
-        let prefix = format!("mcp__{}__", client.name());
-
-        let mut inner = self.inner.write().await;
-        inner.tools.retain(|t| !t.spec().name.starts_with(&prefix));
-        inner.specs.retain(|s| !s.name.starts_with(&prefix));
-        for tool in new_tools {
-            inner.specs.push(tool.spec().clone());
-            inner.tools.push(Arc::from(tool));
-        }
+        let total = self.install_client_tools(client, remote_tools).await;
         info!(
-            "MCP '{}': tool list refreshed ({} total tools)",
+            "MCP '{}': tool list refreshed ({total} total tools)",
             client.name(),
-            inner.tools.len()
         );
         Ok(())
     }

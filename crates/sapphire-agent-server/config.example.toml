@@ -388,6 +388,7 @@ system_prompt = "You are a helpful personal assistant."
 #     `mcp__<name>__<tool_name>`. Distinct from the inbound MCP
 #     server block above: that lets external AIs call sapphire-agent;
 #     this lets sapphire-agent call external MCP servers.
+#     MCP servers an ACP client provides over ACP need no entry here; see docs/sapphire-agent-tools.md.
 #   - `[tools.admin].room_profiles` — the room profiles whose sessions may
 #     use the config-file management tools (`heartbeat`, `autonomous`,
 #     `agents`), which add and edit the definitions under the workspace

@@ -10,6 +10,10 @@
 //! dead connection is replaced, and how a remote tool becomes a local
 //! [`Tool`].
 
+pub mod acp_transport;
+
+use acp_transport::{AcpMcpTransport, McpOverAcpPeer};
+
 use crate::config::{McpServerConfig, McpTransportConfig, McpTrust};
 use crate::provider::ToolSpec;
 use crate::tools::{Tool, ToolKind};
@@ -50,10 +54,15 @@ pub use rmcp::service::{Subscription, SubscriptionEnd};
 // ---------------------------------------------------------------------------
 
 /// A tool specification retrieved from a remote MCP server.
+#[derive(Debug)]
 pub struct RemoteToolSpec {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
+    /// The server's `ToolAnnotations`, when it sent any. Only the ACP source
+    /// reads them (to pick a [`ToolKind`]); a configured server's kind comes
+    /// from its `trust`.
+    pub annotations: Option<rmcp::model::ToolAnnotations>,
 }
 
 // ---------------------------------------------------------------------------
@@ -84,7 +93,7 @@ impl ClientHandler for AgentClientHandler {
         _context: RequestContext<RoleClient>,
     ) -> Result<ListRootsResult, ErrorData> {
         Ok(ListRootsResult::new(vec![
-            Root::new(format!("file://{}", self.workspace_root)).with_name("workspace"),
+            Root::new(file_uri(&self.workspace_root)).with_name("workspace"),
         ]))
     }
 
@@ -182,13 +191,25 @@ pub trait ToolCallObserver: Send + Sync {
     fn tool_called(&self, tool: &str, result: &CallToolResult);
 }
 
+/// Where a client's server comes from, and so how it is reached.
+enum McpSource {
+    /// An `[[tools.mcp_servers]]` entry: spawned or dialled by the agent.
+    Config(McpServerConfig),
+    /// A server the ACP client provides, reached through `mcp/message` on
+    /// the ACP connection.
+    Acp {
+        server_id: String,
+        peer: Arc<dyn McpOverAcpPeer>,
+    },
+}
+
 /// Client for a single external MCP server.
 ///
 /// Construction does not touch the server; [`Self::connect`] does, and every
 /// call after it reconnects on its own when it finds the connection gone.
 pub struct McpClient {
     name: String,
-    config: McpServerConfig,
+    source: McpSource,
     workspace_root: String,
     connection: RwLock<Option<Arc<Connection>>>,
     /// Set to `true` when the server reports `tools/list_changed`.
@@ -201,11 +222,42 @@ impl McpClient {
     pub fn new(config: &McpServerConfig, workspace_root: &str) -> Self {
         Self {
             name: config.name.clone(),
-            config: config.clone(),
+            source: McpSource::Config(config.clone()),
             workspace_root: workspace_root.to_string(),
             connection: RwLock::new(None),
             tools_changed: Arc::new(AtomicBool::new(false)),
             observer: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// A client for a server the ACP client provides. Never respawns its
+    /// transport once the peer is closed: `open` fails with "ACP connection
+    /// closed".
+    pub fn over_acp(
+        name: &str,
+        server_id: &str,
+        peer: Arc<dyn McpOverAcpPeer>,
+        workspace_root: &str,
+    ) -> Self {
+        Self {
+            name: name.to_string(),
+            source: McpSource::Acp {
+                server_id: server_id.to_string(),
+                peer,
+            },
+            workspace_root: workspace_root.to_string(),
+            connection: RwLock::new(None),
+            tools_changed: Arc::new(AtomicBool::new(false)),
+            observer: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// `mcp__<name>__` for configured servers, `acp__<name>__` for
+    /// ACP-provided ones.
+    pub fn tool_prefix(&self) -> String {
+        match self.source {
+            McpSource::Config(_) => format!("mcp__{}__", self.name),
+            McpSource::Acp { .. } => format!("acp__{}__", self.name),
         }
     }
 
@@ -221,8 +273,14 @@ impl McpClient {
     }
 
     /// How far the operator declared this server's tools to be trusted.
+    ///
+    /// An ACP-provided server has no `trust`; its tools are classified by
+    /// their annotations instead, so this is `None` there and unused.
     pub fn trust(&self) -> McpTrust {
-        self.config.trust
+        match &self.source {
+            McpSource::Config(config) => config.trust,
+            McpSource::Acp { .. } => McpTrust::None,
+        }
     }
 
     /// Check and clear the `tools_changed` flag.
@@ -274,6 +332,7 @@ impl McpClient {
                 name: t.name.into_owned(),
                 description: t.description.map(Cow::into_owned).unwrap_or_default(),
                 input_schema: Value::Object((*t.input_schema).clone()),
+                annotations: t.annotations,
             })
             .collect();
 
@@ -406,6 +465,14 @@ impl McpClient {
     /// Build the transport, negotiate the protocol, and start watching for
     /// tool-list changes.
     async fn open(&self) -> Result<Arc<Connection>> {
+        // An ACP peer speaks only the 2026-07-28 lifecycle and cannot be
+        // redialled: one `Discover` handshake, no `initialize` fallback.
+        if let McpSource::Acp { .. } = &self.source {
+            let discover = ClientLifecycleMode::Discover {
+                preferred_versions: vec![ProtocolVersion::LATEST],
+            };
+            return self.finish_open(self.handshake(discover).await).await;
+        }
         // Prefer the stateless 2026-07-28 lifecycle, falling back to the
         // `initialize` handshake. rmcp's `Auto` mode falls back on its own
         // for a server that rejects `server/discover` (one that ignores it
@@ -427,6 +494,11 @@ impl McpClient {
             }
             other => other,
         };
+        self.finish_open(service).await
+    }
+
+    /// Report the handshake's outcome and start watching the connection.
+    async fn finish_open(&self, service: Result<Service>) -> Result<Arc<Connection>> {
         let service = service.map_err(|e| match e.downcast_ref::<ClientInitializeError>() {
             Some(init) => anyhow!(
                 "MCP '{}': handshake failed: {}",
@@ -462,7 +534,17 @@ impl McpClient {
             workspace_root: self.workspace_root.clone(),
             tools_changed: Arc::clone(&self.tools_changed),
         };
-        let service = match &self.config.transport {
+        let config = match &self.source {
+            McpSource::Config(config) => config,
+            McpSource::Acp { server_id, peer } => {
+                if peer.is_closed() {
+                    return Err(anyhow!("ACP connection closed"));
+                }
+                let transport = AcpMcpTransport::new(Arc::clone(peer), server_id.clone());
+                return Ok(handler.serve_with_lifecycle(transport, lifecycle).await?);
+            }
+        };
+        let service = match &config.transport {
             McpTransportConfig::Http { url, api_key } => {
                 let mut config = StreamableHttpClientTransportConfig::with_uri(url.as_str());
                 if let Some(key) = api_key {
@@ -541,6 +623,33 @@ impl McpClient {
                 subscription.end()
             );
         }))
+    }
+}
+
+/// `path` as a `file:` URI, whichever platform it is a path of: `\` turns
+/// into `/`, a drive path (`C:\work`) becomes `file:///C:/work`, a UNC path
+/// (`\\host\share`) `file://host/share`, and the characters a URI
+/// path cannot carry as they are (`%`, space, `#`, `?`) are escaped. A pure
+/// string conversion: the workspace root of an ACP-sourced client is the
+/// client's cwd, which need not be a path of the agent's own platform.
+fn file_uri(path: &str) -> String {
+    let path = path.replace('\\', "/");
+    let mut escaped = String::with_capacity(path.len());
+    for c in path.chars() {
+        match c {
+            '%' => escaped.push_str("%25"),
+            ' ' => escaped.push_str("%20"),
+            '#' => escaped.push_str("%23"),
+            '?' => escaped.push_str("%3F"),
+            c => escaped.push(c),
+        }
+    }
+    if let Some(unc) = escaped.strip_prefix("//") {
+        format!("file://{unc}")
+    } else if escaped.starts_with('/') {
+        format!("file://{escaped}")
+    } else {
+        format!("file:///{escaped}")
     }
 }
 
@@ -674,16 +783,69 @@ fn kind_for_trust(trust: McpTrust) -> ToolKind {
     }
 }
 
+/// The `ToolKind` a tool's own MCP annotations buy it.
+///
+/// Read-only wins; failing that, an explicit "not destructive" is an edit
+/// (it writes, but nothing is lost); anything else, including no
+/// annotations at all, is `Other`.
+fn kind_for_annotations(annotations: Option<&rmcp::model::ToolAnnotations>) -> ToolKind {
+    match annotations {
+        Some(a) if a.read_only_hint == Some(true) => ToolKind::Read,
+        Some(a) if a.destructive_hint == Some(false) => ToolKind::Edit,
+        _ => ToolKind::Other,
+    }
+}
+
+/// Make `s` safe as one segment of a tool name: every char outside
+/// `[A-Za-z0-9_-]` becomes `_`. Names are not truncated.
+pub(crate) fn sanitize_tool_segment(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 /// Build `McpTool` instances from a connected client's tool list.
+///
+/// A configured server's tools keep their names as they are. A server the
+/// ACP client provides has each name sanitized, and two names that
+/// sanitize alike (`a.b`, `a_b`) would then collide — a duplicate tool name
+/// fails every request to the provider — so the first keeps it and later
+/// ones get `_2`, `_3`… Either way the call goes out under the remote name.
 pub fn build_tools_for_client(
     client: &Arc<McpClient>,
     remote_tools: Vec<RemoteToolSpec>,
 ) -> Vec<Box<dyn Tool>> {
-    let kind = kind_for_trust(client.trust());
+    let acp = matches!(client.source, McpSource::Acp { .. });
+    let trust_kind = kind_for_trust(client.trust());
+    let mut taken = std::collections::HashSet::new();
     remote_tools
         .into_iter()
         .map(|rt| {
-            let tool_name = format!("mcp__{}__{}", client.name(), rt.name);
+            let (segment, kind) = if acp {
+                let base = sanitize_tool_segment(&rt.name);
+                let mut segment = base.clone();
+                let mut n = 2;
+                while !taken.insert(segment.clone()) {
+                    segment = format!("{base}_{n}");
+                    n += 1;
+                }
+                if segment != base {
+                    warn!(
+                        "MCP '{}': tool '{}' sanitizes to a name already taken; listed as '{segment}'",
+                        client.name, rt.name
+                    );
+                }
+                (segment, kind_for_annotations(rt.annotations.as_ref()))
+            } else {
+                (rt.name.clone(), trust_kind)
+            };
+            let tool_name = format!("{}{segment}", client.tool_prefix());
             Box::new(McpTool {
                 client: Arc::clone(client),
                 spec: ToolSpec {
