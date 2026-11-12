@@ -319,7 +319,12 @@ mod tests {
 
     #[tokio::test]
     async fn image_read_expands_tilde_like_file_read() {
-        let home = std::env::var_os("HOME").expect("HOME for tilde expansion");
+        let home = crate::tools::builtin_tools::expand_path("~");
+        assert!(
+            home.is_absolute(),
+            "tilde must resolve to an absolute home: {}",
+            home.display()
+        );
         let dir = tempfile::Builder::new()
             .prefix("sapphire-image-test-")
             .tempdir_in(&home)
@@ -339,6 +344,28 @@ mod tests {
                 .execute(&json!({"path":format!("~/{rel}/text.txt")}))
                 .await
                 .is_ok()
+        );
+    }
+
+    // The 2026-11-12 resolution ruling requires the workspace boundary to
+    // be checked after canonicalization, including symlinks escaping it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn image_read_rejects_symlink_escape_from_workspace() {
+        use std::os::unix::fs::symlink;
+        let external = tempfile::tempdir().unwrap();
+        let image = external.path().join("outside.png");
+        std::fs::write(&image, png(1, 1)).unwrap();
+        let state = test_workspace(false);
+        symlink(&image, state.workspace.root.join("escape.png")).unwrap();
+        let tool = ImageReadTool::new(state);
+        let err = tool
+            .execute_full(&json!({"path": "escape.png"}))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("escapes the workspace"),
+            "{err:#}"
         );
     }
 
