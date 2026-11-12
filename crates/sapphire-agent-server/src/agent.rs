@@ -592,9 +592,9 @@ impl Agent {
         // forced `false` here. That hides the names with no agent-side
         // body — the lifecycle trio and the skill tools, which could
         // otherwise only ever answer "no editor is connected" — while
-        // `host_access_enabled` remains the sole gate on the seven
-        // unified names (`file_read`, `file_write`, `file_append`,
-        // `file_delete`, `dir_list`, `dir_walk`, `shell`), whose
+        // `host_access_enabled` remains the sole gate on the eight
+        // host tools (`file_read`, `file_write`, `file_append`,
+        // `file_delete`, `dir_list`, `dir_walk`, `shell`, `image_read`), whose
         // agent-side bodies are what this transport runs.
         let host_access_enabled = self.config.tools.host_access.enabled;
         let tool_specs = match &self.tools {
@@ -1037,7 +1037,7 @@ mod tests {
     }
 
     /// The hole this permission work closes: with `host_access` **off**
-    /// (the default), `file_read` — like the other six `HOST_TOOLS` —
+    /// (the default), `file_read` — like the other seven `HOST_TOOLS` —
     /// is refused over chat too, not just `Execute`/`Other`. Before
     /// this, `file_write`/`file_delete` (`Edit`/`Delete`) were reachable
     /// from an unasked Discord message; `file_read` sits in the same

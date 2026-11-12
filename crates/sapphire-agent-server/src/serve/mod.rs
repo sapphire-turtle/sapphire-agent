@@ -2387,6 +2387,10 @@ pub(crate) fn visible_tool_predicate(
     client_terminal: bool,
 ) -> impl Fn(&str) -> bool {
     move |name: &str| {
+        // ACP has no image-read request: never fall back to the host.
+        if has_client && name == "image_read" {
+            return false;
+        }
         // The host gate, and the one place #270 changed its meaning:
         // `has_client` is the `routed_to_client` argument. On an ACP turn
         // these calls are going to the *editor's* machine, which this
@@ -6772,6 +6776,7 @@ mod tests {
             "dir_list",
             "dir_walk",
             "shell",
+            "image_read",
             // Skill tools, gated on the same terminal capability.
             "skill",
             "skill_install",
@@ -6833,12 +6838,31 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn image_read_visibility_host_and_acp() {
+        for (host, client, expected) in [
+            (false, false, false),
+            (true, false, true),
+            (false, true, false),
+            (true, true, false),
+        ] {
+            for caps in [false, true] {
+                let visible = visible_tool_predicate(host, client, caps, caps, caps);
+                assert_eq!(
+                    visible("image_read"),
+                    expected,
+                    "host={host} client={client} caps={caps}"
+                );
+            }
+        }
+    }
+
     /// A client that says it can read but not write gets exactly one of
     /// the two file tools. Clients implement these independently, so
     /// the two flags are read separately rather than as one "fs" bit.
     ///
     /// `host_access` is off in the helper: the seven names are
-    /// `HOST_TOOLS`, and an ACP turn must offer them regardless — that
+    /// in `HOST_TOOLS`, and an ACP turn must offer them regardless — that
     /// the deployment-wide switch has no say here is the change #270
     /// makes.
     #[tokio::test]
@@ -6941,9 +6965,13 @@ mod tests {
             false,
         )
         .await;
-        for n in crate::tools::policy::HOST_TOOLS {
+        for n in crate::tools::policy::HOST_TOOLS
+            .iter()
+            .filter(|n| **n != "image_read")
+        {
             assert!(names.contains(&n.to_string()), "missing {n}: {names:?}");
         }
+        assert!(!names.contains(&"image_read".to_string()));
 
         // `fs.read` only: the read half survives, the write half and the
         // terminal-dependent names do not. No fallback to the agent's
@@ -6971,7 +6999,7 @@ mod tests {
         }
     }
 
-    /// Outside an ACP session the same seven names answer to the
+    /// Outside an ACP session all eight host names answer to the
     /// deployment switch and nothing else.
     ///
     /// `dir_list` and `dir_walk` are pinned on their own here because

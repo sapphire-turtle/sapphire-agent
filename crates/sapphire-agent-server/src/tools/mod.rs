@@ -1,6 +1,7 @@
 pub mod acp_client;
 pub mod ambient_tools;
 pub mod ask_human;
+pub mod attachment_tools;
 pub mod avatar_tools;
 pub(crate) mod background_shell;
 pub mod background_tools;
@@ -328,6 +329,7 @@ pub async fn default_tool_set(
     mcp_servers: &[McpServerConfig],
     day_boundary_hour: u8,
 ) -> Arc<ToolSet> {
+    use attachment_tools::ImageReadTool;
     use builtin_tools::*;
     use client_tools::*;
     use session_tools::CurrentTimeTool;
@@ -345,6 +347,7 @@ pub async fn default_tool_set(
         Box::new(WorkspaceSearchTool::new(Arc::clone(&state))),
         Box::new(WorkspaceSyncTool::new(Arc::clone(&state))),
         Box::new(FileReadTool::new(Arc::clone(&state))),
+        Box::new(ImageReadTool::new(Arc::clone(&state))),
         Box::new(FileWriteTool::new(Arc::clone(&state))),
         Box::new(FileAppendTool::new(Arc::clone(&state))),
         Box::new(FileDeleteTool::new(Arc::clone(&state))),
@@ -485,6 +488,7 @@ mod tests {
             ("file_delete", ToolKind::Delete),
             ("file_read", ToolKind::Read),
             ("file_write", ToolKind::Edit),
+            ("image_read", ToolKind::Read),
             ("memory_add", ToolKind::Edit),
             ("memory_append", ToolKind::Edit),
             ("memory_read", ToolKind::Read),
