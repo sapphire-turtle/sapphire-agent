@@ -10,6 +10,42 @@ Changes up to `0.8.0`, when this crate was a binary of its own, are recorded in
 
 ## [Unreleased]
 
+## [0.13.2](https://github.com/sapphire-turtle/sapphire-agent/compare/sapphire-agent-server-v0.13.1...sapphire-agent-server-v0.13.2) - 2026-11-12
+
+### Added
+
+- *(mcp)* An rmcp transport that carries MCP over ACP mcp/message
+- *(mcp)* Run McpClient over ACP and classify its tools by annotations
+- *(acp)* Offer and run per-session tools in a turn
+- *(acp)* Accept client MCP servers over ACP (mcp/message)
+- *(acp)* Keep tool-list subscriptions alive; make client tool names collision-free
+- *(channel)* Cache attachment originals for seven days
+- *(tools)* Read local image files as multimodal results
+- *(tools)* Save conversation-owned attachment originals
+- *(channel)* Receive and cache non-image attachments
+- *(agent)* Scope attachment saving to channel conversations
+
+### Documentation
+
+- *(acp)* Document tools a client provides over MCP over ACP
+- *(tools)* Document attachment retention and image reading
+
+### Fixed
+
+- *(acp)* Wait for client MCP tools only before the first turn, install them once
+- *(channel)* Shrink oversized images and tell the model about dropped attachments
+- *(tools)* Make the image_read tilde check cross-platform
+- *(channel)* Scope the lossless-root test to the platform that can create it
+
+### Testing
+
+- *(acp)* Round-trip a client-provided MCP tool
+- *(acp)* Wait for the initialize reply before sending the next request
+- *(acp)* Wait for the initialize reply in the load-then-prompt test too
+- *(provider)* Pin image tool-result serialization
+
+
+
 ## [0.13.1](https://github.com/sapphire-turtle/sapphire-agent/compare/sapphire-agent-server-v0.13.0...sapphire-agent-server-v0.13.1) - 2026-11-09
 
 ### Added

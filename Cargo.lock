@@ -8271,7 +8271,7 @@ dependencies = [
 
 [[package]]
 name = "sapphire-agent-cli"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -8302,7 +8302,7 @@ dependencies = [
 
 [[package]]
 name = "sapphire-agent-desktop"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "anyhow",
  "bevy",
@@ -8345,7 +8345,7 @@ dependencies = [
 
 [[package]]
 name = "sapphire-agent-headless"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -8354,7 +8354,7 @@ dependencies = [
 
 [[package]]
 name = "sapphire-agent-server"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "a2a-lf",
  "agent-client-protocol",

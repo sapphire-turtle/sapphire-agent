@@ -3,7 +3,7 @@ name = "sapphire-agent-cli"
 # Released together with the two editions that run it, `sapphire-agent-headless`
 # and `sapphire-agent-desktop` (release-plz.toml). Published as the CLI binary
 # up to 0.8.0, so this name resumes at 0.12.0.
-version = "0.13.1"
+version = "0.13.2"
 edition.workspace = true
 description = "The command line of sapphire-agent's two editions, the headless one and the desktop app: its commands, the framework's and its own, which run the agent or talk to it"
 license.workspace = true
@@ -20,7 +20,7 @@ redb-store = ["sapphire-agent-server/redb-store"]
 voice-sherpa = ["sapphire-agent-server/voice-sherpa"]
 
 [dependencies]
-sapphire-agent-server = { path = "../sapphire-agent-server", version = "0.13.1", default-features = false }
+sapphire-agent-server = { path = "../sapphire-agent-server", version = "0.13.2", default-features = false }
 # The local chat protocol and its client, for `chat`.
 sapphire-agent-core = { path = "../sapphire-agent-core", version = "0.12.0" }
 # The framework's verbs (`serve`, `status`, `workspace`, …), which sit beside
