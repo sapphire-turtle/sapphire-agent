@@ -14,6 +14,14 @@ and predate any user-facing release of this binary.
 
 ## [Unreleased]
 
+## [0.13.2](https://github.com/sapphire-turtle/sapphire-agent/compare/v0.13.1...v0.13.2) - 2026-11-12
+
+### Other
+
+- Update Cargo.lock dependencies
+
+
+
 ## [0.13.1](https://github.com/sapphire-turtle/sapphire-agent/compare/v0.13.0...v0.13.1) - 2026-11-09
 
 ### Added
