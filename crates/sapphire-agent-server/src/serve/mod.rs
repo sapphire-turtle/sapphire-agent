@@ -2387,6 +2387,11 @@ pub(crate) fn visible_tool_predicate(
     client_terminal: bool,
 ) -> impl Fn(&str) -> bool {
     move |name: &str| {
+        // Only Agent's channel-owner check may let this tool back in.
+        // RPC, ACP, heartbeat and subagents never gain it from these flags.
+        if name == "attachment_save" {
+            return false;
+        }
         // ACP has no image-read request: never fall back to the host.
         if has_client && name == "image_read" {
             return false;
@@ -6777,6 +6782,7 @@ mod tests {
             "dir_walk",
             "shell",
             "image_read",
+            "attachment_save",
             // Skill tools, gated on the same terminal capability.
             "skill",
             "skill_install",
@@ -6836,6 +6842,15 @@ mod tests {
             .into_iter()
             .map(|s| s.name.to_string())
             .collect()
+    }
+
+    #[test]
+    fn attachment_save_is_hidden_without_channel_override() {
+        for mask in 0..32 {
+            let flag = |bit| mask & (1 << bit) != 0;
+            let visible = visible_tool_predicate(flag(0), flag(1), flag(2), flag(3), flag(4));
+            assert!(!visible("attachment_save"), "flags={mask}");
+        }
     }
 
     #[test]
@@ -6967,11 +6982,12 @@ mod tests {
         .await;
         for n in crate::tools::policy::HOST_TOOLS
             .iter()
-            .filter(|n| **n != "image_read")
+            .filter(|n| !matches!(**n, "image_read" | "attachment_save"))
         {
             assert!(names.contains(&n.to_string()), "missing {n}: {names:?}");
         }
         assert!(!names.contains(&"image_read".to_string()));
+        assert!(!names.contains(&"attachment_save".to_string()));
 
         // `fs.read` only: the read half survives, the write half and the
         // terminal-dependent names do not. No fallback to the agent's
@@ -7018,7 +7034,7 @@ mod tests {
 
         let on = tool_names_for_turn_without_a_client(true).await;
         for n in crate::tools::policy::HOST_TOOLS {
-            assert!(on.contains(&n.to_string()), "{n} should be present");
+            assert_eq!(on.contains(&n.to_string()), *n != "attachment_save", "{n}");
         }
 
         for n in ["shell_start", "shell_output", "shell_kill"] {

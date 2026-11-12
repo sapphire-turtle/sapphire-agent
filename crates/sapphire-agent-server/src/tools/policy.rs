@@ -201,6 +201,7 @@ pub fn refusal_message(tool: &str, why: Refusal) -> String {
 pub const HOST_TOOLS: &[&str] = &[
     "file_read",
     "image_read",
+    "attachment_save",
     "file_write",
     "file_append",
     "file_delete",

@@ -507,6 +507,44 @@ mod tests {
         assert_eq!(got_refs, want);
     }
 
+    // Production registers this only after successful store initialization
+    // (Task 5); the shared registry must retain its edit classification.
+    #[tokio::test]
+    async fn attachment_save_can_be_registered_with_store() {
+        let state = test_workspace();
+        let tools = default_tool_set(Arc::clone(&state), None, &[], 4).await;
+        assert!(
+            !tools
+                .specs_filtered(|_| true)
+                .await
+                .iter()
+                .any(|s| s.name == "attachment_save")
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            crate::attachment_store::AttachmentStore::open(dir.path().join("attachments")).unwrap();
+        tools
+            .register_tool(Box::new(attachment_tools::AttachmentSaveTool::new(
+                store, state,
+            )))
+            .await;
+        assert!(
+            tools
+                .kinds()
+                .await
+                .contains(&("attachment_save".into(), ToolKind::Edit))
+        );
+        assert!(
+            !tools
+                .specs_filtered(crate::serve::visible_tool_predicate(
+                    true, false, false, false, false
+                ))
+                .await
+                .iter()
+                .any(|s| s.name == "attachment_save")
+        );
+    }
+
     /// `mcp_reconnect` is registered only when an MCP server is
     /// configured, so `every_tool_declares_its_kind` never sees it —
     /// and it is the one tool that deliberately relies on the *default*

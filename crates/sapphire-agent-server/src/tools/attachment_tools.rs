@@ -8,8 +8,102 @@ use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use sapphire_framework::workspace::WorkspaceState;
 use serde_json::json;
 
+use crate::attachment_store::{AttachmentOwner, AttachmentStore};
 use crate::provider::ToolSpec;
 use crate::tools::{Tool, ToolKind, ToolOutput};
+
+tokio::task_local! {
+    static ATTACHMENT_OWNER: Option<AttachmentOwner>;
+}
+
+pub fn current_attachment_owner() -> Option<AttachmentOwner> {
+    ATTACHMENT_OWNER.try_with(Clone::clone).ok().flatten()
+}
+
+pub async fn scope_attachment_owner<F: std::future::Future>(
+    owner: Option<AttachmentOwner>,
+    future: F,
+) -> F::Output {
+    ATTACHMENT_OWNER.scope(owner, future).await
+}
+
+pub struct AttachmentSaveTool {
+    store: Arc<AttachmentStore>,
+    state: Arc<WorkspaceState>,
+    spec: ToolSpec,
+}
+
+impl AttachmentSaveTool {
+    pub fn new(store: Arc<AttachmentStore>, state: Arc<WorkspaceState>) -> Self {
+        Self {
+            store,
+            state,
+            spec: ToolSpec {
+                name: "attachment_save".into(),
+                description: "Save an attachment's original bytes from this same conversation. \
+                    Cached originals expire after 7 days. Requires an explicit path; overwrites \
+                    existing files. Requires host_access; agent-side only, unavailable over ACP."
+                    .into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "attachment_id": { "type": "string" },
+                        "path": { "type": "string" }
+                    },
+                    "required": ["attachment_id", "path"],
+                    "additionalProperties": false
+                }),
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for AttachmentSaveTool {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+    fn kind(&self) -> ToolKind {
+        ToolKind::Edit
+    }
+    async fn execute(&self, input: &serde_json::Value) -> Result<String> {
+        anyhow::ensure!(
+            crate::tools::acp_client::current_acp_client().is_none(),
+            "attachment_save is unavailable in ACP sessions; no host fallback is permitted"
+        );
+        let owner =
+            current_attachment_owner().context("attachment_save requires a conversation owner")?;
+        let id = input["attachment_id"]
+            .as_str()
+            .context("missing 'attachment_id'")?
+            .to_owned();
+        let path = crate::tools::builtin_tools::expand_path(
+            input["path"].as_str().context("missing 'path'")?,
+        );
+        crate::tools::builtin_tools::refuse_if_sensitive(
+            &path,
+            Some(&self.state.workspace.root),
+            "Writing to",
+        )?;
+        let store = Arc::clone(&self.store);
+        let state = Arc::clone(&self.state);
+        tokio::task::spawn_blocking(move || -> Result<String> {
+            let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+            // Keep get's indistinguishable unavailable error intact.
+            let (_, bytes) = store.get(&owner, &id, now_ms)?;
+            state
+                .write_bytes(&path, &bytes)
+                .with_context(|| format!("Failed to write '{}'", path.display()))?;
+            Ok(format!(
+                "Saved attachment {id} to {} ({} original bytes).",
+                crate::workspace::slash_path(&path),
+                bytes.len(),
+            ))
+        })
+        .await
+        .context("attachment save task failed")?
+    }
+}
 
 pub struct ImageReadTool {
     state: Arc<WorkspaceState>,
@@ -162,6 +256,330 @@ mod tests {
         let root = dir.path().canonicalize().unwrap();
         std::fs::create_dir_all(root.join(".sapphire-agent")).unwrap();
         Arc::new(WorkspaceState::open(Workspace::from_root(ctx, &root).unwrap()).unwrap())
+    }
+
+    fn owner() -> AttachmentOwner {
+        AttachmentOwner {
+            platform: "matrix".into(),
+            room_id: "!padoc:example.org".into(),
+            thread_id: None,
+        }
+    }
+
+    fn save_fixture() -> (
+        tempfile::TempDir,
+        Arc<AttachmentStore>,
+        Arc<WorkspaceState>,
+        crate::attachment_store::StoredAttachment,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AttachmentStore::open(dir.path().join("store")).unwrap();
+        let meta = store
+            .insert(
+                owner(),
+                "message".into(),
+                "original.pdf".into(),
+                "application/pdf".into(),
+                b"original\0\xff",
+                chrono::Utc::now().timestamp_millis().max(0) as u64,
+            )
+            .unwrap();
+        (dir, store, test_workspace(false), meta)
+    }
+
+    #[tokio::test]
+    async fn attachment_save_copies_original_and_overwrites() {
+        let (_dir, store, state, meta) = save_fixture();
+        let tool = AttachmentSaveTool::new(store.clone(), state.clone());
+        assert_eq!(tool.kind(), ToolKind::Edit);
+        assert_eq!(
+            tool.spec().input_schema,
+            json!({
+                "type":"object", "properties":{"attachment_id":{"type":"string"}, "path":{"type":"string"}},
+                "required":["attachment_id","path"], "additionalProperties":false
+            })
+        );
+        let path = state.workspace.root.join("nested/saved.pdf");
+        assert!(!path.parent().unwrap().exists());
+        let input = json!({"attachment_id":meta.id, "path":"nested/saved.pdf"});
+        assert_eq!(current_attachment_owner(), None);
+        scope_attachment_owner(Some(owner()), async {
+            let expected = format!(
+                "Saved attachment {} to nested/saved.pdf (10 original bytes).",
+                meta.id
+            );
+            assert_eq!(tool.execute(&input).await.unwrap(), expected);
+            assert_eq!(std::fs::read(&path).unwrap(), b"original\0\xff");
+            std::fs::write(&path, b"replace me").unwrap();
+            assert_eq!(tool.execute(&input).await.unwrap(), expected);
+            assert_eq!(std::fs::read(&path).unwrap(), b"original\0\xff");
+        })
+        .await;
+        assert_eq!(current_attachment_owner(), None);
+        assert_eq!(
+            store
+                .get(&owner(), &meta.id, meta.received_at_ms)
+                .unwrap()
+                .0
+                .expires_at_ms,
+            meta.expires_at_ms
+        );
+    }
+
+    #[tokio::test]
+    async fn attachment_save_absolute_tilde_and_workspace_boundary() {
+        let (_dir, store, restricted, meta) = save_fixture();
+        let home = crate::tools::builtin_tools::expand_path("~");
+        assert!(home.is_absolute());
+        let dir = tempfile::Builder::new()
+            .prefix("sapphire-save-test-")
+            .tempdir_in(&home)
+            .unwrap();
+        let path = dir.path().join("saved.pdf");
+        let tilde_path = format!(
+            "~/{}/saved.pdf",
+            crate::workspace::slash_path(dir.path().strip_prefix(&home).unwrap())
+        );
+        let restricted_tool = AttachmentSaveTool::new(store.clone(), restricted);
+        let external_tool = AttachmentSaveTool::new(store, test_workspace(true));
+        scope_attachment_owner(Some(owner()), async {
+            assert!(
+                restricted_tool
+                    .execute(&json!({"attachment_id":meta.id,"path":path}))
+                    .await
+                    .is_err()
+            );
+            assert!(!path.exists());
+            for supplied in [path.to_str().unwrap(), &tilde_path] {
+                let result = external_tool
+                    .execute(&json!({"attachment_id":meta.id,"path":supplied}))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    result,
+                    format!(
+                        "Saved attachment {} to {} (10 original bytes).",
+                        meta.id,
+                        crate::workspace::slash_path(&path)
+                    )
+                );
+                assert_eq!(std::fs::read(&path).unwrap(), b"original\0\xff");
+            }
+        })
+        .await;
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn attachment_save_windows_path_uses_slashes() {
+        let (_dir, store, state, meta) = save_fixture();
+        let tool = AttachmentSaveTool::new(store, state.clone());
+        let result = scope_attachment_owner(
+            Some(owner()),
+            tool.execute(&json!({"attachment_id":meta.id,"path":r"nested\saved.pdf"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result,
+            format!(
+                "Saved attachment {} to nested/saved.pdf (10 original bytes).",
+                meta.id
+            )
+        );
+        assert_eq!(
+            std::fs::read(state.workspace.root.join("nested/saved.pdf")).unwrap(),
+            b"original\0\xff"
+        );
+    }
+
+    #[tokio::test]
+    async fn attachment_save_requires_owner() {
+        let (_dir, store, state, meta) = save_fixture();
+        let tool = AttachmentSaveTool::new(store, state.clone());
+        let err = tool
+            .execute(&json!({"attachment_id":meta.id,"path":"saved"}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("owner"), "{err:#}");
+        assert!(!state.workspace.root.join("saved").exists());
+    }
+
+    #[tokio::test]
+    async fn attachment_save_requires_explicit_string_fields() {
+        let (_dir, store, state, meta) = save_fixture();
+        let tool = AttachmentSaveTool::new(store, state);
+        scope_attachment_owner(Some(owner()), async {
+            for input in [
+                json!({"attachment_id":meta.id}),
+                json!({"path":"saved"}),
+                json!({"attachment_id":42,"path":"saved"}),
+                json!({"attachment_id":meta.id,"path":42}),
+            ] {
+                assert!(
+                    tool.execute(&input)
+                        .await
+                        .unwrap_err()
+                        .to_string()
+                        .contains("missing")
+                );
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn attachment_save_rejects_foreign_owner_and_expired() {
+        let (_dir, store, state, meta) = save_fixture();
+        let tool = AttachmentSaveTool::new(store.clone(), state.clone());
+        let mut owners = vec![owner(); 3];
+        owners[0].platform = "discord".into();
+        owners[1].room_id = "!another:example.org".into();
+        owners[2].thread_id = Some("thread".into());
+        for foreign in owners {
+            assert!(
+                scope_attachment_owner(
+                    Some(foreign),
+                    tool.execute(&json!({"attachment_id":meta.id,"path":"saved"}))
+                )
+                .await
+                .is_err()
+            );
+        }
+        // Test a persisted entry whose expiry is exactly now or earlier.
+        let expired = store
+            .insert(
+                owner(),
+                "m".into(),
+                "old".into(),
+                "text/plain".into(),
+                b"old",
+                0,
+            )
+            .unwrap();
+        assert!(
+            scope_attachment_owner(
+                Some(owner()),
+                tool.execute(&json!({"attachment_id":expired.id,"path":"saved"}))
+            )
+            .await
+            .is_err()
+        );
+        assert!(!state.workspace.root.join("saved").exists());
+    }
+
+    #[tokio::test]
+    async fn attachment_save_unavailable_errors_are_identical() {
+        let (_dir, store, state, meta) = save_fixture();
+        let expired = store
+            .insert(
+                owner(),
+                "m".into(),
+                "old".into(),
+                "text/plain".into(),
+                b"old",
+                0,
+            )
+            .unwrap();
+        let tool = AttachmentSaveTool::new(store, state);
+        let foreign = AttachmentOwner {
+            room_id: "!other:example.org".into(),
+            ..owner()
+        };
+        for (who, id) in [
+            (foreign, meta.id),
+            (owner(), uuid::Uuid::now_v7().to_string()),
+            (owner(), expired.id),
+        ] {
+            let err = scope_attachment_owner(
+                Some(who),
+                tool.execute(&json!({"attachment_id":id,"path":"saved"})),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                format!("{err:#}"),
+                "attachment unavailable in this conversation or expired"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn attachment_save_refuses_sensitive_and_api_keys() {
+        let (_dir, store, state, meta) = save_fixture();
+        let path = state
+            .workspace
+            .root
+            .join(".sapphire-agent/api_keys/blocked");
+        let tool = AttachmentSaveTool::new(store, state);
+        let err = scope_attachment_owner(
+            Some(owner()),
+            tool.execute(&json!({"attachment_id":meta.id,"path":path})),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("API keys"), "{err:#}");
+        assert!(!path.exists());
+    }
+
+    #[cfg(all(unix, not(target_os = "android")))]
+    #[tokio::test]
+    async fn attachment_save_refuses_sensitive_system_path() {
+        let (_dir, store, state, meta) = save_fixture();
+        let tool = AttachmentSaveTool::new(store, state);
+        let err = scope_attachment_owner(
+            Some(owner()),
+            tool.execute(&json!({"attachment_id":meta.id,"path":"/etc/sapphire-attachment-test"})),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("sensitive system path"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn attachment_save_refuses_acp() {
+        let (_dir, store, state, meta) = save_fixture();
+        let fake = Arc::new(FakeClient::default());
+        let tool = AttachmentSaveTool::new(store, state.clone());
+        // ACP refusal wins even when there is no owner or valid input.
+        let err = scope_acp_client(fake.clone(), tool.execute(&json!({})))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("ACP"));
+        let err = scope_attachment_owner(
+            Some(owner()),
+            scope_acp_client(
+                fake.clone(),
+                tool.execute(&json!({"attachment_id":meta.id,"path":"saved"})),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("ACP"));
+        assert!(!state.workspace.root.join("saved").exists());
+        assert!(fake.creates.lock().unwrap().is_empty());
+        assert!(fake.reads.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn attachment_save_owner_scope_is_cleared_in_child() {
+        assert_eq!(current_attachment_owner(), None);
+        scope_attachment_owner(Some(owner()), async {
+            assert_eq!(current_attachment_owner(), Some(owner()));
+            scope_attachment_owner(None, async {
+                assert_eq!(current_attachment_owner(), None);
+            })
+            .await;
+            assert_eq!(current_attachment_owner(), Some(owner()));
+            assert_eq!(
+                tokio::spawn(async { current_attachment_owner() })
+                    .await
+                    .unwrap(),
+                None
+            );
+        })
+        .await;
+        assert_eq!(current_attachment_owner(), None);
     }
 
     fn png(width: u32, height: u32) -> Vec<u8> {
