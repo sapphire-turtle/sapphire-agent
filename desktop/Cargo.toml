@@ -62,7 +62,7 @@ bevy = { version = "0.20", default-features = false, features = [
 # portal, falling back to `zenity`; with neither, rfd only logs and reports
 # "no file picked", which src/file_dialog.rs tells apart from a cancel
 # beforehand. Windows and macOS use their native dialogs whatever the features.
-rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
+rfd = { version = "0.18", default-features = false, features = ["xdg-portal"] }
 
 # Logging
 tracing = "0.1"
