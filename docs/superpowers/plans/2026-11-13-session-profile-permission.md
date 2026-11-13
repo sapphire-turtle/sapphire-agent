@@ -5,7 +5,7 @@
 
 **Goal:** Replace the room-profile/origin×kind permission system with `[session_profile.<n>]` (a session declares its own profile) + `[permission_profile.<n>].tools = [<groups>]` (the allow table), so a turn's allowed set is "groups listed by its permission profile ∧ groups enabled on this host", decided by exactly one function on both turn loops.
 
-**Architecture:** `config.rs` gains `ToolGroup`/`SessionProfileConfig`/`PermissionProfileConfig` and the presets, and stops resolving profiles from a room list: channel configs become `[discord.room1]`-shaped room blocks, and heartbeat/autonomous frontmatter gains `profile` (`room_id` becomes delivery-only). `policy.rs` becomes the single decision function `allow(profile, entry)` over a `ResolvedPermission` + the tool's registration `ToolEntry{group, enabled, kind}`, replacing `decide`/`host_tool_denied`/`kind_of`/`HOST_TOOLS`. `tools/mod.rs` carries `kind` and `group` on `ToolSpec` itself at registration time, registers a group only when `enabled ∧ listed`, and refuses definition-file writes. Definition files stay the `admin` group's land: the fs *write* tools refuse them, the read half keeps reading them.
+**Architecture:** `config.rs` gains `ToolGroup`/`SessionProfileConfig`/`PermissionProfileConfig` and the presets, and is renamed at the same time (`room_profiles` → `session_profiles`), so the rename is what makes Task 1 compile and pass on its own; Task 2 then moves the binding to the declaration side (`[discord.room1]`-shaped room blocks, the four `migration_errors` cases, the per-group `[tools.<group>]` blocks). `policy.rs` becomes the single decision function `allow(profile, entry)` over a `ResolvedPermission` + the tool's registration entry `ToolEntry{group, enabled, kind}`, replacing `decide`/`host_tool_denied`/`kind_of`/`HOST_TOOLS`; the entry is built from `ToolSpec`, which by then carries `kind` and `group` themselves — one source, no name→group table. The definition files stay the `admin` group's land: the fs *write* tools refuse them (on the path the writer will actually open), the read half keeps reading them.
 
 **Tech Stack:** Rust (tokio task-local, serde/toml, async-trait, serde_json), the existing `Config` / `ToolSet` / `Tool` / `TurnLoop` / `TurnContext` machinery, `StubProvider`-based scripted turn tests.
 
@@ -21,18 +21,20 @@
 - Commits are conventional commits, English, each ending with the trailer line `Co-authored-by: Saphina <spph12@sapphire-turtle.org>`.
 - The four group names are literally today's section names: `fs` (the file half of `HOST_TOOLS`), `shell`, `mcp` (`[tools.mcp_servers]` tools + `mcp_reconnect`), `admin` (`heartbeat_config`/`autonomous_config`/`agent_config`/`task_test`). A group's per-group `enabled` key stays **host-only** (`HOST_ONLY_PATHS`); the `tools` listings (permission profiles) are synced config.
 - Registration philosophy is unchanged (decision 4): a group listed by no permission profile and every profile unlisted alike is **not registered at all** — "registered but always refused" makes the model believe a tool exists that cannot work.
-- The always-allowed tools stay **outside** the table (`group: None`): `current_time`, `weather`, `web_search`, `workspace_search`, `workspace_sync`, `skill`+`skill_install`/`skill_update`/`skill_uninstall`, `subagent` (inherits the delegating turn), the memory tools, and everything else the spec does not name — the spec names exactly four groups' members, so anything outside those four lists is not the table's subject. Memory namespace comes from the session profile (`namespace_for_room_profile` → `namespace_for_session_profile`).
+- The always-allowed tools stay **outside** the table (`group: None`): `current_time`, `weather`, `web_search`, `workspace_search`, `workspace_sync`, `skill`+`skill_install`/`skill_update`/`skill_uninstall`, `subagent` (inherits the delegating turn), the memory tools, and everything else the spec does not name — the spec names exactly four groups' members, so anything outside those four lists is not the table's subject. Being outside the table is about the *group* only: `kind` still meets the mode exactly as a grouped tool's does (Task 3's `allow` has no early return). Memory namespace comes from the session profile (`namespace_for_room_profile` → `namespace_for_session_profile`).
 - Migration fails loudly (decision 8): each leftover names the key and stops startup; `room_id` in a heartbeat/autonomous frontmatter keeps parsing, now meaning delivery-only.
 - Routing of the unified names to the editor's machine through ACP capabilities is unchanged (capabilities and groups are orthogonal, R9): an ACP turn with a client is exactly as decided by the editor's capabilities today; `routed_to_client` survives as "this turn's calls land elsewhere", and a turn with no client is decided by the group table alone.
+- The guard reads the path the writer is about to open — `expand_path`'s output (`~/...` already expanded, a relative path already resolved against the root) then `lexically_normalize`'s (a `..` detour collapsed) — the same raw-and-collapsed double comparison `refuse_if_sensitive_in` uses, and it covers every definition file: the `ConfigDir` directories' Markdown *and* the config definition files `PROTECTED_CONFIG_FILES` names.
 
 ## File Structure
 
 | File | Responsibility in this plan |
 |---|---|
-| `server/src/config.rs` | `ToolGroup`, `SessionProfileConfig`, `PermissionProfileConfig`, presets + precedence, per-group `[tools.<group>]` enabled blocks, room blocks on `[discord]`/`[matrix]`, the four `migration_errors` cases, `validate_*`. |
+| `server/src/config.rs` | `ToolGroup`, `SessionProfileConfig` (the rename of `RoomProfileConfig`), `PermissionProfileConfig`, presets + precedence, the per-group `[tools.<group>]` enabled blocks, room blocks on `[discord]`/`[matrix]`, the four `migration_errors` cases, `validate_*`. |
 | `server/src/config_layer.rs` | `HOST_ONLY_PATHS` gains the per-group `[tools.<group>]` paths. |
+| `server/src/provider/mod.rs` | `ToolSpec { name, description, input_schema, kind: ToolKind, group: Option<ToolGroup> }` (`:19-23`). |
 | `server/src/tools/policy.rs` | `Origin` (carries the resolved profile name), `Allow`, `ResolvedPermission`, `ToolEntry`, the single `allow`, `partition_without_asking`. `decide`/`host_tool_denied`/`kind_of`/`HOST_TOOLS` die. |
-| `server/src/tools/mod.rs` | `ToolSpec{kind, group}`; `ToolSet::entries()`; `default_tool_set` registers per group. |
+| `server/src/tools/mod.rs` | `ToolSet::kinds()` → `entries()`; `default_tool_set` registers per group. |
 | `server/src/tools/config_tools.rs` | `current_session_profile()`/`current_permission_profile()`, the refusal naming `permission_profile`, `register_admin_tools`' condition, `definition_owner` (the write guard). |
 | `server/src/tools/builtin_tools.rs` | the fs write tools call the guard; per-spec `kind`+`group` literals. |
 | `server/src/heartbeat_config.rs`, `autonomous_config.rs` | frontmatter gains `profile`; carried onto `HeartbeatTask`/`AutonomousTask`. |
@@ -43,15 +45,16 @@
 
 ---
 
-## Task 1: `ToolGroup`, `SessionProfileConfig`, `PermissionProfileConfig`, presets and precedence
+## Task 1: The types, and the rename that makes them the same field
 
 **Files:**
-- Modify: `crates/sapphire-agent-server/src/config.rs` (new types beside today's `room_profiles`; nothing is renamed yet in this task, so every existing call site and test keeps compiling)
+- Modify: `crates/sapphire-agent-server/src/config.rs` (`room_profiles` → `session_profiles` (`:85`), `RoomProfileConfig` → `SessionProfileConfig` — `rooms`/`api_keys` keep existing for now, so every existing call site and test keeps compiling and passing, and only gain `permission`)
+- Modify (mechanical rename, behaviour unchanged): `tools/config_tools.rs:142,156,172` (`current_admin_room_profile` → `current_session_profile`, plus a `current_permission_profile()` reading it), `serve/mod.rs:3239` + `serve/mod.rs:3301` (the pin `session_room_profiles` → `session_profiles`, `admin_room_profile` → `session_profile`), `serve/acp.rs` (the `namespace_for_room_profile` call sites), `provider/registry.rs:163`, `heartbeat.rs:95`, `agent.rs:279,338,462,776`, `config.example.toml`'s and `templates/workspace/config.toml`'s section names, `README.md`
 - Test: inline `#[cfg(test)] mod tests` of `config.rs`
 
 **Interfaces:**
 - Consumes: nothing (this is the first task).
-- Produces: `ToolGroup{Fs,Shell,Mcp,Admin}` (Copy+Eq), `SessionProfileConfig{profile, memory_namespace, session_policy, permission, voice_pipeline, devices}`, `PermissionProfileConfig{tools}`, `Config::permission_profiles`, `Config::session_profiles` (lands in Task 2 as the rename of `room_profiles`), `Config::permission_profile(&self, name) -> PermissionProfileConfig`, `PermissionProfileConfig::lists(&self, ToolGroup) -> bool`, `Config::group_enabled(&self, ToolGroup) -> bool`, `Config::group_registered(&self, ToolGroup) -> bool` (enabled ∧ listed by at least one effective profile — R7), `Config::session_profile_for(&self, declared: Option<&str>) -> String` (declared wins; absent means the implicit `DEFAULT_PROFILE_NAME`). Task 2-6 depend on exactly these names.
+- Produces: `ToolGroup{Fs,Shell,Mcp,Admin}` (Copy+Eq), `SessionProfileConfig{profile, memory_namespace, session_policy, permission, voice_pipeline, devices}` (as `RoomProfileConfig` was, plus `permission`; `rooms`/`api_keys` are still read by the existing `room_profile_for` until Task 2 retires them), `PermissionProfileConfig{tools}`, `Config::session_profiles`, `Config::permission_profiles`, `Config::session_profile(&self, name) -> Option<&SessionProfileConfig>`, `Config::permission_profile(&self, name) -> PermissionProfileConfig`, `Config::permission_profile_name_for_session(&self, session_profile: &str) -> String` (that profile's `permission`, absent meaning `DEFAULT_PROFILE_NAME`), `PermissionProfileConfig::lists(&self, ToolGroup) -> bool`, `Config::group_registered(&self, ToolGroup) -> bool` (enabled ∧ listed by at least one effective profile — R7), `Config::session_profile_for(&self, declared: Option<&str>) -> String` (declared wins verbatim; absent means the implicit `DEFAULT_PROFILE_NAME`). Tasks 2-6 depend on exactly these names.
 
 - [ ] **Step 1: Write the failing tests** — append to `config.rs`'s `mod tests`, real TOML, no stubs:
 
@@ -67,54 +70,61 @@
         assert_eq!(cfg.permission_profile("default").tools, vec![ToolGroup::Fs, ToolGroup::Mcp]);
         assert!(cfg.permission_profile("chat").tools.is_empty());
         assert!(!cfg.permission_profile("default").lists(ToolGroup::Shell));
-        assert!(cfg.permission_profile("default").lists(ToolGroup::Fs));
         assert!(cfg.permission_profile("default").lists(ToolGroup::Mcp));
     }
 
     /// Decision 3: an operator-written section wins over the built-in preset of the same
     /// name, and the built-in table is the fallback — same shape as the LLM-profile
-    /// resolution.
-    #[test]
-    fn an_operator_permission_profile_overrides_a_preset_of_the_same_name() {
+    /// resolution. And what a session profile's `permission` names is what governs:
+    /// absent means `"default"`, never the session profile's own name guessed at.
+    #[tokio::test]
+    async fn an_operator_permission_profile_overrides_a_preset_and_a_session_names_one() {
         let cfg = Config::parse_for_test(
             "[anthropic]\napi_key = \"test\"\n\n[permission_profile.default]\ntools = [\"shell\"]\n",
         );
         assert_eq!(cfg.permission_profile("default").tools, vec![ToolGroup::Shell]);
-    }
 
-    /// R2/R7: the host key and the listing are two different keys.
-    #[test]
-    fn a_group_is_registered_only_when_enabled_here_and_listed_somewhere() {
-        let cfg = Config::parse_for_test(
-            "[anthropic]\napi_key = \"test\"\n\n[tools.fs]\nenabled = true\n",
-        );
-        // Listed by the `default` preset, and enabled on this host: registered.
-        assert!(cfg.group_registered(ToolGroup::Fs));
-        // Enabled nowhere and listed by nobody (the `chat` preset is empty): not registered.
-        let none = Config::parse_for_test(
-            "[anthropic]\napi_key = \"test\"\n\n[permission_profile.default]\ntools = []\n",
-        );
-        assert!(!none.group_registered(ToolGroup::Admin));
-        assert!(none.group_registered(ToolGroup::Fs));
-    }
-
-    /// A session profile carries `permission`, and absent means `"default"` (decision 3).
-    #[test]
-    fn a_session_profile_section_parses_and_names_its_permission_profile() {
-        let cfg = Config::parse_for_test(
+        let named = Config::parse_for_test(
             "[anthropic]\napi_key = \"test\"\n\n[session_profile.ops]\nprofile = \"dev\"\npermission = \"admin\"\n",
         );
-        let sp = cfg.session_profile("ops").expect("the section parses");
-        assert_eq!(sp.profile, "dev");
-        assert_eq!(sp.permission.as_deref(), Some("admin"));
-        assert_eq!(cfg.session_profile_for(Some("ops")), "ops");
-        assert_eq!(cfg.session_profile_for(None), DEFAULT_PROFILE_NAME);
+        assert_eq!(named.session_profile("ops").expect("the section parses").permission.as_deref(), Some("admin"));
+        // The chain: session profile -> the permission profile its `permission` names.
+        assert_eq!(named.permission_profile_name_for_session("ops"), "admin");
+        let unnamed = Config::parse_for_test(
+            "[anthropic]\napi_key = \"test\"\n\n[session_profile.ops]\nprofile = \"dev\"\n",
+        );
+        assert_eq!(unnamed.permission_profile_name_for_session("ops"), DEFAULT_PROFILE_NAME);
+    }
+
+    /// R2/R7: two different keys. `fs` enabled here and listed by the profile the only
+    /// session profile names: registered. `admin` enabled here and listed by nobody: not
+    /// registered at all (decision 4). And the converse half: listed, off on this host.
+    #[test]
+    fn a_group_is_registered_only_when_enabled_here_and_listed_by_a_profile() {
+        let both = Config::parse_for_test(
+            "[anthropic]\napi_key = \"test\"\n\n\
+             [session_profile.ops]\nprofile = \"dev\"\npermission = \"ops\"\n\
+             [permission_profile.ops]\ntools = [\"fs\"]\n\n[tools.fs]\nenabled = true\n",
+        );
+        assert!(both.group_enabled(ToolGroup::Fs) && both.group_registered(ToolGroup::Fs));
+        assert!(both.permission_lists("ops", ToolGroup::Fs));
+
+        let off = Config::parse_for_test("[anthropic]\napi_key = \"test\"\n");
+        assert!(!off.group_enabled(ToolGroup::Fs));
+        assert!(!off.group_registered(ToolGroup::Fs), "listed by the `default` preset, switched off on this host");
+
+        let unlisted = Config::parse_for_test(
+            "[anthropic]\napi_key = \"test\"\n\n\
+             [session_profile.ops]\nprofile = \"dev\"\npermission = \"chat\"\n\n[tools.admin]\nenabled = true\n",
+        );
+        assert!(unlisted.group_enabled(ToolGroup::Admin));
+        assert!(!unlisted.group_registered(ToolGroup::Admin), "enabled, and the `admin` preset lists it, but no effective profile here does");
     }
 ```
 
 - [ ] **Step 2: Run them to verify they fail** — `cargo test -p sapphire-agent-server config:: 2>&1 | tail -20`. Expected: compile error, `cannot find type \`ToolGroup\` in this scope`.
 
-- [ ] **Step 3: Write the types** — in `config.rs`, beside `SessionPolicy` (`:186`) and the `Config` struct:
+- [ ] **Step 3: Write the types and do the rename** — in `config.rs`, beside `SessionPolicy` (`:186`) and the `Config` struct:
 
 ```rust
 /// One of the four tool groups (decision 4). The names are literally the
@@ -137,7 +147,9 @@ pub struct PermissionProfileConfig {
     pub tools: Vec<ToolGroup>,
 }
 
-/// `[session_profile.<n>]` — what kind of session this is (decision 1).
+/// `[session_profile.<n>]` — what kind of session this is (decision 1). Renamed
+/// from `RoomProfileConfig` in this task; `rooms` and `api_keys` are still read
+/// by `room_profile_for` until Task 2 retires them into the legacy capture.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct SessionProfileConfig {
     /// Name of the LLM profile (`[profiles.<n>]`) driving this profile's turns.
@@ -154,12 +166,13 @@ pub struct SessionProfileConfig {
     pub voice_pipeline: Option<String>,
     #[serde(default)]
     pub devices: Vec<String>,
+    /// Still read by `room_profile_for` until Task 2; not what names a profile.
+    #[serde(default)]
+    pub rooms: Vec<String>,
+    #[serde(default)]
+    pub api_keys: Vec<String>,
 }
-```
 
-and the built-in permission-profile table, exactly as decision 3 writes it:
-
-```rust
 /// The built-in permission profiles: the fallback under an operator section
 /// of the same name. The `default` preset is what a session profile names when
 /// it writes no `permission`, and it lists `fs` and `mcp` — never `shell`,
@@ -177,8 +190,8 @@ and the resolution methods (they keep the LLM-profile resolution's shape — ope
 impl Config {
     /// The permission profile `name` names: the operator's
     /// `[permission_profile.<name>]` when the host wrote one, else the built-in
-    /// preset. `name` is always one of `admin`/`default`/`chat` or an operator key —
-    /// an unknown name is a startup error (Task 2's validation), never a fallback.
+    /// preset. An unknown name is a startup error (Task 2's validation), never a
+    /// silently-chosen preset.
     pub fn permission_profile(&self, name: &str) -> PermissionProfileConfig {
         self.permission_profiles
             .get(name)
@@ -193,20 +206,27 @@ impl Config {
             })
     }
 
-    /// R3: whether `name`'s effective permission profile lists `group`.
-    pub fn permission_lists(&self, name: &str, group: ToolGroup) -> bool {
-        self.permission_profile(name).lists(group)
+    /// The permission profile that governs a turn under session profile `session_profile`:
+    /// that profile's `permission`, absent meaning `"default"`. This is the second half
+    /// of the resolution — the session profile names a permission profile, and the
+    /// permission profile is what decides (decision 3).
+    pub fn permission_profile_name_for_session(&self, session_profile: &str) -> String {
+        self.session_profile(session_profile)
+            .and_then(|sp| sp.permission.clone())
+            .unwrap_or_else(|| DEFAULT_PROFILE_NAME.to_string())
     }
 
-    /// R2: whether this host hands the agent that key (the per-group
-    /// `[tools.<group>]` block, host-only — see `config_layer::HOST_ONLY_PATHS`).
+    /// R3: whether the profile governing a turn under `session_profile` lists `group`.
+    pub fn permission_lists(&self, session_profile: &str, group: ToolGroup) -> bool {
+        let name = self.permission_profile_name_for_session(session_profile);
+        self.permission_profile(&name).lists(group)
+    }
+
+    /// R2: whether this host hands the agent that key. Today every group answers with
+    /// `[tools.host_access].enabled`, the one switch that exists until Task 2 splits it
+    /// into `[tools.<group>]` — a fact about the deployment, not a row in the table.
     pub fn group_enabled(&self, group: ToolGroup) -> bool {
-        match group {
-            ToolGroup::Fs => self.tools.fs.enabled,
-            ToolGroup::Shell => self.tools.shell.enabled,
-            ToolGroup::Mcp => self.tools.mcp.enabled,
-            ToolGroup::Admin => self.tools.admin.enabled,
-        }
+        self.tools.host_access.enabled
     }
 
     /// R7: registered at all ⇔ enabled here ∧ listed by at least one effective
@@ -217,6 +237,24 @@ impl Config {
                 .iter()
                 .any(|p| p.lists(group))
     }
+
+    /// Every profile that decides anything here: every `[permission_profile.<n>]` section,
+    /// plus every built-in preset at least one session profile falls through to.
+    pub(crate) fn effective_permission_profiles(&self) -> Vec<PermissionProfileConfig> {
+        let mut out = self.permission_profiles.values().cloned().collect::<Vec<_>>();
+        for (preset, _) in BUILT_IN_PERMISSION_PROFILES {
+            if self.session_profile(preset).is_none() {
+                out.push(self.permission_profile(preset));
+            }
+        }
+        out
+    }
+
+    /// The session profile `name` names, by name — `room_profile()` (`:1549`) under its
+    /// new name, same body.
+    pub fn session_profile(&self, name: &str) -> Option<&SessionProfileConfig> {
+        self.session_profiles.get(name)
+    }
 }
 
 impl PermissionProfileConfig {
@@ -226,15 +264,15 @@ impl PermissionProfileConfig {
 }
 ```
 
-`effective_permission_profiles()` returns every profile that decides anything here — the presets the session profiles fall through to plus every `[permission_profile.<n>]` section — and lands in Task 2 with the rename; until then it returns the presets' three entries built from `BUILT_IN_PERMISSION_PROFILES` plus the operator sections. `session_profile_for(declared)` is `declored.unwrap_or(DEFAULT_PROFILE_NAME)` (`DEFAULT_PROFILE_NAME` is `config.rs:783`), and `session_profile(name)` is `self.session_profiles.get(name)` — both are the existing `room_profile()`/`room_profile_name_for_room()` (`:1549`, `:1842`) under their new names, which Task 2 renames. The four `Config::tools` group blocks are `ToolGroupConfig { enabled: bool }` (same shape as today's `HostAccess`, `:968`) and `AdminToolsConfig { enabled, .. }`.
+The field rename is `#[serde(default, rename = "session_profile")] pub session_profiles: HashMap<String, SessionProfileConfig>` (`:85`) with every internal reader renamed too (`room_profile_for`→`session_profile_for_room` (`:1537`), `profile_for`→`profile_for_session` (`:1567`), `namespace_for_room_profile`→`namespace_for_session_profile` (`:1949`), `room_profile_name_for_room`→`session_profile_name_for_room` (`:1842`), `namespace_for_room` (`:1958`)); `validate_profiles` (`:1589`) now reports an unknown `permission` target alongside the LLM profile/namespace/voice checks, and `validate_subagent_profiles` (`:1740`) is untouched; `[acp].stdio_room_profile` (`:304`) becomes `stdio_session_profile` and `[cli].room_profile` (`:336`) becomes `profile`; `config_tools_enabled()`/`admin_allows_room_profile()` (`:1827`, `:1855`) keep answering today's `register_admin_tools` until Task 4 replaces their condition with `group_registered(Admin)`. `config.example.toml` and `templates/workspace/config.toml` get their `[room_profile.<n>]` sections renamed to `[session_profile.<n>]` in English (the `rooms` keys stay until Task 2 moves them), and `README.md` names the sections it already names under their new names.
 
-- [ ] **Step 4: Run to verify they pass** — `cargo test -p sapphire-agent-server config:: 2>&1 | tail -15`. Expected: all green, including the pre-existing `room_profile` tests untouched.
+- [ ] **Step 4: Run to verify they pass** — `cargo test -p sapphire-agent-server config:: 2>&1 | tail -15`; then `cargo clippy -p sapphire-agent-server --all-targets 2>&1 | tail -5`. Expected: all green including the pre-existing profile tests (renamed, assertions unchanged), zero warnings.
 
 - [ ] **Step 5: Format and commit**
 
 ```bash
 cargo fmt --all
-git add crates/sapphire-agent-server/src/config.rs
+git add -A
 git commit -m "$(cat <<'EOF'
 feat(config): add ToolGroup and the session/permission profile types
 
@@ -245,17 +283,17 @@ EOF
 
 ---
 
-## Task 2: The rename, the declaration-side binding, and the four migration cases
+## Task 2: The declaration-side binding, the per-group host keys, and the four migration cases
 
 **Files:**
-- Modify: `crates/sapphire-agent-server/src/config.rs` (`room_profiles`→`session_profiles`, `RoomProfileConfig`→`SessionProfileConfig` minus `rooms`/`api_keys`, `MatrixConfig`/`DiscordConfig` room blocks, `ToolsConfig` group blocks, `migration_errors`, `validate_profiles`)
+- Modify: `crates/sapphire-agent-server/src/config.rs` (`MatrixConfig`/`DiscordConfig` room blocks, `SessionProfileConfig` loses `rooms`/`api_keys` into a capture-only `LegacyRoomProfile`, `ToolsConfig`'s per-group blocks replacing `host_access`, `migration_errors`)
 - Modify: `crates/sapphire-agent-server/src/config_layer.rs` (`HOST_ONLY_PATHS`)
-- Modify (mechanical rename only, behaviour unchanged): `tools/config_tools.rs:142,156,172` (`current_admin_room_profile`→`current_session_profile`/`current_permission_profile`, `ROOM_REFUSAL`), `serve/mod.rs:3239` + `serve/mod.rs:3301` (the pin `session_room_profiles`→`session_profiles`, `admin_room_profile`→`session_profile`), `serve/acp.rs` (the `namespace_for_room_profile` call sites), `provider/registry.rs:163`, `heartbeat.rs:95`, `agent.rs:279,338,462,776`, `lib.rs`, `config.example.toml`, `templates/workspace/config.toml`, `README.md`
-- Test: `config.rs`'s `mod tests`, plus the call-site tests named below
+- Modify (mechanical, behaviour unchanged): the `room_ids`/`channel_ids` readers (`MatrixConfig.primary_room_id()`, `serve/acp.rs`), `tools/config_tools.rs`' `ROOM_REFUSAL` wording
+- Test: `config.rs`'s `mod tests`, plus the renamed channel tests
 
 **Interfaces:**
-- Consumes: Task 1's `SessionProfileConfig`/`PermissionProfileConfig`/`Config::permission_profile`.
-- Produces: `Config::session_profile(name) -> Option<&SessionProfileConfig>`; `Config::session_profile_name(&self, declared: Option<&str>, room_id: &str) -> String` (a room's own block wins, else the declared name, else the implicit `"default"`); `Config::profile_for_session(&self, name) -> Option<&str>` (the LLM profile a session profile names), `Config::namespace_for_session_profile(&self, name) -> &str`, `Config::session_policy_for_session(&self, name) -> SessionPolicy`, `Config::validate_session_profiles(&self) -> Vec<String>` and `Config::session_profile_defined(name) -> bool` (R1: an unknown name — explicit or the implicit `default` when the host defines none — fails startup).
+- Consumes: Task 1's `SessionProfileConfig`/`PermissionProfileConfig`/`Config::permission_profile`/`group_enabled`.
+- Produces: `RoomConfig { room_id: String, profile: String, voice_pipeline: Option<String> }`; `MatrixConfig.rooms`/`DiscordConfig.rooms: Vec<RoomConfig>`; `Config::session_profile_name(&self, declared: Option<&str>, room_id: &str) -> String` — an explicit declaration wins **verbatim** (never silently dropped: an unknown name is what `validate_session_profiles` stops startup for, and `Config::session_profile_defined(name) -> bool` is what it reads), else the room block's, else `DEFAULT_PROFILE_NAME`; `Config::group_enabled` now reads the four per-group blocks.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -274,22 +312,35 @@ EOF
         assert_eq!(cfg.session_profile_name(None, "!unlisted:srv"), DEFAULT_PROFILE_NAME);
     }
 
-    /// R1: what ingress resolves and the turn carries is the resolved name only.
+    /// R1: an explicit declaration is carried verbatim — including one this host has no
+    /// section for, which is what `validate_session_profiles` stops startup for. Silently
+    /// falling through to a room's or the implicit profile is what a typo rotting into
+    /// "I granted it but nothing changed" would mean.
     #[test]
-    fn a_declared_profile_wins_and_an_unknown_one_fails_startup() {
+    fn an_explicit_declaration_wins_verbatim_and_an_unknown_one_fails_startup() {
         let cfg = Config::parse_for_test(
-            "[anthropic]\napi_key = \"test\"\n\n[session_profile.ops]\nprofile = \"dev\"\nmemory_namespace = \"user_ops\"\n",
+            "[anthropic]\napi_key = \"test\"\n\n[session_profile.ops]\nprofile = \"dev\"\npermission = \"admin\"\nmemory_namespace = \"user_ops\"\n",
         );
         assert_eq!(cfg.session_profile_name(Some("ops"), "!any:srv"), "ops");
+        assert_eq!(cfg.permission_profile_name_for_session("ops"), "admin");
         assert_eq!(cfg.namespace_for_session_profile("ops"), "user_ops");
-        let errors = cfg.validate_session_profiles();
-        assert!(errors.iter().any(|e| e.contains("references unknown profile 'dev'")), "{errors:?}");
+        assert!(cfg.session_profile_defined("ops"));
+
+        let unknown = Config::parse_for_test("[anthropic]\napi_key = \"test\"\n");
+        // No `[session_profile.default]` on this host, and the name the frontmatter gave is
+        // unknown: carried, and named. The room block does not override an explicit one.
+        assert_eq!(cfg.session_profile_name(Some("opss"), "!any:srv"), "opss");
+        assert!(!unknown.session_profile_defined("opss"));
+        let errors = unknown.validate_session_profiles();
+        assert!(errors.iter().any(|e| e.contains("'opss'") && e.contains("session_profile")), "{errors:?}");
+        // Case 4: resolving to "default" while the host defines none is itself an error.
+        assert!(errors.iter().any(|e| e.contains("no [session_profile.default]")), "{errors:?}");
     }
 
-    /// Decision 8 cases 1, 2, 3 and 4: named, and startup stops.
+    /// Decision 8 cases 1, 2, 3: named, and startup stops.
     #[test]
     fn migration_leftovers_are_named_and_stop_startup() {
-        // Case 1 + 2: a leftover `[room_profile.<n>]`, still carrying `rooms`.
+        // Cases 1 and 2 together: a leftover `[room_profile.<n>]`, still carrying `rooms`.
         let cfg = Config::parse_for_test(
             "[anthropic]\napi_key = \"test\"\n\n[room_profile.ops]\nprofile = \"dev\"\nrooms = [\"!ops:x\"]\n",
         );
@@ -307,13 +358,6 @@ EOF
             .iter()
             .any(|e| e.contains("[tools.admin].room_profiles")
                 && e.contains("permission_profile.<name>.tools")));
-
-        // Case 4: a session resolving to "default" while the host defines none.
-        let cfg = Config::parse_for_test("[anthropic]\napi_key = \"test\"\n\n[discord]\nbot_token = \"t\"\n\n[discord.room1]\nroom_id = \"!a:srv\"\n");
-        assert!(cfg
-            .migration_errors()
-            .iter()
-            .any(|e| e.contains("no [session_profile.default]")));
     }
 
     /// The per-group enabled keys are host-only; `tools.mcp_servers` and the
@@ -322,7 +366,7 @@ EOF
     #[test]
     fn per_group_enabled_stays_host_only_and_the_listings_stay_synced() {
         for group in ["fs", "shell", "mcp", "admin"] {
-            assert!(!config_layer::path_allowed(&["tools", group]));
+            assert!(!config_layer::path_allowed(&["tools", group]), "{group} is a fact about this deployment");
         }
         assert!(config_layer::path_allowed(&["tools", "mcp_servers"]));
         assert!(config_layer::path_allowed(&["permission_profile"]));
@@ -332,24 +376,7 @@ EOF
 
 - [ ] **Step 2: Run to verify it fails** — `cargo test -p sapphire-agent-server config:: 2>&1 | tail -20`. Expected: FAIL (`no field \`rooms\` on \`DiscordConfig\``, `no method named \`session_profile_name\``).
 
-- [ ] **Step 3: Implement the shapes.** `Config::room_profiles` (`:85`) becomes, and the old struct loses `rooms` and `api_keys` (both are now named by `migration_errors`):
-
-```rust
-    /// Session profiles: what kind of session this is — the LLM profile, the memory
-    /// namespace, the session policy, the permission profile. A session declares its
-    /// own profile (decision 1); there is no profile-side room list any more.
-    #[serde(default, rename = "session_profile")]
-    pub session_profiles: HashMap<String, SessionProfileConfig>,
-    /// Removed in this migration; retained only so a config that still sets it fails
-    /// loudly rather than losing its grant silently. Never read otherwise.
-    #[serde(default, rename = "room_profile")]
-    pub legacy_room_profiles: HashMap<String, LegacyRoomProfile>,
-    /// `[permission_profile.<n>]`: which groups a session may use (decision 3).
-    #[serde(default, rename = "permission_profile")]
-    pub permission_profiles: HashMap<String, PermissionProfileConfig>,
-```
-
-with the capture-only old shape (`LegacyRoomProfile { profile, rooms, api_keys }`), and the channel configs (`:1112`, `:1168`):
+- [ ] **Step 3: Implement the shapes.** The channel configs (`:1112`, `:1168`):
 
 ```rust
 /// One room the bot listens to, and the session profile it runs under (decision 2).
@@ -365,35 +392,50 @@ pub struct RoomConfig {
 }
 ```
 
-`MatrixConfig.room_ids`/`DiscordConfig.channel_ids` are replaced by `rooms: Vec<RoomConfig>` (`MatrixConfig.primary_room_id()` becomes `self.rooms.first().map(|r| &r.room_id)`; `allowed_users` stays channel-level — room-level override is out of scope). `ToolsConfig` keeps `tavily_api_key`/`mcp_servers`/`tool_rounds`/`subagent`/`background` and replaces `host_access` with `fs: ToolGroupConfig`, `shell: ToolGroupConfig`, `mcp: ToolGroupConfig`, and `admin: AdminToolsConfig { enabled: bool, room_profiles: Vec<String> /* capture-only */ }`; `HOST_ONLY_PATHS` (`config_layer.rs:51`) gains `&["tools","fs"]`, `&["tools","shell"]`, `&["tools","mcp"]`, `&["tools","admin"]` and loses `&["tools","host_access"]`.
-
-The resolution methods keep today's precedence, now reading the declaration side (`:1537` `room_profile_for`, `:1567` `profile_for`, `:1949` `namespace_for_room_profile`, `:1842` `room_profile_name_for_room`, `:1958` `namespace_for_room`):
+`MatrixConfig.room_ids`/`DiscordConfig.channel_ids` are replaced by `rooms: Vec<RoomConfig>` (`primary_room_id()` becomes `self.rooms.first().map(|r| r.room_id.as_str())`; `allowed_users` stays channel-level — room-level override is out of scope). `SessionProfileConfig` loses `rooms`/`api_keys`, which move to the capture-only `LegacyRoomProfile { profile, rooms, api_keys }` on `Config::legacy_room_profiles` (`#[serde(default, rename = "room_profile")]`) — read by nothing but `migration_errors`, so a config still naming the old section cannot lose its grant silently. `ToolsConfig` keeps `tavily_api_key`/`mcp_servers`/`tool_rounds`/`subagent`/`background` and replaces `host_access` with `fs: ToolGroupConfig`/`shell: ToolGroupConfig`/`mcp: ToolGroupConfig` (`ToolGroupConfig { enabled: bool }`, same shape as today's `HostAccess`, `:968`) and `admin: AdminToolsConfig { enabled: bool, room_profiles: Vec<String> /* capture-only */ }`; `group_enabled` becomes
 
 ```rust
-    /// The session profile a turn runs under: the session's own declared name when it
-    /// has one (a heartbeat/autonomous frontmatter, an ACP pin, a device binding),
-    /// else the `[<channel>.room<n>]` block's, else the implicit `"default"` — the
-    /// same resolution the LLM profile and the memory namespace use, so a room's grant
-    /// cannot disagree with the provider it runs on.
-    pub fn session_profile_name(&self, declared: Option<&str>, room_id: &str) -> String {
-        declared
-            .map(|n| (n, self.session_profile(n).is_some()))
-            .filter(|(_, defined)| *defined)
-            .map(|(n, _)| n.to_string())
-            .or_else(|| {
-                self.channels()
-                    .iter()
-                    .find_map(|(_, room)| (room.room_id == room_id).then(|| room.profile.clone()))
-                    .map(|n| n)
-                    .or_else(|| self.session_profiles.get(DEFAULT_PROFILE_NAME).map(|_| DEFAULT_PROFILE_NAME.to_string()))
-            })
-            .unwrap_or_else(|| DEFAULT_PROFILE_NAME.to_string())
+    /// R2: whether this host hands the agent that key (the per-group `[tools.<group>]`
+    /// block, host-only — see `config_layer::HOST_ONLY_PATHS`).
+    pub fn group_enabled(&self, group: ToolGroup) -> bool {
+        match group {
+            ToolGroup::Fs => self.tools.fs.enabled,
+            ToolGroup::Shell => self.tools.shell.enabled,
+            ToolGroup::Mcp => self.tools.mcp.enabled,
+            ToolGroup::Admin => self.tools.admin.enabled,
+        }
     }
 ```
 
-`profile_for(room_id)`/`namespace_for_room(room_id)` callers (`agent.rs:279,338,462,776`, `heartbeat.rs:95`, `serve/mod.rs:303,1148,1732`, `provider/registry.rs:163`, `serve/acp.rs:1294,1501,1572`) become `profile_for_session(name)`/`namespace_for_session_profile(name)`; `validate_profiles` (`:1589`) validates session profiles (unknown LLM profile, unknown memory namespace, unknown `voice_pipeline`, and the two `permission`-side shapes of Task 1) and `validate_subagent_profiles` (`:1740`) is untouched; `[acp].stdio_room_profile` (`:304`) becomes `stdio_session_profile` and `[cli].room_profile` (`:336`) becomes `profile`; `config_tools_enabled()`/`admin_allows_room_profile()` (`:1827`, `:1855`) die (the `admin`-group gate is `allow()`'s job, Tasks 3-4). `config.example.toml` and `templates/workspace/config.toml` are rewritten in English to `[session_profile.<n>]` + `[permission_profile.<n>]` + `[tools.<group>]`, and `README.md`'s admin-tools section names `permission_profile.<n>.tools`.
+and the resolution, which carries an explicit declaration rather than discarding one:
 
-- [ ] **Step 4: Run everything** — `cargo test -p sapphire-agent-server 2>&1 | tail -15`; then `cargo clippy -p sapphire-agent-server --all-targets 2>&1 | tail -5`. Expected: green, zero warnings; the gate tests renamed in this step pin the same behaviour through the new names.
+```rust
+    /// The session profile a turn runs under: the session's own declared name when it has
+    /// one — a heartbeat/autonomous frontmatter, an ACP pin, a device binding, a
+    /// subagent delegation — else the `[<channel>.room<n>]` block's, else the implicit
+    /// `"default"`. A declared name is carried verbatim: an unknown one is a startup error
+    /// (`validate_session_profiles`), never a silent fall-through to a room's or the implicit
+    /// profile, because a typo would rot into "I granted it but nothing changed".
+    pub fn session_profile_name(&self, declared: Option<&str>, room_id: &str) -> String {
+        if let Some(name) = declared {
+            return name.to_string();
+        }
+        self.channels()
+            .iter()
+            .find_map(|(_, room)| (room.room_id == room_id).then(|| room.profile.clone()))
+            .unwrap_or_else(|| DEFAULT_PROFILE_NAME.to_string())
+    }
+
+    /// R1: whether `name` is defined — the implicit `"default"` when the host defined a
+    /// `[session_profile.default]`, or any section the host wrote.
+    pub fn session_profile_defined(&self, name: &str) -> bool {
+        name != DEFAULT_PROFILE_NAME || self.session_profiles.contains_key(name)
+    }
+```
+
+`session_profile_defined`'s body is `self.session_profiles.contains_key(name) || name == DEFAULT_PROFILE_NAME && self.session_profiles.contains_key(DEFAULT_PROFILE_NAME)` as written in the plan's prose above: an unknown name is `false`, `"default"` is `true` only where the host wrote it. Callers `profile_for(room_id)`/`namespace_for_room(room_id)` (`agent.rs:279,338,462,776`, `heartbeat.rs:95`, `serve/mod.rs:303,1148,1732`, `provider/registry.rs:163`, `serve/acp.rs:1294,1501,1572`) become `profile_for_session(name)`/`namespace_for_session_profile(name)`; `config.example.toml` gains `[permission_profile.<n>]` + `[tools.<group>]` and its channel sections gain room blocks.
+
+- [ ] **Step 4: Run everything** — `cargo test -p sapphire-agent-server 2>&1 | tail -15`; then `cargo clippy -p sapphire-agent-server --all-targets 2>&1 | tail -5`. Expected: green, zero warnings.
 
 - [ ] **Step 5: Format and commit**
 
@@ -410,165 +452,180 @@ EOF
 
 ---
 
-## Task 3: `policy.rs` — the origins carry the resolved name, and one function decides
+## Task 3: `ToolSpec` carries `kind` and `group`; `policy.rs` decides with one function
 
 **Files:**
+- Modify: `crates/sapphire-agent-server/src/provider/mod.rs` (`ToolSpec` gains the two fields, `:19-23`)
+- Modify: every prod `ToolSpec` literal: `tools/builtin_tools.rs`, `tools/workspace_tools.rs`, `tools/session_tools.rs`, `tools/ambient_tools.rs`, `tools/skill_tools.rs`, `tools/attachment_tools.rs`, `tools/background_tools.rs`, `tools/config_tools.rs`, `tools/client_tools.rs`, `tools/subagent.rs`, `mcp_client/mod.rs:740`
 - Modify: `crates/sapphire-agent-server/src/tools/policy.rs` (whole file)
-- Modify (mechanical, call sites only — end-to-end tests land in Task 6): `agent.rs:821-827`, `serve/mod.rs:2674,2692,2852-2920,2382-2410`
-- Test: `policy.rs`'s `mod tests`, `agent.rs`'s gate tests (`:1028-1099`) renamed, `serve/mod.rs`'s existing turn tests
+- Modify (mechanical, call sites only — the end-to-end tests land in Task 6): `agent.rs:821-827`, `serve/mod.rs:2674,2692,2852-2920,2382-2410`
+- Test: `policy.rs`'s `mod tests`, `agent.rs`'s gate tests (`:995-1099`) renamed
 
 **Interfaces:**
-- Consumes: Task 1's `ToolGroup`; Task 2's `Config::session_profile_name`/`permission_profile`/`group_registered`.
-- Produces: `Origin::{Acp { mode: SessionMode, session_profile: String }, Channel { session_profile: String }, Unattended { session_profile: String }}`; `Allow{Allow,Ask,Deny}` (the `Decision`-equivalent the spec's Design names, replacing `Decision`); `ResolvedPermission { name, groups, mode }` with `ResolvedPermission::resolve(&Config, Origin) -> Self` and `lists(&self, ToolGroup) -> bool`; `ToolEntry { name: String, group: Option<ToolGroup>, enabled: bool, kind: ToolKind }` with `ToolEntry::for_tool(name, sp, cfg, kind) -> Self`; `pub fn allow(profile: &ResolvedPermission, entry: &ToolEntry) -> Allow`; `partition_without_asking(&ResolvedPermission, &[ToolCall], &[ToolEntry]) -> (Vec<ToolCall>, Vec<(String,String)>)`. `Origin::Trusted` is replaced by `Unattended` (R1: `/rpc`, voice and A2A sessions are governed by the profile their session belongs to, so they carry a name too).
+- Consumes: Task 1's `ToolGroup`, Task 2's `session_profile_name`/`permission_profile_name_for_session`/`group_registered`.
+- Produces: `ToolSpec { name, description, input_schema, kind: ToolKind, group: Option<ToolGroup> }`; `Origin::{Acp { mode: SessionMode, session_profile: String }, Channel { session_profile: String }, Unattended { session_profile: String }}`; `Allow{Allow,Ask,Deny}` (replacing `Decision`); `ResolvedPermission { name: String, permission: String, groups: Vec<ToolGroup>, mode: Option<SessionMode> }` with `ResolvedPermission::resolve(&Config, Origin) -> Self` and `lists(&self, ToolGroup) -> bool`; `ToolEntry { name: String, group: Option<ToolGroup>, enabled: bool, kind: ToolKind }` with `ToolEntry::from_spec(&ToolSpec, &Config) -> Self`; `pub fn allow(profile: &ResolvedPermission, entry: &ToolEntry) -> Allow`; `partition_without_asking(&ResolvedPermission, &[ToolCall], &[ToolEntry]) -> (Vec<ToolCall>, Vec<(String,String)>)`. `Origin::Trusted` is replaced by `Unattended` (R1: `/rpc`, voice and A2A sessions are governed by the profile their session belongs to, so they carry a name too).
 
 - [ ] **Step 1: Write the failing tests**
 
 ```rust
-    /// R2: the table is a group × permission-profile table, and the mode is what
-    /// decides whether an offered one asks (decision 7).
-    #[test]
-    fn allow_is_the_group_table_and_nothing_else() {
-        let entry = |group, enabled, kind| ToolEntry {
-            name: "x".into(),
-            group: Some(group),
-            enabled,
-            kind,
+    /// R2/R9: the table is group × permission profile, and the mode is what decides
+    /// whether an *offered* one asks, from `kind` — today's `decide` rows, unchanged,
+    /// including for a tool that carries no group.
+    #[tokio::test]
+    async fn allow_is_the_group_table_and_the_mode_row() {
+        let entry = |name: &str, group: Option<ToolGroup>, enabled: bool, kind| ToolEntry {
+            name: name.into(), group, enabled, kind,
         };
-        let default_under_fs = ResolvedPermission {
+        let default_fs = ResolvedPermission {
             name: "default".into(),
+            permission: "default".into(),
             groups: vec![ToolGroup::Fs],
             mode: None,
         };
-        // A chat turn under `default`: the fs tools run unasked, and shell is refused
-        // because no profile named it (decision 3).
-        assert_eq!(allow(&default_under_fs, &entry(ToolGroup::Fs, true, ToolKind::Edit)), Allow::Allow);
-        let chat = ResolvedPermission { name: "chat".into(), groups: vec![], mode: None };
-        assert_eq!(allow(&chat, &entry(ToolGroup::Fs, true, ToolKind::Read)), Allow::Deny);
-        // R9: the mode decides the asking, from `kind`, exactly as `decide` did.
-        let acp_default = ResolvedPermission {
-            name: "default".into(),
-            groups: vec![ToolGroup::Fs],
-            mode: Some(SessionMode::Default),
-        };
-        assert_eq!(allow(&acp_default, &entry(ToolGroup::Fs, true, ToolKind::Read)), Allow::Allow);
-        assert_eq!(allow(&acp_default, &entry(ToolGroup::Fs, true, ToolKind::Edit)), Allow::Ask);
-        assert_eq!(
-            allow(
-                &ResolvedPermission { name: "admin".into(), groups: vec![ToolGroup::Shell], mode: Some(SessionMode::AcceptEdits) },
-                &entry(ToolGroup::Shell, true, ToolKind::Execute),
-            ),
-            Allow::Ask
-        );
-        // R7: a group this host does not hand the agent is refused whatever the profile lists.
-        assert_eq!(allow(&default_under_fs, &entry(ToolGroup::Fs, false, ToolKind::Edit)), Allow::Deny);
+        // A channel turn under `default`: `fs` is listed and enabled here, so it runs unasked.
+        assert_eq!(allow(&default_fs, &entry("file_write", Some(ToolGroup::Fs), true, ToolKind::Edit)), Allow::Allow);
+        // `shell` is refused because no profile named it (decision 3), whatever its kind.
+        assert_eq!(allow(&default_fs, &entry("shell", Some(ToolGroup::Shell), true, ToolKind::Execute)), Allow::Deny);
+        // R2's ∧ half: a group this host does not hand the agent is refused whatever lists it.
+        assert_eq!(allow(&default_fs, &entry("file_write", Some(ToolGroup::Fs), false, ToolKind::Edit)), Allow::Deny);
+
+        // R9: under `default` an offered edit asks; under `accept_edits` it does not, and
+        // only `Execute`/`Other` still do; `bypass` asks nothing.
+        let edits = ResolvedPermission { name: "default".into(), permission: "default".into(), groups: vec![ToolGroup::Fs], mode: Some(SessionMode::Default) };
+        assert_eq!(allow(&edits, &entry("file_write", Some(ToolGroup::Fs), true, ToolKind::Edit)), Allow::Ask);
+        let accepted = ResolvedPermission { mode: Some(SessionMode::AcceptEdits), ..edits.clone() };
+        assert_eq!(allow(&accepted, &entry("file_write", Some(ToolGroup::Fs), true, ToolKind::Edit)), Allow::Allow);
+        assert_eq!(allow(&accepted, &entry("shell", Some(ToolGroup::Shell), true, ToolKind::Execute)), Allow::Ask);
+        let bypass = ResolvedPermission { mode: Some(SessionMode::Bypass), ..edits.clone() };
+        assert_eq!(allow(&bypass, &entry("shell", Some(ToolGroup::Shell), true, ToolKind::Execute)), Allow::Allow);
     }
 
-    /// R4: the always-allowed tools are outside the table's subject — they carry no group.
-    #[test]
-    fn always_allowed_tools_are_not_the_table_subject() {
-        let chat = ResolvedPermission { name: "chat".into(), groups: vec![], mode: None };
-        for kind in [ToolKind::Read, ToolKind::Fetch, ToolKind::Search] {
+    /// R4: the always-allowed tools are outside the table's subject — `enabled` and the
+    /// profile's listing are both beside the point. Their `kind` still meets the mode
+    /// exactly as a grouped tool's does: the old early-return that would have skipped it dies.
+    #[tokio::test]
+    async fn always_allowed_tools_are_outside_the_table() {
+        let chat = ResolvedPermission { name: "chat".into(), permission: "chat".into(), groups: vec![], mode: None };
+        for kind in [ToolKind::Read, ToolKind::Fetch, ToolKind::Search, ToolKind::Think] {
             let entry = ToolEntry { name: "current_time".into(), group: None, enabled: false, kind };
             assert_eq!(allow(&chat, &entry), Allow::Allow, "{kind:?}");
         }
+        // A delegation tool with no group is still asked under a mode that asks.
+        let acp_default = ResolvedPermission { name: "chat".into(), permission: "chat".into(), groups: vec![], mode: Some(SessionMode::Default) };
+        assert_eq!(allow(&acp_default, &ToolEntry { name: "subagent".into(), group: None, enabled: false, kind: ToolKind::Other }), Allow::Ask);
+        assert_eq!(allow(&acp_default, &ToolEntry { name: "memory_read".into(), group: None, enabled: false, kind: ToolKind::Read }), Allow::Allow);
     }
 
-    /// A channel/unattended turn never asks: `partition_without_asking` sees only Allow/Deny.
-    #[test]
-    fn a_channel_turn_partitions_on_allow_alone() {
+    /// A channel turn never asks: the partition sees Allow and Deny only, and every refusal
+    /// names the setting that would change it.
+    #[tokio::test]
+    async fn a_channel_turn_partitions_on_allow_alone() {
         let cfg = Config::parse_for_test(
-            "[anthropic]\napi_key = \"test\"\n\n[tools.fs]\nenabled = true\n[tools.shell]\nenabled = true\n",
+            "[anthropic]\napi_key = \"test\"\n\n\
+             [session_profile.ops]\nprofile = \"dev\"\npermission = \"default\"\n\n\
+             [tools.fs]\nenabled = true\n[tools.shell]\nenabled = true\n",
         );
-        let profile = ResolvedPermission::resolve(&cfg, Origin::Channel { session_profile: cfg.session_profile_name(None, "!a:srv") });
+        // Declared wins verbatim; its `permission` names `default`, and `default` lists fs
+        // and mcp — never shell.
+        let profile = ResolvedPermission::resolve(&cfg, Origin::Channel { session_profile: cfg.session_profile_name(Some("ops"), "!a:srv") });
+        assert_eq!(profile.name, "ops", "the turn carries the session-profile name it came with");
+        assert_eq!(profile.permission, "default", "and the permission profile is what the chain resolves to");
+
         let entries = [
-            ToolEntry::for_tool("file_write", "default", &cfg, ToolKind::Edit),
-            ToolEntry::for_tool("shell", "default", &cfg, ToolKind::Execute),
-            ToolEntry::for_tool("memory_add", "default", &cfg, ToolKind::Edit),
+            ToolEntry { name: "file_write".into(), group: Some(ToolGroup::Fs), enabled: cfg.group_enabled(ToolGroup::Fs), kind: ToolKind::Edit },
+            ToolEntry { name: "shell".into(), group: Some(ToolGroup::Shell), enabled: cfg.group_enabled(ToolGroup::Shell), kind: ToolKind::Execute },
+            ToolEntry { name: "memory_add".into(), group: None, enabled: false, kind: ToolKind::Edit },
         ];
-        let calls = vec![
-            call("c0", "file_write"),
-            call("c1", "shell"),
-            call("c2", "memory_add"),
-        ];
+        let calls: Vec<crate::provider::ToolCall> = [("file_write", "c0"), ("shell", "c1"), ("memory_add", "c2")]
+            .into_iter()
+            .map(|(name, id)| crate::provider::ToolCall { id: id.into(), name: name.into(), input: serde_json::json!({}) })
+            .collect();
+
         let (permitted, refused) = partition_without_asking(&profile, &calls, &entries);
         let kept: Vec<&str> = permitted.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(kept, vec!["file_write", "memory_add"]);
         let name_of = |id: &str| calls.iter().find(|c| c.id == id).map(|c| c.name.clone()).unwrap();
         let blocked: Vec<String> = refused.iter().map(|(id, _)| name_of(id)).collect();
         assert_eq!(blocked, vec!["shell"]);
-        for (_, reason) in &refused {
+        for (id, reason) in &refused {
+            assert!(reason.contains(&name_of(id)), "{reason} names its tool");
             assert!(reason.contains("permission_profile"), "{reason} names the setting to change");
         }
+        assert_eq!(permitted.len() + refused.len(), calls.len());
     }
 ```
 
-- [ ] **Step 2: Run to verify it fails** — `cargo test -p sapphire-agent-server policy:: 2>&1 | tail -20`. Expected: compile error (`unknown type \`Allow\``).
+- [ ] **Step 2: Run to verify it fails** — `cargo test -p sapphire-agent-server policy:: 2>&1 | tail -20`. Expected: compile error (`no field \`group\` on \`ToolSpec\``, `unknown type \`Allow\``).
 
-- [ ] **Step 3: Write the policy.** `Origin` becomes a type that carries the resolved profile name; `Decision`→`Allow`; `decide`, `host_tool_denied`, `HOST_TOOLS`, `kind_of` and the `Trusted` variant die (the `enabled` flag inside `ToolEntry` is what absorbed `host_tool_denied` — "a fact about the deployment, not a row in the table" is kept):
+- [ ] **Step 3: Write the fields and the policy.** `provider::ToolSpec` gains `pub kind: ToolKind` and `pub group: Option<ToolGroup>`; every literal gains both — `file_read`/`dir_list`/`dir_walk`/`image_read` `(their kind, Some(Fs))`, `file_write`/`file_append` `(Edit, Some(Fs))`, `file_delete` `(Delete, Some(Fs))`, `shell` `(Execute, Some(Shell))`, `heartbeat_config`/`autonomous_config`/`agent_config` `(Edit, Some(Admin))`, `task_test` `(Edit, Some(Admin))`, `weather`/`web_search` `(Fetch, None)`, `mcp_reconnect` and `McpTool` `(kind_for_trust(trust)`/`kind_for_annotations`'s kind (`Other` for reconnect, decision 5), Some(Mcp))`, and everything else the four groups do not name `(its kind, None)` — the always-allowed set, `session_list`/`session_read`/`refresh_system_prompt`/`ask_human`/`background_task`/the ambient and avatar tools/the delegation tools included. `Tool::kind()`'s default stays `Other` and **there is no `Tool::group()`**: the group is declared on the spec literal and nowhere else, because "the group decides whether a tool is offered at all" is registration knowledge, not behaviour — a second `group_of(name)` table beside these literals would be a second source of truth. `policy.rs` becomes:
 
 ```rust
 /// The single decision function. Both turn loops build their `Origin`'s resolved
 /// profile and pass it here with the tool's registration entry.
 ///
-/// Allowed ⇔ `profile` lists `group` and `group` is enabled on this host. A
-/// tool outside the table's subject (`group: None`) is always allowed (R4); the
-/// mode decides whether an *offered* one asks, from `kind`, exactly as the old
-/// `decide` row did (decision 7).
+/// Allowed ⇔ `profile` lists `group` and `group` is enabled on this host. A tool
+/// outside the table's subject (`group: None`) is allowed by the table either way (R4) —
+/// what still applies to it is the mode, from `kind`, exactly as today.
 pub fn allow(profile: &ResolvedPermission, entry: &ToolEntry) -> Allow {
-    let Some(group) = entry.group else {
-        return Allow::Allow;
-    };
-    if !entry.enabled || !profile.lists(group) {
+    // A grouped tool is refused when either half of R2's ∧ is missing. An ungrouped
+    // one is the table's subject for neither: `enabled` is a fact about a group, and
+    // there is no group to list it.
+    if entry.group.is_some_and(|g| !entry.enabled || !profile.lists(g)) {
         return Allow::Deny;
     }
     // `Edit`/`Delete`/`Move`/`SwitchMode` are the middle row, `Execute`/`Other` the
-    // strict one, `Read`/`Search`/`Fetch`/`Think` the safe one — grouped so a
-    // `ToolKind` variant added upstream lands in the strict bucket rather than
-    // silently becoming safe.
+    // strict one, `Read`/`Search`/`Fetch`/`Think` the safe one — written so a
+    // `ToolKind` variant added upstream lands in the strict bucket rather than silently
+    // becoming safe.
+    let risky = matches!(entry.kind, ToolKind::Execute | ToolKind::Other);
     let safe = matches!(entry.kind, ToolKind::Read | ToolKind::Search | ToolKind::Fetch | ToolKind::Think);
     match profile.mode {
         None => Allow::Allow,
         Some(SessionMode::Bypass) => Allow::Allow,
         Some(_) if safe => Allow::Allow,
-        Some(SessionMode::AcceptEdits) => Allow::Ask,
+        // Today's rows: `accept_edits` asks for the strict bucket only; `default` asks
+        // for everything not safe.
+        Some(SessionMode::AcceptEdits) if risky => Allow::Ask,
+        Some(SessionMode::AcceptEdits) => Allow::Allow,
         Some(SessionMode::Default) => Allow::Ask,
     }
 }
 
 impl ResolvedPermission {
-    /// One call per turn, at ingress: the origin's session-profile name resolves to the
-    /// permission profile that profile's `permission` names (absent means `"default"`),
-    /// and the ACP asking shape travels with the mode.
+    /// One call per turn, at ingress. Two hops, both reading a config the operator wrote:
+    /// the origin's session-profile name resolves to the permission profile that
+    /// profile's `permission` names (absent means `"default"`), and that permission
+    /// profile is what lists the groups. The ACP asking shape travels with the mode.
     pub fn resolve(config: &Config, origin: Origin) -> Self {
-        match origin {
-            Origin::Acp { mode, session_profile } => Self {
-                groups: config.permission_profile(&session_profile).tools,
-                name: session_profile,
-                mode: Some(mode),
-            },
-            Origin::Channel { session_profile } | Origin::Unattended { session_profile } => Self {
-                groups: config.permission_profile(&session_profile).tools,
-                name: session_profile,
-                mode: None,
-            },
-        }
+        let (name, mode) = match origin {
+            Origin::Acp { mode, session_profile } => (session_profile, Some(mode)),
+            Origin::Channel { session_profile } => (session_profile, None),
+            Origin::Unattended { session_profile } => (session_profile, None),
+        };
+        let permission = config.permission_profile_name_for_session(&name);
+        Self { groups: config.permission_profile(&permission).tools, name, permission, mode }
+    }
+
+    pub fn lists(&self, group: ToolGroup) -> bool {
+        self.groups.contains(&group)
     }
 }
 
 impl ToolEntry {
-    /// What registration knew: this tool's group and this host's flag for it.
-    pub fn for_tool(name: &str, session_profile: &str, config: &Config, kind: ToolKind) -> Self {
+    /// What registration knew, read off the spec the tool was registered with: its group,
+    /// its kind, and this host's flag for that group. There is no name→group table.
+    pub(crate) fn from_spec(spec: &crate::provider::ToolSpec, config: &Config) -> Self {
         Self {
-            group: group_of(name),
-            enabled: group_of(name).is_some_and(|g| config.group_enabled(g)),
-            name: name.to_string(),
-            kind,
+            name: spec.name.to_string(),
+            group: spec.group,
+            kind: spec.kind,
+            enabled: spec.group.is_some_and(|g| config.group_enabled(g)),
         }
     }
 }
 ```
 
-`group_of(name)` is the one name→group table (the four groups' members from this plan's File Structure; `None` for everything else), and `refusal_message` gains a `Refusal::Unavailable` wording that names `permission_profile.<name>.tools` / `[tools.<group>].enabled`. `Origin::Channel` never asks (a channel turn is asynchronous, so blocking it on a human reply could hang for hours); `/rpc`, voice, A2A and the unattended loops arrive as `Unattended { session_profile }` and behave as before. The two call sites become, at this stage, the mechanical shape (`agent.rs:821`: `let profile = ResolvedPermission::resolve(&self.config, Origin::Channel { session_profile: self.config.session_profile_name(None, &incoming.room_id) }); partition_without_asking(&profile, &offered, &entries)`; `serve/mod.rs:2852-2920`: the same `allow` for `Allow::Allow`/`Ask`→`progress.approve`/`Deny`), with `visible_tool_predicate`'s `host_tool_denied` clause reading `group_registered`.
+`decide`, `host_tool_denied`, `HOST_TOOLS`, `kind_of` and the `Trusted` variant die (the `enabled` flag inside `ToolEntry` is what absorbed `host_tool_denied`); `refusal_message`'s `Refusal::Unavailable` wording gains the names it must name — `permission_profile.<profile>.tools` and `[tools.<group>].enabled` — and `Refusal::NotOffered`/`NeedsApproval`/`UserDeclined` keep their wording. The two call sites become, at this stage, the mechanical shape (`agent.rs:821`: `let profile = ResolvedPermission::resolve(&self.config, Origin::Channel { session_profile: self.config.session_profile_name(None, &incoming.room_id) }); let entries = specs.iter().map(|s| ToolEntry::from_spec(s, &self.config)).collect::<Vec<_>>(); partition_without_asking(&profile, &offered, &entries)` — reading today's `specs_filtered`'s `Vec<ToolSpec>` until Task 4's `entries()` replaces `kinds()`; `serve/mod.rs:2852-2920`: the same `allow` for `Allow::Allow`/`Ask`→`progress.approve`/`Deny`), with `visible_tool_predicate`'s `host_tool_denied` clause reading `group_registered` and `has_client`/the capability flags unchanged.
 
 - [ ] **Step 4: Run everything** — `cargo test -p sapphire-agent-server 2>&1 | tail -15` (the renamed `agent.rs` gate tests keep the old assertions' meaning: `file_write` allowed under `default`, `shell` refused, always-allowed tools unaffected). Expected: green.
 
@@ -578,7 +635,7 @@ impl ToolEntry {
 cargo fmt --all
 git add -A
 git commit -m "$(cat <<'EOF'
-refactor(policy)!: decide the group table, one function, on both loops
+refactor(policy)!: carry group and kind on the spec, decide with allow
 
 Co-authored-by: Saphina <spph12@sapphire-turtle.org>
 EOF
@@ -587,40 +644,41 @@ EOF
 
 ---
 
-## Task 4: `ToolSpec` carries `kind` and `group`; registration is per group
+## Task 4: Registration is per group, and the definitions stop being writable through `fs`
 
 **Files:**
-- Modify: `crates/sapphire-agent-server/src/provider/mod.rs` (`ToolSpec` gains the two fields, `:19-23`)
-- Modify: `crates/sapphire-agent-server/src/tools/mod.rs` (`Tool::kind()` stays, `ToolSet::kinds()`→`entries()`, `default_tool_set` (`:318-388`) registers by group)
-- Modify: every prod `ToolSpec` literal in `tools/builtin_tools.rs`, `tools/workspace_tools.rs`, `tools/session_tools.rs`, `tools/ambient_tools.rs`, `tools/skill_tools.rs`, `tools/attachment_tools.rs`, `tools/background_tools.rs`, `tools/config_tools.rs`, `tools/client_tools.rs`, `tools/subagent.rs`, `mcp_client/mod.rs:740`
-- Test: `tools/mod.rs`'s `mod tests` (the `every_tool_declares_its_kind` table, `:481-505`)
+- Modify: `crates/sapphire-agent-server/src/tools/mod.rs` (`ToolSet::kinds()`→`entries()`, `default_tool_set` (`:318-388`) registers by group and gains `config: &Config`)
+- Modify: `crates/sapphire-agent-server/src/tools/builtin_tools.rs` (the three write tools call the guard)
+- Modify: `crates/sapphire-agent-server/src/tools/config_tools.rs` (`definition_owner`, `register_admin_tools`' condition, `test_workspace`)
+- Test: `tools/mod.rs`'s `mod tests`, `config_tools.rs`'s `mod tests`
 
 **Interfaces:**
-- Consumes: `ToolGroup` (Task 1), `ToolEntry`/`ResolvedPermission` (Task 3).
-- Produces: `ToolSpec { name, description, input_schema, kind: ToolKind, group: Option<ToolGroup> }`; `ToolSet::entries(&self) -> Vec<(String, ToolEntry)>`; `config_tools::definition_owner(&Path) -> Option<&'static str>` (the write guard, R6); `register_admin_tools`' condition `config.group_registered(ToolGroup::Admin)` (the `[tools.admin]` philosophy is kept — *not registered at all*).
+- Consumes: `ToolSpec{kind, group}`/`ToolEntry::from_spec` (Task 3), `Config::group_registered` (Tasks 1-2).
+- Produces: `ToolSet::entries(&self) -> Vec<(String, ToolEntry)>`; `default_tool_set(state, tavily_api_key, mcp_servers, day_boundary_hour, config: &Config)`; `config_tools::definition_owner(abs: &Path, workspace_root: &Path) -> Option<&'static str>` (the write guard, R6); `register_admin_tools`' condition `config.group_registered(ToolGroup::Admin)` (the `[tools.admin]` philosophy is kept — *not registered at all*).
 
 - [ ] **Step 1: Write the failing tests**
 
 ```rust
-    /// Decision 4/7: every tool is registered with the group that decides whether it
-    /// is offered at all, and the kind that drives the mode's asking. A tool added
-    /// without a `group` lands outside the table — so does one added without a
-    /// `kind`, in `Other`, the strictest bucket.
+    /// Decision 4/7: every tool is registered with the group that decides whether it is
+    /// offered at all, and the kind that drives the mode's asking. A tool added without a
+    /// `group` lands outside the table — so does one added without a `kind`, in `Other`,
+    /// the strictest bucket.
     #[tokio::test]
     async fn every_tool_declares_its_group_and_kind() {
-        let tools = default_tool_set(test_workspace(), Some("test-tavily-key".to_string()), &[], 4).await;
-        let mut entries = tools.entries().await;
-        entries.sort();
-        let want = [
-            ("file_append", ToolKind::Edit, ToolGroup::Fs),
-            ("file_delete", ToolKind::Delete, ToolGroup::Fs),
-            ("file_read", ToolKind::Read, ToolGroup::Fs),
-            ("file_write", ToolKind::Edit, ToolGroup::Fs),
-            ("dir_list", ToolKind::Search, ToolGroup::Fs),
-            ("dir_walk", ToolKind::Search, ToolGroup::Fs),
-            ("image_read", ToolKind::Read, ToolGroup::Fs),
-            ("shell", ToolKind::Execute, ToolGroup::Shell),
-            ("mcp_reconnect", ToolKind::Other, ToolGroup::Mcp),
+        let cfg = Config::parse_for_test("[anthropic]\napi_key = \"test\"\n");
+        let tools = default_tool_set(test_workspace(), Some("test-tavily-key".to_string()), &[], 4, &cfg).await;
+        let entries = tools.entries().await;
+        let want: Vec<(&str, ToolKind, Option<ToolGroup>)> = vec![
+            ("file_append", ToolKind::Edit, Some(ToolGroup::Fs)),
+            ("file_delete", ToolKind::Delete, Some(ToolGroup::Fs)),
+            ("file_read", ToolKind::Read, Some(ToolGroup::Fs)),
+            ("file_write", ToolKind::Edit, Some(ToolGroup::Fs)),
+            ("dir_list", ToolKind::Search, Some(ToolGroup::Fs)),
+            ("dir_walk", ToolKind::Search, Some(ToolGroup::Fs)),
+            ("image_read", ToolKind::Read, Some(ToolGroup::Fs)),
+            ("shell", ToolKind::Execute, Some(ToolGroup::Shell)),
+            ("mcp_reconnect", ToolKind::Other, Some(ToolGroup::Mcp)),
+            ("task_test", ToolKind::Edit, Some(ToolGroup::Admin)),
             ("current_time", ToolKind::Read, None),
             ("memory_add", ToolKind::Edit, None),
             ("workspace_search", ToolKind::Search, None),
@@ -634,42 +692,65 @@ EOF
         }
     }
 
-    /// R6: the definition files are the `admin` group's land — modifiable only by the
-    /// dedicated tool that owns them; the read half keeps reading them.
+    /// R6: every definition file is the `admin` group's land — modifiable only by the
+    /// dedicated tool that owns it, on every spelling the writer will open it with.
     #[tokio::test]
     async fn a_fs_write_tool_refuses_a_definition_file_naming_its_owner() {
         let (_, root, ws) = config_tools::test_workspace();
-        let write = FileWriteTool::new(Arc::clone(&ws));
-        let err = write.execute(&json!({"path": "<root>/heartbeat/morning_call.md"})).await.unwrap_err();
-        assert!(err.to_string().contains("heartbeat_config"), "{err}");
-        assert_eq!(config_tools::definition_owner(Path::new("heartbeat/morning_call.md")), Some("heartbeat_config"));
-        assert_eq!(config_tools::definition_owner(Path::new("autonomous/journal.md")), Some("autonomous_config"));
-        assert_eq!(config_tools::definition_owner(Path::new("agents/reviewer.md")), Some("agent_config"));
-        assert_eq!(config_tools::definition_owner(Path::new("MEMORY.md")), None);
+        std::fs::create_dir_all(root.join("heartbeat")).unwrap();
+        std::fs::write(&root.join("heartbeat/morning_call.md"), "---\n---\n\nold\n").unwrap();
+        let write = crate::tools::builtin_tools::FileWriteTool::new(Arc::clone(&ws));
+        // The path the writer opens is what is compared: `expand_path`'s output (so a
+        // `~/...` and a workspace-relative one are the same file to it) and
+        // `lexically_normalize`'s (so `nope/../` and `./` and a `..` detour are).
+        for spelling in [
+            format!("heartbeat/morning_call.md"),
+            format!("./heartbeat/./morning_call.md"),
+            format!("nope/../heartbeat/../heartbeat/morning_call.md"),
+            root.join("heartbeat/morning_call.md").to_string_lossy().to_string(),
+        ] {
+            let err = write.execute(&json!({"path": spelling, "content": "new"})).await.unwrap_err();
+            assert!(err.to_string().contains("heartbeat_config"), "{spelling} -> {err}");
+        }
+        // The config definition files are covered too, by the same comparison.
+        assert!(write.execute(&json!({"path": ".sapphire-agent/config.toml", "content": ""})).await.is_err());
+        // And the read half keeps reading them — reading one's own task is not a rewrite risk.
+        let read = crate::tools::builtin_tools::FileReadTool::new(Arc::clone(&ws));
+        assert!(read.execute(&json!({"path": "heartbeat/morning_call.md"})).await.unwrap().contains("old"));
     }
 ```
 
-- [ ] **Step 2: Run to verify it fails** — `cargo test -p sapphire-agent-server tools:: 2>&1 | tail -20`. Expected: compile error (`no field \`group\` on \`ToolSpec\``).
+- [ ] **Step 2: Run to verify it fails** — `cargo test -p sapphire-agent-server tools:: 2>&1 | tail -20`. Expected: FAIL (`no method named \`entries\``, `no field \`config\` on default_tool_set`).
 
-- [ ] **Step 3: Implement.** `provider::ToolSpec` gains `pub kind: ToolKind` and `pub group: Option<ToolGroup>` (every literal in the inventory gains both — the ones named in the table above plus `weather`/`web_search` → `(Fetch, None)`, `recall_image`/`attachment_save` → per R4 outside the table, `session_list`/`session_read`/`refresh_system_prompt`/`ask_human`/`background_task`/the 3 ambient and 3 avatar tools → `(kind, None)`, `skill_install`/`skill_update`/`skill_uninstall`/`transcript_read`/`speaker_*` → `(kind, None)`, `heartbeat_config`/`autonomous_config`/`agent_config`/`task_test` → `(Edit, Admin)`); `McpTool`'s and `McpReconnectTool`'s come from `kind_for_trust(trust)` (`mcp_client/mod.rs:778`) and `kind_for_annotations` at registration, group `Mcp` (decision 5 — `mcp_reconnect` stays `Other` and is therefore asked under an ACP mode that asks); `Tool::kind()`'s default stays `Other`, `Tool::group()` is not a method — the group is declared on the spec literal, because "the group decides whether a tool is offered at all" is registration knowledge, not behaviour. `default_tool_set` builds its `Vec<Box<dyn Tool>>` from the groups it was handed (`enabled ∧ registered-somewhere`, same shape as today's "registered when the tavily key exists") and gains `permission_profiles: &Config` so `group_registered` answers it; the guard:
+- [ ] **Step 3: Implement.** `ToolSet::entries()` is today's `kinds()` (`:139`) with the group read off the same spec — `self.specs.iter().map(|s| (s.name.to_string(), ToolEntry::from_spec(s, &self.config))).collect()` — and `default_tool_set` builds its `Vec<Box<dyn Tool>>` from the groups it was handed (`group_registered`, same shape as today's "registered when the tavily key exists"; `register_admin_tools` (`config_tools.rs:947`) keeps its own loop over `ConfigDir::ALL` and its own early return on `config.group_registered(ToolGroup::Admin)`). The guard:
 
 ```rust
-/// Which dedicated tool owns `rel`'s definition file, `None` for a file that is not
-/// a definition. The fs tools' *write* half refuses what this names (decision 6):
-/// a heartbeat session cannot rewrite its own definitions through `fs`, and an
-/// unattended task that writes no `profile` has neither `admin` nor `shell` to go
-/// around the dedicated tools with. The read half keeps reading them — reading one's
-/// own task is not a rewrite risk.
-pub(crate) fn definition_owner(rel: &Path) -> Option<&'static str> {
-    let dir = rel.iter().next()?.to_str()?.to_string();
-    ConfigDir::ALL
-        .iter()
-        .find(|d| d.dir_name() == dir.as_str() && rel.extension().is_some_and(|e| e == "md"))
-        .map(|d| d.tool_name())
+/// Which dedicated tool owns the definition file `abs` is, `None` for a file that is not
+/// a definition. `abs` is the path the writer is about to open — `expand_path` already
+/// applied, `lexically_normalize` already collapsed — and the comparison is the same
+/// raw-and-collapsed pair `refuse_if_sensitive_in` uses, so no spelling of a definition
+/// file slips through: a `~/...`, an absolute path, a `./`, and a `nope/../` detour
+/// all name the same file. Covers the `ConfigDir` directories' Markdown *and* the config
+/// definition files (`PROTECTED_CONFIG_FILES`) — R6 names both.
+pub(crate) fn definition_owner(abs: &Path, workspace_root: &Path) -> Option<&'static str> {
+    let raw = abs.to_string_lossy().to_string();
+    let collapsed = lexically_normalize(abs).to_string_lossy().to_string().replace('\\', "/");
+    for candidate in [&raw, &collapsed] {
+        let rel = Path::new(candidate.as_str()).strip_prefix(workspace_root).ok()?;
+        if rel.extension().is_some_and(|e| e.eq_ignore_ascii_case("md"))
+            && let Some(dir) = ConfigDir::ALL.iter().find(|d| d.dir_name() == rel.iter().next()?.to_str()?)
+        {
+            return Some(dir.tool_name());
+        }
+        if PROTECTED_CONFIG_FILES.iter().any(|f| rel.file_name().is_some_and(|n| n == **f)) {
+            return Some("the config definition file");
+        }
+    }
+    None
 }
 ```
 
-called from `FileWriteTool::execute`/`FileAppendTool::execute`/`FileDeleteTool::execute` (and `ShellTool` needs nothing: under `default` it is not listed, so it is not offered).
+called right after each write tool's existing `let path = expand_path(path_str);` and `refuse_if_sensitive(..)?`, from `FileWriteTool::execute`/`FileAppendTool::execute`/`FileDeleteTool::execute`, with `bail!("{verb} '{path}' is a definition file, owned by {owner}: use it.")`; `ShellTool` needs nothing (under `default` it is not listed, so it is not offered).
 
 - [ ] **Step 4: Run everything** — `cargo test -p sapphire-agent-server 2>&1 | tail -15`; `cargo clippy -p sapphire-agent-server --all-targets 2>&1 | tail -5`. Expected: green, zero warnings.
 
@@ -679,7 +760,7 @@ called from `FileWriteTool::execute`/`FileAppendTool::execute`/`FileDeleteTool::
 cargo fmt --all
 git add -A
 git commit -m "$(cat <<'EOF'
-feat(tools)!: carry kind and group at registration, guard the definitions
+feat(tools)!: register by group, guard the definitions on the opened path
 
 Co-authored-by: Saphina <spph12@sapphire-turtle.org>
 EOF
@@ -722,7 +803,7 @@ EOF
 
 - [ ] **Step 2: Run to verify it fails** — `cargo test -p sapphire-agent-server heartbeat 2>&1 | tail -20`. Expected: FAIL (`no field \`profile\``).
 
-- [ ] **Step 3: Implement.** `validate_task_profiles` reports every task profile that names no defined session profile (the two loaders' `deny_unknown_fields`/`warn!`-skip shape unchanged); `heartbeat.rs`'s `DueTask` gains `profile: Option<String>` and `fire_task` hands the task's name plus the resolved profile to the turn it builds (`Heartbeat`'s chat leg goes through `Agent::trigger(name, prompt, room_id, profile)`, and the ACP/autonomous leg through `run_llm_turn`'s pin clone); `lib.rs`'s startup keeps `validate_profiles`' renamed twin and adds `validate_session_profiles` for the frontmatter/room-block names, and every `default_tool_set`/`register_tool` call site passes the config so `group_registered` answers it — the session tools (`lib.rs:1140-1160`) and `register_admin_tools` (`:1129`) included, so an `admin` group named by nobody registers none of the four.
+- [ ] **Step 3: Implement.** `validate_task_profiles` reports every task profile that names no defined session profile (`!cfg.session_profile_defined(name)`, the two loaders' `deny_unknown_fields`/`warn!`-skip shape unchanged); `heartbeat.rs`'s `DueTask` gains `profile: Option<String>` and `fire_task` hands the task's name plus the resolved profile to the turn it builds (`Heartbeat`'s chat leg goes through `Agent::trigger(name, prompt, room_id, profile)`, and the ACP/autonomous leg through `run_llm_turn`'s pin clone); `lib.rs`'s startup keeps `validate_profiles`' renamed twin and adds `validate_session_profiles` for the frontmatter/room-block names, and every `default_tool_set`/`register_tool` call site passes the config so `group_registered` answers it — the session tools (`lib.rs:1140-1160`) and `register_admin_tools` (`:1129`) included, so an `admin` group named by nobody registers none of the four.
 
 - [ ] **Step 4: Run everything** — `cargo test -p sapphire-agent-server 2>&1 | tail -15`. Expected: green.
 
@@ -744,77 +825,180 @@ EOF
 ## Task 6: Both loops through the one function, end to end
 
 **Files:**
-- Modify: `crates/sapphire-agent-server/src/agent.rs:776` (`IncomingMessage`'s room + any declared profile → `Origin::Channel { session_profile }`, `partition_without_asking(&profile, ..)` — `ns` from `namespace_for_session_profile`)
-- Modify: `crates/sapphire-agent-server/src/serve/mod.rs` (`run_llm_turn`'s pin clone → `Origin::Acp { mode, session_profile }` / `Origin::Unattended { session_profile }`; `TurnContext`/`TurnLoop` field `session_profile`; `TurnLoop::run`'s gate calls `allow`; `visible_tool_predicate` (`:2382`) keeps the capability flags and `has_client`, and drops a shared name only when its group is unregistered or unroutable here)
+- Modify: `crates/sapphire-agent-server/src/agent.rs:776,821` (`IncomingMessage`'s room → `Origin::Channel { session_profile }`, `partition_without_asking(&profile, ..)` — `ns` from `namespace_for_session_profile`)
+- Modify: `crates/sapphire-agent-server/src/serve/mod.rs` (the pin clone → `Origin::Acp { mode, session_profile }` / `Origin::Unattended { session_profile }`; `TurnContext`/`TurnLoop` field `session_profile`; `TurnLoop::run`'s gate calls `allow`; `visible_tool_predicate` (`:2382`) keeps the capability flags and `has_client`, and drops a shared name only when its group is unregistered or unroutable here)
 - Modify: `tools/subagent.rs` + `tools/skill_tools.rs`' `TurnContext` literals
-- Test: `agent.rs`'s gate tests, `serve/mod.rs`'s + `serve/acp.rs`'s turn tests, through execution with per-instance probe tools
+- Test: `agent.rs`'s and `serve/mod.rs`'s turn tests below — each runs a real turn through `handle_message`/`run_llm_turn` with a per-instance probe with a handle (N4), and reads what the turn actually did to the filesystem and to the stored history
 
 **Interfaces:**
-- Consumes: `allow`/`ResolvedPermission`/`ToolEntry` (Task 3), `ToolSpec{kind,group}`/`entries()` (Task 4), `validate_task_profiles` (Task 5).
+- Consumes: `allow`/`ResolvedPermission`/`ToolEntry` (Task 3), `ToolSpec{kind,group}`/`ToolSet::entries()` (Task 4), the loaders carrying `profile` (Task 5).
 - Produces: nothing (the last task). The end-to-end shape is what it pins.
 
-- [ ] **Step 1: Write the failing end-to-end tests** — one per behaviour, each through the real loop and a per-instance probe with a handle (N4), not by reading fields:
+- [ ] **Step 1: Write the failing end-to-end tests** — the fixture (in `agent.rs`'s `mod tests`; the ACP test below sits in `serve/mod.rs`'s own `mod tests` and reuses its own `tool_round`/`final_round`/`persisted`/`texts_of` helpers there):
 
 ```rust
-    /// The two-loops-merged shape, through `handle_message`: the same function
-    /// `run_llm_turn` goes through produces the same behaviour (Task 3 pinned the
-    /// function; this pins both call sites on it).
+    /// The session profile the tests pin, the permission profile it names, and the groups that
+    /// profile lists — with **every** group enabled on this host, so what a turn may use is
+    /// decided only by the listing, never by a host key a test forgot to set. The channel
+    /// name is `incoming()`'s own `"test-room"`, so what the channel loop resolves is the
+    /// room block's name (decision 2), and each test names the whole chain itself.
+    fn gate_config(session_profile: &str, permission: &str, groups: &[&str]) -> Config {
+        let enabled = ["fs", "shell", "mcp", "admin"]
+            .iter()
+            .map(|g| format!("\n[tools.{g}]\nenabled = true\n"))
+            .collect::<String>();
+        Config::parse_for_test(&format!(
+            "[anthropic]\napi_key = \"test\"\n\n[profiles.default]\nprovider = \"stub\"\n\n\
+             [session_profile.{session_profile}]\nprofile = \"default\"\npermission = \"{permission}\"\n\n\
+             [permission_profile.{permission}]\ntools = [{groups}]\n{enabled}"
+        ))
+    }
+
+    /// One channel turn through `handle_message`: `name`'s call, then a final round with no
+    /// tool_use. Returns the handles the assertions read — what the channel was told, the
+    /// workspace root the tools write into, and the probe.
+    fn gate_channel_turn(name: &str, input: Value, cfg: Config) -> (Vec<OutgoingMessage>, PathBuf, Arc<GateProbe>) {
+        let state = test_workspace();   // agent.rs's existing helper, Arc<WorkspaceState>, tempdir leaked on purpose
+        let root = state.workspace.root.clone();
+        let tools = crate::tools::default_tool_set(Arc::clone(&state), None, &[], 4, &cfg).await;
+        let probe = GateProbe::new();
+        tools.register_tool(Box::new(Arc::clone(&probe))).await;
+        let responses = vec![
+            crate::provider::ChatResponse {
+                prompt_usage: None,
+                text: None,
+                tool_calls: vec![crate::provider::ToolCall { id: "c0".into(), name: name.into(), input }],
+                stop_reason: None,
+            },
+            crate::provider::ChatResponse {
+                prompt_usage: None,
+                text: Some("done".into()),
+                tool_calls: Vec::new(),
+                stop_reason: None,
+            },
+        ];
+        let ((agent, sent, _typing), _log) =
+            build_test_agent_with_tools(responses, false, Some((cfg, tools)));
+        agent.handle_message(&incoming("go")).await.unwrap();
+        (sent.lock().unwrap().clone(), root, probe)
+    }
+
+    /// The honest instrument: it records the pair the surrounding tool execution was scoped
+    /// with, which is only observable from inside a tool. `group: None`, so no group and no
+    /// capability gates on it, and it is offered on both loops. Its own `impl Tool` plus the
+    /// `impl Tool for Arc<Self>` forwarding, exactly as `AdminProfileProbe` does today, and its
+    /// `execute` writes `*self.seen.lock().unwrap() = Some((current_session_profile().expect("a turn scopes its session profile"), current_permission_profile().expect("and its permission profile")));`.
+    /// `seen()` is what the assertions read: `None` means the call never reached execution,
+    /// which is what "not even offered" means.
+    #[cfg(test)]
+    pub(crate) struct GateProbe {
+        seen: std::sync::Mutex<Option<(String, String)>>,
+        spec: crate::provider::ToolSpec,   // name `"gate_probe"`, `kind: ToolKind::Read`, `group: None`
+    }
+```
+
+The tests:
+
+```rust
+    /// N2/R2, through `handle_message`: a room whose block names a profile listing `fs` ran
+    /// `file_write` unasked — a channel turn has nobody to ask, so it ran because it was
+    /// allowed — and carried both resolved names into the execution scope.
     #[tokio::test]
     async fn a_channel_turn_under_default_runs_file_write_unasked() {
-        let (calls, entries) = channel_gate_test_calls().await; // file_write / shell / memory_add / the MCP tool
-        let cfg = cfg_with(&[("fs", true), ("shell", true), ("mcp", true)]);
-        let profile = ResolvedPermission::resolve(&cfg, Origin::Channel { session_profile: "default".into() });
-        let (permitted, refused) = partition_without_asking(&profile, &calls, &entries);
-        assert_eq!(
-            names(&permitted),
-            vec!["file_write", "memory_add"],
-            "fs is listed by `default` and enabled here; `shell` is not listed, and the mcp tool is refused by the profile that names no mcp"
-        );
-        let blocked: Vec<String> = refused.iter().map(|(id, _)| name_of(&calls, id)).collect();
-        assert_eq!(blocked, vec!["shell"]);
+        let (sent, root, probe) = gate_channel_turn("file_write", json!({"path": "notes/x.md", "content": "written by the turn"}), gate_config("default", "default", &["\"fs\""])).await;
+        assert_eq!(std::fs::read_to_string(root.join("notes/x.md")).unwrap(), "written by the turn");
+        assert_eq!(probe.seen(), Some(("default".into(), "default".into())));
+        assert!(sent.iter().any(|m| m.content == "done"), "the turn completed: {sent:?}");
     }
 
-    /// Under `chat` even `fs` is invisible: the tool is not offered at all.
+    /// Under `chat` even `fs` is invisible: registered (some profile lists it somewhere), and
+    /// this turn's profile does not list it.
     #[tokio::test]
     async fn a_turn_under_chat_does_not_even_see_fs() {
-        let state = ServeState::for_test_scripted(vec![ChatResponse::ok()]);
-        let specs = state.tools.specs_filtered(turn_predicate("chat", &state.config)).await;
-        assert!(!specs.iter().any(|s| s.name == "file_read"), "{:?}", names(&specs));
-        assert!(specs.iter().any(|s| s.name == "memory_read"), "the always-allowed tools are not the table's subject");
+        let (sent, root, probe) = gate_channel_turn("file_write", json!({"path": "notes/x.md", "content": "x"}), gate_config("chat", "chat", &[])).await;
+        assert_eq!(probe.seen(), None, "the call never reached execution");
+        assert!(!root.join("notes/x.md").exists(), "and so it wrote nothing");
+        assert!(sent.iter().any(|m| m.content.contains("file_write") && m.content.contains("permission_profile")), "{sent:?}");
     }
 
-    /// `shell` refuses under `default` and runs under `admin`; a turn under `default`
-    /// cannot see the admin tools even where the `admin` preset made them registered.
+    /// `shell` refuses under `default` and runs under `admin`; and a turn under `default` cannot
+    /// see the admin tools even where the `admin` preset is what made them registered.
     #[tokio::test]
     async fn shell_refuses_under_default_and_runs_under_admin() {
-        let (calls, entries) = shell_and_admin_calls().await;
-        let under = |profile: &str| {
-            let profile = ResolvedPermission::resolve(&cfg_with(&[("fs", true), ("shell", true)]), Origin::Channel { session_profile: profile.into() });
-            partition_without_asking(&profile, &calls, &entries).0.into_iter().map(|c| c.name).collect::<Vec<_>>()
-        };
-        assert_eq!(under("default"), vec!["file_write"]);
-        assert_eq!(under("admin"), vec!["file_write", "shell", "heartbeat_config"]);
+        let (sent, _root, probe) = gate_channel_turn("shell", json!({"command": "true"}), gate_config("default", "default", &["\"fs\""])).await;
+        assert_eq!(probe.seen(), None, "not listed, so not offered");
+        assert!(sent.iter().any(|m| m.content.contains("shell") && m.content.contains("permission_profile")), "{sent:?}");
+
+        let (_sent, _root, probe) = gate_channel_turn("heartbeat_config", json!({"action": "list"}), gate_config("default", "default", &["\"fs\""])).await;
+        assert_eq!(probe.seen(), None, "registered — the `admin` preset lists it somewhere — and still invisible here");
+
+        let (_sent, _root, probe) = gate_channel_turn("shell", json!({"command": "true"}), gate_config("admin", "admin", &["\"shell\""])).await;
+        assert_eq!(probe.seen(), Some(("admin".into(), "admin".into())), "and a profile that names it runs it");
     }
 
-    /// The guard, end to end: `file_write` refuses `heartbeat/morning_call.md`
-    /// naming `heartbeat_config`; `file_read` reads it; only `heartbeat_config` modifies it.
+    /// The same function, the other loop: `run_llm_turn` resolves the pin `session/new` wrote
+    /// and hands it to `allow`. Listing ⇒ the call ran and the probe recorded both names;
+    /// not listing ⇒ the name was never offered, and the refusal that reached the stored
+    /// history names the setting. Proved through execution, not by reading a field.
+    #[tokio::test]
+    async fn the_acp_loop_resolves_its_pin_through_the_same_allow() {
+        for (profile, groups, ran) in [("chat", &[] as &[&str], false), ("ops", &["\"fs\""], true)] {
+            let mut state = ServeState::for_test_scripted(true, vec![tool_round("call-1"), final_round("done")]);
+            Arc::get_mut(&mut state).expect("a fresh state has one owner").config = gate_config(profile, profile, groups);
+            let probe = GateProbe::new();
+            state.tools.register_tool(Box::new(Arc::clone(&probe))).await;
+            let sid = format!("gate-{profile}");
+            // What `session/new` writes for an ACP session: that it is one, and the name.
+            state.acp_sessions.lock().await.insert(sid.clone());
+            state.session_profiles.lock().await.insert(sid.clone(), profile.into());
+            run_llm_turn(Arc::clone(&state), sid.clone(), ChatMessage::user("go"), Arc::new(NullProgress), None).await;
+            assert_eq!(probe.seen().is_some(), ran, "{profile}: offered to this turn's profile, or not");
+            if ran {
+                assert_eq!(probe.seen(), Some((profile.into(), profile.into())));
+            } else {
+                let stored = persisted(&state, &sid).await;
+                assert!(stored.iter().any(|m| texts_of(m).iter().any(|t| t.contains("file_write") && t.contains("permission_profile"))), "{profile}: {stored:?}");
+            }
+        }
+    }
+
+    /// R1: a name arriving from a declaration rather than a room block — an unattended task's
+    /// frontmatter (Task 5's loader carried it here) — wins verbatim.
+    #[tokio::test]
+    async fn an_unattended_turn_carries_the_profile_its_task_declared() {
+        let (_d, root, _ws) = config_tools::test_workspace();
+        std::fs::write(&root.join("heartbeat/morning_call.md"), "---\nschedule: \"0 8 * * *\"\nroom_id: \"test-room\"\nprofile: \"ops\"\nenabled: true\n---\n\n# Morning Call\n").unwrap();
+        let tasks = crate::heartbeat_config::load_heartbeat_dir(&root.join("heartbeat"));
+        let cfg = gate_config("default", "default", &["\"fs\""]);
+        assert_eq!(cfg.session_profile_name(tasks[0].meta.profile.as_deref(), "test-room"), "ops");
+    }
+
+    /// The guard, end to end: `file_write` refuses `heartbeat/morning_call.md` naming
+    /// `heartbeat_config` and wrote nothing, `file_read` reads it, and only `heartbeat_config`
+    /// **modifies** it — proved by what is on disk afterwards, not by a returned string.
     #[tokio::test]
     async fn only_the_dedicated_tool_modifies_a_definition() {
         let (dir, root, ws) = config_tools::test_workspace();
         std::fs::create_dir_all(root.join("heartbeat")).unwrap();
-        std::fs::write(&root.join("heartbeat/morning_call.md"), "---\nschedule: \"0 8 * * *\"\n---\n\nold\n").unwrap();
-        let read = FileReadTool::new(Arc::clone(&ws));
-        assert!(read.execute(&json!({"path": "<root>/heartbeat/morning_call.md"})).await.unwrap().contains("old"));
-        let write = FileWriteTool::new(Arc::clone(&ws));
-        assert!(write.execute(&json!({"path": "<root>/heartbeat/morning_call.md", "content": "new"})).await.is_err());
-        let admin = ConfigTool::new(ConfigDir::Heartbeat, root.clone(), cfg_with(&[("fs", true)]), Arc::clone(&ws), None, Weak::new());
-        assert!(admin.execute(&json!({"action": "read", "name": "morning_call"})).await.is_ok());
+        let task_file = root.join("heartbeat/morning_call.md");
+        std::fs::write(&task_file, "---\nschedule: \"0 8 * * *\"\n---\n\nold\n").unwrap();
+        let write = crate::tools::builtin_tools::FileWriteTool::new(Arc::clone(&ws));
+        let err = write.execute(&json!({"path": "heartbeat/morning_call.md", "content": "new"})).await.unwrap_err();
+        assert!(err.to_string().contains("heartbeat_config"), "{err}");
+        assert_eq!(std::fs::read_to_string(&task_file).unwrap(), "---\nschedule: \"0 8 * * *\"\n---\n\nold\n", "the refused write wrote nothing");
+        let read = crate::tools::builtin_tools::FileReadTool::new(Arc::clone(&ws));
+        assert!(read.execute(&json!({"path": "heartbeat/morning_call.md"})).await.unwrap().contains("old"));
+
+        let admin = ConfigTool::new(ConfigDir::Heartbeat, root.clone(), gate_config("admin", "admin", &["\"admin\""]), Arc::clone(&ws), None, std::sync::Weak::new());
+        assert!(admin.execute(&json!({"action": "write", "name": "morning_call", "content": "new"})).await.is_ok());
+        assert_eq!(std::fs::read_to_string(&task_file).unwrap(), "new", "the dedicated tool modified it");
+        let _ = dir;
     }
 ```
 
-- [ ] **Step 2: Run to verify they fail** — `cargo test -p sapphire-agent-server agent:: serve:: 2>&1 | tail -25`. Expected: FAIL (the loops still route a name through a table rather than through `allow`'s `ToolEntry`).
+- [ ] **Step 2: Run to verify they fail** — `cargo test -p sapphire-agent-server agent:: serve:: 2>&1 | tail -25`. Expected: FAIL (the loops still route a name through a table rather than through `allow`'s `ToolEntry`, and a turn still reaches execution with no profile scoped at all).
 
-- [ ] **Step 3: Finish the wiring.** `agent.rs`: the room's resolved name is built once per message and travels as the `Origin`; `serve/mod.rs`: `let session_profile = if is_acp { state.session_profiles.lock().await.get(&session_id).cloned() } else { None };` → `Origin::Acp { mode: progress.mode(), session_profile }` / `Origin::Unattended { session_profile }`, and the turn's `entries` come from `tools.entries()` (so the profile that names no `admin` cannot see the four even though the `admin` preset registered them). `[acp].stdio_session_profile` and the `cli` block keep being the only sources for stdio ACP and the local clients — the principle of not adding sources of truth is unchanged (decision 2). `subagent` keeps inheriting the delegating turn's profile through `TurnContext`.
+- [ ] **Step 3: Finish the wiring — every origin carries a resolved `String`, so no transport loses its binding.** `agent.rs`: `Origin::Channel { session_profile: self.config.session_profile_name(None, &incoming.room_id) }` (a channel message declares nothing; the room block *is* the declaration). `serve/mod.rs`: the pin clone is `Option<String>` and `Origin` needs `String`, so it is handed to `session_profile_name` **as `Option<&str>`**, which returns the resolved `String` both `Origin::Acp` and `Origin::Unattended` carry: pinned ⇒ the pinned name, unpinned ⇒ `DEFAULT_PROFILE_NAME`, and never silently a room's instead of a binding's. So `Origin::Acp { mode: progress.mode(), session_profile: state.session_profile_name(pin.as_deref(), &session_id) }` for an ACP turn, and `Origin::Unattended { session_profile: config.session_profile_name(pin.or(device_binding).as_deref(), room_id) }` for `/rpc`, voice (reverse-looked-up from the `voice/subscribe` registration) and A2A — the device/voice/unattended bindings stay sources of a resolved name (R1), not of a fallback. The turn's `entries` come from `tools.entries()` (so the profile that names no `admin` cannot see the four even though the `admin` preset registered them). `[acp].stdio_session_profile` and the `cli` block keep being the only sources for stdio ACP and the local clients — the principle of not adding sources of truth is unchanged (decision 2). `subagent` keeps inheriting the delegating turn's profile through `TurnContext`, and `TurnContext`/`TurnLoop`'s renamed `session_profile` field is set at every literal (`tools/subagent.rs`, `tools/skill_tools.rs`).
 
 - [ ] **Step 4: Run the whole suite and the gates**
 
