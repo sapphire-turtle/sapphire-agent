@@ -1,5 +1,10 @@
 # Session profiles and permission profiles: unifying the profile system and splitting out the tool-allow table
 
+> **Glossary** (the word "profile" works at two levels): an **LLM profile**
+> (`[profiles.<n>]`: model/provider config), a **session profile**
+> (`[session_profile.<n>]`: what kind of session this is), and a **permission
+> profile** (`[permission_profile.<n>]`: which tool groups it lists).
+
 ## Background (policy)
 
 Today a Discord channel turn can run neither `shell` nor `mcp_reconnect`:
@@ -24,7 +29,7 @@ Policy:
 
 ```toml
 [session_profile.default]
-profile = "default"          # existing: names [profiles.<n>], the LLM profile
+profile = "default"          # names [profiles.<n>], the LLM profile
 memory_namespace = "default"
 session_policy = "reset"
 devices = ["saphuna-linux"]
@@ -49,7 +54,7 @@ voice_pipeline = "default"   # a room with a voice path writes it here
 
 Matrix is the same shape (`[matrix.room1] room_id = "!xxx:srv" profile = "..."`). Heartbeat and autonomous frontmatters keep `room_id` as delivery-only (where the fire is delivered) and gain `profile` (the session profile that governs the run). Absent means the implicit `"default"`.
 
-- What ingress resolves and the turn carries is **the resolved profile name only**. `Agent::handle_message` (the Matrix/Discord loop) and `run_llm_turn` call the one same `visible_tool_predicate(origin)`; the decision logic is no longer duplicated between the two loops (the heart of this refactor: the per-gate resolution paths — re-reading `TimerOrigin` and friends — disappear).
+- What ingress resolves and the turn carries is **the resolved profile name only**. `Agent::handle_message` (the Matrix/Discord loop) and `run_llm_turn` (the ACP/autonomous loop) each build an `Origin` carrying the resolved name and call the one same decision function — see Design, `policy.rs`: one function, one name, one signature.
 - ACP keeps its existing session pin as the only source of truth (the principle of not adding sources of truth is unchanged). `[acp].stdio_room_profile` is renamed `stdio_session_profile`.
 - voice, `/rpc` and A2A keep being governed by the profile their session belongs to (voice reverse-looked-up from the `voice/subscribe` registration; `/rpc`/A2A through the device→profile binding).
 
@@ -67,8 +72,9 @@ tools = []                                   # only the always-allowed tools
 ```
 
 - `session_profile.<n>.permission: Option<String>`. Absent means the implicit `"default"`.
+- Resolution precedence: **an operator-written `[permission_profile.<n>]]` section wins over the built-in preset of the same name; the built-in table is the fallback.** Same shape as the LLM-profile resolution.
+- A session profile's `profile` names an entry that does not exist anywhere (built-in or operator) is a startup error — a typo must not rot into "I granted it but nothing changed".
 - `shell` is **not** in `default`, deliberately: a shell turn can read and rewrite `heartbeat/*.md` and the other admin-domain definition files raw, bypassing the dedicated admin tools' domain. Only a profile that explicitly names `shell` (in practice: `admin`) gains it.
-- Presets are overridable (an operator can write `[permission_profile.family] tools = ["fs"]`).
 - **Always allowed (outside the table; permission is not their subject)**: `current_time`, `weather`, `workspace_search`, `skill`, `subagent` (inherits the delegating turn), and the memory tools. The memory namespace comes from the session profile's `memory_namespace` (existing `namespace_for_room_profile` → `namespace_for_session_profile`).
 
 This **changes behaviour**. The implicit profile's `default` lists `fs`, so a Discord turn on a host where `[tools.fs].enabled = true` runs `file_write` unasked (unchanged), but where today `Execute`/`Other` is always refused, nothing under `fs` is refused by the row any more — and `shell` is refused until a profile names it. This is the explicit consequence of #257's policy ("let the agent use fs and shell freely; do the privilege separation in profiles"). A room that must stay narrow (nsfw, say) writes `profile = "chat"` or names its own permission profile.
@@ -86,7 +92,7 @@ enabled = true
 ```
 
 - **Allowed ⇔ the turn's permission profile lists the group ∧ the group is `enabled` on this host.** Two keys: "does this machine hand the agent that key" is the host's decision, and a synced file must not declare it across hosts (the current `host_access` host-only property is kept).
-- The registration condition keeps the current `[tools.admin]` philosophy — *not registered at all*: a group's tools are registered only when the group is `enabled` on this host **and** listed by at least one permission profile (presets included). "Registered but always refused" makes the model believe a tool exists that cannot work.
+- The registration condition keeps the current `[tools.admin]` philosophy — *not registered at all*: a group's tools are registered only when the group is `enabled` on this host **and** listed by at least one permission profile (presets included). "Registered but always refused" makes the model believe a tool exists that cannot work. Registration is workspace-wide; visibility for one turn further requires that turn's profile to list the group.
 - Four group names, and they are literally today's section names:
   - `fs` — the file half of `HOST_TOOLS` (`file_read`/`file_write`/`file_append`/`file_delete`/`dir_list`/`dir_walk`/`image_read`). Routing of the same names to the editor's machine through ACP capabilities is unchanged (capabilities and groups are orthogonal).
   - `shell` — `shell` (and the background-shell path).
@@ -100,33 +106,39 @@ Today `mcp_reconnect` is registered whenever at least one MCP server is, and is 
 
 ### 6. Definition files are the admin group's land
 
-`heartbeat/*.md`, `autonomous/*.md`, `agents/*.md` and the config definition files themselves are touched only by the admin group's dedicated tools (`heartbeat_config` etc.). The `fs` group's `file_write` does not reach them (it refuses a definition-file path and its refusal message says so). This pins "a heartbeat session cannot rewrite its own definitions by default" on both paths:
+`heartbeat/*.md`, `autonomous/*.md`, `agents/*.md` and the config definition files themselves are **modified** only by the admin group's dedicated tools. The guard covers the fs tools' *write* half (`file_write`, `file_append`, `file_delete`), which refuse a definition-file path with a message naming the dedicated tool that owns it; the read half (`file_read`, `dir_list`, `dir_walk`, `image_read`) keeps reading them (reading one's own task is not a rewrite risk). This pins "a heartbeat session cannot rewrite its own definitions by default" on both paths:
 
 - an unattended task that writes no `profile` runs under the implicit `default`, which does not list `admin` → it cannot even see the admin tools; and it has no `shell` to go around them with (decision 3).
-- even a turn that does hold `fs` cannot reach the definitions through it.
+- even a turn that does hold `fs` cannot *modify* the definitions through it.
 
-### 7. Migration fails loudly (precedent)
+### 7. `kind` survives; only the routing tables die
+
+`kind` stays a per-tool attribute and still drives ACP mode asking exactly as today (under a mode that asks, `Write`/`Execute`/`Other` produces `Ask`, `Read` produces `Allow`). What disappears is the name→kind routing tables: registration carries the group, and the group decides whether a tool is offered at all. `mcp_reconnect` stays `Other` and is therefore asked under an ACP mode that asks, as are the trust-classified tools of its group.
+
+### 8. Migration fails loudly (precedent)
 
 `Config::migration_errors` names and stops startup on:
 
 1. a leftover `[room_profile.<n>]` (rename it to `session_profile`)
 2. a section still carrying `rooms` (move it to declaration-side binding)
 3. a leftover `[tools.admin].room_profiles` (move it to `permission_profile.<n>.tools`)
-4. leftover legacy heartbeat/autonomous frontmatter: the parsers read the new `profile`, and a leftover `room_id` is interpreted as delivery-only
+4. a session (room block, heartbeat/autonomous frontmatter, or pin) resolving to `"default"` while no `[session_profile.default]` is defined by the host
+
+`room_id` inside a heartbeat/autonomous frontmatter is *not* a migration error: it keeps parsing, now meaning delivery-only.
 
 ## Requirements
 
 ### Functional
 
-1. R1: `[session_profile.<n>]` drives a session, and the session declares the profile name — channel room blocks, heartbeat/autonomous frontmatter, the ACP pin, device bindings. No profile-side room list exists.
+1. R1: `[session_profile.<n>]` drives a session, and the session declares the profile name — channel room blocks, heartbeat/autonomous frontmatter, the ACP pin, device bindings. No profile-side room list exists. An unknown profile name (explicit or the implicit `default` when the host defines none) fails startup.
 2. R2: A turn's allowed set = "groups listed by its permission profile ∧ groups enabled on this host". One single pure function in `policy`; both turn loops call it.
-3. R3: Presets `admin` (every group) / `default` (`fs`, `mcp`; not `shell`, not `admin`) / `chat` (empty). The implicit value when `permission` is absent is `default`. Presets are overridable.
+3. R3: Presets `admin` (every group) / `default` (`fs`, `mcp`; not `shell`, not `admin`) / `chat` (empty). The implicit value when `permission` is absent is `default`. An operator section overrides a preset of the same name.
 4. R4: Always-allowed tools (`current_time`/`weather`/search/skill/memory/delegation) are outside the table's subject. Memory uses the session profile's namespace.
 5. R5: `mcp__<name>__*` and `mcp_reconnect` are the `mcp` group; trust still decides the kind classification inside the group.
-6. R6: Definition files (heartbeat/autonomous/agents/config) are admin-dedicated tools' land; fs tools do not reach them.
-7. R7: A group listed by no permission profile (presets included) is not registered at all.
+6. R6: Definition files (heartbeat/autonomous/agents/config) are modifiable only by the admin group's dedicated tools; the fs write tools refuse them, the fs read tools read them.
+7. R7: A group listed by no permission profile (presets and operator sections included) is not registered at all.
 8. R8: Migration leftovers are named by `verify` and fail serve startup.
-9. R9: ACP keeps capability routing, `session/request_permission`, and the Ask semantics of ACP modes (Default asks before edits, and so on). The group table decides *whether a tool is offered at all*; the mode decides *whether an offered one asks*.
+9. R9: ACP keeps capability routing, `session/request_permission`, and the Ask semantics of ACP modes (Default asks before edits, and so on), computed from `kind` exactly as today (decision 7). The group table decides *whether a tool is offered at all*; the mode decides *whether an offered one asks*.
 
 ### Non-functional
 
@@ -134,7 +146,7 @@ Today `mcp_reconnect` is registered whenever at least one MCP server is, and is 
 - N2: One decision function. `run_llm_turn` and `Agent::handle_message` each call it with their own origin (the resolved profile name + the host keys) and nothing else.
 - N3: The execution half of #257's policy lands as execution-user separation; this change does not move process privileges, but the gate's shape must not obstruct it.
 - N4: Existing test style (`Config::parse_for_test`, `ServeState::for_test_scripted*` + `StubProvider`, per-instance probe tools with a handle, end-to-end through execution rather than inspecting fields).
-- N5: `cargo fmt --all`; `cargo clippy -p sapphire-agent-server --all-targets` (zero warnings); `cargo test -p sapphire-agent-server`.
+- N5: `cargo fmt --all`; `cargo clippy -p sapphire-agent-server -p sapphire-agent-config --all-targets` (zero warnings); `cargo test -p sapphire-agent-config -p sapphire-agent-server`.
 
 ## Design
 
@@ -171,23 +183,29 @@ pub enum ToolGroup { Fs, Shell, Mcp, Admin }
 ```
 
 - `Config::session_profiles: HashMap<String, SessionProfileConfig>`, `Config::permission_profiles: HashMap<String, PermissionProfileConfig>`.
-- `permission_for(name)` consults the built-in preset table (`admin`/`default`/`chat`), then an operator override. A preset is overridable (an operator may write `[permission_profile.default]`).
-- Startup validation: a `session_profile.<n>.permission` naming neither a preset nor a defined permission profile is reported by `validate` and fails serve startup (same reasoning as the provider/namespace checks — a typo must not rot into "I granted it but nothing changed").
+- `permission_for(name)` returns the operator section when one exists, else the built-in preset (`admin`/`default`/`chat`).
 - `[channel.<x>]`: `enabled` plus room blocks (`room_id`/`profile`/`voice_pipeline`). `allowed_users` stays channel-level (room-level override is out of scope). The subscription itself stays untouched; only the profile resolution of the room a voice actually runs in moves to declaration-side.
 - `HOST_ONLY_PATHS`: the per-group `enabled` keys under `[tools]` remain host-only; the `tools` listings are synced config.
 
 ### policy.rs
 
 - `Origin` becomes **a type that carries the resolved profile name** (`Acp { mode, session_profile }` / `Channel { session_profile }` / `Unattended { session_profile }`, shaped at ingress: `handle_message`'s entry, `run_llm_turn`'s pin clone, frontmatter).
-- `decide(origin, kind)` becomes `allow(origin, group_of(name), table)`. `group_of` reads the group a tool was registered with from `ToolSet` (the name-list tables behind `kind_of` disappear).
-- `host_tool_denied` is absorbed into the group-`enabled` check ("a fact about the deployment, not a row in the table" is kept; the `host_enabled: bool` parameter becomes "is that group enabled on this host").
-- Ask semantics: ACP modes keep producing `Ask` through `session/request_permission` exactly as today. Channel and unattended turns never ask (`partition_without_asking` sees only Allow/Deny).
+- One decision function, one name:
+
+```rust
+/// Allowed ⇔ `profile` lists `group` and `group` is enabled on this host.
+/// The single decision function; both turn loops build their `Origin`'s
+/// resolved profile and pass it here with the tool's registration entry.
+pub fn allow(profile: &ResolvedPermission, entry: &ToolEntry) -> Allow
+```
+
+  `ToolEntry` carries what registration knew: the tool's `ToolGroup` and this host's `enabled` flag for it. `host_tool_denied` is absorbed into that flag ("a fact about the deployment, not a row in the table" is kept).
+- Ask semantics: `allow` computes from `kind` + the ACP mode exactly as `decide` does today; channel and unattended turns never ask (`partition_without_asking` sees only Allow/Deny).
 
 ### tools/
 
 - `config_tools.rs`: the `current_admin_room_profile()` task-locals become `current_session_profile()`/`current_permission_profile()`. `ROOM_REFUSAL` names `permission_profile`. `register_admin_tools`' condition becomes "`admin` is enabled on this host ∧ some permission profile lists `admin`".
-- `builtin_tools.rs`: `McpReconnectTool::kind` stays `Other` (kind no longer decides anything once the group does; only `kind_for_trust`'s classification of remote tools still means what it means).
-- Definition-file guard: a new refusal message for when an fs tool receives a definition-file path (a kind of `Refusal::Unavailable`, pointing at `heartbeat_config` and friends).
+- Definition-file guard: a new refusal for when a fs *write* tool receives a definition-file path, naming the dedicated tool that owns it (`heartbeat_config` and friends).
 
 ### lib.rs (startup)
 
@@ -196,12 +214,6 @@ pub enum ToolGroup { Fs, Shell, Mcp, Admin }
 
 ### Tests
 
-- `Config::parse_for_test` pins session profiles, permission profiles, and each migration case.
-- The two-loops-merged end-to-end: through `handle_message`, that a room under `profile = "default"` runs `file_write` unasked on a host with fs enabled; that under `chat` even `fs` is invisible; that the implicit `default` registers the admin tools; that `shell` refuses under `default` and runs under `admin` — verifying the same function `run_llm_turn` goes through produces the same behaviour (through execution, not by reading fields).
-- The guard: an fs tool refuses `heartbeat/morning_call.md`; only `heartbeat_config` can update it.
-
-## Options not taken
-
-- **Writing the allow table directly into `session_profile`** (`allow_tools = [...]`): the table mixes host-scope and sync-scope. Folding it in would split every profile across the host file and the synced file, and every new profile copies the same lists. Split out, the host file keeps only "does this host hand over that group".
-- **Splitting reconnect per surface (a new `bridge_reconnect`)**: the inbound bridge is capability land, outside the table; there is nothing to split off today.
-- **Making `chat` the implicit default**: it would fail to describe that a channel turn reads its workspace files today, and an unattended session could not even read its own definitions; the middle preset `default` is the implicit one — with `shell` out of it, per decision 3.
+- `Config::parse_for_test` (in `sapphire-agent-config`) pins session profiles, permission profiles, and each migration case.
+- The two-loops-merged end-to-end: through `handle_message`, that a room under `profile = "default"` runs `file_write` unasked on a host with fs enabled; that under `chat` even `fs` is invisible; that a turn under `default` cannot see the admin tools even where another profile (the `admin` preset) made them registered; that `shell` refuses under `default` and runs under `admin` — verifying the same function `run_llm_turn` goes through produces the same behaviour (through execution, not by reading fields).
+- The guard: `file_write` refuses `heartbeat/morning_call.md` naming `heartbeat_config`; `file_read` reads it; only `heartbeat_config` modifies it.
