@@ -31,7 +31,7 @@
 //!   a file.
 //!
 //! There is no token: the IPC endpoint admits only the OS user that runs
-//! the server, and the agent's `[cli].room_profile` names the room profile.
+//! the server, and the agent's `[cli].profile` names the room profile.
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use base64::Engine as _;

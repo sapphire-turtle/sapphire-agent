@@ -996,7 +996,7 @@ impl SubagentTool {
             timer_origin: ctx.timer_origin.clone(),
             session_id: ctx.session_id.clone(),
             subagent_depth: ctx.subagent_depth,
-            admin_room_profile: ctx.admin_room_profile.clone(),
+            session_profile: ctx.session_profile.clone(),
         });
         let refused = Arc::new(std::sync::Mutex::new(Vec::new()));
         let progress: Arc<dyn crate::serve::TurnHost> = Arc::new(BackgroundSubagentHost::new(
@@ -1322,7 +1322,7 @@ impl SubagentTool {
             tool_specs: &specs,
             progress: &progress,
             timer_origin: ctx.timer_origin.clone(),
-            admin_room_profile: ctx.admin_room_profile.clone(),
+            session_profile: ctx.session_profile.clone(),
             namespace,
             // This nested turn sits one level below whoever delegated to
             // it, so it can delegate further exactly when
@@ -1443,8 +1443,7 @@ async fn scope_background<F: std::future::Future>(
     fut: F,
 ) -> F::Output {
     let fut = crate::tools::workspace_tools::scope_memory_namespace(namespace, fut);
-    let fut =
-        crate::tools::config_tools::scope_admin_room_profile(ctx.admin_room_profile.clone(), fut);
+    let fut = crate::tools::config_tools::scope_session_profile(ctx.session_profile.clone(), fut);
     let origin = ctx.timer_origin.clone();
     let client = ctx.progress.acp_client();
     let fut = crate::serve::scope_turn_context(ctx, fut);
@@ -2690,7 +2689,7 @@ mod tests {
             // pass because a test handed it a `Some`.
             session_id: None,
             subagent_depth: 0,
-            admin_room_profile: None,
+            session_profile: None,
         })
     }
 
@@ -2735,7 +2734,7 @@ mod tests {
                 timer_origin: None,
                 session_id: Some("parent-session".to_string()),
                 subagent_depth: 0,
-                admin_room_profile: None,
+                session_profile: None,
             })
         };
 
@@ -3689,7 +3688,7 @@ mod tests {
             timer_origin: None,
             session_id: session_id.map(str::to_string),
             subagent_depth,
-            admin_room_profile: None,
+            session_profile: None,
         })
     }
 

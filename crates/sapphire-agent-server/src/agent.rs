@@ -276,7 +276,7 @@ impl Agent {
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "unknown".to_string())
             });
-        let namespace = self.config.namespace_for_room(&key.0).to_string();
+        let namespace = self.config.namespace_for_session(&key.0).to_string();
         match self
             .session_store
             .create_session(key, &channel_name, &namespace)
@@ -459,7 +459,7 @@ impl Agent {
             }
         }
 
-        let namespace = self.config.namespace_for_room(&key.0);
+        let namespace = self.config.namespace_for_session(&key.0);
         let chain = self.config.resolve_namespace_chain(namespace);
         // Best-effort: a missing or unreachable RoomInfo just leaves the
         // "# Current Room" block out — never blocks the turn.
@@ -773,7 +773,7 @@ impl Agent {
                     let tools = self.tools.clone();
                     let ns = self
                         .config
-                        .namespace_for_room(&incoming.room_id)
+                        .namespace_for_session(&incoming.room_id)
                         .to_string();
                     let room_id_for_timer = incoming.room_id.clone();
                     // Permission gate for the channel path.
@@ -1233,7 +1233,7 @@ mod tests {
         let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
         let base = dir.path().to_path_buf();
 
-        // Minimal config: no room_profile mapping for the test room, so
+        // Minimal config: no session_profile mapping for the test room, so
         // `ProviderRegistry::for_room` falls through to the "anthropic"
         // key — which `for_test` below points at the same stub.
         let config = crate::config::Config::parse_for_test(
@@ -1246,7 +1246,7 @@ api_key = "test"
         let provider = crate::serve::StubProvider::new(responses);
         let log = provider.call_log();
         // Registered under both names, as `ServeState::build_for_test_with`
-        // does: the fallback path (no room_profile match) resolves the
+        // does: the fallback path (no session_profile match) resolves the
         // built-in "anthropic" key.
         let registry = crate::provider::registry::ProviderRegistry::for_test(
             &["anthropic", "stub"],

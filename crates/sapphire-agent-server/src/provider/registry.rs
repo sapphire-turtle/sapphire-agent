@@ -160,7 +160,7 @@ impl ProviderRegistry {
     /// wrapped in a `FallbackProvider` so refusals or errors transparently
     /// retry on the secondary.
     pub fn for_room(&self, config: &Config, room_id: &str) -> Arc<dyn Provider> {
-        let Some(profile_name) = config.profile_for(room_id) else {
+        let Some(profile_name) = config.profile_for_session(room_id) else {
             return self.default_provider();
         };
         self.for_profile(config, profile_name)
@@ -582,7 +582,7 @@ model = "gemma-4-31b-it"
 [profiles.nsfw]
 provider = "local"
 
-[room_profile.private_nsfw]
+[session_profile.private_nsfw]
 profile = "nsfw"
 rooms   = ["!nsfw:srv"]
 "#,

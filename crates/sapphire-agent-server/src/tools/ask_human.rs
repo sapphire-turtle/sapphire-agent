@@ -143,7 +143,7 @@ mod tests {
             timer_origin: None,
             session_id: Some("s".into()),
             subagent_depth: 0,
-            admin_room_profile: None,
+            session_profile: None,
         });
         crate::serve::scope_turn_context(ctx, AskHumanTool::new().execute(&input)).await
     }

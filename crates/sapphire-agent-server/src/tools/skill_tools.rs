@@ -1865,7 +1865,7 @@ mod tests {
             timer_origin: None,
             session_id: Some(session_id.to_string()),
             subagent_depth: 0,
-            admin_room_profile: None,
+            session_profile: None,
         })
     }
 

@@ -81,7 +81,7 @@ pub struct Heartbeat {
 
 impl Heartbeat {
     /// Resolve which namespace a session belongs to. Matrix/Discord rooms
-    /// follow `Config::namespace_for_room`. Device-default sessions
+    /// follow `Config::namespace_for_session`. Device-default sessions
     /// (channel=`"device-default"`) and cross-device sessions
     /// (channel=`"rpc"`) persist their resolved namespace in the JSONL
     /// meta — trust that first, falling back to the default namespace
@@ -92,7 +92,7 @@ impl Heartbeat {
                 .clone()
                 .unwrap_or_else(|| crate::config::DEFAULT_NAMESPACE_NAME.to_string())
         } else {
-            self.config.namespace_for_room(&meta.room_id).to_string()
+            self.config.namespace_for_session(&meta.room_id).to_string()
         }
     }
 
@@ -496,7 +496,7 @@ impl Heartbeat {
                 }
                 Err(crate::serve::VoicePushError::NotConfigured) => {
                     warn!(
-                        "Heartbeat cron: subscribed satellite's room_profile has no voice_pipeline; falling back to chat for {name}"
+                        "Heartbeat cron: subscribed satellite's session_profile has no voice_pipeline; falling back to chat for {name}"
                     );
                 }
                 Err(crate::serve::VoicePushError::Other(msg)) => {

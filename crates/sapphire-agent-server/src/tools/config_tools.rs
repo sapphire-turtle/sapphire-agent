@@ -8,7 +8,7 @@
 //!
 //! Two properties hold the design together:
 //!
-//! - **A room profile must be named.** `[tools.admin].room_profiles` is a
+//! - **A room profile must be named.** `[tools.admin].session_profiles` is a
 //!   host-layer list of room-profile names, and every action refuses in a
 //!   session whose profile is not on it. A channel room resolves to its
 //!   profile the same way its provider does; an ACP session carries the
@@ -118,29 +118,42 @@ tokio::task_local! {
     /// The room profile an ACP turn runs under, scoped around tool execution
     /// by `TurnLoop::run` from the profile pinned at `session/new` (or
     /// `load`/`resume`). `None` on every other serve-path turn.
-    static ADMIN_ROOM_PROFILE_TL: Option<String>;
+    static SESSION_PROFILE_TL: Option<String>;
 }
 
 /// Run `fut` with the turn's room profile reachable from
-/// [`current_admin_room_profile`]. Called once per round by
+/// [`current_session_profile`]. Called once per round by
 /// `TurnLoop::run`, wrapping the same tool execution the timer and ACP-client
 /// scopes wrap.
 ///
-pub(crate) fn scope_admin_room_profile<F: std::future::Future>(
+pub(crate) fn scope_session_profile<F: std::future::Future>(
     profile: Option<String>,
     fut: F,
 ) -> impl std::future::Future<Output = F::Output> {
-    ADMIN_ROOM_PROFILE_TL.scope(profile, fut)
+    SESSION_PROFILE_TL.scope(profile, fut)
 }
 
 /// The room profile scoped around the tool call currently executing, if the
 /// turn came in on a transport that pins one — today only ACP.
 ///
-/// `None` outside `scope_admin_room_profile` and `None` for a `/rpc`, A2A or
+/// `None` outside `scope_session_profile` and `None` for a `/rpc`, A2A or
 /// unattended turn, which pins no profile. The two are the same answer on
 /// purpose: neither is a place an operator declared.
-pub(crate) fn current_admin_room_profile() -> Option<String> {
-    ADMIN_ROOM_PROFILE_TL.try_with(Clone::clone).ok().flatten()
+pub(crate) fn current_session_profile() -> Option<String> {
+    SESSION_PROFILE_TL.try_with(Clone::clone).ok().flatten()
+}
+
+/// The permission profile governing the scoped session, when a turn is active.
+#[allow(dead_code)] // Used by the permission gate in the next task.
+pub fn current_permission_profile() -> Option<String> {
+    let profile = current_session_profile()?;
+    let context = crate::serve::current_turn_context()?;
+    Some(
+        context
+            .state
+            .config
+            .permission_profile_name_for_session(&profile),
+    )
 }
 
 /// The room profile this call's admin grant is judged by, or `None` when the
@@ -153,23 +166,23 @@ pub(crate) fn current_admin_room_profile() -> Option<String> {
 /// present. Voice is a device, not a room or an editor. With no timer origin
 /// the turn is on the serve path: an ACP turn scopes the profile its bearer
 /// token pinned, while `/rpc`, A2A and the unattended loops scope nothing.
-pub(crate) fn current_admin_room_profile_for(config: &Config) -> Option<String> {
+pub(crate) fn current_session_profile_for(config: &Config) -> Option<String> {
     match crate::timer::current_origin() {
         Some(crate::timer::TimerOrigin::Chat { room_id }) => {
-            Some(config.room_profile_name_for_room(&room_id).to_string())
+            Some(config.session_profile_name_for_room(&room_id).to_string())
         }
         Some(crate::timer::TimerOrigin::Voice { .. }) => None,
-        None => current_admin_room_profile(),
+        None => current_session_profile(),
     }
 }
 
 /// What every action answers with when the calling room profile is not on
-/// `[tools.admin].room_profiles`.
+/// `[tools.admin].session_profiles`.
 ///
 /// The wording names the config key on purpose: a model that is refused has
 /// no other way to find out, and an operator being told by the agent *which*
 /// setting to change is the whole reason the refusal is not just "denied".
-pub(crate) const ROOM_REFUSAL: &str = "Permission denied: the config tools are not available for this room profile. An operator can allow them with `[tools.admin].room_profiles` in the host config.";
+pub(crate) const ROOM_REFUSAL: &str = "Permission denied: the config tools are not available for this room profile. An operator can allow them with `[tools.admin].session_profiles` in the host config.";
 
 /// The *effective* `enabled` value of a definition, as the loaders read
 /// it: `enabled:` when present, `true` when absent (both loaders declare
@@ -262,7 +275,7 @@ impl ConfigTool {
         }
         description.push_str(
             " These tools are available only in sessions whose room profile an operator \
-             listed in `[tools.admin].room_profiles`; anywhere else, every action including \
+             listed in `[tools.admin].session_profiles`; anywhere else, every action including \
              `list` is refused.",
         );
 
@@ -335,7 +348,7 @@ impl ConfigTool {
     /// `ToolPolicy`, because the grant that matters is the host's room-profile
     /// list, not a per-tool policy the workspace can set.
     fn gate(&self) -> Result<()> {
-        if current_admin_room_profile_for(&self.config)
+        if current_session_profile_for(&self.config)
             .is_some_and(|name| self.config.admin_allows_room_profile(&name))
         {
             Ok(())
@@ -672,7 +685,7 @@ impl TaskTestTool {
                  task's `room_id:` / `voice:` targets are ignored, because what this tool \
                  checks is the prompt and how the task ends, not where a result would go. \
                  These tools are available only in sessions whose room profile an operator \
-                 listed in `[tools.admin].room_profiles`."
+                 listed in `[tools.admin].session_profiles`."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -721,8 +734,8 @@ impl TaskTestTool {
     /// whether or not the gate could ever be reached. Display only, so this
     /// degrades to the default namespace rather than failing the report.
     fn namespace(&self) -> &str {
-        match current_admin_room_profile_for(&self.state.config) {
-            Some(name) => self.state.config.namespace_for_room_profile(&name),
+        match current_session_profile_for(&self.state.config) {
+            Some(name) => self.state.config.namespace_for_session_profile(&name),
             None => DEFAULT_NAMESPACE_NAME,
         }
     }
@@ -898,7 +911,7 @@ impl Tool for TaskTestTool {
         // config tool shares. A run is the most powerful thing on this
         // surface — it drives a whole turn — so it is refused as firmly as a
         // write.
-        if !current_admin_room_profile_for(&self.state.config)
+        if !current_session_profile_for(&self.state.config)
             .is_some_and(|name| self.state.config.admin_allows_room_profile(&name))
         {
             anyhow::bail!(ROOM_REFUSAL);
@@ -936,7 +949,7 @@ impl Tool for TaskTestTool {
 /// Register the four admin tools when the deployment has named a room profile.
 ///
 /// Extracted from `lib.rs` so the condition is testable, because the
-/// condition *is* the grant: with `[tools.admin].room_profiles` empty, `serve`
+/// condition *is* the grant: with `[tools.admin].session_profiles` empty, `serve`
 /// must register nothing at all — four tools that always refuse would
 /// still tell the model they exist, and "exists but never works" is a
 /// worse answer than "does not exist". The run-time gate in
@@ -1012,17 +1025,17 @@ mod tests {
         tool: ConfigTool,
     }
 
-    /// The tool as the deployment wires it: `[tools.admin].room_profiles =
-    /// ["ops"]`, `[room_profile.ops]` claiming `!ops:x`, the three
+    /// The tool as the deployment wires it: `[tools.admin].session_profiles =
+    /// ["ops"]`, `[session_profile.ops]` claiming `!ops:x`, the three
     /// directories present, no subagent / tool set back-reference (that is
     /// the agents-directory wiring, tested where it exists).
     fn fixture(dir: ConfigDir) -> Fixture {
         let (d, root, ws) = test_workspace();
         let mut config = Config::for_test();
-        config.tools.admin.room_profiles = vec!["ops".to_string()];
-        config.room_profiles.insert(
+        config.tools.admin.session_profiles = vec!["ops".to_string()];
+        config.session_profiles.insert(
             "ops".to_string(),
-            crate::config::RoomProfileConfig {
+            crate::config::SessionProfileConfig {
                 profile: "dev".to_string(),
                 rooms: vec!["!ops:x".to_string()],
                 ..Default::default()
@@ -1052,8 +1065,8 @@ mod tests {
     /// Every call goes through the ACP path's scope, the way an editor's
     /// prompt does: `run_llm_turn` scopes the profile the session pinned
     /// around tool execution, and no `TimerOrigin` is set on that path.
-    async fn from_room_profile<F: Future>(profile: Option<&str>, fut: F) -> F::Output {
-        scope_admin_room_profile(profile.map(str::to_string), fut).await
+    async fn from_session_profile<F: Future>(profile: Option<&str>, fut: F) -> F::Output {
+        scope_session_profile(profile.map(str::to_string), fut).await
     }
 
     async fn call(tool: &ConfigTool, input: serde_json::Value) -> anyhow::Result<String> {
@@ -1259,9 +1272,9 @@ mod tests {
     /// lets `agent_config` manage subagent definitions from Zed — the whole
     /// reason this grant is no longer written in room ids.
     #[tokio::test]
-    async fn an_acp_session_is_allowed_by_its_pinned_room_profile() {
+    async fn an_acp_session_is_allowed_by_its_pinned_session_profile() {
         let f = fixture(ConfigDir::Agents);
-        let listing = from_room_profile(Some("ops"), f.tool.execute(&json!({"action": "list"})))
+        let listing = from_session_profile(Some("ops"), f.tool.execute(&json!({"action": "list"})))
             .await
             .unwrap();
         assert!(listing.contains("No agents definitions."), "{listing}");
@@ -1274,28 +1287,28 @@ mod tests {
     async fn an_acp_session_off_the_list_is_refused() {
         let f = fixture(ConfigDir::Agents);
         for profile in [Some("guest"), None] {
-            let err = from_room_profile(profile, f.tool.execute(&json!({"action": "list"})))
+            let err = from_session_profile(profile, f.tool.execute(&json!({"action": "list"})))
                 .await
                 .unwrap_err()
                 .to_string();
             assert!(err.contains("Permission denied"), "{profile:?}: {err}");
-            assert!(err.contains("room_profiles"), "{profile:?}: {err}");
+            assert!(err.contains("session_profiles"), "{profile:?}: {err}");
         }
     }
 
     /// A channel turn resolves its room to a profile the same way its
-    /// provider does, so `[room_profile.default]` captures an unlisted room
+    /// provider does, so `[session_profile.default]` captures an unlisted room
     /// there exactly as it does for the provider. A room in a *different*
     /// profile than the allow list is a refusal.
     #[tokio::test]
-    async fn a_channel_room_is_gated_by_its_resolved_room_profile() {
+    async fn a_channel_room_is_gated_by_its_resolved_session_profile() {
         let (d, root, ws) = test_workspace();
         let mut config = Config::for_test();
-        config.tools.admin.room_profiles = vec!["ops".to_string()];
+        config.tools.admin.session_profiles = vec!["ops".to_string()];
         for (name, room) in [("ops", "!ops:x"), ("guest", "!lounge:y")] {
-            config.room_profiles.insert(
+            config.session_profiles.insert(
                 name.to_string(),
-                crate::config::RoomProfileConfig {
+                crate::config::SessionProfileConfig {
                     profile: "dev".to_string(),
                     rooms: vec![room.to_string()],
                     ..Default::default()
@@ -1336,16 +1349,16 @@ mod tests {
     /// namespace, resolved from the profile rather than from a room id — so
     /// an ACP call writes its report where the operator already reads.
     #[tokio::test]
-    async fn a_test_session_uses_the_room_profiles_namespace() {
+    async fn a_test_session_uses_the_session_profiles_namespace() {
         let mut state = ServeState::for_test_scripted(false, vec![test_response("ok")]);
         {
             let config = &mut Arc::get_mut(&mut state)
                 .expect("uniquely owned immediately after construction")
                 .config;
-            config.tools.admin.room_profiles = vec!["ops".to_string()];
-            config.room_profiles.insert(
+            config.tools.admin.session_profiles = vec!["ops".to_string()];
+            config.session_profiles.insert(
                 "ops".to_string(),
-                crate::config::RoomProfileConfig {
+                crate::config::SessionProfileConfig {
                     profile: "dev".to_string(),
                     rooms: vec!["!ops:x".to_string()],
                     memory_namespace: Some("ops_ns".to_string()),
@@ -1364,7 +1377,7 @@ mod tests {
         )
         .unwrap();
         let tool = TaskTestTool::new(Arc::clone(&state));
-        from_room_profile(
+        from_session_profile(
             Some("ops"),
             tool.execute(&json!({"kind": "heartbeat", "name": "x"})),
         )
@@ -1409,10 +1422,10 @@ mod tests {
             let config = &mut Arc::get_mut(&mut state)
                 .expect("uniquely owned immediately after construction")
                 .config;
-            config.tools.admin.room_profiles = vec!["ops".to_string()];
-            config.room_profiles.insert(
+            config.tools.admin.session_profiles = vec!["ops".to_string()];
+            config.session_profiles.insert(
                 "ops".to_string(),
-                crate::config::RoomProfileConfig {
+                crate::config::SessionProfileConfig {
                     profile: "dev".to_string(),
                     rooms: vec!["!ops:x".to_string()],
                     ..Default::default()
@@ -1592,7 +1605,7 @@ mod tests {
         let serve_state = test_state(vec![test_response("ok")]);
         let set = Arc::new(ToolSet::new(Vec::new(), Vec::new()));
         let mut config = Config::for_test();
-        config.tools.admin.room_profiles = Vec::new();
+        config.tools.admin.session_profiles = Vec::new();
         assert!(!config.config_tools_enabled());
 
         register_admin_tools(&set, &root, config, ws, None, serve_state).await;
@@ -1615,7 +1628,7 @@ mod tests {
         let serve_state = test_state(vec![test_response("ok")]);
         let set = Arc::new(ToolSet::new(Vec::new(), Vec::new()));
         let mut config = Config::for_test();
-        config.tools.admin.room_profiles = vec!["ops".to_string()];
+        config.tools.admin.session_profiles = vec!["ops".to_string()];
 
         register_admin_tools(&set, &root, config, ws, None, serve_state).await;
 
@@ -1660,10 +1673,10 @@ mod tests {
             Vec::new(),
         ));
         let mut config = Config::for_test();
-        config.tools.admin.room_profiles = vec!["ops".to_string()];
-        config.room_profiles.insert(
+        config.tools.admin.session_profiles = vec!["ops".to_string()];
+        config.session_profiles.insert(
             "ops".to_string(),
-            crate::config::RoomProfileConfig {
+            crate::config::SessionProfileConfig {
                 profile: "dev".to_string(),
                 rooms: vec!["!ops:x".to_string()],
                 ..Default::default()
@@ -1739,7 +1752,7 @@ You are a reviewer.
             timer_origin: None,
             session_id: None,
             subagent_depth: 0,
-            admin_room_profile: None,
+            session_profile: None,
         });
         let out = crate::serve::scope_turn_context(
             ctx,

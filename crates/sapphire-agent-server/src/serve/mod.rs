@@ -50,13 +50,13 @@ use tracing::{debug, error, info, warn};
 // Shared server state
 // ---------------------------------------------------------------------------
 
-/// Map of `device_id` → (`room_profile`, push channel), populated by
+/// Map of `device_id` → (`session_profile`, push channel), populated by
 /// `voice/subscribe`. Heartbeat (and any future server-initiated voice
 /// notifier) looks up subscribers here to deliver TTS audio.
 ///
 /// Keyed by `device_id` alone because a single satellite only ever
 /// holds one active voice session at a time — the satellite tells us
-/// which room_profile it's bound to when it subscribes, and we keep
+/// which session_profile it's bound to when it subscribes, and we keep
 /// that around as the reverse index so heartbeat tasks don't have to
 /// duplicate the value.
 pub type VoiceSubscribers =
@@ -77,7 +77,7 @@ pub struct ServeState {
     /// `--resume <grain-id>`.
     pub(crate) cross_device_session_store: Arc<SessionStore>,
     /// Device-default session store (kind = `"device-default"`). Holds the
-    /// per-`(device_id, room_profile)` always-on session that heartbeat
+    /// per-`(device_id, session_profile)` always-on session that heartbeat
     /// pushes target and that a satellite falls into when no other session
     /// is selected. Lazy-created, daily-rotated. See #122.
     pub(crate) device_default_session_store: Arc<SessionStore>,
@@ -96,11 +96,11 @@ pub struct ServeState {
     /// that quitting without sending anything leaves no empty file behind.
     /// Maps internal UUID → reserved public_id (grain-id).
     pub(crate) pending_sessions: tokio::sync::Mutex<HashMap<String, String>>,
-    /// Per-session room_profile pin from `initialize`. Sessions absent
+    /// Per-session session_profile pin from `initialize`. Sessions absent
     /// from this map fall through to the background provider. Not
-    /// persisted across restarts — clients must re-pass `room_profile`
+    /// persisted across restarts — clients must re-pass `session_profile`
     /// on resume.
-    pub(crate) session_room_profiles: tokio::sync::Mutex<HashMap<String, String>>,
+    pub(crate) session_profiles: tokio::sync::Mutex<HashMap<String, String>>,
     /// Per-session room metadata supplied by the client at `initialize`
     /// (a voice client's `[device]` block, principally). Mirrors the
     /// channel-side `Channel::room_info()` lookup so the agent can tell
@@ -119,7 +119,7 @@ pub struct ServeState {
     /// (rare). Absent → no in-memory scrub; on-disk persistence still
     /// gets the hash-marker fallback from `SessionStore::append`.
     pub(crate) image_cache: Option<Arc<crate::image_cache::ImageCache>>,
-    /// Active satellites, keyed by `(device_id, room_profile)`. Inserted
+    /// Active satellites, keyed by `(device_id, session_profile)`. Inserted
     /// by `voice/subscribe`, removed by the per-subscription writer task
     /// when its SSE channel closes (i.e. satellite disconnects).
     pub(crate) voice_subscribers: Arc<VoiceSubscribers>,
@@ -221,7 +221,7 @@ impl ServeState {
             autonomous_session_store,
             sessions: tokio::sync::Mutex::new(HashMap::new()),
             pending_sessions: tokio::sync::Mutex::new(HashMap::new()),
-            session_room_profiles: tokio::sync::Mutex::new(HashMap::new()),
+            session_profiles: tokio::sync::Mutex::new(HashMap::new()),
             session_room_metadata: tokio::sync::Mutex::new(HashMap::new()),
             voice,
             voice_subscribers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -290,17 +290,12 @@ impl ServeState {
     }
 
     /// Provider that should serve the given session. Resolves the
-    /// session's pinned room_profile to its `profile`, then to a
+    /// session's pinned session_profile to its `profile`, then to a
     /// concrete provider (with optional refusal fallback). Falls back
-    /// to the background provider when no room_profile is pinned.
+    /// to the background provider when no session_profile is pinned.
     pub(crate) async fn provider_for_session(&self, session_id: &str) -> Arc<dyn Provider> {
-        let rp_name = self
-            .session_room_profiles
-            .lock()
-            .await
-            .get(session_id)
-            .cloned();
-        match rp_name.and_then(|n| self.config.room_profile(&n).map(|rp| rp.profile.clone())) {
+        let rp_name = self.session_profiles.lock().await.get(session_id).cloned();
+        match rp_name.and_then(|n| self.config.session_profile(&n).map(|rp| rp.profile.clone())) {
             Some(profile_name) => self.registry.for_profile(&self.config, &profile_name),
             None => self.registry.background_provider(&self.config),
         }
@@ -552,8 +547,8 @@ async fn rpc_post(
 
     let req_id = req.id.clone().unwrap_or(Value::Null);
 
-    // Bearer auth → room_profile reverse lookup. The token IS the
-    // profile selector; clients no longer pass `room_profile` in
+    // Bearer auth → session_profile reverse lookup. The token IS the
+    // profile selector; clients no longer pass `session_profile` in
     // params. Missing/empty bearer → 401 at the HTTP layer (matches
     // /a2a); unknown token → JSON-RPC AUTH_REQUIRED.
     let bearer = match extract_bearer(&headers) {
@@ -563,7 +558,7 @@ async fn rpc_post(
         }
     };
     let (profile_name, authenticated_device_id) = match state.device_auth.resolve(&bearer).await {
-        Ok(r) => (r.room_profile, r.device.id.to_string()),
+        Ok(r) => (r.session_profile, r.device.id.to_string()),
         Err(crate::device_auth::AuthError::Forbidden) => {
             return (
                 StatusCode::FORBIDDEN,
@@ -658,7 +653,7 @@ async fn handle_initialize(
     existing_header_session: Option<String>,
     profile_name: String,
 ) -> axum::response::Response {
-    // `room_profile` is no longer accepted as a JSON-RPC param — the
+    // `session_profile` is no longer accepted as a JSON-RPC param — the
     // bearer token resolved in `rpc_post` is the sole profile selector
     // (mirrors A2A / MCP). `DeviceAuth::resolve` only returns profile
     // names that exist in the config, so no extra validation is needed
@@ -709,7 +704,7 @@ pub(crate) struct OpenedSession {
     /// The 7-char grain-id shown to people. Reserved now for a new session.
     pub public_id: Option<String>,
     pub is_new: bool,
-    pub room_profile: String,
+    pub session_profile: String,
 }
 
 impl OpenedSession {
@@ -718,7 +713,7 @@ impl OpenedSession {
         let mut result = json!({
             "session_id": self.session_id,
             "is_new": self.is_new,
-            "room_profile": self.room_profile,
+            "room_profile": self.session_profile,
         });
         if let Some(pub_id) = &self.public_id {
             result["public_id"] = json!(pub_id);
@@ -811,7 +806,7 @@ pub(crate) async fn open_session(
     };
 
     state
-        .session_room_profiles
+        .session_profiles
         .lock()
         .await
         .insert(session_id.clone(), profile_name.clone());
@@ -848,7 +843,7 @@ pub(crate) async fn open_session(
         session_id,
         public_id,
         is_new,
-        room_profile: profile_name,
+        session_profile: profile_name,
     })
 }
 
@@ -1027,7 +1022,7 @@ pub(crate) fn session_history(state: &ServeState, session_id: &str) -> Vec<Value
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// voice/config — return the room_profile's wake-word + (future)
+// voice/config — return the session_profile's wake-word + (future)
 // per-session voice settings so satellites can self-configure
 // ---------------------------------------------------------------------------
 
@@ -1040,7 +1035,7 @@ async fn handle_voice_config(
     use sha2::{Digest, Sha256};
 
     // Wake-word config is global — the same Saphina (or whatever)
-    // greets the user across every room_profile. `params` is reserved
+    // greets the user across every session_profile. `params` is reserved
     // for a future per-profile override but currently unused.
     let mut result = json!({});
     if let Some(path_str) = &state.config.voice.wake_word_model {
@@ -1092,7 +1087,7 @@ async fn handle_voice_pipeline_run(
     state: Arc<ServeState>,
     req_id: Value,
     params: Option<Value>,
-    room_profile: String,
+    session_profile: String,
     authenticated_device_id: String,
 ) -> axum::response::Response {
     if state.voice.is_none() {
@@ -1134,24 +1129,24 @@ async fn handle_voice_pipeline_run(
         );
         return body.into_response();
     }
-    // `room_profile` comes from the bearer token resolved in
+    // `session_profile` comes from the bearer token resolved in
     // `rpc_post`; clients no longer pass it as a param.
     let language = params["language"].as_str().map(|s| s.to_string());
 
     // Resolve / lazily-create the device-default session for this
-    // `(device_id, room_profile)` pair under that profile's memory
+    // `(device_id, session_profile)` pair under that profile's memory
     // namespace. Daily rotation falls out naturally: a satellite
     // reconnecting after the day boundary finds yesterday's file as
     // "not in today's window" and a fresh UUID file is opened. See #122.
     let namespace = state
         .config
-        .namespace_for_room_profile(&room_profile)
+        .namespace_for_session_profile(&session_profile)
         .to_string();
     let session_id = match state
         .device_default_session_store
         .find_or_create_for_device(
             &device_id,
-            &room_profile,
+            &session_profile,
             &namespace,
             state.config.day_boundary_hour,
         ) {
@@ -1166,10 +1161,10 @@ async fn handle_voice_pipeline_run(
         }
     };
     state
-        .session_room_profiles
+        .session_profiles
         .lock()
         .await
-        .insert(session_id.clone(), room_profile.clone());
+        .insert(session_id.clone(), session_profile.clone());
 
     // Same `device` block accepted by `initialize` — refreshed on every
     // pipeline_run so satellites can update their description without a
@@ -1227,7 +1222,7 @@ async fn handle_voice_subscribe(
     state: Arc<ServeState>,
     req_id: Value,
     params: Option<Value>,
-    room_profile: String,
+    session_profile: String,
     authenticated_device_id: String,
 ) -> axum::response::Response {
     let params = params.unwrap_or(Value::Null);
@@ -1249,21 +1244,21 @@ async fn handle_voice_subscribe(
         );
         return body.into_response();
     }
-    // `room_profile` comes from the bearer token resolved in
+    // `session_profile` comes from the bearer token resolved in
     // `rpc_post`; clients no longer pass it as a param.
 
     // Replace any prior subscription for this device (typical case:
     // the same satellite reconnects after a brief network blip). The
     // old sender is dropped; its writer task exits on the first
-    // failed send. The room_profile may also have changed across
+    // failed send. The session_profile may also have changed across
     // reconnect, so the freshest value wins — that's the satellite's
     // current binding.
     let (push_tx, push_rx) = mpsc::channel::<crate::voice::VoicePushItem>(32);
     {
         let mut subs = state.voice_subscribers.lock().await;
-        subs.insert(device_id.clone(), (room_profile.clone(), push_tx));
+        subs.insert(device_id.clone(), (session_profile.clone(), push_tx));
     }
-    info!("voice/subscribe: registered (device={device_id}, room_profile={room_profile})");
+    info!("voice/subscribe: registered (device={device_id}, session_profile={session_profile})");
 
     let (sse_tx, sse_rx) = mpsc::channel::<Result<Event, Infallible>>(32);
     let cleanup_state = Arc::clone(&state);
@@ -1281,7 +1276,7 @@ async fn handle_voice_subscribe(
             .unwrap_or(false)
             && let Some((rp, _)) = subs.remove(&cleanup_device)
         {
-            info!("voice/subscribe: unregistered (device={cleanup_device}, room_profile={rp})");
+            info!("voice/subscribe: unregistered (device={cleanup_device}, session_profile={rp})");
         }
     });
 
@@ -1368,7 +1363,7 @@ async fn run_voice_turn(
             send(error_event(
                 &req_id,
                 -32602,
-                "Session's room_profile has no voice_pipeline configured",
+                "Session's session_profile has no voice_pipeline configured",
             ))
             .await;
             return;
@@ -1466,15 +1461,10 @@ async fn resolve_voice_pipeline(
     if state.voice.is_none() {
         return Err(VoicePipelineLookup::NoVoice);
     }
-    let rp_name = state
-        .session_room_profiles
-        .lock()
-        .await
-        .get(session_id)
-        .cloned();
+    let rp_name = state.session_profiles.lock().await.get(session_id).cloned();
     rp_name
         .as_deref()
-        .and_then(|n| state.config.voice_pipeline_for_room_profile(n))
+        .and_then(|n| state.config.voice_pipeline_for_session_profile(n))
         .cloned()
         .ok_or(VoicePipelineLookup::NotConfigured)
 }
@@ -1514,7 +1504,7 @@ async fn run_voice_turn_from_text_sse(
             send(error_event(
                 &req_id,
                 -32602,
-                "Session's room_profile has no voice_pipeline configured",
+                "Session's session_profile has no voice_pipeline configured",
             ))
             .await;
             return;
@@ -1681,10 +1671,10 @@ pub enum VoicePushError {
     /// The server has no `[stt_provider.*]` / `[tts_provider.*]` blocks
     /// configured at all — voice push is fundamentally unavailable.
     NoVoice,
-    /// The room_profile is unknown or has no `voice_pipeline` set.
+    /// The session_profile is unknown or has no `voice_pipeline` set.
     NotConfigured,
     /// No satellite is currently subscribed for this `(device_id,
-    /// room_profile)` pair. Caller should fall back to chat if the
+    /// session_profile)` pair. Caller should fall back to chat if the
     /// heartbeat task has a `room_id`, or log and skip otherwise.
     Offline,
     /// Any other failure (TTS, LLM, etc.) surfaced for logging.
@@ -1695,9 +1685,9 @@ pub enum VoicePushError {
 /// session bound to `device_id` and stream the TTS audio to the
 /// satellite subscribed via `voice/subscribe`.
 ///
-/// The satellite supplied its current `room_profile` when it
+/// The satellite supplied its current `session_profile` when it
 /// subscribed — that value is the authoritative reverse index, so the
-/// caller never has to duplicate it (a satellite's room_profile can
+/// caller never has to duplicate it (a satellite's session_profile can
 /// only change via a fresh subscription, which atomically replaces
 /// the binding).
 ///
@@ -1711,40 +1701,40 @@ pub(crate) async fn push_voice_text_to_subscriber(
 ) -> Result<(), VoicePushError> {
     // Look up the active subscription up front — if the satellite is
     // offline, surface that without burning an LLM call. The map also
-    // tells us which room_profile the satellite is bound to.
-    let (room_profile, push_tx) = {
+    // tells us which session_profile the satellite is bound to.
+    let (session_profile, push_tx) = {
         let subs = state.voice_subscribers.lock().await;
         match subs.get(&device_id) {
             Some((rp, tx)) => (rp.clone(), tx.clone()),
             None => return Err(VoicePushError::Offline),
         }
     };
-    if state.config.room_profile(&room_profile).is_none() {
+    if state.config.session_profile(&session_profile).is_none() {
         return Err(VoicePushError::NotConfigured);
     }
 
     // Resolve / lazily-create the device-default session for this
-    // `(device_id, room_profile)` pair under that profile's memory
-    // namespace, then pin the room_profile so `resolve_voice_pipeline`
+    // `(device_id, session_profile)` pair under that profile's memory
+    // namespace, then pin the session_profile so `resolve_voice_pipeline`
     // and `run_llm_turn` find the right config. See #122.
     let namespace = state
         .config
-        .namespace_for_room_profile(&room_profile)
+        .namespace_for_session_profile(&session_profile)
         .to_string();
     let session_id = state
         .device_default_session_store
         .find_or_create_for_device(
             &device_id,
-            &room_profile,
+            &session_profile,
             &namespace,
             state.config.day_boundary_hour,
         )
         .map_err(|e| VoicePushError::Other(format!("device-default lookup: {e}")))?;
     state
-        .session_room_profiles
+        .session_profiles
         .lock()
         .await
-        .insert(session_id.clone(), room_profile.clone());
+        .insert(session_id.clone(), session_profile.clone());
 
     let pipeline = match resolve_voice_pipeline(&state, &session_id).await {
         Ok(p) => p,
@@ -2589,13 +2579,13 @@ pub(crate) struct TurnContext {
     /// transport that names no profile an operator could have allowed
     /// (`/rpc`, A2A, voice, the unattended loops). Set by `run_llm_turn` from
     /// the profile an ACP session pinned, and read through
-    /// `config_tools::current_admin_room_profile_for` while a tool call runs.
+    /// `config_tools::current_session_profile_for` while a tool call runs.
     ///
     /// Copied straight into the nested `TurnLoop` a delegated subagent builds,
     /// so a delegation keeps the grant its parent ran under — the grant is the
     /// session's, not the caller's, the same way `timer_origin` is carried.
     /// A definition that must not hold it narrows its own `tools:` instead.
-    pub admin_room_profile: Option<String>,
+    pub session_profile: Option<String>,
 }
 
 tokio::task_local! {
@@ -2653,8 +2643,8 @@ pub(crate) struct TurnLoop<'a> {
     pub subagent_depth: u32,
     /// The admin-tool grant this loop's tool calls are judged by. Copied into
     /// every round's `TurnContext` and scoped around tool execution the same
-    /// way `timer_origin` is. See `TurnContext::admin_room_profile`.
-    pub admin_room_profile: Option<String>,
+    /// way `timer_origin` is. See `TurnContext::session_profile`.
+    pub session_profile: Option<String>,
 }
 
 impl TurnLoop<'_> {
@@ -2942,7 +2932,7 @@ impl TurnLoop<'_> {
                     let session_tools = session_tools.clone();
                     let ns = namespace.clone();
                     let timer_origin = self.timer_origin.clone();
-                    let admin_room_profile = self.admin_room_profile.clone();
+                    let session_profile = self.session_profile.clone();
                     // Read once per turn, same as `timer_origin`: `None` on
                     // every non-ACP transport, which is what keeps the
                     // client-side tools refusing there rather than reaching
@@ -2969,7 +2959,7 @@ impl TurnLoop<'_> {
                         timer_origin: timer_origin.clone(),
                         session_id: self.persistence.map(|p| p.session_id.clone()),
                         subagent_depth: self.subagent_depth,
-                        admin_room_profile: self.admin_room_profile.clone(),
+                        session_profile: self.session_profile.clone(),
                     });
                     let mut results: Vec<(String, crate::tools::ToolOutput)> =
                         futures_util::future::join_all(permitted.into_iter().map(|c| {
@@ -2979,7 +2969,7 @@ impl TurnLoop<'_> {
                             let origin = timer_origin.clone();
                             let client = acp_client.clone();
                             let turn_ctx = Arc::clone(&turn_ctx);
-                            let admin_room_profile = admin_room_profile.clone();
+                            let session_profile = session_profile.clone();
                             let avatar = avatar.clone();
                             async move {
                                 let fut = crate::tools::workspace_tools::scope_memory_namespace(
@@ -3009,14 +2999,14 @@ impl TurnLoop<'_> {
                                 // to any tool this round, not just the one
                                 // named `subagent`.
                                 // The admin tools read this through
-                                // `config_tools::current_admin_room_profile()`.
+                                // `config_tools::current_session_profile()`.
                                 // Scoped here rather than inside the match
                                 // below so the four (origin, client) arms do
                                 // not each need their own copy; `None` is a
                                 // meaningful value (no profile to allow), not
                                 // "unset".
-                                let fut = crate::tools::config_tools::scope_admin_room_profile(
-                                    admin_room_profile.clone(),
+                                let fut = crate::tools::config_tools::scope_session_profile(
+                                    session_profile.clone(),
                                     fut,
                                 );
                                 // Unconditional for the same reason: `None`
@@ -3236,9 +3226,9 @@ pub(crate) async fn run_llm_turn(
     // refuse there. Channel rooms never reach this function — `Agent::
     // handle_message` runs its own loop, where the room travels as
     // `TimerOrigin::Chat` instead.
-    let admin_room_profile = if is_acp {
+    let session_profile = if is_acp {
         state
-            .session_room_profiles
+            .session_profiles
             .lock()
             .await
             .get(&session_id)
@@ -3292,13 +3282,16 @@ pub(crate) async fn run_llm_turn(
     //    initialize-time; absent that, the background provider is used.
     let provider = state.provider_for_session(&session_id).await;
 
-    // 2a. Namespace chain follows the session's pinned room_profile when
+    // 2a. Namespace chain follows the session's pinned session_profile when
     //     set; otherwise the implicit default namespace. Resolved here
     //     so it can be recorded in the session metadata on first chat
     //     (used by the daily-log builder to route NSFW sessions away
     //     from default-namespace rooms).
-    let namespace = match state.session_room_profiles.lock().await.get(&session_id) {
-        Some(rp_name) => state.config.namespace_for_room_profile(rp_name).to_string(),
+    let namespace = match state.session_profiles.lock().await.get(&session_id) {
+        Some(rp_name) => state
+            .config
+            .namespace_for_session_profile(rp_name)
+            .to_string(),
         None => crate::config::DEFAULT_NAMESPACE_NAME.to_string(),
     };
     let namespace_chain = state.config.resolve_namespace_chain(&namespace);
@@ -3450,7 +3443,7 @@ pub(crate) async fn run_llm_turn(
         namespace: namespace.clone(),
         persistence: Some(&persistence),
         subagent_depth: 0,
-        admin_room_profile: admin_room_profile.clone(),
+        session_profile: session_profile.clone(),
     }
     .run(&mut history)
     .await;
@@ -3605,8 +3598,10 @@ async fn stream_chat_tts(
             return;
         }
         Err(VoicePipelineLookup::NotConfigured) => {
-            emit_tts_error("session's room_profile has no voice_pipeline configured".to_string())
-                .await;
+            emit_tts_error(
+                "session's session_profile has no voice_pipeline configured".to_string(),
+            )
+            .await;
             return;
         }
     };
@@ -3877,7 +3872,7 @@ impl crate::tools::Tool for AdminProfileProbe {
     }
 
     async fn execute(&self, _input: &serde_json::Value) -> anyhow::Result<String> {
-        *self.seen.lock().unwrap() = Some(crate::tools::config_tools::current_admin_room_profile());
+        *self.seen.lock().unwrap() = Some(crate::tools::config_tools::current_session_profile());
         Ok("probed".to_string())
     }
 }
@@ -4256,7 +4251,7 @@ impl ServeState {
         std::fs::create_dir_all(&workspace_dir).unwrap();
 
         // Device auth fixture: one device ("developer-device") routed to
-        // room_profile "developer", with its bearer token fixed at
+        // session_profile "developer", with its bearer token fixed at
         // "sa-acp-token" so the many tests presenting that literal keep
         // working. A static verifier stands in for the bridge.
         let mut config = Config::parse_for_test(
@@ -4267,7 +4262,7 @@ api_key = "test"
 [profiles.dev]
 provider = "stub"
 
-[room_profile.developer]
+[session_profile.developer]
 profile  = "dev"
 rooms    = []
 "#,
@@ -4275,23 +4270,26 @@ rooms    = []
         config.acp = Some(crate::config::AcpConfig {
             enabled: acp_enabled,
             keepalive_secs: acp_keepalive_secs,
-            stdio_room_profile: Some("developer".to_string()),
+            stdio_session_profile: Some("developer".to_string()),
         });
         config.cli = Some(crate::config::CliConfig {
-            room_profile: Some("developer".to_string()),
+            profile: Some("developer".to_string()),
         });
         config.tools.tool_rounds = rounds;
         tweak(&mut config);
-        config.room_profiles.get_mut("developer").unwrap().devices =
-            vec!["developer-device".to_string()];
+        config
+            .session_profiles
+            .get_mut("developer")
+            .unwrap()
+            .devices = vec!["developer-device".to_string()];
 
         let device_auth = crate::device_auth::testing::device_auth(
             &[("sa-acp-token", "developer-device")],
-            &config.room_profiles,
+            &config.session_profiles,
         );
 
         // Registered under both names: `provider_for_session` falls
-        // through to the background provider when no room_profile is
+        // through to the background provider when no session_profile is
         // pinned (as in the fixture_state_serves_the_scripted_provider
         // test above, which looks up an unpinned session), and the
         // background provider resolves the built-in "anthropic" key.
@@ -4342,7 +4340,7 @@ rooms    = []
             ),
             sessions: Default::default(),
             pending_sessions: Default::default(),
-            session_room_profiles: Default::default(),
+            session_profiles: Default::default(),
             session_room_metadata: Default::default(),
             voice: None,
             image_cache: None,
@@ -4534,7 +4532,7 @@ mod tests {
     /// is scoped and the admin tools refuse. Asserting `None` — not merely
     /// "not 'developer'" — keeps the two paths distinguishable.
     #[tokio::test]
-    async fn a_non_acp_turn_scopes_no_room_profile() {
+    async fn a_non_acp_turn_scopes_no_session_profile() {
         let state = ServeState::for_test_scripted(
             true,
             vec![
@@ -4582,21 +4580,21 @@ mod tests {
     /// pinned one) must fail here, the way Task 4's probe would.
     ///
     /// The tool is a real `ConfigTool` over a real workspace with
-    /// `[tools.admin].room_profiles = ["ops"]`; the turn is an ACP turn
+    /// `[tools.admin].session_profiles = ["ops"]`; the turn is an ACP turn
     /// only by `state.acp_sessions` plus the pin in
-    /// `session_room_profiles`, exactly what `session/new` writes. The
+    /// `session_profiles`, exactly what `session/new` writes. The
     /// policy layer is left at the default `Origin::Trusted` so the
     /// profile gate is the only permission this call passes through —
     /// if the profile does not reach the tool, the call is refused.
     #[tokio::test]
-    async fn an_acp_turn_carries_its_pinned_room_profile_to_its_tools() {
+    async fn an_acp_turn_carries_its_pinned_session_profile_to_its_tools() {
         let (state, _dir) = scripted_state_with_agent_config(vec!["ops".to_string()]).await;
 
         // The pin `session/new` writes: ACP session + a room profile name.
         let sid = "acp-profile-carry".to_string();
         state.acp_sessions.lock().await.insert(sid.clone());
         state
-            .session_room_profiles
+            .session_profiles
             .lock()
             .await
             .insert(sid.clone(), "ops".to_string());
@@ -4631,7 +4629,7 @@ mod tests {
         // one some *other* session pinned.
         let sid = "rpc-no-profile".to_string();
         state
-            .session_room_profiles
+            .session_profiles
             .lock()
             .await
             .insert("some-other-session".to_string(), "ops".to_string());
@@ -4647,7 +4645,7 @@ mod tests {
 
         let result = tool_result_for(&state, &sid, "call-1").await;
         assert!(
-            result.contains("Permission denied") && result.contains("room_profiles"),
+            result.contains("Permission denied") && result.contains("session_profiles"),
             "a /rpc turn must be refused by the profile gate: got {result}"
         );
     }
@@ -4655,7 +4653,7 @@ mod tests {
     /// The state + real `agent_config` tool the two wiring tests above
     /// share: a scripted one-round-then-answer provider, and a
     /// `ConfigTool` over `state.workspace` itself with
-    /// `[tools.admin].room_profiles` set to `profiles`. The framework
+    /// `[tools.admin].session_profiles` set to `profiles`. The framework
     /// workspace the tool writes through is opened over the same
     /// directory (`Workspace::from_root` needs the `.sapphire-agent`
     /// marker), with a shared cache dir under the system temp dir.
@@ -4704,7 +4702,7 @@ mod tests {
         std::fs::create_dir_all(root.join(".sapphire-agent")).unwrap();
 
         let mut config = state.config.clone();
-        config.tools.admin.room_profiles = profiles;
+        config.tools.admin.session_profiles = profiles;
         let sw = sapphire_framework::workspace::Workspace::from_root(ctx, &root).unwrap();
         let ws = Arc::new(sapphire_framework::workspace::WorkspaceState::open(sw).unwrap());
 
@@ -5027,7 +5025,7 @@ mod tests {
             namespace: crate::config::DEFAULT_NAMESPACE_NAME.to_string(),
             persistence: None,
             subagent_depth: 1,
-            admin_room_profile: None,
+            session_profile: None,
         }
         .run(&mut history)
         .await;
@@ -6055,7 +6053,7 @@ mod tests {
             .resolve("sa-acp-token")
             .await
             .expect("fixture token should resolve");
-        assert_eq!(resolved.room_profile, "developer");
+        assert_eq!(resolved.session_profile, "developer");
         assert!(state.device_auth.resolve("sa-wrong").await.is_err());
     }
 

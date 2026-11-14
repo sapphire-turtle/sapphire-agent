@@ -8,7 +8,7 @@
 //!
 //! Auth: `Authorization: Bearer <token>` resolved through `DeviceAuth` —
 //! token -> device -> room profile. The match resolves the request's
-//! `room_profile` implicitly — clients don't need to (and can't) name
+//! `session_profile` implicitly — clients don't need to (and can't) name
 //! it. A token leak therefore exposes one device's profile, not all.
 //!
 //! Out of scope (v1): `SendStreamingMessage` (SSE), `GetTask`,
@@ -173,7 +173,7 @@ pub async fn handle_a2a_post(
         );
     }
 
-    // 2. Bearer auth → room_profile reverse lookup. Empty/missing bearer
+    // 2. Bearer auth → session_profile reverse lookup. Empty/missing bearer
     //    returns 401 at the HTTP layer (no JSON-RPC envelope) per A2A
     //    spec: auth failures are an HTTP-level concern, not an
     //    application error.
@@ -184,7 +184,7 @@ pub async fn handle_a2a_post(
         }
     };
     let profile_name = match state.device_auth.resolve(&bearer).await {
-        Ok(r) => r.room_profile,
+        Ok(r) => r.session_profile,
         Err(crate::device_auth::AuthError::Forbidden) => {
             return (
                 StatusCode::FORBIDDEN,
@@ -277,9 +277,9 @@ async fn handle_send_message(
     let session_id = format!("a2a-{profile_name}-{context_id}");
 
     // Pin the profile so `run_llm_turn`'s provider/namespace resolution
-    // picks up the right room_profile.
+    // picks up the right session_profile.
     state
-        .session_room_profiles
+        .session_profiles
         .lock()
         .await
         .insert(session_id.clone(), profile_name.clone());

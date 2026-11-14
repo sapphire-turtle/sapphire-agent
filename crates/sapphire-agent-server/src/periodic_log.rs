@@ -223,7 +223,7 @@ pub fn daily_stems_in_current_iso_week_before(today: NaiveDate) -> Vec<String> {
 /// `memory/<namespace>/daily/`, up to and including yesterday (local time).
 ///
 /// `room_predicate` decides which sessions count toward this namespace.
-/// Callers compute it from `Config::namespace_for_room`.
+/// Callers compute it from `Config::namespace_for_session`.
 pub fn pending_daily_dates<F>(
     session_store: &SessionStore,
     acp_store: Option<&AcpSessionStore>,

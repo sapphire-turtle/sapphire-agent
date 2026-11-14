@@ -132,7 +132,7 @@ use workspace::Workspace;
 /// falling back to the default namespace for old files that predate
 /// the field. Every other channel (Matrix/Discord `"channel"`
 /// sessions) has no such field and resolves via
-/// `Config::namespace_for_room` instead.
+/// `Config::namespace_for_session` instead.
 ///
 /// Extracted to a named function (rather than inlined as a closure)
 /// so it can be unit-tested directly.
@@ -147,7 +147,7 @@ fn daily_log_catchup_predicate(
             .unwrap_or(config::DEFAULT_NAMESPACE_NAME)
             == namespace
     } else {
-        config.namespace_for_room(&meta.room_id) == namespace
+        config.namespace_for_session(&meta.room_id) == namespace
     }
 }
 
@@ -248,7 +248,7 @@ fn consult_timeout(hours: u64) -> std::time::Duration {
 
 /// `verify`'s API key section: the keys of the workspace the agent serves
 /// and the room profile each runs under, so a key that would be refused
-/// shows up before a request is. Also the `[room_profile.<n>].devices`
+/// shows up before a request is. Also the `[session_profile.<n>].devices`
 /// fallback for keys from before profiles, and any entry of it naming no
 /// key. Reads the key files without changing them.
 fn verify_api_keys(auth: &device_auth::DeviceAuth, root: Option<&std::path::Path>) {
@@ -258,7 +258,7 @@ fn verify_api_keys(auth: &device_auth::DeviceAuth, root: Option<&std::path::Path
     if !bindings.is_empty() {
         println!("  Device bindings   : (for API keys from before key profiles)");
         for (selector, rp) in &bindings {
-            println!("    {selector:<20} -> room_profile '{rp}'");
+            println!("    {selector:<20} -> session_profile '{rp}'");
         }
     }
     let Some(root) = root else {
@@ -287,15 +287,15 @@ fn verify_api_keys(auth: &device_auth::DeviceAuth, root: Option<&std::path::Path
     println!("  API keys          : {} in {}", live.len(), dir.display());
     for key in &live {
         let profile = key.profile.as_str();
-        if auth.is_room_profile(profile) {
+        if auth.is_session_profile(profile) {
             println!(
-                "    {:<20} {} -> room_profile '{profile}'",
+                "    {:<20} {} -> session_profile '{profile}'",
                 key.name, key.id
             );
         } else if profile == MIGRATED {
             match auth.legacy_binding(key.id.as_str(), &key.name) {
                 Some(rp) => println!(
-                    "    {:<20} {} -> room_profile '{rp}' (by `devices`; re-issue it with \
+                    "    {:<20} {} -> session_profile '{rp}' (by `devices`; re-issue it with \
                      `--profile {rp}`)",
                     key.name, key.id
                 ),
@@ -518,7 +518,7 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
             // ── Split sessions/<ns>/{api,rpc}/ into cross-device + legacy-voice ─
             // Quarantines pre-redesign voice files (their `voice-<hash>`
             // names can't be re-hydrated into the new
-            // `(device_id, room_profile)` keying) and moves remaining
+            // `(device_id, session_profile)` keying) and moves remaining
             // sessions into the new `cross-device/` directory, rewriting
             // stored `meta.channel = "api"` → `"rpc"` along the way.
             if let Err(e) = migrate_to_device_default_layout(&sessions_base_for_migration) {
@@ -543,7 +543,7 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
             let acp_tunnel = serve::acp_tunnel::AcpTunnel::default();
             let chat_tunnel = serve::chat_ipc::ChatTunnel::default();
             let server = app_server::build(edition)
-                .key_profiles(device_auth::room_key_profiles(&config.room_profiles))
+                .key_profiles(device_auth::room_key_profiles(&config.session_profiles))
                 .extend({
                     let acp = acp_tunnel.clone();
                     let chat = chat_tunnel.clone();
@@ -648,7 +648,7 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
             // `src/agent.rs`, stay untouched by this feature. Registered
             // when at least one definition loaded — a tool with nobody to
             // delegate to has no reason to be offered — and also when
-            // `[tools.admin].room_profiles` names a profile: `agent_config` can
+            // `[tools.admin].session_profiles` names a profile: `agent_config` can
             // create a definition while the process is running.
             let agent_defs = agents::load_agents_dir(&workspace_dir.join("agents"));
             // Taken before `new` moves the list: an empty list is not an
@@ -662,7 +662,7 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
                 );
             }
             // Registered when there is something to delegate to, and also
-            // when `[tools.admin].room_profiles` names a profile: `agent_config`
+            // when `[tools.admin].session_profiles` names a profile: `agent_config`
             // can create a definition while the process is running. `Arc` rather
             // than a bare `Box` because `agent_config` holds a `Weak` to it —
             // same shape `SkillTool` uses.
@@ -801,7 +801,7 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
             ));
 
             // ── Device-default session store (sessions/<ns>/device-default/) ─
-            // Lazy-created, daily-rotated per `(device_id, room_profile)` —
+            // Lazy-created, daily-rotated per `(device_id, session_profile)` —
             // the heartbeat target and the implicit session for a satellite
             // with nothing else selected. See #122.
             let device_default_session_store = Arc::new(SessionStore::with_workspace(
@@ -868,7 +868,9 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
             // there is exactly one answer to "who is this token" in the
             // process. Tokens are checked against the served workspace's
             // API keys; a key's profile is its room profile.
-            let device_auth = Arc::new(device_auth::DeviceAuth::workspace(&config.room_profiles)?);
+            let device_auth = Arc::new(device_auth::DeviceAuth::workspace(
+                &config.session_profiles,
+            )?);
 
             // ── Ambient audio ingest (optional) ─────────────────────────────
             // Built here — after `voice_providers` exists, before it is
@@ -1121,9 +1123,9 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
             // ── Config tools ────────────────────────────────────────────────
             // The agent's own heartbeat / autonomous / subagent definitions,
             // editable from a chat room an operator names in
-            // `[tools.admin].room_profiles`. Registered here rather than in
+            // `[tools.admin].session_profiles`. Registered here rather than in
             // `default_tool_set` because `task_test` needs `serve_state`,
-            // which is built above, and because a `room_profiles` that names
+            // which is built above, and because a `session_profiles` that names
             // nobody must register none of the four at all — see
             // `register_admin_tools`.
             tools::config_tools::register_admin_tools(
@@ -1522,7 +1524,7 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
             // Where each API key goes — its profile, or for a key from
             // before profiles the hand-written `devices` — needs somewhere
             // to be checked.
-            match device_auth::DeviceAuth::workspace(&config.room_profiles) {
+            match device_auth::DeviceAuth::workspace(&config.session_profiles) {
                 Ok(auth) => verify_api_keys(&auth, selection.as_ref().map(|s| s.root.as_path())),
                 Err(e) => println!("  Devices           : INVALID: {e:#}"),
             }
@@ -1724,7 +1726,7 @@ fn migrate_sessions_to_namespaced_layout(sessions_base: &std::path::Path) -> any
 /// `sessions/<ns>/{api,rpc}/` directory into the new layout.
 ///
 /// - Files whose name starts with `voice-` are pre-redesign voice
-///   sessions. Their `(device_id, room_profile)` was hashed into the
+///   sessions. Their `(device_id, session_profile)` was hashed into the
 ///   filename and is unrecoverable from disk, so we can't slot them
 ///   into the new device-default layout. They move to
 ///   `sessions/<ns>/legacy-voice/` instead — the daily-log archive
@@ -2095,7 +2097,7 @@ mod tests {
     fn unknown_keys_are_grouped_under_the_file_that_supplied_them() {
         let provenance = std::collections::BTreeMap::from([
             (
-                "room_profile.default.skills".to_string(),
+                "session_profile.default.skills".to_string(),
                 config_layer::Layer::Host,
             ),
             (
@@ -2105,7 +2107,7 @@ mod tests {
         ]);
         let unknown = vec![
             "memory_namespace.dev.skils".to_string(),
-            "room_profile.default.skills".to_string(),
+            "session_profile.default.skills".to_string(),
         ];
 
         let grouped = group_unknown_keys(
@@ -2120,7 +2122,7 @@ mod tests {
             vec![
                 (
                     "/etc/host.toml".to_string(),
-                    vec!["room_profile.default.skills"]
+                    vec!["session_profile.default.skills"]
                 ),
                 (
                     "/ws/.sapphire-agent/config.toml".to_string(),

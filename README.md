@@ -15,7 +15,7 @@ A personal AI assistant agent that works on file-based, local-first [`sapphire-f
 ## What it does
 
 - **Channels**: Matrix (E2EE via `matrix-sdk`) and Discord (`serenity`), running concurrently.
-- **Providers**: Anthropic Messages API with SSE streaming and a multi-round tool-use loop, plus OpenAI-compatible backends (local LLMs, OpenRouter, …) selectable per room/session via the `[providers]` / `[profiles]` / `[room_profile]` schema.
+- **Providers**: Anthropic Messages API with SSE streaming and a multi-round tool-use loop, plus OpenAI-compatible backends (local LLMs, OpenRouter, …) selectable per room/session via the `[providers]` / `[profiles]` / `[session_profile]` schema.
 - **Workspace**: backed by [`sapphire-framework`](https://github.com/sapphire-turtle/sapphire-framework) — file index, full-text + vector search (redb + tantivy, plus LanceDB vectors by default).
 - **Built-in tools**: `file_read`, `file_write`, `file_append`, `file_delete`, `dir_list`, `dir_walk`, `shell`, plus workspace memory / search / sync tools. The seven that touch a filesystem or a shell (`file_read`, `file_write`, `file_append`, `file_delete`, `dir_list`, `dir_walk`, `shell`) plus `shell_start` / `shell_output` / `shell_kill` for long-running commands are **session-routed: which machine they reach is decided by the session, not by the name**. Inside an ACP session they act on the machine the connected editor is running on, over `/acp`'s `fs/*` and `terminal/*` requests, and only for the capabilities that editor declared at `initialize` — with no fallback to the agent's own disk when one is missing. Everywhere else (Matrix, Discord, `/rpc`, voice, `/a2a`, heartbeat, autonomous, subagents) they act on this agent's own machine, and are opt-in: `[tools.host_access] enabled = false` by default, for every origin. Turning that on is a deliberate act; running the agent in a container is the recommended way to do it once it is. See [Shell and file tools: whose machine](#shell-and-file-tools-whose-machine) below.
 - **Sessions**: human-readable [`grain-id`](https://crates.io/crates/grain-id) aliases, auto-generated titles, history dump on resume.
@@ -28,7 +28,7 @@ A personal AI assistant agent that works on file-based, local-first [`sapphire-f
 - **Editor integration**: Zed (or any ACP client) drives the running agent over the Agent Client Protocol — on the agent's own machine by starting `sapphire-agent acp` (stdio, relayed to the running agent over its local IPC endpoint), from elsewhere over the `/acp` WebSocket endpoint (`[acp].enabled = true`); see [Zed / ACP](#zed--acp) below.
 - **Commands**:
   - `sapphire-agent serve` — start the agent: channel listeners and the local IPC endpoint, plus the JSON-RPC HTTP API (`/rpc`, `/a2a`, `/acp`) when `[serve]` is configured (HTTP is off by default). With no usable config (a new host, say) it runs the IPC endpoint alone, so `workspace init --sync --remote-workspace <name>` can fetch the workspace and its `.sapphire-agent/config.toml`; it restarts into the agent once either config changes
-  - `sapphire-agent chat` — interactive REPL with the agent running on this host, over its local IPC endpoint (`-m TEXT` for one message, `--list`, `--history`, `--session ID`, `--json`); runs under `[cli].room_profile`
+  - `sapphire-agent chat` — interactive REPL with the agent running on this host, over its local IPC endpoint (`-m TEXT` for one message, `--list`, `--history`, `--session ID`, `--json`); runs under `[cli].profile`
   - `sapphire-agent acp` — ACP on stdio for an editor, relayed to the running agent over IPC
   - `sapphire-agent init [PATH]` — seed a workspace with the files the agent reads (`AGENTS.md`, `SOUL.md`, …), then print the host-local config to paste; never overwrites an existing file
   - `sapphire-agent verify` — validate config and report loaded workspace files, including the room profile each API key runs under
@@ -91,7 +91,7 @@ Release binaries of the headless edition (`sapphire-agent-headless-<os>-<arch>`)
 
 On Windows the `shell` tool runs commands under Windows PowerShell unless a call names another shell (`pwsh`, `cmd`, `bash`, …); elsewhere it uses `$SHELL`, falling back to `/bin/sh`. Inside an ACP session, commands (and the file and skill tools' scripts) run on the editor's machine under `bash`, so a Windows editor needs Git Bash on `PATH`; with WSL enabled the editor may pick WSL's `bash.exe` instead (#303).
 
-The server and its CLI are one binary ([#278](https://github.com/sapphire-turtle/sapphire-agent/issues/278)), the way `sapphire-ledger` and the other sapphire-framework apps are: the client commands (`chat`, `acp`, `status`, …) talk to the server already running on the same host over its local IPC endpoint. So does the window of `sapphire-agent-desktop`, the GUI chat client; like `chat` it runs under `[cli].room_profile`. Its binary is the CLI too: run bare it opens the window, and with a subcommand it does what `sapphire-agent` does — `serve` included.
+The server and its CLI are one binary ([#278](https://github.com/sapphire-turtle/sapphire-agent/issues/278)), the way `sapphire-ledger` and the other sapphire-framework apps are: the client commands (`chat`, `acp`, `status`, …) talk to the server already running on the same host over its local IPC endpoint. So does the window of `sapphire-agent-desktop`, the GUI chat client; like `chat` it runs under `[cli].profile`. Its binary is the CLI too: run bare it opens the window, and with a subcommand it does what `sapphire-agent` does — `serve` included.
 
 ## Configure
 
@@ -123,21 +123,21 @@ Then:
 ```sh
 sapphire-agent verify   # sanity-check config and workspace
 sapphire-agent serve    # start the channel listeners + HTTP control API
-sapphire-agent chat     # interactive session with it (needs [cli].room_profile)
+sapphire-agent chat     # interactive session with it (needs [cli].profile)
 ```
 
 ### Keys nothing reads
 
 A key no field consumes is a warning, never an error. A typo (`skils = true`)
 and a setting written under the wrong table (`skills` belongs to
-`[memory_namespace.<name>]`; under `[room_profile.<name>]` it parses fine and
+`[memory_namespace.<name>]`; under `[session_profile.<name>]` it parses fine and
 does nothing) are otherwise silent — serde drops the key, so the file reads as
 configured to whoever wrote it and as unset to the agent. Startup logs one
 warning per file, naming the file through the same provenance `verify` uses:
 
 ```
 WARN Ignoring 1 unrecognised key(s) in /home/you/.config/sapphire-agent/config.toml:
-     room_profile.default.skills. Nothing reads these, so the agent is running as if
+     session_profile.default.skills. Nothing reads these, so the agent is running as if
      they were absent — check for a typo, or for a setting written under the wrong table.
 ```
 
@@ -435,9 +435,9 @@ so the room profile a token would pick is named in the host config instead:
 
 ```toml
 [acp]
-stdio_room_profile = "zed"   # any [room_profile.<name>]; required for `acp`
+stdio_session_profile = "zed"   # any [session_profile.<name>]; required for `acp`
 
-[room_profile.zed]
+[session_profile.zed]
 profile = "default"
 rooms   = []
 ```
@@ -473,7 +473,7 @@ memory namespace) the ACP session runs under. A dedicated room profile keeps
 the editor on its own model or namespace:
 
 ```toml
-[room_profile.zed]
+[session_profile.zed]
 profile = "default"
 rooms   = []              # ACP-only; no chat rooms map here
 ```
@@ -746,7 +746,7 @@ would otherwise sort against each other wrongly.
 Zed's session picker lists the connection's own conversations: `session/list`
 returns every open session under the memory namespace of the connection's
 room profile — the one its token picked on `/acp`, or
-`[acp].stdio_room_profile` for `sapphire-agent acp` — that is the isolation boundary, not the room profile
+`[acp].stdio_session_profile` for `sapphire-agent acp` — that is the isolation boundary, not the room profile
 itself, so two profiles that leave `memory_namespace` unset both land on
 `default` and see each other's sessions. Zed can further narrow the list to
 the project directory it has open (`cwd`), which every ACP session records
@@ -1021,25 +1021,25 @@ through four tools:
   `agents/` still needs a restart, as [Subagents](#subagents) describes.
 
 **A room profile has to be named, in the host config.** The tools are registered
-only when `[tools.admin].room_profiles` lists at least one room profile, and every
+only when `[tools.admin].session_profiles` lists at least one room profile, and every
 action — including the read-only `list` — is refused in a session whose profile is
 not on it:
 
 ```toml
 [tools.admin]
-room_profiles = ["ops", "developer"]   # [room_profile.<name>] keys, not room ids
+session_profiles = ["ops", "developer"]   # [session_profile.<name>] keys, not room ids
 ```
 
-With `room_profiles` absent or empty the four tools are **not registered at all** —
+With `session_profiles` absent or empty the four tools are **not registered at all** —
 the model is never told they exist. A tool that is offered and then always refuses
 is the worse answer: it invites a retry loop against a wall.
 
 A **channel** turn is judged by the profile its room resolves to — the same
 resolution that picks its provider and memory namespace, so an explicit listing in a
-`[room_profile.<name>].rooms` array wins and `[room_profile.default]` catches every
+`[session_profile.<name>].rooms` array wins and `[session_profile.default]` catches every
 room no profile claims. An **ACP** session (Zed and other editors) is judged by the
 profile its bearer token pinned at `session/new`, which is what makes these tools
-usable from an editor at all: ACP has no room id. Note what `room_profiles =
+usable from an editor at all: ACP has no room id. Note what `session_profiles =
 ["default"]` therefore means — every room no other profile claims — and list the
 specific profiles you mean unless that is what you want.
 
@@ -1055,7 +1055,7 @@ workspace `config.toml` can grant this. Guard that file accordingly: a listed pr
 can rewrite, through the agent, what runs unattended. **Pair it with that profile's own API keys
 or the room's `allowed_users`**, or everyone who can reach a session of that profile
 can author code-adjacent work that runs with nobody watching. `[tools.admin].rooms`
-from an earlier build is rejected at startup and names `room_profiles` in the error.
+from an earlier build is rejected at startup and names `session_profiles` in the error.
 
 **Trying a task before enabling it.** `task_test` runs one heartbeat or
 autonomous definition once, in a throwaway session, so a task can be
@@ -1163,7 +1163,7 @@ INFO ACP: Zed 0.209.3 initialized: fs.read=true fs.write=true terminal=true
 
 A client with `terminal=false` will never be offered them however the namespace
 is configured; with `terminal=true` and no tools in sight, the namespace flag is
-the one to check — and misspelling it or putting it under `[room_profile.<name>]`
+the one to check — and misspelling it or putting it under `[session_profile.<name>]`
 now warns at startup (see [Keys nothing reads](#keys-nothing-reads)).
 
 ### The four tools

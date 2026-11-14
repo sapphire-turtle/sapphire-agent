@@ -108,7 +108,7 @@ recovery_key = "EsT... "
 # Where to store matrix-sdk state / crypto DB (default: ~/.local/share/sapphire-agent/matrix)
 # state_dir = "~/.local/share/sapphire-agent/matrix"
 
-# Per-room behaviour is configured via [room_profile.<n>] further down,
+# Per-room behaviour is configured via [session_profile.<n>] further down,
 # not via per-room blocks. A room profile bundles `(profile, namespace,
 # session_policy)` and applies to a list of rooms — perfect when several
 # rooms share the same setup, and trivial to add API access controls to
@@ -193,7 +193,7 @@ system_prompt = "You are a helpful personal assistant."
 # ── Profiles (LLM presets) ──────────────────────────────────────────────
 # A profile is a *pure* LLM preset: a provider plus an optional
 # refusal-fallback provider. Profiles know nothing about rooms or memory
-# namespaces; pairings happen via [room_profile.<n>] (for chat) and
+# namespaces; pairings happen via [session_profile.<n>] (for chat) and
 # memory_namespace.<n>.background_profile (for daily-log / digests /
 # compaction). Profiles that name an unknown provider cause startup to
 # fail.
@@ -253,7 +253,7 @@ system_prompt = "You are a helpful personal assistant."
 # A room profile bundles a chat profile + memory namespace + session
 # policy and applies to a list of rooms (Matrix room_ids, Discord
 # channel ids, etc). Each room_id may appear in at most one room
-# profile. Rooms not listed anywhere fall back to [room_profile.default]
+# profile. Rooms not listed anywhere fall back to [session_profile.default]
 # if defined, otherwise the built-in defaults (Anthropic provider,
 # `default` namespace, global session_policy).
 #
@@ -264,28 +264,28 @@ system_prompt = "You are a helpful personal assistant."
 # is the room profile it runs under — same mechanism `/a2a`, `/acp`
 # and ambient ingest all use (sapphire-agent-desktop: `[server].token`).
 #
-# [room_profile.everyday]
+# [session_profile.everyday]
 # profile          = "default"
 # memory_namespace = "default"     # optional; defaults to "default"
 # session_policy   = "reset"       # optional; defaults to global setting
 # rooms            = ["!chat:example.com"]
 #
-# [room_profile.development]
+# [session_profile.development]
 # profile = "opus"                 # higher-quality model for coding work
 # rooms   = ["!dev:example.com", "!code:example.com"]
 # # memory_namespace omitted → writes to "default" alongside everyday chat
 #
-# [room_profile.private_nsfw]
+# [session_profile.private_nsfw]
 # profile          = "local"
 # memory_namespace = "user_nsfw"
 # session_policy   = "compact"
 # rooms            = ["!nsfw:example.com"]
 #
 # /rpc (sapphire-agent-desktop), A2A (Agent2Agent Protocol), `/acp`
-# and ambient ingest all reach a room_profile through the API key's
+# and ambient ingest all reach a session_profile through the API key's
 # profile: an incoming `Authorization: Bearer <token>` resolves
 # implicitly (token -> API key -> its profile, a room profile), so
-# external clients never name room_profile themselves. A key whose
+# external clients never name session_profile themselves. A key whose
 # profile is no room profile here (one since removed, say) is refused
 # with 403; `verify` lists every key and where it goes.
 #
@@ -296,7 +296,7 @@ system_prompt = "You are a helpful personal assistant."
 # fails if two profiles share one. Re-issue those keys with
 # `api-key add <name> --profile <room profile>` and the entry can go.
 #
-# [room_profile.sapphire_world]
+# [session_profile.sapphire_world]
 # profile          = "default"
 # memory_namespace = "sapphire_world"
 # rooms            = []             # A2A-only; no chat rooms map here
@@ -314,7 +314,7 @@ system_prompt = "You are a helpful personal assistant."
 # Mounts `/a2a` (JSON-RPC) and `/.well-known/agent-card.json` on the
 # same HTTP server as `/rpc`. Disabled by default — flip `enabled` to
 # turn the routes on. Auth resolves like every other endpoint:
-# token -> API key -> its profile, a `[room_profile.<n>]`;
+# token -> API key -> its profile, a `[session_profile.<n>]`;
 # this section configures only the public face of the agent.
 #
 # [a2a]
@@ -399,10 +399,10 @@ system_prompt = "You are a helpful personal assistant."
 #     server block above: that lets external AIs call sapphire-agent;
 #     this lets sapphire-agent call external MCP servers.
 #     MCP servers an ACP client provides over ACP need no entry here; see docs/sapphire-agent-tools.md.
-#   - `[tools.admin].room_profiles` — the room profiles whose sessions may
+#   - `[tools.admin].session_profiles` — the room profiles whose sessions may
 #     use the config-file management tools (`heartbeat`, `autonomous`,
 #     `agents`), which add and edit the definitions under the workspace
-#     that the unattended loops later run. Values are `[room_profile.<name>]`
+#     that the unattended loops later run. Values are `[session_profile.<name>]`
 #     keys, not room ids: a channel turn is judged by the profile its room
 #     resolves to, an ACP session by the profile its bearer token pinned, and
 #     voice / `/rpc` / A2A / the unattended loops by nothing (refused). Empty
@@ -410,7 +410,7 @@ system_prompt = "You are a helpful personal assistant."
 #     `[tools.host_access]`. The workspace layer may set it too, so whoever
 #     can write the synced workspace config can grant itself this.
 #
-#     `room_profiles = ["default"]` is the broad one: it names the implicit
+#     `session_profiles = ["default"]` is the broad one: it names the implicit
 #     profile that every room no other profile claims falls through to, so
 #     list the profiles you actually mean. Anyone who can reach a session of
 #     a listed profile can rewrite, through the agent, what runs unattended
@@ -476,7 +476,7 @@ system_prompt = "You are a helpful personal assistant."
 # # heartbeat/autonomous/agents definitions. Empty by default (all four
 # # tools unregistered).
 # [tools.admin]
-# room_profiles = ["ops", "developer"]
+# session_profiles = ["ops", "developer"]
 #
 # # Example: HTTP transport to a remote MCP server.
 # [[tools.mcp_servers]]
@@ -506,7 +506,7 @@ system_prompt = "You are a helpful personal assistant."
 # Voice pipeline (optional)
 # ─────────────────────────────────────────────────────────────────────
 # Enables the `voice/pipeline_run` method used by voice clients on `/rpc`
-# (sapphire-agent-desktop). Each room_profile can opt in via `voice_pipeline = "<name>"`.
+# (sapphire-agent-desktop). Each session_profile can opt in via `voice_pipeline = "<name>"`.
 # Without these blocks the method returns -32601 "Method not found".
 #
 # Local STT and TTS require the `voice-sherpa` cargo feature:
@@ -558,7 +558,7 @@ system_prompt = "You are a helpful personal assistant."
 # duration_ms  = 200
 # frequency_hz = 440
 #
-# [room_profile.home_voice]
+# [session_profile.home_voice]
 # profile          = "casual"
 # voice_pipeline   = "default"
 # rooms            = []             # MCP-only; not bound to chat rooms
@@ -693,7 +693,7 @@ system_prompt = "You are a helpful personal assistant."
 #   sapphire-agent api-key restore <name-or-id>
 #
 # `add` and `rotate` print the token once. `--profile` is required and
-# takes the name of a `[room_profile.<n>]`: the room profile the key runs
+# takes the name of a `[session_profile.<n>]`: the room profile the key runs
 # under decides which LLM profile and which memory namespace its
 # conversations use — ambient-only devices included. The desktop app's
 # Settings › API keys does the same.
@@ -741,7 +741,7 @@ system_prompt = "You are a helpful personal assistant."
 # Agent Client Protocol endpoint (GET /acp, WebSocket).
 # Lets an ACP client such as Zed drive this agent. Authentication resolves
 # like every other endpoint (token -> API key -> its profile, a
-# [room_profile.<name>]), and the token that
+# [session_profile.<name>]), and the token that
 # connects selects the room profile the ACP session runs under.
 # The workspace config layer may set this too.
 #
@@ -779,7 +779,7 @@ enabled = false
 # runs there), so no token is involved and no profile is picked by one —
 # name it here. Unset, `sapphire-agent acp` exits with an error. Independent
 # of `enabled`, which gates the WebSocket endpoint alone.
-#stdio_room_profile = "editor"
+#stdio_session_profile = "editor"
 
 # ---------------------------------------------------------------------------
 # [cli] — `sapphire-agent chat`
@@ -790,4 +790,4 @@ enabled = false
 # does, so no token picks their room profile — name it here. Unset, they
 # cannot open a session. The workspace layer may set it too.
 #[cli]
-#room_profile = "default"
+#profile = "default"

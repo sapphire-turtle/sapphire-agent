@@ -135,7 +135,7 @@ impl SessionSources {
     fn namespace_of(&self, meta: &SessionMeta) -> String {
         meta.namespace
             .clone()
-            .unwrap_or_else(|| self.config.namespace_for_room(&meta.room_id).to_string())
+            .unwrap_or_else(|| self.config.namespace_for_session(&meta.room_id).to_string())
     }
 
     /// Every row from every store, unfiltered.
@@ -552,7 +552,7 @@ api_key = "test"
 [memory_namespace.work]
 include = []
 
-[room_profile.work]
+[session_profile.work]
 profile = "default"
 memory_namespace = "work"
 rooms = ["!work:example.org"]

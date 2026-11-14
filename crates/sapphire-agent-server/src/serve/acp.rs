@@ -95,7 +95,7 @@ struct AcpSession {
     /// The agent-side session id, minted the same way `handle_initialize`
     /// (`src/serve/mod.rs`) mints one for a brand-new `/rpc` session:
     /// `uuid::Uuid::now_v7().to_string()`. This is also the key under which
-    /// `state.session_room_profiles` pins the session to a room profile, so
+    /// `state.session_profiles` pins the session to a room profile, so
     /// it is what routes this ACP session through the same namespace chain
     /// and provider selection every other transport uses. It duplicates the
     /// map key (a `SessionId` wrapping this same string) because the
@@ -935,7 +935,7 @@ pub async fn handle_acp_ws(
         return (StatusCode::UNAUTHORIZED, "missing bearer token").into_response();
     };
     let profile_name = match state.device_auth.resolve(&bearer).await {
-        Ok(r) => r.room_profile,
+        Ok(r) => r.session_profile,
         Err(crate::device_auth::AuthError::Forbidden) => {
             return (
                 StatusCode::FORBIDDEN,
@@ -1291,7 +1291,7 @@ async fn adopt_session(
     let id = session_id.to_string();
     let namespace = state
         .config
-        .namespace_for_room_profile(profile_name)
+        .namespace_for_session_profile(profile_name)
         .to_string();
     let refuse = || Error::invalid_params().data("no such session is available on this connection");
 
@@ -1314,7 +1314,7 @@ async fn adopt_session(
     }
 
     state
-        .session_room_profiles
+        .session_profiles
         .lock()
         .await
         .insert(id.clone(), profile_name.to_string());
@@ -1483,7 +1483,7 @@ pub(crate) async fn serve_connection<O, I>(
                     // the ACP session its namespace chain and provider
                     // through the paths that already exist for `/rpc`.
                     state
-                        .session_room_profiles
+                        .session_profiles
                         .lock()
                         .await
                         .insert(agent_session_id.clone(), profile_name.clone());
@@ -1498,7 +1498,7 @@ pub(crate) async fn serve_connection<O, I>(
                     // messages through that store instead of `/rpc`'s.
                     let namespace = state
                         .config
-                        .namespace_for_room_profile(&profile_name)
+                        .namespace_for_session_profile(&profile_name)
                         .to_string();
                     let cwd_string = req.cwd.to_string_lossy().to_string();
                     if let Err(e) =
@@ -1569,7 +1569,7 @@ pub(crate) async fn serve_connection<O, I>(
                 async move |req: ListSessionsRequest, responder, _connection| {
                     let namespace = state
                         .config
-                        .namespace_for_room_profile(&profile_name)
+                        .namespace_for_session_profile(&profile_name)
                         .to_string();
                     let store = Arc::clone(&state.acp_session_store);
                     let wanted_cwd = req.cwd.as_ref().map(|c| c.to_string_lossy().to_string());
@@ -2764,7 +2764,7 @@ mod tests {
         // `"developer"`). Asserting the exact mapping, not just that the map
         // is non-empty, so a swapped key/value or a write into the wrong map
         // fails this test.
-        let profiles = state.session_room_profiles.lock().await;
+        let profiles = state.session_profiles.lock().await;
         assert_eq!(
             profiles.get(session_id).map(String::as_str),
             Some("developer"),
@@ -2898,10 +2898,10 @@ mod tests {
     /// The grant this feature exists for, pinned end to end: an editor's
     /// `session/prompt` turn scopes the room profile its bearer token pinned,
     /// so `agent_config` — which ACP has no room id to allow — can be judged
-    /// against `[tools.admin].room_profiles`. The probe stands in for one of
+    /// against `[tools.admin].session_profiles`. The probe stands in for one of
     /// the admin tools: it is offered and judged on the same path.
     #[tokio::test]
-    async fn an_acp_turn_scopes_its_pinned_room_profile() {
+    async fn an_acp_turn_scopes_its_pinned_session_profile() {
         let state = ServeState::for_test_scripted(
             true,
             vec![
@@ -4026,7 +4026,7 @@ mod tests {
         let state = ServeState::for_test_scripted(true, Vec::new());
         let ours = state
             .config
-            .namespace_for_room_profile("developer")
+            .namespace_for_session_profile("developer")
             .to_string();
 
         state
@@ -4057,7 +4057,7 @@ mod tests {
         let state = ServeState::for_test_scripted(true, Vec::new());
         let ours = state
             .config
-            .namespace_for_room_profile("developer")
+            .namespace_for_session_profile("developer")
             .to_string();
         state
             .acp_session_store
@@ -4079,7 +4079,7 @@ mod tests {
         let store = Arc::clone(&state.acp_session_store);
         let ours = state
             .config
-            .namespace_for_room_profile("developer")
+            .namespace_for_session_profile("developer")
             .to_string();
 
         store.create("mine", &ours, "/p").unwrap();
@@ -4120,7 +4120,7 @@ mod tests {
         let store = Arc::clone(&state.acp_session_store);
         let ours = state
             .config
-            .namespace_for_room_profile("developer")
+            .namespace_for_session_profile("developer")
             .to_string();
         store.create("mine", &ours, "/p").unwrap();
         store
@@ -4174,7 +4174,7 @@ mod tests {
         let store = Arc::clone(&state.acp_session_store);
         let ours = state
             .config
-            .namespace_for_room_profile("developer")
+            .namespace_for_session_profile("developer")
             .to_string();
 
         store.create("open", &ours, "/p").unwrap();
@@ -4209,7 +4209,7 @@ mod tests {
         let store = Arc::clone(&state.acp_session_store);
         let ours = state
             .config
-            .namespace_for_room_profile("developer")
+            .namespace_for_session_profile("developer")
             .to_string();
 
         store.create("here", &ours, "/projects/here").unwrap();
@@ -4282,7 +4282,7 @@ mod tests {
         let store = Arc::clone(&state.acp_session_store);
         let ours = state
             .config
-            .namespace_for_room_profile("developer")
+            .namespace_for_session_profile("developer")
             .to_string();
         let sid = "sess-replay".to_string();
         store.create(&sid, &ours, "/p").unwrap();
@@ -4382,7 +4382,7 @@ mod tests {
         let store = Arc::clone(&state.acp_session_store);
         let ours = state
             .config
-            .namespace_for_room_profile("developer")
+            .namespace_for_session_profile("developer")
             .to_string();
         let sid = "sess-closed".to_string();
         store.create(&sid, &ours, "/p").unwrap();
@@ -4423,7 +4423,7 @@ mod tests {
         let store = Arc::clone(&state.acp_session_store);
         let ours = state
             .config
-            .namespace_for_room_profile("developer")
+            .namespace_for_session_profile("developer")
             .to_string();
         let sid = "sess-continues".to_string();
         store.create(&sid, &ours, "/p").unwrap();
@@ -4496,7 +4496,7 @@ mod tests {
         let store = Arc::clone(&state.acp_session_store);
         let ours = state
             .config
-            .namespace_for_room_profile("developer")
+            .namespace_for_session_profile("developer")
             .to_string();
         let sid = "sess-resume".to_string();
         store.create(&sid, &ours, "/p").unwrap();
@@ -4565,7 +4565,7 @@ mod tests {
         let store = Arc::clone(&state.acp_session_store);
         let ours = state
             .config
-            .namespace_for_room_profile("developer")
+            .namespace_for_session_profile("developer")
             .to_string();
         let mine = "mine".to_string();
         store.create(&mine, &ours, "/p").unwrap();
@@ -4615,7 +4615,7 @@ mod tests {
         let counts = Arc::clone(&state.open_acp_sessions);
         let ours = state
             .config
-            .namespace_for_room_profile("developer")
+            .namespace_for_session_profile("developer")
             .to_string();
         let sid = "sess-twice".to_string();
         store.create(&sid, &ours, "/p").unwrap();
@@ -4660,7 +4660,7 @@ mod tests {
         let counts = Arc::clone(&state.open_acp_sessions);
         let ours = state
             .config
-            .namespace_for_room_profile("developer")
+            .namespace_for_session_profile("developer")
             .to_string();
         let sid = "sess-readopt".to_string();
         store.create(&sid, &ours, "/p").unwrap();
@@ -4726,7 +4726,7 @@ mod tests {
         let counts = Arc::clone(&state.open_acp_sessions);
         let ours = state
             .config
-            .namespace_for_room_profile("developer")
+            .namespace_for_session_profile("developer")
             .to_string();
         let sid = "sess-close-conn".to_string();
         store.create(&sid, &ours, "/p").unwrap();

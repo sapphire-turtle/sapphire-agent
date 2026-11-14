@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 /// (`GITHUB_TOKEN = "…"`).
 pub const CREDENTIAL_KEYS: &[&str] = &[
     "api_key",
-    // `[room_profile.<n>].api_keys`, the removed raw-token list.
+    // `[session_profile.<n>].api_keys`, the removed raw-token list.
     "api_keys",
     "token",
     "secret",
@@ -310,9 +310,9 @@ mod tests {
 
     #[test]
     fn layer_of_reads_an_exact_leaf() {
-        let p = provenance(&[("room_profile.default.skills", Layer::Host)]);
+        let p = provenance(&[("session_profile.default.skills", Layer::Host)]);
         assert_eq!(
-            layer_of("room_profile.default.skills", &p),
+            layer_of("session_profile.default.skills", &p),
             Some(Layer::Host)
         );
     }
@@ -361,9 +361,9 @@ mod tests {
         assert!(path_allowed(&["providers", "local", "model"]));
         assert!(path_allowed(&["providers", "local", "max_tokens"]));
         assert!(path_allowed(&["profiles", "default", "provider"]));
-        assert!(path_allowed(&["room_profile", "work", "devices"]));
+        assert!(path_allowed(&["session_profile", "work", "devices"]));
         assert!(path_allowed(&["tools", "mcp_servers"]));
-        assert!(path_allowed(&["tools", "admin", "room_profiles"]));
+        assert!(path_allowed(&["tools", "admin", "session_profiles"]));
         assert!(path_allowed(&["stt_provider", "whisper", "model"]));
         assert!(path_allowed(&["matrix", "homeserver"]));
         // The name of an env var holding a key is not the key.
@@ -376,7 +376,7 @@ mod tests {
         assert!(!path_allowed(&["providers", "local", "api_key"]));
         assert!(!path_allowed(&["tools", "tavily_api_key"]));
         assert!(!path_allowed(&["tools", "mcp_servers", "0", "api_key"]));
-        assert!(!path_allowed(&["room_profile", "work", "api_keys"]));
+        assert!(!path_allowed(&["session_profile", "work", "api_keys"]));
         assert!(!path_allowed(&["matrix", "access_token"]));
         assert!(!path_allowed(&["matrix", "recovery_key"]));
         assert!(!path_allowed(&["discord", "bot_token"]));
@@ -502,18 +502,18 @@ api_key = "sk-secret"
     fn a_whole_array_of_credentials_is_rejected_as_a_unit() {
         let (kept, rejected) = filter_allowed(parse(
             r#"
-[room_profile.work]
+[session_profile.work]
 profile = "default"
 rooms = ["!a:example.org"]
 api_keys = ["sa-secret"]
 "#,
         ));
-        assert_eq!(rejected, vec!["room_profile.work.api_keys".to_string()]);
+        assert_eq!(rejected, vec!["session_profile.work.api_keys".to_string()]);
         assert_eq!(
-            kept["room_profile"]["work"]["profile"].as_str(),
+            kept["session_profile"]["work"]["profile"].as_str(),
             Some("default")
         );
-        assert!(kept["room_profile"]["work"].get("api_keys").is_none());
+        assert!(kept["session_profile"]["work"].get("api_keys").is_none());
     }
 
     #[test]
@@ -598,24 +598,24 @@ access_token = "t"
         let merged = deep_merge(
             parse(
                 r#"
-[room_profile.work]
+[session_profile.work]
 profile = "default"
 rooms = ["!a:example.org"]
 "#,
             ),
             parse(
                 r#"
-[room_profile.work]
+[session_profile.work]
 api_keys = ["sa-host-only"]
 "#,
             ),
         );
         assert_eq!(
-            merged["room_profile"]["work"]["profile"].as_str(),
+            merged["session_profile"]["work"]["profile"].as_str(),
             Some("default")
         );
         assert_eq!(
-            merged["room_profile"]["work"]["api_keys"][0].as_str(),
+            merged["session_profile"]["work"]["api_keys"][0].as_str(),
             Some("sa-host-only")
         );
     }
@@ -625,15 +625,17 @@ api_keys = ["sa-host-only"]
         // Concatenation cannot express removal, so the host replaces.
         let merged = deep_merge(
             parse(
-                r#"[room_profile.work]
+                r#"[session_profile.work]
 rooms = ["!a:example.org", "!b:example.org"]"#,
             ),
             parse(
-                r#"[room_profile.work]
+                r#"[session_profile.work]
 rooms = ["!c:example.org"]"#,
             ),
         );
-        let rooms = merged["room_profile"]["work"]["rooms"].as_array().unwrap();
+        let rooms = merged["session_profile"]["work"]["rooms"]
+            .as_array()
+            .unwrap();
         assert_eq!(rooms.len(), 1);
         assert_eq!(rooms[0].as_str(), Some("!c:example.org"));
     }
@@ -723,7 +725,7 @@ fallback_provider = "local"
 include = ["default"]
 background_profile = "default"
 
-[room_profile.work]
+[session_profile.work]
 profile = "default"
 memory_namespace = "work"
 rooms = ["!a:example.org"]

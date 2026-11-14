@@ -327,20 +327,20 @@ mod tests {
     }
 
     /// Build a `DeviceAuth` binding one device ("pendant") to a token
-    /// ("sa-dev-good"), routed to room_profile "home". A static verifier
+    /// ("sa-dev-good"), routed to session_profile "home". A static verifier
     /// stands in for the workspace's API keys, so the fixed bearer literal used
     /// throughout these tests keeps resolving.
     fn device_auth_fixture() -> Arc<crate::device_auth::DeviceAuth> {
-        let mut room_profiles = std::collections::HashMap::new();
-        room_profiles.insert(
+        let mut session_profiles = std::collections::HashMap::new();
+        session_profiles.insert(
             "home".to_string(),
-            crate::config::RoomProfileConfig {
+            crate::config::SessionProfileConfig {
                 profile: "sonnet".into(),
                 devices: vec!["pendant".to_string()],
                 ..Default::default()
             },
         );
-        crate::device_auth::testing::device_auth(&[("sa-dev-good", "pendant")], &room_profiles)
+        crate::device_auth::testing::device_auth(&[("sa-dev-good", "pendant")], &session_profiles)
     }
 
     fn harness_with(depth: usize, enabled: bool) -> (Router, mpsc::Receiver<Segment>) {

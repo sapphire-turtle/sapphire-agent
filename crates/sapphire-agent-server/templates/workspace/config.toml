@@ -66,7 +66,7 @@ heartbeat_enabled = false
 
 # Which rooms and devices run under which profile, and which memory
 # namespace they read. `default` catches everything not listed elsewhere.
-# [room_profile.default]
+# [session_profile.default]
 # memory_namespace = "default"
 
 # An OpenAI-compatible provider and a profile that uses it. Its `api_key`

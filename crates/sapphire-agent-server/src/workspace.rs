@@ -120,7 +120,7 @@ impl Workspace {
     ///
     /// `namespace_chain` is the DFS-pre-order list of namespaces this
     /// room reads from — typically computed via
-    /// `Config::resolve_namespace_chain(Config::namespace_for_room(room_id))`.
+    /// `Config::resolve_namespace_chain(Config::namespace_for_session(room_id))`.
     /// The first entry is the room's own namespace; later entries are
     /// included parents.
     ///
