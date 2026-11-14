@@ -46,13 +46,13 @@ A room carries its own block, and that block names the profile:
 bot_token = "..."
 enabled = true
 
-[discord.room1]
+[[discord.rooms]]
 room_id = "1474368482296807444"
 profile = "default"
 voice_pipeline = "default"   # a room with a voice path writes it here
 ```
 
-Matrix is the same shape (`[matrix.room1] room_id = "!xxx:srv" profile = "..."`). Heartbeat and autonomous frontmatters keep `room_id` as delivery-only (where the fire is delivered) and gain `profile` (the session profile that governs the run). Absent means the implicit `"default"`.
+Matrix is the same shape (`[[matrix.rooms]] room_id = "!xxx:srv" profile = "..." — array-of-tables into `rooms: Vec<RoomConfig> (plain serde; no name-keyed tables)`). Heartbeat and autonomous frontmatters keep `room_id` as delivery-only (where the fire is delivered) and gain `profile` (the session profile that governs the run). Absent means the implicit `"default"`.
 
 - What ingress resolves and the turn carries is **the resolved profile name only**. `Agent::handle_message` (the Matrix/Discord loop) and `run_llm_turn` (the ACP/autonomous loop) each build an `Origin` carrying the resolved name and call the one same decision function — see Design, `policy.rs`: one function, one name, one signature.
 - ACP keeps its existing session pin as the only source of truth (the principle of not adding sources of truth is unchanged). `[acp].stdio_room_profile` is renamed `stdio_session_profile`.
@@ -184,7 +184,7 @@ pub enum ToolGroup { Fs, Shell, Mcp, Admin }
 
 - `Config::session_profiles: HashMap<String, SessionProfileConfig>`, `Config::permission_profiles: HashMap<String, PermissionProfileConfig>`.
 - `permission_for(name)` returns the operator section when one exists, else the built-in preset (`admin`/`default`/`chat`).
-- `[channel.<x>]`: `enabled` plus room blocks (`room_id`/`profile`/`voice_pipeline`). `allowed_users` stays channel-level (room-level override is out of scope). The subscription itself stays untouched; only the profile resolution of the room a voice actually runs in moves to declaration-side.
+- `[channel.<x>]`: `enabled` plus an array-of-tables `[[<channel>.rooms]]` of blocks (`room_id`/`profile`/`voice_pipeline`), deserialized plainly into `rooms: Vec<RoomConfig>`. `allowed_users` stays channel-level (room-level override is out of scope). The subscription itself stays untouched; only the profile resolution of the room a voice actually runs in moves to declaration-side.
 - `HOST_ONLY_PATHS`: the per-group `enabled` keys under `[tools]` remain host-only; the `tools` listings are synced config.
 
 ### policy.rs

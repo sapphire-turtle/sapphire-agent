@@ -5,7 +5,7 @@
 
 **Goal:** Replace the room-profile/origin×kind permission system with `[session_profile.<n>]` (a session declares its own profile) + `[permission_profile.<n>].tools = [<groups>]` (the allow table), so a turn's allowed set is "groups listed by its permission profile ∧ groups enabled on this host", decided by exactly one function on both turn loops.
 
-**Architecture:** `config.rs` gains `ToolGroup`/`SessionProfileConfig`/`PermissionProfileConfig` and the presets, and is renamed at the same time (`room_profiles` → `session_profiles`), so the rename is what makes Task 1 compile and pass on its own; Task 2 then moves the binding to the declaration side (`[discord.room1]`-shaped room blocks, the four `migration_errors` cases, the per-group `[tools.<group>]` blocks). `policy.rs` becomes the single decision function `allow(profile, entry)` over a `ResolvedPermission` + the tool's registration entry `ToolEntry{group, enabled, kind}`, replacing `decide`/`host_tool_denied`/`kind_of`/`HOST_TOOLS`; the entry is built from `ToolSpec`, which by then carries `kind` and `group` themselves — one source, no name→group table. The definition files stay the `admin` group's land: the fs *write* tools refuse them (on the path the writer will actually open), the read half keeps reading them.
+**Architecture:** `config.rs` gains `ToolGroup`/`SessionProfileConfig`/`PermissionProfileConfig` and the presets, and is renamed at the same time (`room_profiles` → `session_profiles`), so the rename is what makes Task 1 compile and pass on its own; Task 2 then moves the binding to the declaration side (`[[discord.rooms]]` array-of-tables room blocks, the four `migration_errors` cases, the per-group `[tools.<group>]` blocks). `policy.rs` becomes the single decision function `allow(profile, entry)` over a `ResolvedPermission` + the tool's registration entry `ToolEntry{group, enabled, kind}`, replacing `decide`/`host_tool_denied`/`kind_of`/`HOST_TOOLS`; the entry is built from `ToolSpec`, which by then carries `kind` and `group` themselves — one source, no name→group table. The definition files stay the `admin` group's land: the fs *write* tools refuse them (on the path the writer will actually open), the read half keeps reading them.
 
 **Tech Stack:** Rust (tokio task-local, serde/toml, async-trait, serde_json), the existing `Config` / `ToolSet` / `Tool` / `TurnLoop` / `TurnContext` machinery, `StubProvider`-based scripted turn tests.
 
@@ -30,7 +30,7 @@
 
 | File | Responsibility in this plan |
 |---|---|
-| `server/src/config.rs` | `ToolGroup`, `SessionProfileConfig` (the rename of `RoomProfileConfig`), `PermissionProfileConfig`, presets + precedence, the per-group `[tools.<group>]` enabled blocks, room blocks on `[discord]`/`[matrix]`, the four `migration_errors` cases, `validate_*`. |
+| `server/src/config.rs` | `ToolGroup`, `SessionProfileConfig` (the rename of `RoomProfileConfig`), `PermissionProfileConfig`, presets + precedence, the per-group `[tools.<group>]` enabled blocks, array-of-tables room blocks on `[discord]`/`[matrix]`, the four `migration_errors` cases, `validate_*`. |
 | `server/src/config_layer.rs` | `HOST_ONLY_PATHS` gains the per-group `[tools.<group>]` paths. |
 | `server/src/provider/mod.rs` | `ToolSpec { name, description, input_schema, kind: ToolKind, group: Option<ToolGroup> }` (`:19-23`). |
 | `server/src/tools/policy.rs` | `Origin` (carries the resolved profile name), `Allow`, `ResolvedPermission`, `ToolEntry`, the single `allow`, `partition_without_asking`. `decide`/`host_tool_denied`/`kind_of`/`HOST_TOOLS` die. |
@@ -302,7 +302,7 @@ EOF
     #[test]
     fn a_room_block_is_what_names_the_session_profile() {
         let cfg = Config::parse_for_test(
-            "[anthropic]\napi_key = \"test\"\n\n[discord]\nbot_token = \"t\"\n\n[discord.room1]\nroom_id = \"1474368482296807444\"\nprofile = \"ops\"\n",
+            "[anthropic]\napi_key = \"test\"\n\n[discord]\nbot_token = \"t\"\n\n[[discord.rooms]]\nroom_id = \"1474368482296807444\"\nprofile = \"ops\"\n",
         );
         let discord = cfg.discord.as_ref().expect("configured");
         assert_eq!(discord.rooms[0].room_id, "1474368482296807444");
@@ -412,7 +412,7 @@ and the resolution, which carries an explicit declaration rather than discarding
 ```rust
     /// The session profile a turn runs under: the session's own declared name when it has
     /// one — a heartbeat/autonomous frontmatter, an ACP pin, a device binding, a
-    /// subagent delegation — else the `[<channel>.room<n>]` block's, else the implicit
+    /// subagent delegation — else the room's `[[<channel>.rooms]]` block, else the implicit
     /// `"default"`. A declared name is carried verbatim: an unknown one is a startup error
     /// (`validate_session_profiles`), never a silent fall-through to a room's or the implicit
     /// profile, because a typo would rot into "I granted it but nothing changed".
