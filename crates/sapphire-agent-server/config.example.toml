@@ -399,7 +399,7 @@ system_prompt = "You are a helpful personal assistant."
 #     server block above: that lets external AIs call sapphire-agent;
 #     this lets sapphire-agent call external MCP servers.
 #     MCP servers an ACP client provides over ACP need no entry here; see docs/sapphire-agent-tools.md.
-#   - `[tools.admin].session_profiles` — the room profiles whose sessions may
+#   - `[tools.admin].room_profiles` — the room profiles whose sessions may
 #     use the config-file management tools (`heartbeat`, `autonomous`,
 #     `agents`), which add and edit the definitions under the workspace
 #     that the unattended loops later run. Values are `[session_profile.<name>]`
@@ -410,7 +410,7 @@ system_prompt = "You are a helpful personal assistant."
 #     `[tools.host_access]`. The workspace layer may set it too, so whoever
 #     can write the synced workspace config can grant itself this.
 #
-#     `session_profiles = ["default"]` is the broad one: it names the implicit
+#     `room_profiles = ["default"]` is the broad one: it names the implicit
 #     profile that every room no other profile claims falls through to, so
 #     list the profiles you actually mean. Anyone who can reach a session of
 #     a listed profile can rewrite, through the agent, what runs unattended
@@ -476,7 +476,7 @@ system_prompt = "You are a helpful personal assistant."
 # # heartbeat/autonomous/agents definitions. Empty by default (all four
 # # tools unregistered).
 # [tools.admin]
-# session_profiles = ["ops", "developer"]
+# room_profiles = ["ops", "developer"]
 #
 # # Example: HTTP transport to a remote MCP server.
 # [[tools.mcp_servers]]

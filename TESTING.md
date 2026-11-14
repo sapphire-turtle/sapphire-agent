@@ -188,7 +188,7 @@ the same ONNX via `voice/config` and caches it by SHA-256.
 wake_word_model = "/srv/sapphire/wake-models/saphina-v1.onnx"
 ```
 
-That's it — global to all room_profiles. Validation catches a typo
+That's it — global to all session_profiles. Validation catches a typo
 in the path at startup; missing files surface as a clean
 `validate_profiles` error, not a 500 on the first satellite call.
 
@@ -309,7 +309,7 @@ mic from the speaker.
 | `no default input device` | macOS: app lacks mic permission | System Settings → Privacy & Security → Microphone |
 | Silent reply, no errors | Output device muted or output_rate mismatch in the satellite's log | Check `output: <rate> Hz` line; raise system volume |
 | `[error: Internal error: Provider error: ...]` from satellite | Anthropic key absent / invalid on the server side | Verify `ANTHROPIC_API_KEY` env var on the **server** terminal |
-| `Failed to read voice_pipeline 'irodori'` validation error at server startup | room_profile.voice_pipeline points at undefined block | Match name with `[voice_pipeline.<n>]` |
+| `Failed to read voice_pipeline 'irodori'` validation error at server startup | session_profile.voice_pipeline points at undefined block | Match name with `[voice_pipeline.<n>]` |
 | `failed to fetch Silero VAD model` | No network / proxy | Pre-download the model manually and place at `~/.local/share/sapphire-agent-cli/voice-models/silero_vad.onnx` |
 | First sherpa-onnx build OOM-kills CI | C++ compile is memory-heavy | Use a runner with ≥4 GB / 2 cores or set `CARGO_BUILD_JOBS=1` |
 

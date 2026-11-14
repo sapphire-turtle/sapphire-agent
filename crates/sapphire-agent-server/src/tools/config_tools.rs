@@ -8,7 +8,7 @@
 //!
 //! Two properties hold the design together:
 //!
-//! - **A room profile must be named.** `[tools.admin].session_profiles` is a
+//! - **A room profile must be named.** `[tools.admin].room_profiles` is a
 //!   host-layer list of room-profile names, and every action refuses in a
 //!   session whose profile is not on it. A channel room resolves to its
 //!   profile the same way its provider does; an ACP session carries the
@@ -177,12 +177,12 @@ pub(crate) fn current_session_profile_for(config: &Config) -> Option<String> {
 }
 
 /// What every action answers with when the calling room profile is not on
-/// `[tools.admin].session_profiles`.
+/// `[tools.admin].room_profiles`.
 ///
 /// The wording names the config key on purpose: a model that is refused has
 /// no other way to find out, and an operator being told by the agent *which*
 /// setting to change is the whole reason the refusal is not just "denied".
-pub(crate) const ROOM_REFUSAL: &str = "Permission denied: the config tools are not available for this room profile. An operator can allow them with `[tools.admin].session_profiles` in the host config.";
+pub(crate) const ROOM_REFUSAL: &str = "Permission denied: the config tools are not available for this room profile. An operator can allow them with `[tools.admin].room_profiles` in the host config.";
 
 /// The *effective* `enabled` value of a definition, as the loaders read
 /// it: `enabled:` when present, `true` when absent (both loaders declare
@@ -275,7 +275,7 @@ impl ConfigTool {
         }
         description.push_str(
             " These tools are available only in sessions whose room profile an operator \
-             listed in `[tools.admin].session_profiles`; anywhere else, every action including \
+             listed in `[tools.admin].room_profiles`; anywhere else, every action including \
              `list` is refused.",
         );
 
@@ -685,7 +685,7 @@ impl TaskTestTool {
                  task's `room_id:` / `voice:` targets are ignored, because what this tool \
                  checks is the prompt and how the task ends, not where a result would go. \
                  These tools are available only in sessions whose room profile an operator \
-                 listed in `[tools.admin].session_profiles`."
+                 listed in `[tools.admin].room_profiles`."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -949,7 +949,7 @@ impl Tool for TaskTestTool {
 /// Register the four admin tools when the deployment has named a room profile.
 ///
 /// Extracted from `lib.rs` so the condition is testable, because the
-/// condition *is* the grant: with `[tools.admin].session_profiles` empty, `serve`
+/// condition *is* the grant: with `[tools.admin].room_profiles` empty, `serve`
 /// must register nothing at all — four tools that always refuse would
 /// still tell the model they exist, and "exists but never works" is a
 /// worse answer than "does not exist". The run-time gate in
@@ -1025,14 +1025,14 @@ mod tests {
         tool: ConfigTool,
     }
 
-    /// The tool as the deployment wires it: `[tools.admin].session_profiles =
+    /// The tool as the deployment wires it: `[tools.admin].room_profiles =
     /// ["ops"]`, `[session_profile.ops]` claiming `!ops:x`, the three
     /// directories present, no subagent / tool set back-reference (that is
     /// the agents-directory wiring, tested where it exists).
     fn fixture(dir: ConfigDir) -> Fixture {
         let (d, root, ws) = test_workspace();
         let mut config = Config::for_test();
-        config.tools.admin.session_profiles = vec!["ops".to_string()];
+        config.tools.admin.room_profiles = vec!["ops".to_string()];
         config.session_profiles.insert(
             "ops".to_string(),
             crate::config::SessionProfileConfig {
@@ -1292,7 +1292,7 @@ mod tests {
                 .unwrap_err()
                 .to_string();
             assert!(err.contains("Permission denied"), "{profile:?}: {err}");
-            assert!(err.contains("session_profiles"), "{profile:?}: {err}");
+            assert!(err.contains("room_profiles"), "{profile:?}: {err}");
         }
     }
 
@@ -1304,7 +1304,7 @@ mod tests {
     async fn a_channel_room_is_gated_by_its_resolved_session_profile() {
         let (d, root, ws) = test_workspace();
         let mut config = Config::for_test();
-        config.tools.admin.session_profiles = vec!["ops".to_string()];
+        config.tools.admin.room_profiles = vec!["ops".to_string()];
         for (name, room) in [("ops", "!ops:x"), ("guest", "!lounge:y")] {
             config.session_profiles.insert(
                 name.to_string(),
@@ -1355,7 +1355,7 @@ mod tests {
             let config = &mut Arc::get_mut(&mut state)
                 .expect("uniquely owned immediately after construction")
                 .config;
-            config.tools.admin.session_profiles = vec!["ops".to_string()];
+            config.tools.admin.room_profiles = vec!["ops".to_string()];
             config.session_profiles.insert(
                 "ops".to_string(),
                 crate::config::SessionProfileConfig {
@@ -1422,7 +1422,7 @@ mod tests {
             let config = &mut Arc::get_mut(&mut state)
                 .expect("uniquely owned immediately after construction")
                 .config;
-            config.tools.admin.session_profiles = vec!["ops".to_string()];
+            config.tools.admin.room_profiles = vec!["ops".to_string()];
             config.session_profiles.insert(
                 "ops".to_string(),
                 crate::config::SessionProfileConfig {
@@ -1605,7 +1605,7 @@ mod tests {
         let serve_state = test_state(vec![test_response("ok")]);
         let set = Arc::new(ToolSet::new(Vec::new(), Vec::new()));
         let mut config = Config::for_test();
-        config.tools.admin.session_profiles = Vec::new();
+        config.tools.admin.room_profiles = Vec::new();
         assert!(!config.config_tools_enabled());
 
         register_admin_tools(&set, &root, config, ws, None, serve_state).await;
@@ -1628,7 +1628,7 @@ mod tests {
         let serve_state = test_state(vec![test_response("ok")]);
         let set = Arc::new(ToolSet::new(Vec::new(), Vec::new()));
         let mut config = Config::for_test();
-        config.tools.admin.session_profiles = vec!["ops".to_string()];
+        config.tools.admin.room_profiles = vec!["ops".to_string()];
 
         register_admin_tools(&set, &root, config, ws, None, serve_state).await;
 
@@ -1673,7 +1673,7 @@ mod tests {
             Vec::new(),
         ));
         let mut config = Config::for_test();
-        config.tools.admin.session_profiles = vec!["ops".to_string()];
+        config.tools.admin.room_profiles = vec!["ops".to_string()];
         config.session_profiles.insert(
             "ops".to_string(),
             crate::config::SessionProfileConfig {

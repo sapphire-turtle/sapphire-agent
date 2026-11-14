@@ -2898,7 +2898,7 @@ mod tests {
     /// The grant this feature exists for, pinned end to end: an editor's
     /// `session/prompt` turn scopes the room profile its bearer token pinned,
     /// so `agent_config` — which ACP has no room id to allow — can be judged
-    /// against `[tools.admin].session_profiles`. The probe stands in for one of
+    /// against `[tools.admin].room_profiles`. The probe stands in for one of
     /// the admin tools: it is offered and judged on the same path.
     #[tokio::test]
     async fn an_acp_turn_scopes_its_pinned_session_profile() {

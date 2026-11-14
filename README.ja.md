@@ -15,7 +15,7 @@
 ## できること
 
 - **チャネル**： Matrix（`matrix-sdk`によるE2EE）とDiscord（`serenity`）を並行稼働。
-- **プロバイダ**： SSEストリーミングとマルチラウンドのツール使用ループを備えたAnthropic Messages APIに加え、OpenAI互換バックエンド（ローカルLLM、OpenRouterなど）を `[providers]` / `[profiles]` / `[room_profile]` スキーマでルーム／セッションごとに選択可能。
+- **プロバイダ**： SSEストリーミングとマルチラウンドのツール使用ループを備えたAnthropic Messages APIに加え、OpenAI互換バックエンド（ローカルLLM、OpenRouterなど）を `[providers]` / `[profiles]` / `[session_profile]` スキーマでルーム／セッションごとに選択可能。
 - **ワークスペース**： [`sapphire-framework`](https://github.com/sapphire-turtle/sapphire-framework) をバックエンドに使用 — ファイルインデックス、全文＋ベクトル検索（redb＋tantivy、デフォルトでLanceDBベクトル付き）。
 - **シェル・ファイルツール**： `file_read`、`file_write`、`file_append`、`file_delete`、`dir_list`、`dir_walk`、`shell`、それに長時間実行用の `shell_start` / `shell_output` / `shell_kill`。これらの**届くマシンは名前ではなくセッションで決まります**。ACPセッション内では、接続したエディタが動いているマシンに、`/acp`の`fs/*`と`terminal/*`リクエストを介して作用します。ただし接続したエディタが`initialize`で宣言した機能に対してのみで、欠けた機能はエージェント自身のディスクへのフォールバックなしに非表示になります。それ以外（Matrix、Discord、`/rpc`、音声、`/a2a`、ハートビート、autonomous、サブエージェント）ではエージェント自身のマシンに作用し、オプトインです： `[tools.host_access] enabled = false`がデフォルトで、すべてのオージンに適用されます。有効化は意図的な行為で、有効化したうえでエージェントをコンテナで動かすのが推奨されます。下記「シェル・ファイルツール：誰のマシンか」参照。
 - **セッション**： 人間が読める[`grain-id`](https://crates.io/crates/grain-id)エイリアス、自動生成タイトル、再開時の履歴ダンプ。
@@ -26,13 +26,13 @@
 - **サブエージェント**： メインエージェントが`subagent`ツールでタスクを委譲できる`<workspace>/agents/<name>.md`定義 — 独自のシステムプロンプト、独自のツールループ、最終回答のみが返り、ハンドルで後のラウンドに再開可能。定義のフロントマターの`profile:`は省略可能。書くとその`[profiles.<name>]`のプロバイダ（`fallback_provider`込み）で親の代わりに走り、省略時は委譲元のターンと同じモデルで走る — 後者が仕様変更前の既定動作そのままの、どちらも正当な書き方。configの`[profiles]`が定義していない名前なら起動時に即失敗する。プロバイダは親から引き継がれないことがある唯一の要素であり、権限ゲート・ツール一覧・隔離はプロファイルの有無で一切変わらない。下記「サブエージェント」参照。
 - **サブエージェントのネスト**： 委譲は再帰でき、段数の上限はconfigの`[tools.subagent] max_depth`で決まる（既定2。メインエージェントが段数0 → 委譲先が1 → その先が2）。`1`は従来の「常に1段のみ」動作、`0`は委譲そのものを禁止し、メインエージェントのターンからも`subagent`ツールが見えない。定義のフロントマターの`subagents:`は`tools:`と同型の許可リストで、省略時は委譲元ターンに見えているエージェント集合をそのまま継承、`[]`は段数と無関係にそれ以上委譲しない、リストはその名前に限定する。ネストしたサブエージェントもこの段数上限と、各段の許可リストの連鎖の両方に従い、各ネスト段は個別に`[tools.subagent] turn_timeout_secs`の締切対象になる。
 - **スキル**： エディタの*マシン*上にあるチェックアウトからACP経由でリクエスト時に読み込まれる、手順の書き下げ（プランニング、TDD、デバッグ、コードレビューなど）。ターミナルサポートを宣言したACPクライアントが必要 — Matrix、Discord、音声では完全に無効。下記「スキル」参照。
-- **エディタ統合**： Zed（などのACPクライアント）が稼働中のエージェントをAgent Client Protocolで操作できる。エージェントが動いているマシンでは `sapphire-agent acp` を起動させる（stdio。ローカルのIPCで稼働中のエージェントへ中継し、`[acp].stdio_room_profile` が必要）。別のマシンからはWebSocketの`/acp`エンドポイントを使う（`[acp].enabled = true`で有効化）。下記「Zed / ACP」参照。
+- **エディタ統合**： Zed（などのACPクライアント）が稼働中のエージェントをAgent Client Protocolで操作できる。エージェントが動いているマシンでは `sapphire-agent acp` を起動させる（stdio。ローカルのIPCで稼働中のエージェントへ中継し、`[acp].stdio_session_profile` が必要）。別のマシンからはWebSocketの`/acp`エンドポイントを使う（`[acp].enabled = true`で有効化）。下記「Zed / ACP」参照。
 - **コマンド**：
   - `sapphire-agent` — チャネルリスナー＋JSON-RPC HTTP制御API（`/rpc`、`/a2a`、`/acp`）を開始
   - `sapphire-agent init [PATH]` — エージェントが読むファイル（`AGENTS.md`、`SOUL.md`など）でワークスペースをシードし、貼り付けるホストローカル設定を出力。既存ファイルを決して上書きしない
-  - `sapphire-agent verify` — 設定を検証し、各 API キーがどの room_profile で動くかを含む読み込まれたワークスペースファイルを報告
+  - `sapphire-agent verify` — 設定を検証し、各 API キーがどの session_profile で動くかを含む読み込まれたワークスペースファイルを報告
   - sapphire-framework の動詞（稼働中のサーバーまたは bridge と話す）: `status`、`service install|uninstall|status`、`workspace init|select|show|…`（エージェントは選択されたワークスペースを扱う。`config.toml` の `workspace_dir` は初回起動時にだけ取り込まれ、切り替えるとエージェントは新しいワークスペースで再起動する）、`api-key add|list|rotate|retire|restore`（ベアラートークンでエージェントにアクセスするクライアント。ワークスペースの API キーで、それぞれ `add --profile` で指定した room profile で動く。`add` と `rotate` はトークンを一度だけ表示）、`config`。ワークグループ・デバイス・埋め込みは bridge のもの: `sapphire-bridge workgroup|device|embedding`
-  - `sapphire-agent chat` — 同じホストで動いているエージェントとローカル IPC 経由で対話する REPL（`-m TEXT` で単発、`--list`、`--history`、`--session ID`、`--json`）。`[cli].room_profile` のルームプロファイルで動く
+  - `sapphire-agent chat` — 同じホストで動いているエージェントとローカル IPC 経由で対話する REPL（`-m TEXT` で単発、`--list`、`--history`、`--session ID`、`--json`）。`[cli].profile` のルームプロファイルで動く
 
 ## インストール
 
@@ -87,7 +87,7 @@ cargo build --release   # ヘッドレス版：target/release/sapphire-agent
 
 Windows では `shell` ツールは、呼び出しで別のシェル（`pwsh`、`cmd`、`bash` など）を指定しない限り Windows PowerShell でコマンドを実行します。それ以外の OS では `$SHELL`、未設定なら `/bin/sh` を使います。ACP セッション中のコマンド（ファイル系・スキル系ツールのスクリプトも）はエディタ側のマシンで `bash` を使って実行するため、Windows のエディタでは Git Bash が `PATH` 上に必要です。WSL が有効だとエディタが WSL の `bash.exe` を選ぶことがあります（#303）。
 
-サーバーとその CLI は 1 つのバイナリです（[#278](https://github.com/sapphire-turtle/sapphire-agent/issues/278)）。`sapphire-ledger` など他の sapphire-framework アプリと同じく、クライアント系のコマンド（`chat`、`acp`、`status` など）は同じホストで動いているサーバーにローカル IPC で問い合わせます。GUI チャットクライアントの `sapphire-agent-desktop` のウィンドウも同じで、`chat` と同じく `[cli].room_profile` のルームプロファイルで動きます。そのバイナリは CLI でもあり、引数なしで実行するとウィンドウを開き、サブコマンドを付けると `sapphire-agent` と同じ処理（`serve` も含む）をします。
+サーバーとその CLI は 1 つのバイナリです（[#278](https://github.com/sapphire-turtle/sapphire-agent/issues/278)）。`sapphire-ledger` など他の sapphire-framework アプリと同じく、クライアント系のコマンド（`chat`、`acp`、`status` など）は同じホストで動いているサーバーにローカル IPC で問い合わせます。GUI チャットクライアントの `sapphire-agent-desktop` のウィンドウも同じで、`chat` と同じく `[cli].profile` のルームプロファイルで動きます。そのバイナリは CLI でもあり、引数なしで実行するとウィンドウを開き、サブコマンドを付けると `sapphire-agent` と同じ処理（`serve` も含む）をします。
 
 ## 設定
 
@@ -108,16 +108,16 @@ sapphire-agent init ~/sapphire-workspace
 ```sh
 sapphire-agent verify   # 設定とワークスペースのサニティチェック
 sapphire-agent serve    # チャネルリスナー＋HTTP制御APIを開始
-sapphire-agent chat     # そのエージェントとの対話セッション（[cli].room_profile が必要）
+sapphire-agent chat     # そのエージェントとの対話セッション（[cli].profile が必要）
 ```
 
 ### 誰にも読まれないキー
 
-どのフィールドも消費しないキーは、エラーではなく警告です。タイプ（`skils = true`）や間違ったテーブル下の設定（`skills`は`[memory_namespace.<name>]`のものです。`[room_profile.<name>]`の下ではパースは通るが何も起きません）はそのままでは静かに見過ぎさえます — serdeがそのキーを落とすため、書いた人には設定済み、エージェントには未設定として見えます。起動時にファイルごとに1件の警告をログし、`verify`と同じプロベナンスでファイル名を明示します：
+どのフィールドも消費しないキーは、エラーではなく警告です。タイプ（`skils = true`）や間違ったテーブル下の設定（`skills`は`[memory_namespace.<name>]`のものです。`[session_profile.<name>]`の下ではパースは通るが何も起きません）はそのままでは静かに見過ぎさえます — serdeがそのキーを落とすため、書いた人には設定済み、エージェントには未設定として見えます。起動時にファイルごとに1件の警告をログし、`verify`と同じプロベナンスでファイル名を明示します：
 
 ```
 WARN Ignoring 1 unrecognised key(s) in /home/you/.config/sapphire-agent/config.toml:
-     room_profile.default.skills. Nothing reads these, so the agent is running as if
+     session_profile.default.skills. Nothing reads these, so the agent is running as if
      they were absent — check for a typo, or for a setting written under the wrong table.
 ```
 
@@ -131,7 +131,7 @@ WARN Ignoring 1 unrecognised key(s) in /home/you/.config/sapphire-agent/config.t
 - Zed / ACP — ACPエンドポイント、権限とモード、シェル・ファイルツール、過去セッションの読み込み
 - Skills — スキルの読み込み元ディレクトリ、有効化、4つのツール
 - クライアントが出すツール — ACP クライアントが MCP over ACP で渡すツール（`acp__…`）、名前の付け方と annotations による権限（[docs/sapphire-agent-tools.md](docs/sapphire-agent-tools.md)）
-- エージェント自身の定義編集 — heartbeat / autonomous / agents の定義ファイルを読み書きする4ツールと `[tools.admin].room_profiles` の room_profile 許可リスト（ACP セッションからも使えます）
+- エージェント自身の定義編集 — heartbeat / autonomous / agents の定義ファイルを読み書きする4ツールと `[tools.admin].room_profiles` の session_profile 許可リスト（ACP セッションからも使えます）
 
 ## ライセンス
 

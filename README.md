@@ -1021,16 +1021,16 @@ through four tools:
   `agents/` still needs a restart, as [Subagents](#subagents) describes.
 
 **A room profile has to be named, in the host config.** The tools are registered
-only when `[tools.admin].session_profiles` lists at least one room profile, and every
+only when `[tools.admin].room_profiles` lists at least one room profile, and every
 action — including the read-only `list` — is refused in a session whose profile is
 not on it:
 
 ```toml
 [tools.admin]
-session_profiles = ["ops", "developer"]   # [session_profile.<name>] keys, not room ids
+room_profiles = ["ops", "developer"]   # [session_profile.<name>] keys, not room ids
 ```
 
-With `session_profiles` absent or empty the four tools are **not registered at all** —
+With `room_profiles` absent or empty the four tools are **not registered at all** —
 the model is never told they exist. A tool that is offered and then always refuses
 is the worse answer: it invites a retry loop against a wall.
 
@@ -1039,7 +1039,7 @@ resolution that picks its provider and memory namespace, so an explicit listing 
 `[session_profile.<name>].rooms` array wins and `[session_profile.default]` catches every
 room no profile claims. An **ACP** session (Zed and other editors) is judged by the
 profile its bearer token pinned at `session/new`, which is what makes these tools
-usable from an editor at all: ACP has no room id. Note what `session_profiles =
+usable from an editor at all: ACP has no room id. Note what `room_profiles =
 ["default"]` therefore means — every room no other profile claims — and list the
 specific profiles you mean unless that is what you want.
 
@@ -1055,7 +1055,7 @@ workspace `config.toml` can grant this. Guard that file accordingly: a listed pr
 can rewrite, through the agent, what runs unattended. **Pair it with that profile's own API keys
 or the room's `allowed_users`**, or everyone who can reach a session of that profile
 can author code-adjacent work that runs with nobody watching. `[tools.admin].rooms`
-from an earlier build is rejected at startup and names `session_profiles` in the error.
+from an earlier build is rejected at startup and names `room_profiles` in the error.
 
 **Trying a task before enabling it.** `task_test` runs one heartbeat or
 autonomous definition once, in a throwaway session, so a task can be

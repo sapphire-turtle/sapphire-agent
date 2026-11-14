@@ -894,8 +894,8 @@ pub struct AdminToolsConfig {
     /// to translate a room id into a profile. Empty (the default) leaves the
     /// four tools unregistered.
     #[serde(default)]
-    pub session_profiles: Vec<String>,
-    /// Removed: replaced by `session_profiles`, which names session profiles rather
+    pub room_profiles: Vec<String>,
+    /// Removed: replaced by `room_profiles`, which names session profiles rather
     /// than rooms. Retained only so `Config::migration_errors` can name the
     /// leftover key and stop startup instead of letting the grant vanish
     /// silently. Never populated by anything else.
@@ -1719,10 +1719,10 @@ api_key = "test"
         // The admin allow list names room profiles. A typo there would grant
         // nothing and say nothing — the same hour-costing shape
         // `validate_subagent_profiles` exists to close.
-        for name in &self.tools.admin.session_profiles {
+        for name in &self.tools.admin.room_profiles {
             if name != DEFAULT_PROFILE_NAME && !self.session_profiles.contains_key(name) {
                 errors.push(format!(
-                    "[tools.admin].session_profiles references unknown session profile '{name}'"
+                    "[tools.admin].room_profiles references unknown session profile '{name}'"
                 ));
             }
         }
@@ -1824,9 +1824,9 @@ api_key = "test"
 
         if !self.tools.admin.legacy_rooms.is_empty() {
             errors.push(
-                "[tools.admin].rooms was replaced by `[tools.admin].session_profiles`, which names \
+                "[tools.admin].rooms was replaced by `[tools.admin].room_profiles`, which names \
                  session profiles instead of room ids. Delete the `rooms` line and write the session \
-                 profile names you mean, e.g. `session_profiles = [\"ops\"]`. For each room, use \
+                 profile names you mean, e.g. `room_profiles = [\"ops\"]`. For each room, use \
                  the name of the profile whose `[session_profile.<name>].rooms` array lists that \
                  room. Leaving `rooms` in place would drop the grant without saying so, so \
                  startup refuses until it is gone."
@@ -1879,7 +1879,7 @@ api_key = "test"
     }
 
     /// True when `name` is one of the room profiles declared in
-    /// `[tools.admin].session_profiles`.
+    /// `[tools.admin].room_profiles`.
     ///
     /// The name is a `[session_profile.<n>]` key, resolved from the calling
     /// transport rather than typed by the caller: a channel room through
@@ -1892,7 +1892,7 @@ api_key = "test"
     pub fn admin_allows_room_profile(&self, name: &str) -> bool {
         self.tools
             .admin
-            .session_profiles
+            .room_profiles
             .iter()
             .any(|allowed| allowed == name)
     }
@@ -1910,10 +1910,10 @@ api_key = "test"
             .unwrap_or(DEFAULT_PROFILE_NAME)
     }
 
-    /// True when `[tools.admin].session_profiles` names at least one session
+    /// True when `[tools.admin].room_profiles` names at least one session
     /// profile, i.e. the config-file management tools are registered at all.
     pub fn config_tools_enabled(&self) -> bool {
-        !self.tools.admin.session_profiles.is_empty()
+        !self.tools.admin.room_profiles.is_empty()
     }
 
     /// True if `name` is either the implicit `"default"` namespace or has a
@@ -2081,13 +2081,6 @@ api_key = "test"
             .unwrap_or_else(|| DEFAULT_PROFILE_NAME.to_string())
     }
 
-    /// R3: whether the profile governing a turn under `session_profile` lists `group`.
-    #[allow(dead_code)] // Consumed by the upcoming permission gate.
-    pub fn permission_lists(&self, session_profile: &str, group: ToolGroup) -> bool {
-        let name = self.permission_profile_name_for_session(session_profile);
-        self.permission_profile(&name).lists(group)
-    }
-
     /// R2: whether this host hands the agent that key. Today every group answers with
     /// the one switch that exists until Task 2 splits it per group —
     /// `[tools.host_access].enabled` — a fact about the deployment, not a row in the table.
@@ -2125,12 +2118,6 @@ api_key = "test"
             out.push(self.permission_profile(&self.permission_profile_name_for_session(name)));
         }
         out
-    }
-
-    /// A declaration wins verbatim; no declaration selects the implicit default.
-    #[allow(dead_code)] // Consumed by the upcoming permission gate.
-    pub fn session_profile_for(&self, declared: Option<&str>) -> String {
-        declared.unwrap_or(DEFAULT_PROFILE_NAME).to_string()
     }
 
     /// Resolve the default config path: `~/.config/sapphire-agent/config.toml`
@@ -2430,7 +2417,7 @@ mod tests {
     fn config_tools_are_allowed_in_a_named_session_profile() {
         let cfg = parse(
             "[anthropic]\napi_key = \"test\"\n\n[tools.admin]\n\
-             session_profiles = [\"ops\", \"developer\"]\n",
+             room_profiles = [\"ops\", \"developer\"]\n",
         );
         assert!(cfg.config_tools_enabled());
         assert!(cfg.admin_allows_room_profile("ops"));
@@ -2470,7 +2457,7 @@ mod tests {
     fn default_profile_is_allowed_by_name() {
         let cfg = parse(
             "[anthropic]\napi_key = \"test\"\n\n[tools.admin]\n\
-             session_profiles = [\"default\"]\n",
+             room_profiles = [\"default\"]\n",
         );
         assert!(cfg.config_tools_enabled());
         assert!(cfg.admin_allows_room_profile("default"));
@@ -2485,7 +2472,7 @@ mod tests {
         let errors = cfg.migration_errors();
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert!(errors[0].contains("[tools.admin].rooms"), "{errors:?}");
-        assert!(errors[0].contains("session_profiles"), "{errors:?}");
+        assert!(errors[0].contains("room_profiles"), "{errors:?}");
     }
 
     /// A typo in the allow list must fail `verify` and startup, not silently
@@ -2494,20 +2481,20 @@ mod tests {
     fn an_unknown_session_profile_in_the_allow_list_is_reported() {
         let cfg = parse(
             "[anthropic]\napi_key = \"test\"\n\n[tools.admin]\n\
-             session_profiles = [\"typo\"]\n",
+             room_profiles = [\"typo\"]\n",
         );
         let errors = cfg.validate_profiles();
         assert!(
             errors
                 .iter()
-                .any(|e| e.contains("[tools.admin].session_profiles") && e.contains("typo")),
+                .any(|e| e.contains("[tools.admin].room_profiles") && e.contains("typo")),
             "{errors:?}"
         );
 
         // `"default"` is always valid, defined or not.
         let ok = parse(
             "[anthropic]\napi_key = \"test\"\n\n[tools.admin]\n\
-             session_profiles = [\"default\"]\n",
+             room_profiles = [\"default\"]\n",
         );
         assert!(
             ok.validate_profiles().is_empty(),
@@ -4091,7 +4078,6 @@ model = "m"
              [permission_profile.ops]\ntools = [\"fs\"]\n\n[tools.host_access]\nenabled = true\n",
         );
         assert!(both.group_enabled(ToolGroup::Fs) && both.group_registered(ToolGroup::Fs));
-        assert!(both.permission_lists("ops", ToolGroup::Fs));
 
         let off = Config::parse_for_test("[anthropic]\napi_key = \"test\"\n");
         assert!(!off.group_enabled(ToolGroup::Fs));
@@ -4110,15 +4096,6 @@ model = "m"
             "enabled, and the `admin` preset lists it, but no effective profile here does"
         );
     }
-    #[test]
-    fn a_session_declaration_wins_verbatim_or_defaults_when_absent() {
-        let cfg = Config::for_test();
-        assert_eq!(cfg.session_profile_for(None), DEFAULT_PROFILE_NAME);
-        assert_eq!(cfg.session_profile_for(Some("ops")), "ops");
-        assert_eq!(cfg.session_profile_for(Some("unknown")), "unknown");
-        assert_eq!(cfg.session_profile_for(Some("")), "");
-    }
-
     #[test]
     fn validate_reports_unknown_permission_profiles_but_accepts_presets_and_sections() {
         let cfg = Config::parse_for_test(
@@ -4176,5 +4153,12 @@ model = "m"
             section.group_registered(ToolGroup::Shell),
             "operator sections are effective"
         );
+    }
+    #[test]
+    fn existing_admin_room_profiles_key_still_grants_access() {
+        let cfg = Config::parse_for_test("[tools.admin]\nroom_profiles = [\"ops\"]\n");
+        assert!(cfg.config_tools_enabled());
+        assert!(cfg.admin_allows_room_profile("ops"));
+        assert!(!cfg.admin_allows_room_profile("guest"));
     }
 }

@@ -710,6 +710,7 @@ pub(crate) struct OpenedSession {
 impl OpenedSession {
     /// The `initialize` result's shape, which the IPC `open` shares.
     pub(crate) fn to_json(&self) -> Value {
+        // Keep the legacy wire key for client compatibility.
         let mut result = json!({
             "session_id": self.session_id,
             "is_new": self.is_new,
@@ -4580,7 +4581,7 @@ mod tests {
     /// pinned one) must fail here, the way Task 4's probe would.
     ///
     /// The tool is a real `ConfigTool` over a real workspace with
-    /// `[tools.admin].session_profiles = ["ops"]`; the turn is an ACP turn
+    /// `[tools.admin].room_profiles = ["ops"]`; the turn is an ACP turn
     /// only by `state.acp_sessions` plus the pin in
     /// `session_profiles`, exactly what `session/new` writes. The
     /// policy layer is left at the default `Origin::Trusted` so the
@@ -4645,7 +4646,7 @@ mod tests {
 
         let result = tool_result_for(&state, &sid, "call-1").await;
         assert!(
-            result.contains("Permission denied") && result.contains("session_profiles"),
+            result.contains("Permission denied") && result.contains("room_profiles"),
             "a /rpc turn must be refused by the profile gate: got {result}"
         );
     }
@@ -4653,7 +4654,7 @@ mod tests {
     /// The state + real `agent_config` tool the two wiring tests above
     /// share: a scripted one-round-then-answer provider, and a
     /// `ConfigTool` over `state.workspace` itself with
-    /// `[tools.admin].session_profiles` set to `profiles`. The framework
+    /// `[tools.admin].room_profiles` set to `profiles`. The framework
     /// workspace the tool writes through is opened over the same
     /// directory (`Workspace::from_root` needs the `.sapphire-agent`
     /// marker), with a shared cache dir under the system temp dir.
@@ -4702,7 +4703,7 @@ mod tests {
         std::fs::create_dir_all(root.join(".sapphire-agent")).unwrap();
 
         let mut config = state.config.clone();
-        config.tools.admin.session_profiles = profiles;
+        config.tools.admin.room_profiles = profiles;
         let sw = sapphire_framework::workspace::Workspace::from_root(ctx, &root).unwrap();
         let ws = Arc::new(sapphire_framework::workspace::WorkspaceState::open(sw).unwrap());
 
