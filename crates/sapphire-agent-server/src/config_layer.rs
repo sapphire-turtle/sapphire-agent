@@ -42,14 +42,20 @@ pub const CREDENTIAL_SUFFIXES: &[&str] = &["_api_key", "_token", "_secret", "_pa
 /// - `workspace_dir` locates the workspace config, so a workspace config
 ///   naming it is circular — and the path is one machine's, which another
 ///   host syncing the same workspace does not have.
-/// - `tools.host_access` hands the agent this machine's shell and
+/// - `tools.fs` hands the agent this machine's shell and
 ///   filesystem. Whether a device grants that is the device's own decision,
 ///   not one a synced file makes for every host at once.
 /// - `serve` is the HTTP bind address, which belongs to one machine and one
 ///   OS user: two agents syncing the same workspace on one host would
 ///   otherwise both try to listen on the port it names.
-pub const HOST_ONLY_PATHS: &[&[&str]] =
-    &[&["workspace_dir"], &["tools", "host_access"], &["serve"]];
+pub const HOST_ONLY_PATHS: &[&[&str]] = &[
+    &["workspace_dir"],
+    &["tools", "fs"],
+    &["tools", "shell"],
+    &["tools", "mcp"],
+    &["tools", "admin"],
+    &["serve"],
+];
 
 /// True when `key` names a credential. See [`CREDENTIAL_KEYS`].
 pub fn is_credential_key(key: &str) -> bool {
@@ -363,7 +369,7 @@ mod tests {
         assert!(path_allowed(&["profiles", "default", "provider"]));
         assert!(path_allowed(&["session_profile", "work", "devices"]));
         assert!(path_allowed(&["tools", "mcp_servers"]));
-        assert!(path_allowed(&["tools", "admin", "session_profiles"]));
+        assert!(!path_allowed(&["tools", "admin", "session_profiles"]));
         assert!(path_allowed(&["stt_provider", "whisper", "model"]));
         assert!(path_allowed(&["matrix", "homeserver"]));
         // The name of an env var holding a key is not the key.
@@ -404,8 +410,8 @@ mod tests {
     #[test]
     fn host_only_paths_are_refused_with_everything_beneath_them() {
         assert!(!path_allowed(&["workspace_dir"]));
-        assert!(!path_allowed(&["tools", "host_access"]));
-        assert!(!path_allowed(&["tools", "host_access", "enabled"]));
+        assert!(!path_allowed(&["tools", "fs"]));
+        assert!(!path_allowed(&["tools", "fs", "enabled"]));
         assert!(!path_allowed(&["serve", "port"]));
         assert!(!path_allowed(&["serve", "host"]));
         // The rest of `[tools]` is shared.
@@ -416,15 +422,15 @@ mod tests {
     fn a_host_access_table_is_rejected_as_a_whole() {
         let (kept, rejected) = filter_allowed(parse(
             r#"
-[tools.host_access]
+[tools.fs]
 enabled = true
 
 [tools.tool_rounds]
 unattended = 100
 "#,
         ));
-        assert_eq!(rejected, vec!["tools.host_access".to_string()]);
-        assert!(kept["tools"].get("host_access").is_none());
+        assert_eq!(rejected, vec!["tools.fs".to_string()]);
+        assert!(kept["tools"].get("fs").is_none());
         assert_eq!(
             kept["tools"]["tool_rounds"]["unattended"].as_integer(),
             Some(100)

@@ -169,7 +169,7 @@ pub fn current_permission_profile() -> Option<String> {
 pub(crate) fn current_session_profile_for(config: &Config) -> Option<String> {
     match crate::timer::current_origin() {
         Some(crate::timer::TimerOrigin::Chat { room_id }) => {
-            Some(config.session_profile_name_for_room(&room_id).to_string())
+            Some(config.session_profile_name(None, &room_id))
         }
         Some(crate::timer::TimerOrigin::Voice { .. }) => None,
         None => current_session_profile(),
@@ -182,7 +182,7 @@ pub(crate) fn current_session_profile_for(config: &Config) -> Option<String> {
 /// The wording names the config key on purpose: a model that is refused has
 /// no other way to find out, and an operator being told by the agent *which*
 /// setting to change is the whole reason the refusal is not just "denied".
-pub(crate) const ROOM_REFUSAL: &str = "Permission denied: the config tools are not available for this room profile. An operator can allow them with `[tools.admin].room_profiles` in the host config.";
+pub(crate) const ROOM_REFUSAL: &str = "Permission denied: the config tools are not available for this session profile. An operator can allow them with `[tools.admin].room_profiles` in the host config.";
 
 /// The *effective* `enabled` value of a definition, as the loaders read
 /// it: `enabled:` when present, `true` when absent (both loaders declare
@@ -1033,11 +1033,26 @@ mod tests {
         let (d, root, ws) = test_workspace();
         let mut config = Config::for_test();
         config.tools.admin.room_profiles = vec!["ops".to_string()];
+        config.discord = Some(crate::config::DiscordConfig {
+            bot_token: "test".into(),
+            rooms: vec![
+                crate::config::RoomConfig {
+                    room_id: "!ops:x".into(),
+                    profile: "ops".into(),
+                    voice_pipeline: None,
+                },
+                crate::config::RoomConfig {
+                    room_id: "!lounge:y".into(),
+                    profile: "guest".into(),
+                    voice_pipeline: None,
+                },
+            ],
+            allowed_users: vec![],
+        });
         config.session_profiles.insert(
             "ops".to_string(),
             crate::config::SessionProfileConfig {
                 profile: "dev".to_string(),
-                rooms: vec!["!ops:x".to_string()],
                 ..Default::default()
             },
         );
@@ -1305,12 +1320,27 @@ mod tests {
         let (d, root, ws) = test_workspace();
         let mut config = Config::for_test();
         config.tools.admin.room_profiles = vec!["ops".to_string()];
-        for (name, room) in [("ops", "!ops:x"), ("guest", "!lounge:y")] {
+        config.discord = Some(crate::config::DiscordConfig {
+            bot_token: "test".into(),
+            rooms: vec![
+                crate::config::RoomConfig {
+                    room_id: "!ops:x".into(),
+                    profile: "ops".into(),
+                    voice_pipeline: None,
+                },
+                crate::config::RoomConfig {
+                    room_id: "!lounge:y".into(),
+                    profile: "guest".into(),
+                    voice_pipeline: None,
+                },
+            ],
+            allowed_users: vec![],
+        });
+        for name in ["ops", "guest"] {
             config.session_profiles.insert(
                 name.to_string(),
                 crate::config::SessionProfileConfig {
                     profile: "dev".to_string(),
-                    rooms: vec![room.to_string()],
                     ..Default::default()
                 },
             );
@@ -1356,11 +1386,26 @@ mod tests {
                 .expect("uniquely owned immediately after construction")
                 .config;
             config.tools.admin.room_profiles = vec!["ops".to_string()];
+            config.discord = Some(crate::config::DiscordConfig {
+                bot_token: "test".into(),
+                rooms: vec![
+                    crate::config::RoomConfig {
+                        room_id: "!ops:x".into(),
+                        profile: "ops".into(),
+                        voice_pipeline: None,
+                    },
+                    crate::config::RoomConfig {
+                        room_id: "!lounge:y".into(),
+                        profile: "guest".into(),
+                        voice_pipeline: None,
+                    },
+                ],
+                allowed_users: vec![],
+            });
             config.session_profiles.insert(
                 "ops".to_string(),
                 crate::config::SessionProfileConfig {
                     profile: "dev".to_string(),
-                    rooms: vec!["!ops:x".to_string()],
                     memory_namespace: Some("ops_ns".to_string()),
                     ..Default::default()
                 },
@@ -1423,11 +1468,26 @@ mod tests {
                 .expect("uniquely owned immediately after construction")
                 .config;
             config.tools.admin.room_profiles = vec!["ops".to_string()];
+            config.discord = Some(crate::config::DiscordConfig {
+                bot_token: "test".into(),
+                rooms: vec![
+                    crate::config::RoomConfig {
+                        room_id: "!ops:x".into(),
+                        profile: "ops".into(),
+                        voice_pipeline: None,
+                    },
+                    crate::config::RoomConfig {
+                        room_id: "!lounge:y".into(),
+                        profile: "guest".into(),
+                        voice_pipeline: None,
+                    },
+                ],
+                allowed_users: vec![],
+            });
             config.session_profiles.insert(
                 "ops".to_string(),
                 crate::config::SessionProfileConfig {
                     profile: "dev".to_string(),
-                    rooms: vec!["!ops:x".to_string()],
                     ..Default::default()
                 },
             );
@@ -1629,6 +1689,22 @@ mod tests {
         let set = Arc::new(ToolSet::new(Vec::new(), Vec::new()));
         let mut config = Config::for_test();
         config.tools.admin.room_profiles = vec!["ops".to_string()];
+        config.discord = Some(crate::config::DiscordConfig {
+            bot_token: "test".into(),
+            rooms: vec![
+                crate::config::RoomConfig {
+                    room_id: "!ops:x".into(),
+                    profile: "ops".into(),
+                    voice_pipeline: None,
+                },
+                crate::config::RoomConfig {
+                    room_id: "!lounge:y".into(),
+                    profile: "guest".into(),
+                    voice_pipeline: None,
+                },
+            ],
+            allowed_users: vec![],
+        });
 
         register_admin_tools(&set, &root, config, ws, None, serve_state).await;
 
@@ -1674,11 +1750,26 @@ mod tests {
         ));
         let mut config = Config::for_test();
         config.tools.admin.room_profiles = vec!["ops".to_string()];
+        config.discord = Some(crate::config::DiscordConfig {
+            bot_token: "test".into(),
+            rooms: vec![
+                crate::config::RoomConfig {
+                    room_id: "!ops:x".into(),
+                    profile: "ops".into(),
+                    voice_pipeline: None,
+                },
+                crate::config::RoomConfig {
+                    room_id: "!lounge:y".into(),
+                    profile: "guest".into(),
+                    voice_pipeline: None,
+                },
+            ],
+            allowed_users: vec![],
+        });
         config.session_profiles.insert(
             "ops".to_string(),
             crate::config::SessionProfileConfig {
                 profile: "dev".to_string(),
-                rooms: vec!["!ops:x".to_string()],
                 ..Default::default()
             },
         );

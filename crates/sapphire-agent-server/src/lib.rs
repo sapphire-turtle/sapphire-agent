@@ -203,11 +203,11 @@ fn consult_room_warnings(config: &config::Config) -> Vec<String> {
     let listed = config
         .discord
         .as_ref()
-        .is_some_and(|d| d.channel_ids.iter().any(|c| c == room))
+        .is_some_and(|d| d.rooms.iter().any(|c| c.room_id == room))
         || config
             .matrix
             .as_ref()
-            .is_some_and(|m| m.room_ids.iter().any(|r| r == room))
+            .is_some_and(|m| m.rooms.iter().any(|r| r.room_id == room))
         || discord_listens_to_room(config, room);
     if !listed {
         lines.push(format!(
@@ -227,11 +227,7 @@ fn consult_room_warnings(config: &config::Config) -> Vec<String> {
 /// Whether Discord listens in `room` without listing it: an empty
 /// `channel_ids` means every channel, and a Discord channel ID is numeric.
 fn discord_listens_to_room(config: &config::Config, room: &str) -> bool {
-    config
-        .discord
-        .as_ref()
-        .is_some_and(|d| d.channel_ids.is_empty())
-        && room.parse::<u64>().is_ok()
+    config.discord.as_ref().is_some_and(|d| d.rooms.is_empty()) && room.parse::<u64>().is_ok()
 }
 
 /// `consult_timeout_hours` as a duration, clamped to
@@ -1360,7 +1356,7 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
                         config
                             .discord
                             .as_ref()
-                            .and_then(|d| d.channel_ids.first().cloned())
+                            .and_then(|d| d.rooms.first().map(|r| r.room_id.clone()))
                     });
                 Heartbeat {
                     workspace_dir: workspace_dir.clone(),
@@ -1375,14 +1371,8 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
                     default_room_id,
                     placement: Arc::clone(&placement),
                     local_rooms: channel::seed_routing_from_config(&config),
-                    local_catch_all: config
-                        .matrix
-                        .as_ref()
-                        .is_some_and(|m| m.room_ids.is_empty())
-                        || config
-                            .discord
-                            .as_ref()
-                            .is_some_and(|d| d.channel_ids.is_empty()),
+                    local_catch_all: config.matrix.as_ref().is_some_and(|m| m.rooms.is_empty())
+                        || config.discord.as_ref().is_some_and(|d| d.rooms.is_empty()),
                     config: config.clone(),
                     serve_state: Some(Arc::clone(&serve_state)),
                 }
@@ -1493,7 +1483,7 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
             server_task.await.context("the app server panicked")??;
         }
         Mode::Verify => {
-            let mut profile_errors = config.validate_profiles();
+            let mut profile_errors = config.validate_session_profiles();
             // `serve` refuses to start on what only the registry can see —
             // a profile naming `anthropic` with no API key, or no key and no
             // `[profiles.default]` — so `verify` builds it too.
@@ -1542,10 +1532,16 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
                 println!("  Channel           : matrix");
                 println!("  Matrix homeserver : {}", m.homeserver);
                 println!("  Matrix user_id    : {}", m.user_id);
-                println!("  Matrix rooms      : {:?}", m.room_ids);
+                println!(
+                    "  Matrix rooms      : {:?}",
+                    m.rooms.iter().map(|r| &r.room_id).collect::<Vec<_>>()
+                );
             } else if let Some(d) = &config.discord {
                 println!("  Channel           : discord");
-                println!("  Discord channels  : {:?}", d.channel_ids);
+                println!(
+                    "  Discord channels  : {:?}",
+                    d.rooms.iter().map(|r| &r.room_id).collect::<Vec<_>>()
+                );
                 println!("  Allowed users     : {:?}", d.allowed_users);
             } else {
                 println!("  Channel           : NONE (add [discord] or [matrix] to config)");
@@ -2033,7 +2029,7 @@ mod tests {
     fn verify_accepts_a_listed_consult_room_and_warns_when_autonomous_is_off() {
         let cfg = consult_config(
             "[autonomous]\nconsult_room = \"c1\"\n\
-             [discord]\nbot_token = \"x\"\nchannel_ids = [\"c1\"]\nallowed_users = []\n",
+             [discord]\nbot_token = \"x\"\nallowed_users = []\n[[discord.rooms]]\nroom_id = \"c1\"\n",
         );
         let lines = consult_room_warnings(&cfg);
         assert_eq!(lines.len(), 1, "{lines:?}");

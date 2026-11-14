@@ -47,7 +47,7 @@ impl ProviderRegistry {
     /// resolved, so tests do not depend on the `ANTHROPIC_API_KEY` of
     /// whoever runs them.
     fn build(config: &Config, anthropic_key: Result<String>) -> Result<Self> {
-        let errors = config.validate_profiles();
+        let errors = config.validate_session_profiles();
         if !errors.is_empty() {
             anyhow::bail!(
                 "invalid profile configuration:\n  - {}",
@@ -160,7 +160,9 @@ impl ProviderRegistry {
     /// wrapped in a `FallbackProvider` so refusals or errors transparently
     /// retry on the secondary.
     pub fn for_room(&self, config: &Config, room_id: &str) -> Arc<dyn Provider> {
-        let Some(profile_name) = config.profile_for_session(room_id) else {
+        let Some(profile_name) =
+            config.profile_for_session(&config.session_profile_name(None, room_id))
+        else {
             return self.default_provider();
         };
         self.for_profile(config, profile_name)
@@ -584,7 +586,11 @@ provider = "local"
 
 [session_profile.private_nsfw]
 profile = "nsfw"
-rooms   = ["!nsfw:srv"]
+[discord]
+bot_token = "t"
+[[discord.rooms]]
+room_id = "!nsfw:srv"
+profile = "private_nsfw"
 "#,
         );
         let reg = ProviderRegistry::from_config(&cfg).unwrap();

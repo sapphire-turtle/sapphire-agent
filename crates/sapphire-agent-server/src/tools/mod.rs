@@ -537,7 +537,7 @@ mod tests {
         assert!(
             !tools
                 .specs_filtered(crate::serve::visible_tool_predicate(
-                    true, false, false, false, false
+                    true, true, false, false, false, false
                 ))
                 .await
                 .iter()

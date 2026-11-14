@@ -109,9 +109,13 @@ impl std::fmt::Debug for DiscordChannel {
 impl DiscordChannel {
     pub fn new(cfg: &DiscordConfig) -> Result<Self> {
         let channel_ids = cfg
-            .channel_ids
+            .rooms
             .iter()
-            .map(|s| s.parse::<u64>().context("Invalid Discord channel_id"))
+            .map(|r| {
+                r.room_id
+                    .parse::<u64>()
+                    .context("Invalid Discord channel_id")
+            })
             .collect::<Result<HashSet<_>>>()?;
 
         let allowed_user_ids = cfg
@@ -617,7 +621,7 @@ mod tests {
     fn builder_accepts_optional_store() {
         let cfg = crate::config::DiscordConfig {
             bot_token: "unused".into(),
-            channel_ids: vec![],
+            rooms: vec![],
             allowed_users: vec![],
         };
         let channel = DiscordChannel::new(&cfg)

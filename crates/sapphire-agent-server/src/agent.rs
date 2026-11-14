@@ -101,17 +101,17 @@ impl Agent {
         let allowed_rooms: std::collections::HashSet<String> = {
             let mut set = std::collections::HashSet::new();
             if let Some(m) = &config.matrix {
-                if m.room_ids.is_empty() {
+                if m.rooms.is_empty() {
                     wildcard = true;
                 } else {
-                    set.extend(m.room_ids.iter().cloned());
+                    set.extend(m.rooms.iter().map(|r| r.room_id.clone()));
                 }
             }
             if let Some(d) = &config.discord {
-                if d.channel_ids.is_empty() {
+                if d.rooms.is_empty() {
                     wildcard = true;
                 } else {
-                    set.extend(d.channel_ids.iter().cloned());
+                    set.extend(d.rooms.iter().map(|r| r.room_id.clone()));
                 }
             }
             set
@@ -597,10 +597,17 @@ impl Agent {
         // host tools (`file_read`, `file_write`, `file_append`,
         // `file_delete`, `dir_list`, `dir_walk`, `shell`, `image_read`), whose
         // agent-side bodies are what this transport runs.
-        let host_access_enabled = self.config.tools.host_access.enabled;
-        let can_save = host_access_enabled && incoming.attachment_owner.is_some();
-        let base =
-            crate::serve::visible_tool_predicate(host_access_enabled, false, false, false, false);
+        let fs_enabled = self.config.tools.fs.enabled;
+        let shell_enabled = self.config.tools.shell.enabled;
+        let can_save = fs_enabled && incoming.attachment_owner.is_some();
+        let base = crate::serve::visible_tool_predicate(
+            fs_enabled,
+            shell_enabled,
+            false,
+            false,
+            false,
+            false,
+        );
         let tool_specs = match &self.tools {
             Some(t) => Some(
                 t.specs_filtered(|name| {
@@ -822,7 +829,8 @@ impl Agent {
                             crate::tools::policy::Origin::Channel,
                             &offered,
                             &kinds,
-                            self.config.tools.host_access.enabled,
+                            self.config.tools.fs.enabled,
+                            self.config.tools.shell.enabled,
                             false,
                         );
                     refused.extend(policy_refused);
@@ -1030,7 +1038,7 @@ mod tests {
         let (calls, kinds) = channel_gate_test_calls().await;
 
         let (permitted, refused) =
-            partition_without_asking(Origin::Channel, &calls, &kinds, true, false);
+            partition_without_asking(Origin::Channel, &calls, &kinds, true, true, false);
 
         let kept: Vec<&str> = permitted.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(
@@ -1081,7 +1089,7 @@ mod tests {
         let (calls, kinds) = channel_gate_test_calls().await;
 
         let (permitted, refused) =
-            partition_without_asking(Origin::Channel, &calls, &kinds, false, false);
+            partition_without_asking(Origin::Channel, &calls, &kinds, false, false, false);
 
         let kept: Vec<&str> = permitted.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(
@@ -1383,7 +1391,7 @@ api_key = "test"
             vec![],
         ));
         let config = crate::config::Config::parse_for_test(&format!(
-            "[anthropic]\napi_key = \"test\"\n[tools.host_access]\nenabled = {host}\n"
+            "[anthropic]\napi_key = \"test\"\n[tools.fs]\nenabled = {host}\n[tools.shell]\nenabled = {host}\n"
         ));
         let ((agent, _, _), log) =
             build_test_agent_with_tools(script, false, Some((config, tools)));
@@ -1463,7 +1471,7 @@ api_key = "test"
             vec![],
         ));
         let config = crate::config::Config::parse_for_test(
-            "[anthropic]\napi_key = \"test\"\n[tools.host_access]\nenabled = true\n",
+            "[anthropic]\napi_key = \"test\"\n[tools.fs]\nenabled = true\n[tools.shell]\nenabled = true\n",
         );
         let (((agent, _, _), log), session_store) = build_test_agent_with_options(
             vec![

@@ -101,6 +101,9 @@ pub struct ServeState {
     /// persisted across restarts — clients must re-pass `session_profile`
     /// on resume.
     pub(crate) session_profiles: tokio::sync::Mutex<HashMap<String, String>>,
+    /// Channel room voice overrides, keyed by the same internal session id.
+    /// Device/API pins have no room override and keep the profile's pipeline.
+    session_voice_overrides: tokio::sync::Mutex<HashMap<String, String>>,
     /// Per-session room metadata supplied by the client at `initialize`
     /// (a voice client's `[device]` block, principally). Mirrors the
     /// channel-side `Channel::room_info()` lookup so the agent can tell
@@ -222,6 +225,7 @@ impl ServeState {
             sessions: tokio::sync::Mutex::new(HashMap::new()),
             pending_sessions: tokio::sync::Mutex::new(HashMap::new()),
             session_profiles: tokio::sync::Mutex::new(HashMap::new()),
+            session_voice_overrides: Default::default(),
             session_room_metadata: tokio::sync::Mutex::new(HashMap::new()),
             voice,
             voice_subscribers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -286,6 +290,26 @@ impl ServeState {
             &self.device_default_session_store
         } else {
             &self.cross_device_session_store
+        }
+    }
+
+    /// Pin at ingress, retaining only the profile name on the turn. A room's
+    /// optional voice override accompanies the pin, never a client parameter.
+    async fn pin_session_profile(&self, session_id: &str, declared: Option<&str>, room_id: &str) {
+        let profile = self.config.session_profile_name(declared, room_id);
+        let voice = self.config.channels().find_map(|(_, room)| {
+            (room.room_id == room_id)
+                .then_some(room.voice_pipeline.as_ref())
+                .flatten()
+        });
+        // Use the same lock order as voice resolution.
+        let mut profiles = self.session_profiles.lock().await;
+        let mut overrides = self.session_voice_overrides.lock().await;
+        profiles.insert(session_id.to_string(), profile);
+        if let Some(voice) = voice {
+            overrides.insert(session_id.to_string(), voice.clone());
+        } else {
+            overrides.remove(session_id);
         }
     }
 
@@ -807,10 +831,8 @@ pub(crate) async fn open_session(
     };
 
     state
-        .session_profiles
-        .lock()
-        .await
-        .insert(session_id.clone(), profile_name.clone());
+        .pin_session_profile(&session_id, Some(&profile_name), "")
+        .await;
 
     // Optional `params.device = { name, description }` from voice
     // clients. We treat `name` as the device handle (e.g.
@@ -1162,10 +1184,8 @@ async fn handle_voice_pipeline_run(
         }
     };
     state
-        .session_profiles
-        .lock()
-        .await
-        .insert(session_id.clone(), session_profile.clone());
+        .pin_session_profile(&session_id, Some(&session_profile), "")
+        .await;
 
     // Same `device` block accepted by `initialize` — refreshed on every
     // pipeline_run so satellites can update their description without a
@@ -1462,12 +1482,15 @@ async fn resolve_voice_pipeline(
     if state.voice.is_none() {
         return Err(VoicePipelineLookup::NoVoice);
     }
-    let rp_name = state.session_profiles.lock().await.get(session_id).cloned();
-    rp_name
-        .as_deref()
-        .and_then(|n| state.config.voice_pipeline_for_session_profile(n))
-        .cloned()
-        .ok_or(VoicePipelineLookup::NotConfigured)
+    let profiles = state.session_profiles.lock().await;
+    let overrides = state.session_voice_overrides.lock().await;
+    let pipeline = match overrides.get(session_id) {
+        Some(name) => state.config.voice_pipelines.get(name),
+        None => profiles
+            .get(session_id)
+            .and_then(|name| state.config.voice_pipeline_for_session_profile(name)),
+    };
+    pipeline.cloned().ok_or(VoicePipelineLookup::NotConfigured)
 }
 
 /// LLM turn + TTS streaming, with progress emitted as SSE notifications
@@ -1732,10 +1755,8 @@ pub(crate) async fn push_voice_text_to_subscriber(
         )
         .map_err(|e| VoicePushError::Other(format!("device-default lookup: {e}")))?;
     state
-        .session_profiles
-        .lock()
-        .await
-        .insert(session_id.clone(), session_profile.clone());
+        .pin_session_profile(&session_id, Some(&session_profile), "")
+        .await;
 
     let pipeline = match resolve_voice_pipeline(&state, &session_id).await {
         Ok(p) => p,
@@ -2371,7 +2392,8 @@ fn turn_tool_predicate(
 /// the deployment switch's entire domain. `Agent::handle_message` calls
 /// this with every client flag false for exactly that reason.
 pub(crate) fn visible_tool_predicate(
-    host_access_enabled: bool,
+    fs_enabled: bool,
+    shell_enabled: bool,
     has_client: bool,
     client_fs_read: bool,
     client_fs_write: bool,
@@ -2395,7 +2417,7 @@ pub(crate) fn visible_tool_predicate(
         // is the whole answer. On a turn with no client (Matrix, Discord,
         // `/rpc`, voice, the heartbeat) the gate is exactly the old rule
         // and every name it lets through is the agent's own.
-        if crate::tools::policy::host_tool_denied(name, host_access_enabled, has_client) {
+        if crate::tools::policy::host_tool_denied(name, fs_enabled, shell_enabled, has_client) {
             return false;
         }
 
@@ -2662,7 +2684,8 @@ impl TurnLoop<'_> {
         // Read once per turn: `None` on every non-ACP transport, which
         // is what keeps the client-side tools refusing there rather
         // than reaching for a connection that does not exist.
-        let host_access_enabled = state.config.tools.host_access.enabled;
+        let fs_enabled = state.config.tools.fs.enabled;
+        let shell_enabled = state.config.tools.shell.enabled;
         // The tools the ACP client provided for this session. A subagent's
         // loop never sees them: its tool list is cut from the parent's by
         // `subagent_tool_specs`, which drops them, and its calls would not
@@ -2884,7 +2907,8 @@ impl TurnLoop<'_> {
                             Some(refusal_message(&call.name, Refusal::NotOffered))
                         } else if host_tool_denied(
                             &call.name,
-                            host_access_enabled,
+                            fs_enabled,
+                            shell_enabled,
                             routed_to_client,
                         ) {
                             Some(refusal_message(&call.name, Refusal::Unavailable))
@@ -3219,6 +3243,9 @@ pub(crate) async fn run_llm_turn(
     // Pick the right store up front so every persistence call in this
     // turn lands in the same place (device-default vs cross-device).
     let store = Arc::clone(state.store_for_session(&session_id));
+    if let Some(crate::timer::TimerOrigin::Chat { room_id }) = &timer_origin {
+        state.pin_session_profile(&session_id, None, room_id).await;
+    }
     let is_acp = state.is_acp(&session_id).await;
     // The room profile this turn's admin-tool grant hangs on. An ACP session
     // carries the one its bearer token pinned at `session/new` (or
@@ -3375,7 +3402,8 @@ pub(crate) async fn run_llm_turn(
     // opted this deployment into host access; the two client-side file
     // tools are hidden whenever there is no editor on the other end, or
     // it did not declare the matching `fs` capability.
-    let host_access_enabled = state.config.tools.host_access.enabled;
+    let fs_enabled = state.config.tools.fs.enabled;
+    let shell_enabled = state.config.tools.shell.enabled;
     let has_client = progress.acp_client().is_some();
     let (client_fs_read, client_fs_write) = progress.client_fs_caps();
     let client_terminal = progress.client_terminal_cap();
@@ -3392,7 +3420,8 @@ pub(crate) async fn run_llm_turn(
         .map(|ns| ns.skills)
         .unwrap_or(false);
     let base = visible_tool_predicate(
-        host_access_enabled,
+        fs_enabled,
+        shell_enabled,
         has_client,
         client_fs_read,
         client_fs_write,
@@ -4222,7 +4251,8 @@ impl ServeState {
             crate::config::ToolRounds::default(),
             DEFAULT_TEST_ACP_KEEPALIVE_SECS,
             |config| {
-                config.tools.host_access.enabled = true;
+                config.tools.fs.enabled = true;
+                config.tools.shell.enabled = true;
                 config.autonomous.origin = crate::config::AutonomousOrigin::Trusted;
             },
         )
@@ -4342,6 +4372,7 @@ rooms    = []
             sessions: Default::default(),
             pending_sessions: Default::default(),
             session_profiles: Default::default(),
+            session_voice_overrides: Default::default(),
             session_room_metadata: Default::default(),
             voice: None,
             image_cache: None,
@@ -4571,6 +4602,83 @@ mod tests {
         .await;
 
         assert_eq!(probe.seen(), Some(None), "no profile may be scoped here");
+    }
+
+    #[tokio::test]
+    async fn a_room_voice_override_wins_and_absence_keeps_the_profile_pipeline() {
+        let mut state = ServeState::for_test_scripted(false, vec![]);
+        let state_mut = Arc::get_mut(&mut state).unwrap();
+        state_mut.config = Config::parse_for_test(
+            r#"
+[profiles.dev]
+provider = "anthropic"
+[session_profile.ops]
+profile = "dev"
+voice_pipeline = "default"
+[discord]
+bot_token = "t"
+[[discord.rooms]]
+room_id = "inherited"
+profile = "ops"
+[[discord.rooms]]
+room_id = "overridden"
+profile = "ops"
+voice_pipeline = "room"
+[voice_pipeline.default]
+stt_provider = "stt"
+tts_provider = "tts"
+language = "ja"
+[voice_pipeline.room]
+stt_provider = "stt"
+tts_provider = "tts"
+language = "en"
+[stt_provider.stt]
+type = "mock"
+transcript = "hello"
+[tts_provider.tts]
+type = "mock"
+"#,
+        );
+        state_mut.voice = Some(Arc::new(
+            VoiceProviders::from_config(&state_mut.config).unwrap(),
+        ));
+        assert!(state_mut.config.validate_session_profiles().is_empty());
+        state.pin_session_profile("s1", None, "inherited").await;
+        state.pin_session_profile("s2", None, "overridden").await;
+        assert_eq!(
+            resolve_voice_pipeline(&state, "s1")
+                .await
+                .ok()
+                .unwrap()
+                .language
+                .as_deref(),
+            Some("ja")
+        );
+        assert_eq!(
+            resolve_voice_pipeline(&state, "s2")
+                .await
+                .ok()
+                .unwrap()
+                .language
+                .as_deref(),
+            Some("en")
+        );
+        // An authenticated explicit profile is never replaced by a room's binding.
+        state.pin_session_profile("s3", Some("ops"), "").await;
+        assert_eq!(
+            resolve_voice_pipeline(&state, "s3")
+                .await
+                .ok()
+                .unwrap()
+                .language
+                .as_deref(),
+            Some("ja")
+        );
+        state.pin_session_profile("s1", Some("missing"), "").await;
+        assert!(matches!(
+            resolve_voice_pipeline(&state, "s1").await,
+            Err(VoicePipelineLookup::NotConfigured)
+        ));
     }
 
     /// A config tool must be reachable through the room profile an ACP
@@ -6913,6 +7021,7 @@ mod tests {
         client_filtering_test_set()
             .specs_filtered(visible_tool_predicate(
                 host_access,
+                host_access,
                 true,
                 caps.fs_read,
                 caps.fs_write,
@@ -6932,6 +7041,7 @@ mod tests {
         client_filtering_test_set()
             .specs_filtered(visible_tool_predicate(
                 host_access,
+                host_access,
                 false,
                 false,
                 false,
@@ -6947,7 +7057,8 @@ mod tests {
     fn attachment_save_is_hidden_without_channel_override() {
         for mask in 0..32 {
             let flag = |bit| mask & (1 << bit) != 0;
-            let visible = visible_tool_predicate(flag(0), flag(1), flag(2), flag(3), flag(4));
+            let visible =
+                visible_tool_predicate(flag(0), flag(0), flag(1), flag(2), flag(3), flag(4));
             assert!(!visible("attachment_save"), "flags={mask}");
         }
     }
@@ -6961,7 +7072,7 @@ mod tests {
             (true, true, false),
         ] {
             for caps in [false, true] {
-                let visible = visible_tool_predicate(host, client, caps, caps, caps);
+                let visible = visible_tool_predicate(host, host, client, caps, caps, caps);
                 assert_eq!(
                     visible("image_read"),
                     expected,
@@ -7167,21 +7278,21 @@ mod tests {
     /// machine.
     #[test]
     fn skill_tools_need_a_client_with_a_terminal() {
-        let none = visible_tool_predicate(false, false, false, false, false);
+        let none = visible_tool_predicate(false, false, false, false, false, false);
         for t in ["skill", "skill_install", "skill_update", "skill_uninstall"] {
             assert!(!none(t), "{t} offered with no client");
         }
         // And the host switch does not change that: it speaks for the
         // agent's own disk, which is not where these run.
-        let none_host_on = visible_tool_predicate(true, false, false, false, false);
+        let none_host_on = visible_tool_predicate(true, true, false, false, false, false);
         for t in ["skill", "skill_install", "skill_update", "skill_uninstall"] {
             assert!(!none_host_on(t), "{t} offered with no client");
         }
-        let full = visible_tool_predicate(false, true, true, true, true);
+        let full = visible_tool_predicate(false, false, true, true, true, true);
         for t in ["skill", "skill_install", "skill_update", "skill_uninstall"] {
             assert!(full(t), "{t} hidden from a fully capable editor");
         }
-        let no_term = visible_tool_predicate(false, true, true, true, false);
+        let no_term = visible_tool_predicate(false, false, true, true, true, false);
         assert!(!no_term("skill"), "skill offered without a terminal");
     }
 
@@ -7200,8 +7311,8 @@ mod tests {
         set.register_tool(Box::new(crate::tools::avatar_tools::SetPoseTool))
             .await;
         for predicate in [
-            visible_tool_predicate(false, false, false, false, false),
-            visible_tool_predicate(true, true, true, true, true),
+            visible_tool_predicate(false, false, false, false, false, false),
+            visible_tool_predicate(true, true, true, true, true, true),
         ] {
             let names: Vec<String> = set
                 .specs_filtered(predicate)
@@ -7219,7 +7330,7 @@ mod tests {
     fn ask_human_is_hidden_without_consult_identity() {
         for bits in 0..32u8 {
             let f = |i: u8| bits & (1 << i) != 0;
-            let visible = visible_tool_predicate(f(0), f(1), f(2), f(3), f(4));
+            let visible = visible_tool_predicate(f(0), f(0), f(1), f(2), f(3), f(4));
             assert!(!visible("ask_human"), "visible for flags {bits:05b}");
         }
     }
@@ -7241,7 +7352,7 @@ mod tests {
             let specs = state
                 .tools
                 .specs_filtered(turn_tool_predicate(
-                    visible_tool_predicate(false, false, false, false, false),
+                    visible_tool_predicate(false, false, false, false, false, false),
                     false,
                     progress.consult_identity().is_some(),
                     false,
@@ -7566,7 +7677,7 @@ mod tests {
             ],
         );
         assert!(
-            !state.config.tools.host_access.enabled,
+            !state.config.tools.fs.enabled,
             "the shipped default is the case under test"
         );
 

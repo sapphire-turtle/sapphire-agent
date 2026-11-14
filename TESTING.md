@@ -324,3 +324,11 @@ manual flow above. Bringing that into automated CI would require
 spawning a real axum process plus a mock LLM that talks the
 JSON-streaming Anthropic protocol, which is more bookkeeping than it
 saves at the project's current size.
+
+### Declaration-side room configuration
+
+Use ordered `[[discord.rooms]]` / `[[matrix.rooms]]` entries with `room_id`
+and `profile` naming `[session_profile.<name>]`. A room's optional
+`voice_pipeline` overrides that profile's pipeline; otherwise it inherits it.
+Host switches `[tools.fs]`, `[tools.shell]`, `[tools.mcp]` and `[tools.admin]`
+are host-only; permission-profile tool listings may be synced.

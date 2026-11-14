@@ -17,7 +17,7 @@
 - **チャネル**： Matrix（`matrix-sdk`によるE2EE）とDiscord（`serenity`）を並行稼働。
 - **プロバイダ**： SSEストリーミングとマルチラウンドのツール使用ループを備えたAnthropic Messages APIに加え、OpenAI互換バックエンド（ローカルLLM、OpenRouterなど）を `[providers]` / `[profiles]` / `[session_profile]` スキーマでルーム／セッションごとに選択可能。
 - **ワークスペース**： [`sapphire-framework`](https://github.com/sapphire-turtle/sapphire-framework) をバックエンドに使用 — ファイルインデックス、全文＋ベクトル検索（redb＋tantivy、デフォルトでLanceDBベクトル付き）。
-- **シェル・ファイルツール**： `file_read`、`file_write`、`file_append`、`file_delete`、`dir_list`、`dir_walk`、`shell`、それに長時間実行用の `shell_start` / `shell_output` / `shell_kill`。これらの**届くマシンは名前ではなくセッションで決まります**。ACPセッション内では、接続したエディタが動いているマシンに、`/acp`の`fs/*`と`terminal/*`リクエストを介して作用します。ただし接続したエディタが`initialize`で宣言した機能に対してのみで、欠けた機能はエージェント自身のディスクへのフォールバックなしに非表示になります。それ以外（Matrix、Discord、`/rpc`、音声、`/a2a`、ハートビート、autonomous、サブエージェント）ではエージェント自身のマシンに作用し、オプトインです： `[tools.host_access] enabled = false`がデフォルトで、すべてのオージンに適用されます。有効化は意図的な行為で、有効化したうえでエージェントをコンテナで動かすのが推奨されます。下記「シェル・ファイルツール：誰のマシンか」参照。
+- **シェル・ファイルツール**： `file_read`、`file_write`、`file_append`、`file_delete`、`dir_list`、`dir_walk`、`shell`、それに長時間実行用の `shell_start` / `shell_output` / `shell_kill`。これらの**届くマシンは名前ではなくセッションで決まります**。ACPセッション内では、接続したエディタが動いているマシンに、`/acp`の`fs/*`と`terminal/*`リクエストを介して作用します。ただし接続したエディタが`initialize`で宣言した機能に対してのみで、欠けた機能はエージェント自身のディスクへのフォールバックなしに非表示になります。それ以外（Matrix、Discord、`/rpc`、音声、`/a2a`、ハートビート、autonomous、サブエージェント）ではエージェント自身のマシンに作用し、オプトインです： `[tools.fs] / [tools.shell] enabled = false`がデフォルトで、すべてのオージンに適用されます。有効化は意図的な行為で、有効化したうえでエージェントをコンテナで動かすのが推奨されます。下記「シェル・ファイルツール：誰のマシンか」参照。
 - **セッション**： 人間が読める[`grain-id`](https://crates.io/crates/grain-id)エイリアス、自動生成タイトル、再開時の履歴ダンプ。
 - **バックグラウンド**： ハートビートcronタスク、定期的なメモリー圧縮、定期的なワークスペース再インデックス、キャッチアップ付きの日次／週次／月次／年次ログ。
 - **音声**： サーバー側の STT → ターン → TTS パイプライン（`/rpc` の `voice/*`）。ローカル STT/TTS は `sherpa-onnx` 経由。`sapphire-agent-desktop` などの音声クライアント向け。`sapphire-agent-cli voice` サテライトは CLI の本バイナリへの統合時に削除された（[#278](https://github.com/sapphire-turtle/sapphire-agent/issues/278)）。この役割はウェアラブルデバイスのファームウェアへ移行予定。
@@ -31,7 +31,7 @@
   - `sapphire-agent` — チャネルリスナー＋JSON-RPC HTTP制御API（`/rpc`、`/a2a`、`/acp`）を開始
   - `sapphire-agent init [PATH]` — エージェントが読むファイル（`AGENTS.md`、`SOUL.md`など）でワークスペースをシードし、貼り付けるホストローカル設定を出力。既存ファイルを決して上書きしない
   - `sapphire-agent verify` — 設定を検証し、各 API キーがどの session_profile で動くかを含む読み込まれたワークスペースファイルを報告
-  - sapphire-framework の動詞（稼働中のサーバーまたは bridge と話す）: `status`、`service install|uninstall|status`、`workspace init|select|show|…`（エージェントは選択されたワークスペースを扱う。`config.toml` の `workspace_dir` は初回起動時にだけ取り込まれ、切り替えるとエージェントは新しいワークスペースで再起動する）、`api-key add|list|rotate|retire|restore`（ベアラートークンでエージェントにアクセスするクライアント。ワークスペースの API キーで、それぞれ `add --profile` で指定した room profile で動く。`add` と `rotate` はトークンを一度だけ表示）、`config`。ワークグループ・デバイス・埋め込みは bridge のもの: `sapphire-bridge workgroup|device|embedding`
+  - sapphire-framework の動詞（稼働中のサーバーまたは bridge と話す）: `status`、`service install|uninstall|status`、`workspace init|select|show|…`（エージェントは選択されたワークスペースを扱う。`config.toml` の `workspace_dir` は初回起動時にだけ取り込まれ、切り替えるとエージェントは新しいワークスペースで再起動する）、`api-key add|list|rotate|retire|restore`（ベアラートークンでエージェントにアクセスするクライアント。ワークスペースの API キーで、それぞれ `add --profile` で指定した session profile で動く。`add` と `rotate` はトークンを一度だけ表示）、`config`。ワークグループ・デバイス・埋め込みは bridge のもの: `sapphire-bridge workgroup|device|embedding`
   - `sapphire-agent chat` — 同じホストで動いているエージェントとローカル IPC 経由で対話する REPL（`-m TEXT` で単発、`--list`、`--history`、`--session ID`、`--json`）。`[cli].profile` のルームプロファイルで動く
 
 ## インストール

@@ -229,8 +229,19 @@ pub const HOST_TOOLS: &[&str] = &[
 /// to fire; a caller that does not (every non-ACP transport, whose turns
 /// never have one) passes `false` and gets exactly the old behaviour.
 /// `image_read` is host-only: ACP visibility and execution reject it separately.
-pub fn host_tool_denied(name: &str, host_access_enabled: bool, routed_to_client: bool) -> bool {
-    !host_access_enabled && !routed_to_client && HOST_TOOLS.contains(&name)
+pub fn host_tool_denied(
+    name: &str,
+    fs_enabled: bool,
+    shell_enabled: bool,
+    routed_to_client: bool,
+) -> bool {
+    !routed_to_client
+        && HOST_TOOLS.contains(&name)
+        && if name == "shell" {
+            !shell_enabled
+        } else {
+            !fs_enabled
+        }
 }
 
 /// The whole policy. The table in the design spec is this function.
@@ -299,14 +310,15 @@ pub fn partition_without_asking(
     origin: Origin,
     calls: &[crate::provider::ToolCall],
     kinds: &[(String, ToolKind)],
-    host_access_enabled: bool,
+    fs_enabled: bool,
+    shell_enabled: bool,
     routed_to_client: bool,
 ) -> (Vec<crate::provider::ToolCall>, Vec<(String, String)>) {
     let mut permitted = Vec::with_capacity(calls.len());
     let mut refused = Vec::new();
 
     for call in calls {
-        if host_tool_denied(&call.name, host_access_enabled, routed_to_client) {
+        if host_tool_denied(&call.name, fs_enabled, shell_enabled, routed_to_client) {
             refused.push((
                 call.id.clone(),
                 refusal_message(&call.name, Refusal::Unavailable),
@@ -538,7 +550,7 @@ mod tests {
         ];
 
         let (permitted, refused) =
-            partition_without_asking(Origin::Channel, &calls, &kinds, true, false);
+            partition_without_asking(Origin::Channel, &calls, &kinds, true, true, false);
 
         let kept: Vec<&str> = permitted.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(kept, vec!["c1"]);
@@ -558,7 +570,7 @@ mod tests {
         let calls = vec![call("c1", "file_delete")];
 
         let (permitted, refused) =
-            partition_without_asking(Origin::Channel, &calls, &kinds, false, false);
+            partition_without_asking(Origin::Channel, &calls, &kinds, false, false, false);
 
         assert!(permitted.is_empty(), "host access is off by default");
         assert_eq!(refused.len(), 1);
@@ -571,7 +583,7 @@ mod tests {
         let calls = vec![call("c1", "file_delete")];
 
         let (permitted, refused) =
-            partition_without_asking(Origin::Channel, &calls, &kinds, true, false);
+            partition_without_asking(Origin::Channel, &calls, &kinds, true, true, false);
 
         assert_eq!(permitted.len(), 1);
         assert!(refused.is_empty());
@@ -581,10 +593,20 @@ mod tests {
     /// the operator turned them on — including for `Origin::Trusted`,
     /// which is the voice pipeline and the heartbeat.
     #[test]
+    fn fs_and_shell_switches_are_independent() {
+        assert!(!host_tool_denied("file_read", true, false, false));
+        assert!(!host_tool_denied("file_write", true, false, false));
+        assert!(host_tool_denied("shell", true, false, false));
+        assert!(host_tool_denied("file_read", false, true, false));
+        assert!(!host_tool_denied("shell", false, true, false));
+        assert!(!host_tool_denied("shell", false, false, true));
+    }
+
+    #[test]
     fn host_tools_are_denied_when_host_access_is_off() {
         for name in HOST_TOOLS {
             assert!(
-                host_tool_denied(name, false, false),
+                host_tool_denied(name, false, false, false),
                 "{name} must be denied with host access off"
             );
         }
@@ -594,7 +616,7 @@ mod tests {
     fn host_tools_are_allowed_through_when_host_access_is_on() {
         for name in HOST_TOOLS {
             assert!(
-                !host_tool_denied(name, true, false),
+                !host_tool_denied(name, true, true, false),
                 "{name} must fall through to the policy table when enabled"
             );
         }
@@ -611,7 +633,7 @@ mod tests {
             "web_search",
         ] {
             assert!(
-                !host_tool_denied(name, false, false),
+                !host_tool_denied(name, false, false, false),
                 "{name} is not a host tool"
             );
         }
@@ -628,7 +650,7 @@ mod tests {
             "the policy table alone still allows it — which is the point"
         );
         assert!(
-            host_tool_denied("file_delete", false, false),
+            host_tool_denied("file_delete", false, false, false),
             "the host gate is what stops it"
         );
     }
@@ -640,7 +662,7 @@ mod tests {
         let calls = vec![call("c1", "shell")];
 
         let (permitted, refused) =
-            partition_without_asking(Origin::Trusted, &calls, &kinds, true, false);
+            partition_without_asking(Origin::Trusted, &calls, &kinds, true, true, false);
 
         assert_eq!(permitted.len(), 1);
         assert!(refused.is_empty());
@@ -660,6 +682,7 @@ mod tests {
             &calls,
             &kinds,
             true,
+            true,
             false,
         );
 
@@ -675,7 +698,7 @@ mod tests {
     #[test]
     fn a_call_routed_to_the_client_is_never_denied_by_the_host_gate() {
         for name in HOST_TOOLS {
-            assert!(!host_tool_denied(name, false, true), "{name}");
+            assert!(!host_tool_denied(name, false, false, true), "{name}");
         }
     }
 
@@ -684,8 +707,8 @@ mod tests {
     #[test]
     fn a_call_routed_to_the_agent_is_still_denied_with_host_access_off() {
         for name in HOST_TOOLS {
-            assert!(host_tool_denied(name, false, false), "{name}");
-            assert!(!host_tool_denied(name, true, false), "{name}");
+            assert!(host_tool_denied(name, false, false, false), "{name}");
+            assert!(!host_tool_denied(name, true, true, false), "{name}");
         }
     }
 
@@ -701,7 +724,7 @@ mod tests {
         let calls = vec![call("c1", "file_read")];
 
         let (permitted, refused) =
-            partition_without_asking(Origin::Channel, &calls, &kinds, false, true);
+            partition_without_asking(Origin::Channel, &calls, &kinds, false, false, true);
 
         let kept: Vec<&str> = permitted.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(kept, vec!["c1"], "a routed call is not this machine's call");

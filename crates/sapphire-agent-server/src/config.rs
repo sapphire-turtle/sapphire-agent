@@ -84,6 +84,9 @@ pub struct Config {
     /// `rooms` lists move to the declaration side in Task 2).
     #[serde(default, rename = "session_profile")]
     pub session_profiles: HashMap<String, SessionProfileConfig>,
+    /// Retired room profiles, retained to report migration errors.
+    #[serde(default, rename = "room_profile")]
+    pub legacy_room_profiles: HashMap<String, LegacyRoomProfile>,
     /// Permission profiles: which tool groups a session may use. Named by a
     /// session profile's `permission`; an operator section of the same name wins
     /// over the built-in preset (see [`BUILT_IN_PERMISSION_PROFILES`]).
@@ -242,13 +245,8 @@ const BUILT_IN_PERMISSION_PROFILES: &[(&str, &[ToolGroup])] = &[
     ("chat", &[]),
 ];
 
-/// Bundle of (chat profile, memory namespace, session policy)
-/// applied to a set of rooms.
-///
-/// Each `room_id` may appear in at most one room profile. Rooms that
-/// don't appear in any room profile fall back to `[session_profile.default]`
-/// if defined, otherwise the built-in defaults (Anthropic provider,
-/// `"default"` namespace, global `session_policy`).
+/// A session's LLM profile, memory namespace, permission and session policy.
+/// Rooms and client pins declare the name of the session profile they use.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct SessionProfileConfig {
     /// Name of the LLM profile (in `[profiles.<n>]`) that drives chat
@@ -265,9 +263,7 @@ pub struct SessionProfileConfig {
     /// Permission profile name. Absent means `"default"`.
     #[serde(default)]
     pub permission: Option<String>,
-    /// Channel-side room ids this profile applies to. Matrix room ids,
-    /// Discord channel ids, etc. Empty `[]` means the room profile is
-    /// usable from API sessions only — no channel rooms map to it.
+    /// Capture-only migration field. Rooms now bind on `[[<channel>.rooms]]`.
     #[serde(default)]
     pub rooms: Vec<String>,
     /// Voice pipeline preset (in `[voice_pipeline.<n>]`) used when the
@@ -290,6 +286,17 @@ pub struct SessionProfileConfig {
     /// Replaced `api_keys`, which held raw tokens in this file.
     #[serde(default)]
     pub devices: Vec<String>,
+}
+
+/// Retired section, retained only to name migration errors.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct LegacyRoomProfile {
+    #[serde(default)]
+    pub profile: String,
+    #[serde(default)]
+    pub rooms: Vec<String>,
+    #[serde(default)]
+    pub api_keys: Vec<String>,
 }
 
 /// A2A (Agent2Agent Protocol) server settings.
@@ -895,6 +902,9 @@ pub struct AdminToolsConfig {
     /// four tools unregistered.
     #[serde(default)]
     pub room_profiles: Vec<String>,
+    /// Whether this host enables admin tools.
+    #[serde(default)]
+    pub enabled: bool,
     /// Removed: replaced by `room_profiles`, which names session profiles rather
     /// than rooms. Retained only so `Config::migration_errors` can name the
     /// leftover key and stop startup instead of letting the grant vanish
@@ -912,9 +922,12 @@ pub struct ToolsConfig {
     /// with the naming convention `mcp__<name>__<tool_name>`.
     #[serde(default)]
     pub mcp_servers: Vec<McpServerConfig>,
-    /// Whether the agent may touch its own filesystem and shell.
     #[serde(default)]
-    pub host_access: HostAccess,
+    pub fs: ToolGroupConfig,
+    #[serde(default)]
+    pub shell: ToolGroupConfig,
+    #[serde(default)]
+    pub mcp: ToolGroupConfig,
     /// How many tool rounds one turn may spend. See [`ToolRounds`].
     #[serde(default)]
     pub tool_rounds: ToolRounds,
@@ -1020,7 +1033,7 @@ impl Default for SubagentConfig {
 /// should reach by default. Turning it on is a deliberate act; running
 /// the agent in a container is the recommended way to do it.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
-pub struct HostAccess {
+pub struct ToolGroupConfig {
     #[serde(default)]
     pub enabled: bool,
 }
@@ -1163,49 +1176,39 @@ pub enum McpTransportConfig {
     },
 }
 
+/// A channel subscription and the session profile it runs under.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RoomConfig {
+    pub room_id: String,
+    #[serde(default = "default_session_profile_name")]
+    pub profile: String,
+    #[serde(default)]
+    pub voice_pipeline: Option<String>,
+}
+
+fn default_session_profile_name() -> String {
+    DEFAULT_PROFILE_NAME.to_string()
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MatrixConfig {
     pub homeserver: String,
     pub access_token: String,
     pub user_id: String,
     pub device_id: String,
-    /// Rooms the bot listens to. Accepts either a TOML array
-    /// (`room_ids = ["!a:srv", "!b:srv"]`) or — for backward compatibility —
-    /// a single string key named `room_id`.
-    #[serde(default, alias = "room_id", deserialize_with = "deserialize_room_ids")]
-    pub room_ids: Vec<String>,
+    #[serde(default)]
+    pub rooms: Vec<RoomConfig>,
     #[serde(default)]
     pub allowed_users: Vec<String>,
-    /// E2EE recovery key (optional)
     pub recovery_key: Option<String>,
-    /// Directory for matrix-sdk state/crypto store. Defaults to
-    /// `~/.local/share/sapphire-agent/matrix`.
     pub state_dir: Option<String>,
-}
-
-/// Accept either `"!a:srv"` (legacy single string) or `["!a:srv", "!b:srv"]`
-/// for the `room_ids` / legacy `room_id` field.
-fn deserialize_room_ids<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum OneOrMany {
-        One(String),
-        Many(Vec<String>),
-    }
-    match OneOrMany::deserialize(deserializer)? {
-        OneOrMany::One(s) => Ok(vec![s]),
-        OneOrMany::Many(v) => Ok(v),
-    }
 }
 
 impl MatrixConfig {
     /// Primary room — first configured room. Used as the default target for
     /// heartbeat tasks that don't name a specific room.
     pub fn primary_room_id(&self) -> Option<&str> {
-        self.room_ids.first().map(|s| s.as_str())
+        self.rooms.first().map(|r| r.room_id.as_str())
     }
 
     pub fn resolved_state_dir(&self) -> PathBuf {
@@ -1222,9 +1225,9 @@ impl MatrixConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DiscordConfig {
     pub bot_token: String,
-    /// Text channel IDs the bot listens to. Empty = all channels the bot can see.
+    /// Subscribed rooms. Empty = all channels the bot can see.
     #[serde(default)]
-    pub channel_ids: Vec<String>,
+    pub rooms: Vec<RoomConfig>,
     /// Discord user IDs allowed to interact. Empty = all users.
     #[serde(default)]
     pub allowed_users: Vec<String>,
@@ -1584,20 +1587,31 @@ api_key = "test"
         }
     }
 
-    /// Find the room profile a `room_id` belongs to.
-    ///
-    /// Order: explicit listing in `[session_profile.<n>].rooms` >
-    /// conventional `[session_profile.default]` (catches all unmatched
-    /// rooms) > `None`.
-    pub fn session_profile_for_room(&self, room_id: &str) -> Option<(&str, &SessionProfileConfig)> {
-        for (name, rp) in &self.session_profiles {
-            if rp.rooms.iter().any(|r| r == room_id) {
-                return Some((name.as_str(), rp));
-            }
-        }
-        self.session_profiles
-            .get_key_value(DEFAULT_PROFILE_NAME)
-            .map(|(k, v)| (k.as_str(), v))
+    /// A declared session profile takes precedence over the room's binding.
+    pub fn session_profile_name(&self, declared: Option<&str>, room_id: &str) -> String {
+        declared
+            .map(str::to_owned)
+            .or_else(|| {
+                self.channels()
+                    .find_map(|(_, room)| (room.room_id == room_id).then(|| room.profile.clone()))
+            })
+            .unwrap_or_else(|| DEFAULT_PROFILE_NAME.to_string())
+    }
+
+    /// Room declarations in both configured channels.
+    pub fn channels(&self) -> impl Iterator<Item = (&str, &RoomConfig)> {
+        self.matrix
+            .iter()
+            .flat_map(|c| c.rooms.iter().map(|r| ("matrix", r)))
+            .chain(
+                self.discord
+                    .iter()
+                    .flat_map(|c| c.rooms.iter().map(|r| ("discord", r))),
+            )
+    }
+
+    pub fn session_profile_defined(&self, name: &str) -> bool {
+        self.session_profiles.contains_key(name)
     }
 
     /// Look up a room profile by name. Used by API sessions, which pin
@@ -1609,8 +1623,9 @@ api_key = "test"
     /// Resolve the session policy for a given `room_id`, falling back to
     /// the global default when no room profile sets one.
     pub fn session_policy_for(&self, room_id: &str) -> SessionPolicy {
-        self.session_profile_for_room(room_id)
-            .and_then(|(_, rp)| rp.session_policy)
+        self.session_profiles
+            .get(&self.session_profile_name(None, room_id))
+            .and_then(|rp| rp.session_policy)
             .unwrap_or(self.session_policy)
     }
 
@@ -1619,8 +1634,8 @@ api_key = "test"
     /// Order: room profile that contains this room > `[profiles.default]`
     /// if defined > `None` (caller falls back to the built-in Anthropic
     /// provider).
-    pub fn profile_for_session(&self, room_id: &str) -> Option<&str> {
-        if let Some((_, rp)) = self.session_profile_for_room(room_id) {
+    pub fn profile_for_session(&self, name: &str) -> Option<&str> {
+        if let Some(rp) = self.session_profiles.get(name) {
             return Some(rp.profile.as_str());
         }
         if self.profiles.contains_key(DEFAULT_PROFILE_NAME) {
@@ -1641,7 +1656,7 @@ api_key = "test"
     /// Validate that every profile points to a known provider, and that
     /// every room's `profile` references a defined profile. Returns
     /// human-readable error messages for each issue found.
-    pub fn validate_profiles(&self) -> Vec<String> {
+    pub fn validate_session_profiles(&self) -> Vec<String> {
         let mut errors = Vec::new();
         let known_provider = |name: &str| -> bool {
             name == ANTHROPIC_PROVIDER_NAME || self.providers.contains_key(name)
@@ -1662,7 +1677,6 @@ api_key = "test"
             }
         }
         // Room profile references and uniqueness of room_ids across profiles.
-        let mut seen_rooms: HashMap<String, String> = HashMap::new();
         for (rp_name, rp) in &self.session_profiles {
             if !self.profiles.contains_key(&rp.profile) {
                 errors.push(format!(
@@ -1687,13 +1701,16 @@ api_key = "test"
                     "session_profile '{rp_name}' references unknown memory_namespace '{ns}'"
                 ));
             }
-            for room in &rp.rooms {
-                if let Some(prev) = seen_rooms.get(room) {
-                    errors.push(format!(
-                        "room '{room}' appears in multiple session_profiles: '{prev}' and '{rp_name}'"
-                    ));
+        }
+        for (channel, room) in self.channels() {
+            if !self.session_profile_defined(&room.profile) {
+                if room.profile == DEFAULT_PROFILE_NAME {
+                    errors.push(format!("{channel} room '{}' resolves to default but no [session_profile.default] is defined", room.room_id));
                 } else {
-                    seen_rooms.insert(room.clone(), rp_name.clone());
+                    errors.push(format!(
+                        "{channel} room '{}' references unknown session_profile '{}'",
+                        room.room_id, room.profile
+                    ));
                 }
             }
         }
@@ -1701,16 +1718,14 @@ api_key = "test"
             .acp
             .as_ref()
             .and_then(|a| a.stdio_session_profile.as_ref())
-            && name != DEFAULT_PROFILE_NAME
-            && !self.session_profiles.contains_key(name)
+            && !self.session_profile_defined(name)
         {
             errors.push(format!(
                 "[acp].stdio_session_profile references unknown session_profile '{name}'"
             ));
         }
         if let Some(name) = self.cli.as_ref().and_then(|c| c.profile.as_ref())
-            && name != DEFAULT_PROFILE_NAME
-            && !self.session_profiles.contains_key(name)
+            && !self.session_profile_defined(name)
         {
             errors.push(format!(
                 "[cli].profile references unknown session profile '{name}'"
@@ -1748,6 +1763,17 @@ api_key = "test"
                 errors.push(format!(
                     "memory_namespace cycle detected: {}",
                     cycle.join(" -> ")
+                ));
+            }
+        }
+        // A per-room override must not silently disable an otherwise valid pipeline.
+        for (channel, room) in self.channels() {
+            if let Some(name) = &room.voice_pipeline
+                && !self.voice_pipelines.contains_key(name)
+            {
+                errors.push(format!(
+                    "{channel} room '{}' references unknown voice_pipeline '{name}'",
+                    room.room_id
                 ));
             }
         }
@@ -1822,6 +1848,28 @@ api_key = "test"
     pub fn migration_errors(&self) -> Vec<String> {
         let mut errors = Vec::new();
 
+        let mut legacy_names: Vec<_> = self.legacy_room_profiles.keys().collect();
+        legacy_names.sort();
+        for name in legacy_names {
+            let old = &self.legacy_room_profiles[name];
+            errors.push(format!("[room_profile.{name}] was renamed to session_profile; move rooms to channel room blocks and migrate api_keys (profile '{}', {} rooms, {} api_keys)", old.profile, old.rooms.len(), old.api_keys.len()));
+        }
+        let mut names: Vec<_> = self
+            .session_profiles
+            .iter()
+            .filter(|(_, p)| !p.rooms.is_empty())
+            .map(|(n, _)| n)
+            .collect();
+        names.sort();
+        for name in names {
+            errors.push(format!(
+                "[session_profile.{name}].rooms is gone; move rooms to channel room blocks"
+            ));
+        }
+        if !self.tools.admin.room_profiles.is_empty() {
+            errors.push("[tools.admin].room_profiles is gone; move the grant to permission_profile.<name>.tools".to_string());
+        }
+
         if !self.tools.admin.legacy_rooms.is_empty() {
             errors.push(
                 "[tools.admin].rooms was replaced by `[tools.admin].room_profiles`, which names \
@@ -1883,7 +1931,7 @@ api_key = "test"
     ///
     /// The name is a `[session_profile.<n>]` key, resolved from the calling
     /// transport rather than typed by the caller: a channel room through
-    /// [`Self::session_profile_name_for_room`], an ACP session through the
+    /// [`Self::session_profile_name`], an ACP session through the
     /// profile its bearer token pinned. The transports that name no profile —
     /// voice, `/rpc`, A2A, the unattended loops — never reach this with a
     /// value, which is the point: the endpoint a client reaches first, before
@@ -1895,19 +1943,6 @@ api_key = "test"
             .room_profiles
             .iter()
             .any(|allowed| allowed == name)
-    }
-
-    /// The room profile a channel `room_id` runs under, by name.
-    ///
-    /// The same resolution [`Self::profile_for_session`] and
-    /// [`Self::namespace_for_session`] use — an explicit listing in
-    /// `[session_profile.<n>].rooms` wins, then `[session_profile.default]` catches
-    /// every unmatched room, then the implicit `"default"` applies — so a
-    /// room's admin grant cannot disagree with the provider it runs on.
-    pub fn session_profile_name_for_room(&self, room_id: &str) -> &str {
-        self.session_profile_for_room(room_id)
-            .map(|(name, _)| name)
-            .unwrap_or(DEFAULT_PROFILE_NAME)
     }
 
     /// True when `[tools.admin].room_profiles` names at least one session
@@ -2021,8 +2056,9 @@ api_key = "test"
     /// Resolve the memory namespace for a given `room_id`. Rooms not
     /// present in any room profile fall through to `"default"`.
     pub fn namespace_for_session(&self, room_id: &str) -> &str {
-        self.session_profile_for_room(room_id)
-            .and_then(|(_, rp)| rp.memory_namespace.as_deref())
+        self.session_profiles
+            .get(&self.session_profile_name(None, room_id))
+            .and_then(|rp| rp.memory_namespace.as_deref())
             .unwrap_or(DEFAULT_NAMESPACE_NAME)
     }
 
@@ -2085,8 +2121,13 @@ api_key = "test"
     /// the one switch that exists until Task 2 splits it per group —
     /// `[tools.host_access].enabled` — a fact about the deployment, not a row in the table.
     #[allow(dead_code)] // Consumed by the upcoming permission gate.
-    pub fn group_enabled(&self, _group: ToolGroup) -> bool {
-        self.tools.host_access.enabled
+    pub fn group_enabled(&self, group: ToolGroup) -> bool {
+        match group {
+            ToolGroup::Fs => self.tools.fs.enabled,
+            ToolGroup::Shell => self.tools.shell.enabled,
+            ToolGroup::Mcp => self.tools.mcp.enabled,
+            ToolGroup::Admin => self.tools.admin.enabled,
+        }
     }
 
     /// R7: registered at all ⇔ enabled here ∧ listed by at least one effective
@@ -2316,7 +2357,7 @@ impl Config {
             host_unknown.retain(|path| !is_framework_key(path));
             host_unknown.sort();
             host_unknown.dedup();
-            let host_errors = host_config.validate_profiles();
+            let host_errors = host_config.validate_session_profiles();
             if !host_errors.is_empty() {
                 anyhow::bail!(
                     "invalid configuration in {}: {}",
@@ -2344,7 +2385,7 @@ impl Config {
 
         match deserialized {
             Ok(config) => {
-                let profile_errors = config.validate_profiles();
+                let profile_errors = config.validate_session_profiles();
                 if workspace_present && !profile_errors.is_empty() {
                     fall_back_to_host_only(format!(
                         "fails validation: {}",
@@ -2397,6 +2438,128 @@ impl Config {
 mod tests {
     use super::*;
 
+    /// A room block declares the profile without changing the subscription.
+    #[test]
+    fn a_room_block_is_what_names_the_session_profile() {
+        let cfg = Config::parse_for_test(
+            "[anthropic]\napi_key = \"test\"\n\n[discord]\nbot_token = \"t\"\n\n[[discord.rooms]]\nroom_id = \"1474368482296807444\"\nprofile = \"ops\"\n",
+        );
+        let discord = cfg.discord.as_ref().expect("configured");
+        assert_eq!(discord.rooms[0].room_id, "1474368482296807444");
+        assert_eq!(discord.rooms[0].profile, "ops");
+        assert_eq!(cfg.session_profile_name(None, "1474368482296807444"), "ops");
+        assert_eq!(
+            cfg.session_profile_name(None, "!unlisted:srv"),
+            DEFAULT_PROFILE_NAME
+        );
+    }
+
+    #[test]
+    fn an_explicit_declaration_wins_verbatim_and_an_unknown_one_fails_startup() {
+        let cfg = Config::parse_for_test(
+            "[anthropic]\napi_key = \"test\"\n\n[session_profile.ops]\nprofile = \"dev\"\npermission = \"admin\"\nmemory_namespace = \"user_ops\"\n",
+        );
+        assert_eq!(cfg.session_profile_name(Some("ops"), "!any:srv"), "ops");
+        assert_eq!(cfg.permission_profile_name_for_session("ops"), "admin");
+        assert_eq!(cfg.namespace_for_session_profile("ops"), "user_ops");
+        assert!(cfg.session_profile_defined("ops"));
+
+        let unknown = Config::parse_for_test(
+            "[anthropic]\napi_key = \"t\"\n\n[discord]\nbot_token = \"t\"\n\n[[discord.rooms]]\nroom_id = \"r1\"\nprofile = \"opss\"\n",
+        );
+        assert_eq!(unknown.session_profile_name(None, "r1"), "opss");
+        assert!(!unknown.session_profile_defined("opss"));
+        let errors = unknown.validate_session_profiles();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("'opss'") && e.contains("session_profile")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_room_resolving_to_an_undefined_default_fails_startup() {
+        let cfg = Config::parse_for_test(
+            "[anthropic]\napi_key = \"t\"\n\n[session_profile.ops]\nprofile = \"dev\"\n\n[discord]\nbot_token = \"t\"\n\n[[discord.rooms]]\nroom_id = \"r1\"\n",
+        );
+        assert_eq!(cfg.session_profile_name(None, "r1"), DEFAULT_PROFILE_NAME);
+        let errors = cfg.validate_session_profiles();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("no [session_profile.default]")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn migration_leftovers_are_named_and_stop_startup() {
+        let cfg = Config::parse_for_test(
+            "[anthropic]\napi_key = \"test\"\n\n[room_profile.ops]\nprofile = \"dev\"\nrooms = [\"!ops:x\"]\n",
+        );
+        let errors = cfg.migration_errors();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("[room_profile.ops]") && errors[0].contains("session_profile"));
+        assert!(errors[0].contains("rooms"));
+        let cfg = Config::parse_for_test(
+            "[anthropic]\napi_key = \"test\"\n\n[tools.admin]\nroom_profiles = [\"ops\"]\n",
+        );
+        assert!(
+            cfg.migration_errors()
+                .iter()
+                .any(|e| e.contains("[tools.admin].room_profiles")
+                    && e.contains("permission_profile.<name>.tools"))
+        );
+    }
+
+    #[test]
+    fn per_group_enabled_stays_host_only_and_the_listings_stay_synced() {
+        for group in ["fs", "shell", "mcp", "admin"] {
+            assert!(
+                !config_layer::path_allowed(&["tools", group]),
+                "{group} is a fact about this deployment"
+            );
+        }
+        assert!(config_layer::path_allowed(&["tools", "mcp_servers"]));
+        assert!(config_layer::path_allowed(&["permission_profile"]));
+        assert!(config_layer::path_allowed(&["session_profile"]));
+    }
+
+    #[test]
+    fn legacy_channel_keys_are_reported_as_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[discord]\nbot_token = \"t\"\nchannel_ids = [\"123\"]\n",
+        )
+        .unwrap();
+        let loaded = Config::load_layered(&path).unwrap();
+        assert!(
+            loaded
+                .unknown
+                .iter()
+                .any(|key| key.ends_with(".channel_ids")),
+            "{:?}",
+            loaded.unknown
+        );
+    }
+
+    #[test]
+    fn room_arrays_preserve_order_for_both_channels() {
+        let cfg = Config::parse_for_test(
+            "[discord]\nbot_token = \"t\"\n[[discord.rooms]]\nroom_id = \"1\"\nprofile = \"ops\"\n[[discord.rooms]]\nroom_id = \"2\"\n[matrix]\nhomeserver = \"h\"\naccess_token = \"t\"\nuser_id = \"u\"\ndevice_id = \"d\"\n[[matrix.rooms]]\nroom_id = \"m\"\nprofile = \"ops\"\n",
+        );
+        let rooms = &cfg.discord.unwrap().rooms;
+        assert_eq!(
+            rooms.iter().map(|r| r.room_id.as_str()).collect::<Vec<_>>(),
+            vec!["1", "2"]
+        );
+        assert_eq!(rooms[0].profile, "ops");
+        assert_eq!(cfg.matrix.unwrap().rooms[0].profile, "ops");
+    }
+
     fn parse(s: &str) -> Config {
         Config::parse_for_test(s)
     }
@@ -2436,15 +2599,15 @@ mod tests {
     fn a_room_resolves_to_the_same_profile_everywhere() {
         let cfg = parse(
             "[anthropic]\napi_key = \"test\"\n\n[profiles.dev]\nprovider = \"stub\"\n\n\
-             [session_profile.ops]\nprofile = \"dev\"\nrooms = [\"!ops:x\"]\n\n\
+             [session_profile.ops]\nprofile = \"dev\"\n\n[discord]\nbot_token = \"t\"\n[[discord.rooms]]\nroom_id = \"!ops:x\"\nprofile = \"ops\"\n\n\
              [session_profile.default]\nprofile = \"dev\"\n",
         );
-        assert_eq!(cfg.session_profile_name_for_room("!ops:x"), "ops");
-        assert_eq!(cfg.session_profile_name_for_room("!unlisted:y"), "default");
+        assert_eq!(cfg.session_profile_name(None, "!ops:x"), "ops");
+        assert_eq!(cfg.session_profile_name(None, "!unlisted:y"), "default");
 
         let bare = parse("[anthropic]\napi_key = \"test\"\n");
         assert_eq!(
-            bare.session_profile_name_for_room("!anything:z"),
+            bare.session_profile_name(None, "!anything:z"),
             "default",
             "with no session_profile table at all the implicit default still names a profile"
         );
@@ -2483,7 +2646,7 @@ mod tests {
             "[anthropic]\napi_key = \"test\"\n\n[tools.admin]\n\
              room_profiles = [\"typo\"]\n",
         );
-        let errors = cfg.validate_profiles();
+        let errors = cfg.validate_session_profiles();
         assert!(
             errors
                 .iter()
@@ -2497,9 +2660,9 @@ mod tests {
              room_profiles = [\"default\"]\n",
         );
         assert!(
-            ok.validate_profiles().is_empty(),
+            ok.validate_session_profiles().is_empty(),
             "{:?}",
-            ok.validate_profiles()
+            ok.validate_session_profiles()
         );
     }
 
@@ -2509,7 +2672,7 @@ mod tests {
     fn an_unknown_stdio_session_profile_is_reported() {
         let cfg =
             parse("[anthropic]\napi_key = \"test\"\n\n[acp]\nstdio_session_profile = \"typo\"\n");
-        let errors = cfg.validate_profiles();
+        let errors = cfg.validate_session_profiles();
         assert!(
             errors
                 .iter()
@@ -2524,7 +2687,7 @@ mod tests {
     #[test]
     fn an_unknown_cli_session_profile_is_reported() {
         let cfg = parse("[anthropic]\napi_key = \"test\"\n\n[cli]\nprofile = \"typo\"\n");
-        let errors = cfg.validate_profiles();
+        let errors = cfg.validate_session_profiles();
         assert!(
             errors
                 .iter()
@@ -2532,7 +2695,12 @@ mod tests {
             "{errors:?}"
         );
         let default = parse("[anthropic]\napi_key = \"test\"\n\n[cli]\nprofile = \"default\"\n");
-        assert!(default.validate_profiles().is_empty());
+        assert!(
+            default
+                .validate_session_profiles()
+                .iter()
+                .any(|e| e.contains("default"))
+        );
     }
 
     /// The default is off. An agent that starts working on its own
@@ -2647,7 +2815,7 @@ trust   = "edit"
     fn no_profiles_means_no_resolution() {
         let cfg = parse(MINIMAL);
         assert!(cfg.profile_for_session("!any:srv").is_none());
-        assert!(cfg.validate_profiles().is_empty());
+        assert!(cfg.validate_session_profiles().is_empty());
     }
 
     #[test]
@@ -2684,15 +2852,22 @@ provider = "local"
 
 [session_profile.private_nsfw]
 profile = "nsfw"
-rooms   = ["!nsfw:srv"]
+[discord]
+bot_token = "t"
+[[discord.rooms]]
+room_id = "!nsfw:srv"
+profile = "private_nsfw"
 "#,
         );
-        assert_eq!(cfg.profile_for_session("!nsfw:srv"), Some("nsfw"));
+        assert_eq!(
+            cfg.profile_for_session(&cfg.session_profile_name(None, "!nsfw:srv")),
+            Some("nsfw")
+        );
         // Unmatched room falls through to [profiles.default].
         assert_eq!(cfg.profile_for_session("!other:srv"), Some("default"));
         assert_eq!(cfg.provider_for_profile("nsfw"), Some("local"));
         assert_eq!(cfg.provider_for_profile("default"), Some("anthropic"));
-        assert!(cfg.validate_profiles().is_empty());
+        assert!(cfg.validate_session_profiles().is_empty());
     }
 
     #[test]
@@ -2710,20 +2885,29 @@ provider = "anthropic"
 
 [session_profile.default]
 profile = "casual"
-rooms   = []
 
 [session_profile.dev]
 profile = "opus"
-rooms   = ["!dev:srv"]
+[discord]
+bot_token = "t"
+[[discord.rooms]]
+room_id = "!dev:srv"
+profile = "dev"
 "#,
         );
-        assert_eq!(cfg.profile_for_session("!dev:srv"), Some("opus"));
+        assert_eq!(
+            cfg.profile_for_session(&cfg.session_profile_name(None, "!dev:srv")),
+            Some("opus")
+        );
         // An unmatched room falls through to session_profile.default.
-        assert_eq!(cfg.profile_for_session("!chat:srv"), Some("casual"));
+        assert_eq!(
+            cfg.profile_for_session(&cfg.session_profile_name(None, "!chat:srv")),
+            Some("casual")
+        );
     }
 
     #[test]
-    fn validate_rejects_room_listed_in_two_profiles() {
+    fn migration_rejects_rooms_left_on_session_profiles() {
         let cfg = parse(
             r#"
 [anthropic]
@@ -2744,13 +2928,9 @@ profile = "b"
 rooms   = ["!shared:srv"]
 "#,
         );
-        let errors = cfg.validate_profiles();
-        assert!(
-            errors
-                .iter()
-                .any(|e| e.contains("multiple session_profiles")),
-            "expected duplicate-room error, got: {errors:?}"
-        );
+        let errors = cfg.migration_errors();
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(errors.iter().all(|e| e.contains(".rooms")));
     }
 
     #[test]
@@ -2764,7 +2944,7 @@ api_key = "test"
 provider = "ghost"
 "#,
         );
-        let errors = cfg.validate_profiles();
+        let errors = cfg.validate_session_profiles();
         assert_eq!(errors.len(), 1, "got: {errors:?}");
         assert!(errors[0].contains("ghost"));
     }
@@ -2781,7 +2961,7 @@ provider = "anthropic"
 fallback_provider = "ghost"
 "#,
         );
-        let errors = cfg.validate_profiles();
+        let errors = cfg.validate_session_profiles();
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("fallback"));
         assert!(errors[0].contains("ghost"));
@@ -2799,7 +2979,7 @@ profile = "missing"
 rooms   = ["!x:srv"]
 "#,
         );
-        let errors = cfg.validate_profiles();
+        let errors = cfg.validate_session_profiles();
         assert!(
             errors.iter().any(|e| e.contains("missing")),
             "got: {errors:?}"
@@ -2981,9 +3161,9 @@ devices = ["a3f9k2p"]
             .expect("config.example.toml should parse")
             .config;
         assert!(
-            cfg.validate_profiles().is_empty(),
+            cfg.validate_session_profiles().is_empty(),
             "validation errors: {:?}",
-            cfg.validate_profiles()
+            cfg.validate_session_profiles()
         );
         // This is the one test guaranteeing the shipped example is clean;
         // it must also check the device-registry migration gate, not just
@@ -3004,7 +3184,7 @@ devices = ["a3f9k2p"]
             vec!["default".to_string()]
         );
         assert_eq!(cfg.namespace_for_session("!any:srv"), "default");
-        assert!(cfg.validate_profiles().is_empty());
+        assert!(cfg.validate_session_profiles().is_empty());
     }
 
     #[test]
@@ -3074,7 +3254,7 @@ include = ["b"]
 include = ["a"]
 "#,
         );
-        let errors = cfg.validate_profiles();
+        let errors = cfg.validate_session_profiles();
         assert!(
             errors.iter().any(|e| e.contains("cycle")),
             "expected cycle error, got: {errors:?}"
@@ -3092,7 +3272,7 @@ api_key = "test"
 include = ["ghost"]
 "#,
         );
-        let errors = cfg.validate_profiles();
+        let errors = cfg.validate_session_profiles();
         assert!(
             errors.iter().any(|e| e.contains("ghost")),
             "expected unknown-namespace error, got: {errors:?}"
@@ -3115,10 +3295,14 @@ provider = "anthropic"
 [session_profile.private_nsfw]
 profile          = "nsfw"
 memory_namespace = "user_nsfw"
-rooms            = ["!nsfw:srv"]
+[discord]
+bot_token = "t"
+[[discord.rooms]]
+room_id = "!nsfw:srv"
+profile = "private_nsfw"
 "#,
         );
-        assert!(cfg.validate_profiles().is_empty());
+        assert!(cfg.validate_session_profiles().is_empty());
         assert_eq!(cfg.namespace_for_session("!nsfw:srv"), "user_nsfw");
         assert_eq!(cfg.namespace_for_session("!other:srv"), "default");
         assert_eq!(
@@ -3143,7 +3327,7 @@ memory_namespace = "ghost"
 rooms            = ["!x:srv"]
 "#,
         );
-        let errors = cfg.validate_profiles();
+        let errors = cfg.validate_session_profiles();
         assert!(
             errors.iter().any(|e| e.contains("ghost")),
             "expected unknown-namespace error, got: {errors:?}"
@@ -3171,7 +3355,7 @@ include            = ["default"]
 background_profile = "bg_nsfw"
 "#,
         );
-        assert!(cfg.validate_profiles().is_empty());
+        assert!(cfg.validate_session_profiles().is_empty());
         // Namespace-local override wins.
         assert_eq!(
             cfg.background_profile_for_namespace("user_nsfw"),
@@ -3218,7 +3402,7 @@ api_key = "test"
 background_profile = "ghost"
 "#,
         );
-        let errors = cfg.validate_profiles();
+        let errors = cfg.validate_session_profiles();
         assert!(
             errors.iter().any(|e| e.contains("ghost")),
             "expected ghost error, got: {errors:?}"
@@ -3282,9 +3466,9 @@ rooms          = []
 "#,
         );
         assert!(
-            cfg.validate_profiles().is_empty(),
+            cfg.validate_session_profiles().is_empty(),
             "errors: {:?}",
-            cfg.validate_profiles()
+            cfg.validate_session_profiles()
         );
         let vp = cfg
             .voice_pipeline_for_session_profile("home")
@@ -3371,7 +3555,7 @@ type     = "openai_tts"
 base_url = "http://localhost:8000"
 "#,
         );
-        let errors = cfg.validate_profiles();
+        let errors = cfg.validate_session_profiles();
         assert!(
             errors.iter().any(|e| e.contains("ghost")),
             "got: {errors:?}"
@@ -3394,7 +3578,7 @@ voice_pipeline = "ghost"
 rooms          = []
 "#,
         );
-        let errors = cfg.validate_profiles();
+        let errors = cfg.validate_session_profiles();
         assert!(
             errors.iter().any(|e| e.contains("ghost")),
             "got: {errors:?}"
@@ -3423,7 +3607,7 @@ api_key = "test"
 wake_word_model = "/nonexistent/saphina.onnx"
 "#,
         );
-        let errors = cfg.validate_profiles();
+        let errors = cfg.validate_session_profiles();
         assert!(
             errors
                 .iter()
@@ -3582,7 +3766,7 @@ reasoning_effort = "low"
             &host_path,
             "[anthropic]\napi_key = \"sk-test\"\n\n\
              [matrix]\nhomeserver = \"https://srv\"\naccess_token = \"t\"\n\
-             user_id = \"@a:srv\"\ndevice_id = \"D\"\nroom_id = \"!a:srv\"\n",
+             user_id = \"@a:srv\"\ndevice_id = \"D\"\n[[matrix.rooms]]\nroom_id = \"!a:srv\"\n",
         )
         .unwrap();
 
@@ -3593,8 +3777,8 @@ reasoning_effort = "low"
             loaded.unknown
         );
         assert_eq!(
-            loaded.config.matrix.as_ref().unwrap().room_ids,
-            vec!["!a:srv".to_string()]
+            loaded.config.matrix.as_ref().unwrap().rooms[0].room_id,
+            "!a:srv"
         );
     }
 
@@ -3752,9 +3936,9 @@ reasoning_effort = "low"
 
         let loaded = Config::load_layered(&host_path).unwrap();
         assert!(
-            loaded.config.validate_profiles().is_empty(),
+            loaded.config.validate_session_profiles().is_empty(),
             "{:?}",
-            loaded.config.validate_profiles()
+            loaded.config.validate_session_profiles()
         );
     }
 
@@ -4075,7 +4259,7 @@ model = "m"
         let both = Config::parse_for_test(
             "[anthropic]\napi_key = \"test\"\n\n\
              [session_profile.ops]\nprofile = \"dev\"\npermission = \"ops\"\n\
-             [permission_profile.ops]\ntools = [\"fs\"]\n\n[tools.host_access]\nenabled = true\n",
+             [permission_profile.ops]\ntools = [\"fs\"]\n\n[tools.fs]\nenabled = true\n[tools.shell]\nenabled = true\n[tools.admin]\nenabled = true\n",
         );
         assert!(both.group_enabled(ToolGroup::Fs) && both.group_registered(ToolGroup::Fs));
 
@@ -4088,7 +4272,7 @@ model = "m"
 
         let unlisted = Config::parse_for_test(
             "[anthropic]\napi_key = \"test\"\n\n\
-             [session_profile.ops]\nprofile = \"dev\"\npermission = \"chat\"\n\n[tools.host_access]\nenabled = true\n",
+             [session_profile.ops]\nprofile = \"dev\"\npermission = \"chat\"\n\n[tools.fs]\nenabled = true\n[tools.shell]\nenabled = true\n[tools.admin]\nenabled = true\n",
         );
         assert!(unlisted.group_enabled(ToolGroup::Admin));
         assert!(
@@ -4102,7 +4286,7 @@ model = "m"
             "[profiles.dev]\nprovider = \"anthropic\"\n\n\
              [session_profile.ops]\nprofile = \"dev\"\npermission = \"typo\"\n",
         );
-        let errors = cfg.validate_profiles();
+        let errors = cfg.validate_session_profiles();
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert!(
             errors[0].contains("unknown permission_profile 'typo'"),
@@ -4114,7 +4298,7 @@ model = "m"
                 .permission_profiles
                 .insert("custom".into(), PermissionProfileConfig::default());
             valid.session_profiles.get_mut("ops").unwrap().permission = Some(name.into());
-            assert!(valid.validate_profiles().is_empty(), "{name}");
+            assert!(valid.validate_session_profiles().is_empty(), "{name}");
         }
     }
 
@@ -4123,7 +4307,7 @@ model = "m"
         let cfg = Config::parse_for_test(
             "[session_profile.ops]\nprofile = \"dev\"\npermission = \"admin\"\n\n\
              [permission_profile.admin]\ntools = []\n\n\
-             [tools.host_access]\nenabled = true\n",
+             [tools.fs]\nenabled = true\n[tools.shell]\nenabled = true\n[tools.admin]\nenabled = true\n",
         );
         assert!(
             cfg.group_registered(ToolGroup::Fs),
@@ -4142,7 +4326,7 @@ model = "m"
         assert!(named.group_registered(ToolGroup::Shell));
         assert!(named.group_registered(ToolGroup::Admin));
         let mut section = Config::for_test();
-        section.tools.host_access.enabled = true;
+        section.tools.shell.enabled = true;
         section.permission_profiles.insert(
             "custom".into(),
             PermissionProfileConfig {
