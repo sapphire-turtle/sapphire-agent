@@ -32,6 +32,8 @@ impl AskHumanTool {
     pub fn new() -> Self {
         Self {
             spec: ToolSpec {
+                kind: ToolKind::Think,
+                group: None,
                 name: NAME.into(),
                 description: "Ask the person overseeing autonomous work a question in the \
                     consult room. Returns at once; the answer arrives later in this \

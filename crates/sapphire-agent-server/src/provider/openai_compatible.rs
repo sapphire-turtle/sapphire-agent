@@ -850,6 +850,8 @@ mod tests {
     #[test]
     fn a_non_empty_tool_list_still_serializes() {
         let specs = [ToolSpec {
+            kind: crate::tools::ToolKind::Other,
+            group: None,
             name: "get_weather".into(),
             description: "…".into(),
             input_schema: json!({"type": "object"}),

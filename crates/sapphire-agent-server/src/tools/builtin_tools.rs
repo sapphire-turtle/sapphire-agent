@@ -1,3 +1,4 @@
+use crate::config::ToolGroup;
 use crate::image_cache::ImageCache;
 use crate::provider::ToolSpec;
 use crate::tools::{Tool, ToolKind, ToolOutput, ToolSet};
@@ -41,6 +42,8 @@ impl FileReadTool {
         Self {
             state,
             spec: ToolSpec {
+                kind: ToolKind::Read,
+                group: Some(ToolGroup::Fs),
                 name: "file_read".into(),
                 description: format!(
                     "{REACHES_SENTENCE}Read a file with optional line-based pagination. \
@@ -492,6 +495,8 @@ impl FileWriteTool {
         Self {
             state,
             spec: ToolSpec {
+                kind: ToolKind::Edit,
+                group: Some(ToolGroup::Fs),
                 name: "file_write".into(),
                 description: format!("{REACHES_SENTENCE}Write content to a file, completely replacing its existing content. \
                     Accepts absolute paths, ~/... paths, or workspace-relative paths \
@@ -572,6 +577,8 @@ impl FileDeleteTool {
         Self {
             state,
             spec: ToolSpec {
+                kind: ToolKind::Delete,
+                group: Some(ToolGroup::Fs),
                 name: "file_delete".into(),
                 description: format!("{REACHES_SENTENCE}In an ACP session the delete runs a `rm` on the editor's machine over `terminal/*`. Delete a file from the filesystem. \
                     Accepts absolute paths, ~/... paths, or workspace-relative paths \
@@ -643,6 +650,8 @@ impl FileAppendTool {
         Self {
             state,
             spec: ToolSpec {
+                kind: ToolKind::Edit,
+                group: Some(ToolGroup::Fs),
                 name: "file_append".into(),
                 description: format!("{REACHES_SENTENCE}Append content to the end of a file, creating it if missing. \
                     Accepts absolute paths, ~/... paths, or workspace-relative paths \
@@ -724,6 +733,8 @@ impl DirListTool {
         Self {
             state,
             spec: ToolSpec {
+                kind: ToolKind::Search,
+                group: Some(ToolGroup::Fs),
                 name: "dir_list".into(),
                 description: format!("{REACHES_SENTENCE}In an ACP session the listing runs a `find` on the editor's machine over `terminal/*`. List the direct children of a directory (non-recursive). \
                     Accepts absolute paths, ~/... paths, or workspace-relative paths. \
@@ -815,6 +826,8 @@ impl DirWalkTool {
         Self {
             state,
             spec: ToolSpec {
+                kind: ToolKind::Search,
+                group: Some(ToolGroup::Fs),
                 name: "dir_walk".into(),
                 description: format!("{REACHES_SENTENCE}In an ACP session the walk runs a `find` on the editor's machine over `terminal/*`. Recursively list all files and directories under a path. \
                     Accepts absolute paths, ~/... paths, or workspace-relative paths. \
@@ -1042,6 +1055,8 @@ const BACKGROUND_DISABLED: &str = "background runs are turned off on this deploy
 /// registration in `lib.rs` and `subagent_tool_specs`).
 pub(crate) fn shell_spec(background: bool) -> ToolSpec {
     let mut spec = ToolSpec {
+        kind: ToolKind::Execute,
+        group: Some(ToolGroup::Shell),
         name: "shell".into(),
         description: format!(
             "{REACHES_SENTENCE}Execute a shell command and return its output. \
@@ -1400,6 +1415,8 @@ impl WeatherTool {
     pub fn new() -> Self {
         Self {
             spec: ToolSpec {
+                kind: ToolKind::Fetch,
+                group: None,
                 name: "weather".into(),
                 description: "Fetch a weather forecast via the Open-Meteo API \
                     (no API key required). Resolve a place by passing `location` \
@@ -1681,6 +1698,8 @@ impl WebSearchTool {
         Self {
             api_key,
             spec: ToolSpec {
+                kind: ToolKind::Fetch,
+                group: None,
                 name: "web_search".into(),
                 description: "Search the web for up-to-date information using Tavily. \
                     Returns titles, URLs, and short content excerpts for the top results."
@@ -1782,6 +1801,8 @@ impl McpReconnectTool {
     pub fn new(tool_set: Weak<ToolSet>) -> Self {
         Self {
             spec: ToolSpec {
+                kind: ToolKind::Other,
+                group: Some(ToolGroup::Mcp),
                 name: "mcp_reconnect".into(),
                 description:
                     "Reconnect to a configured MCP server (stdio or HTTP) and refresh its tool list. \
@@ -1856,6 +1877,8 @@ pub struct RecallImageTool {
 impl RecallImageTool {
     pub fn new(cache: Arc<ImageCache>) -> Self {
         let spec = ToolSpec {
+            kind: ToolKind::Read,
+            group: None,
             name: "recall_image".into(),
             description: "Re-fetch a past image from the conversation by its sha256 hash. \
                 Use this when the user references an image that now appears in history as a \
@@ -2377,6 +2400,8 @@ impl RefreshSystemPromptTool {
         Self {
             agent,
             spec: ToolSpec {
+                kind: ToolKind::Other,
+                group: None,
                 name: "refresh_system_prompt".to_string().into(),
                 description: "システムプロンプトの読み込みキャッシュをクリアし、\
 ワークスペースファイルを再読み込みさせます。メモリ等を編集して即時反映させたい時に呼んでください。"

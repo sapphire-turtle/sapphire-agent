@@ -272,8 +272,12 @@ impl AutonomousLoop {
     /// Which row of the permission table this loop's turns are judged by.
     fn origin(&self) -> crate::tools::policy::Origin {
         match self.state.config.autonomous.origin {
-            AutonomousOrigin::Channel => crate::tools::policy::Origin::Channel,
-            AutonomousOrigin::Trusted => crate::tools::policy::Origin::Trusted,
+            AutonomousOrigin::Channel => crate::tools::policy::Origin::Channel {
+                session_profile: "default".into(),
+            },
+            AutonomousOrigin::Trusted => crate::tools::policy::Origin::Unattended {
+                session_profile: "default".into(),
+            },
         }
     }
 

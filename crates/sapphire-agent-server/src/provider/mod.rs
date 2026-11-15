@@ -5,6 +5,8 @@ pub mod openai_compatible;
 pub mod registry;
 pub mod retry;
 
+use crate::config::ToolGroup;
+use crate::tools::ToolKind;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -20,6 +22,8 @@ pub struct ToolSpec {
     pub name: Cow<'static, str>,
     pub description: Cow<'static, str>,
     pub input_schema: Value,
+    pub kind: ToolKind,
+    pub group: Option<ToolGroup>,
 }
 
 /// A tool call returned by the LLM.

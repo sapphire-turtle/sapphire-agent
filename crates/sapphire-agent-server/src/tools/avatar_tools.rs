@@ -145,6 +145,8 @@ fn declared_name<'a>(input: &'a Value, field: &str, declared: &[String]) -> Resu
 // -- set_expression ----------------------------------------------------------
 
 static SET_EXPRESSION_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| ToolSpec {
+    kind: ToolKind::Think,
+    group: None,
     name: SET_EXPRESSION.into(),
     description: "Set your avatar's expression to match the feeling of your reply. \
                   Call it as often as you like within one turn."
@@ -192,6 +194,8 @@ impl Tool for SetExpressionTool {
 // -- play_action -------------------------------------------------------------
 
 static PLAY_ACTION_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| ToolSpec {
+    kind: ToolKind::Think,
+    group: None,
     name: PLAY_ACTION.into(),
     description: "Play a gesture once. Use it only at the moments that call for it, \
                   such as a greeting or a burst of joy."
@@ -235,6 +239,8 @@ impl Tool for PlayActionTool {
 // -- set_pose ----------------------------------------------------------------
 
 static SET_POSE_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| ToolSpec {
+    kind: ToolKind::Think,
+    group: None,
     name: SET_POSE.into(),
     description: "Switch your avatar's stance (pose). It holds until you change it again, \
                   independent of the expression. Call it as often as you like within one turn."
@@ -548,6 +554,8 @@ mod tests {
     #[test]
     fn specialising_leaves_other_tools_alone() {
         let other = ToolSpec {
+            kind: ToolKind::Read,
+            group: Some(crate::config::ToolGroup::Fs),
             name: "file_read".into(),
             description: "".into(),
             input_schema: json!({"type":"object"}),

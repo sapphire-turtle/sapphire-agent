@@ -29,6 +29,8 @@ impl BackgroundTaskTool {
     pub fn new() -> Self {
         Self {
             spec: ToolSpec {
+                kind: ToolKind::Think,
+                group: None,
                 name: "background_task".into(),
                 description: "List, peek at or cancel the background tasks this \
                     session has running (for example subagents and shell commands \

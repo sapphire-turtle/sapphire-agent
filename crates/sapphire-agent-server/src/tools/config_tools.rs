@@ -22,6 +22,7 @@
 //!   over.
 
 use crate::autonomous::{CONTINUE_PROMPT, marker};
+use crate::config::ToolGroup;
 use crate::config::{Config, DEFAULT_NAMESPACE_NAME};
 use crate::provider::ChatMessage;
 use crate::provider::ToolSpec;
@@ -280,6 +281,8 @@ impl ConfigTool {
         );
 
         let spec = ToolSpec {
+            kind: ToolKind::Edit,
+            group: Some(ToolGroup::Admin),
             name: dir.tool_name().into(),
             description: description.into(),
             input_schema: json!({
@@ -672,6 +675,8 @@ impl TaskTestTool {
         // state, and a second copy could disagree with it.
         let workspace_root = state.workspace.dir().to_path_buf();
         let spec = ToolSpec {
+            kind: ToolKind::Edit,
+            group: Some(ToolGroup::Admin),
             name: "task_test".into(),
             description: "Run one of the agent's own task definitions once, in a throwaway \
                  session, to see what it does before enabling it. The task runs even while \
@@ -721,8 +726,12 @@ impl TaskTestTool {
     /// own, from `[autonomous] origin`.
     fn origin(&self) -> crate::tools::policy::Origin {
         match self.state.config.autonomous.origin {
-            crate::config::AutonomousOrigin::Channel => crate::tools::policy::Origin::Channel,
-            crate::config::AutonomousOrigin::Trusted => crate::tools::policy::Origin::Trusted,
+            crate::config::AutonomousOrigin::Channel => crate::tools::policy::Origin::Channel {
+                session_profile: "default".into(),
+            },
+            crate::config::AutonomousOrigin::Trusted => crate::tools::policy::Origin::Unattended {
+                session_profile: "default".into(),
+            },
         }
     }
 

@@ -40,6 +40,8 @@ impl CurrentTimeTool {
         Self {
             boundary_hour,
             spec: ToolSpec {
+                kind: ToolKind::Read,
+                group: None,
                 name: "current_time".into(),
                 description: "Current date and time on the agent host, in local time, \
                     UTC, and as the agent's logical day (which starts at the configured \
@@ -192,6 +194,8 @@ impl SessionListTool {
         Self {
             sources,
             spec: ToolSpec {
+                kind: ToolKind::Read,
+                group: None,
                 name: "session_list".into(),
                 description: "List the agent's own conversation sessions — chat rooms, \
                     voice satellites, API clients and editor (ACP) sessions — that have \
@@ -305,6 +309,8 @@ impl SessionReadTool {
         Self {
             sources,
             spec: ToolSpec {
+                kind: ToolKind::Read,
+                group: None,
                 name: "session_read".into(),
                 description: "Read what was said in one of the agent's own sessions \
                     (find its session_id with `session_list`). \

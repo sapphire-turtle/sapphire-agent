@@ -62,6 +62,8 @@ impl TranscriptReadTool {
         Self {
             state,
             spec: ToolSpec {
+                kind: ToolKind::Read,
+                group: None,
                 name: "transcript_read".into(),
                 description: "Read ambient (always-on microphone) transcripts for a time \
                               window, optionally filtered to one speaker. Speakers are \
@@ -140,6 +142,8 @@ impl SpeakerCandidatesTool {
         Self {
             state,
             spec: ToolSpec {
+                kind: ToolKind::Search,
+                group: None,
                 name: "speaker_candidates".into(),
                 description: "List auto-enrolled voices that have not been named yet, with \
                               how much they have spoken and what they said. Use with \
@@ -200,6 +204,8 @@ impl SpeakerPromoteTool {
         Self {
             state,
             spec: ToolSpec {
+                kind: ToolKind::Edit,
+                group: None,
                 name: "speaker_promote".into(),
                 description: "Register an auto-enrolled voice in the workspace, optionally \
                               naming it at the same time -- e.g. after the user says 'that \

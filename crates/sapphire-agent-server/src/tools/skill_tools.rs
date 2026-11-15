@@ -271,6 +271,8 @@ fn format_list(index: &SkillIndex) -> String {
 
 fn build_spec() -> ToolSpec {
     ToolSpec {
+        kind: ToolKind::Read,
+        group: None,
         name: "skill".into(),
         description: "Load a skill: a written procedure for a kind of work — planning, TDD, \
             debugging, code review, finishing a branch. Call with no arguments to list \
@@ -579,6 +581,8 @@ impl SkillInstallTool {
 
 fn build_install_spec() -> ToolSpec {
     ToolSpec {
+        kind: ToolKind::Execute,
+        group: None,
         name: "skill_install".into(),
         description: "Install a skill source onto the editor's machine by cloning an \
             https:// git URL into the skills directory `skill()` reads from. Only plain \
@@ -740,6 +744,8 @@ impl SkillUpdateTool {
 
 fn build_update_spec() -> ToolSpec {
     ToolSpec {
+        kind: ToolKind::Execute,
+        group: None,
         name: "skill_update".into(),
         description: "Pull the latest changes for a skill source installed with \
             skill_install. Omit `name` to update every installed source; one entry's \
@@ -869,6 +875,8 @@ impl SkillUninstallTool {
 
 fn build_uninstall_spec() -> ToolSpec {
     ToolSpec {
+        kind: ToolKind::Delete,
+        group: None,
         name: "skill_uninstall".into(),
         description: "Remove a skill source installed with skill_install from the editor's \
             machine. Always refuses if the checkout has local (uncommitted) changes — \

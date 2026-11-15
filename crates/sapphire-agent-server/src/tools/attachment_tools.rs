@@ -1,3 +1,4 @@
+use crate::config::ToolGroup;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -39,6 +40,8 @@ impl AttachmentSaveTool {
             store,
             state,
             spec: ToolSpec {
+                kind: ToolKind::Edit,
+                group: None,
                 name: "attachment_save".into(),
                 description: "Save an attachment's original bytes from this same conversation. \
                     Cached originals expire after 7 days. Requires an explicit path; overwrites \
@@ -115,6 +118,8 @@ impl ImageReadTool {
         Self {
             state,
             spec: ToolSpec {
+                kind: ToolKind::Read,
+                group: Some(ToolGroup::Fs),
                 name: "image_read".into(),
                 description: "Read one JPEG, PNG, GIF or WebP image from this agent's machine \
                     and attach it to the result. Input is limited to 32 MiB; images over \

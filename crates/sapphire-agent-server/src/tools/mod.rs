@@ -70,6 +70,7 @@ pub trait Tool: Send + Sync {
     /// The default is `Other` — the strictest bucket — so a tool added
     /// without a `kind()` fails safe: it asks (ACP) or is refused
     /// (channels) rather than silently running unguarded.
+    #[allow(dead_code)] // Retained for tool implementations; policy reads the spec.
     fn kind(&self) -> ToolKind {
         ToolKind::Other
     }
@@ -136,6 +137,7 @@ impl ToolSet {
     /// Every registered tool's name and kind. Exists so the policy test
     /// can pin the whole classification table in one assertion rather
     /// than constructing each tool by hand.
+    #[cfg(test)]
     pub async fn kinds(&self) -> Vec<(String, ToolKind)> {
         self.inner
             .read()
@@ -572,6 +574,8 @@ mod tests {
             }
         }
         let bare = Bare(ToolSpec {
+            kind: crate::tools::ToolKind::Other,
+            group: None,
             name: "bare".into(),
             description: String::new().into(),
             input_schema: serde_json::json!({}),
@@ -588,6 +592,8 @@ mod tests {
     impl NamedStub {
         fn new(name: &str) -> Self {
             Self(ToolSpec {
+                kind: crate::tools::ToolKind::Other,
+                group: None,
                 name: name.to_string().into(),
                 description: String::new().into(),
                 input_schema: serde_json::json!({}),
@@ -662,6 +668,8 @@ mod tests {
         set.replace_spec(
             "nope",
             crate::provider::ToolSpec {
+                kind: crate::tools::ToolKind::Other,
+                group: None,
                 name: "nope".into(),
                 description: "x".into(),
                 input_schema: serde_json::json!({}),
@@ -713,6 +721,8 @@ mod tests {
         tools
             .register_tool(Box::new(BlockingTool {
                 spec: ToolSpec {
+                    kind: crate::tools::ToolKind::Other,
+                    group: None,
                     name: "blocking".to_string().into(),
                     description: String::new().into(),
                     input_schema: serde_json::json!({}),
@@ -843,6 +853,8 @@ mod truncation_tests {
         fn new() -> Self {
             Self {
                 spec: ToolSpec {
+                    kind: crate::tools::ToolKind::Other,
+                    group: None,
                     name: "huge_output".into(),
                     description: "Always returns a huge result.".into(),
                     input_schema: serde_json::json!({ "type": "object", "properties": {} }),

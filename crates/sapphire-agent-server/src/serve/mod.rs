@@ -1976,9 +1976,11 @@ pub(crate) trait TurnHost: Send + Sync {
     ///
     /// The heartbeat only reaches this default on its *voice* leg. Its
     /// chat leg goes through `Agent::handle_message`, which does not use
-    /// `TurnHost` at all and judges itself `Origin::Channel`.
+    /// `TurnHost` at all and judges itself under a channel origin.
     fn origin(&self) -> crate::tools::policy::Origin {
-        crate::tools::policy::Origin::Trusted
+        crate::tools::policy::Origin::Unattended {
+            session_profile: "default".into(),
+        }
     }
 
     /// The editor on the other end, when there is one.
@@ -2152,7 +2154,7 @@ impl TurnHost for DetachedHost {
     async fn turn_error(&self, _message: &str) {}
 
     fn origin(&self) -> crate::tools::policy::Origin {
-        self.origin
+        self.origin.clone()
     }
 
     fn consult_identity(&self) -> Option<ConsultIdentity> {
@@ -2254,7 +2256,7 @@ impl TurnHost for AutonomousHost {
     }
 
     fn origin(&self) -> crate::tools::policy::Origin {
-        self.origin
+        self.origin.clone()
     }
 
     fn consult_identity(&self) -> Option<ConsultIdentity> {
@@ -2409,15 +2411,21 @@ pub(crate) fn visible_tool_predicate(
         if has_client && name == "image_read" {
             return false;
         }
-        // The host gate, and the one place #270 changed its meaning:
-        // `has_client` is the `routed_to_client` argument. On an ACP turn
-        // these calls are going to the *editor's* machine, which this
-        // deployment's `[tools.host_access]` switch has no business
-        // speaking for, so the gate declines to fire and the list below
-        // is the whole answer. On a turn with no client (Matrix, Discord,
-        // `/rpc`, voice, the heartbeat) the gate is exactly the old rule
-        // and every name it lets through is the agent's own.
-        if crate::tools::policy::host_tool_denied(name, fs_enabled, shell_enabled, has_client) {
+        // Host-only names are hidden without their host capability; ACP
+        // client-routed names continue to use the capability checks below.
+        if !has_client
+            && ((matches!(
+                name,
+                "file_read"
+                    | "file_write"
+                    | "file_append"
+                    | "file_delete"
+                    | "dir_list"
+                    | "dir_walk"
+                    | "image_read"
+            ) && !fs_enabled)
+                || (name == "shell" && !shell_enabled))
+        {
             return false;
         }
 
@@ -2681,29 +2689,30 @@ impl TurnLoop<'_> {
         let tool_specs = self.tool_specs;
         let progress = self.progress;
         let namespace = self.namespace;
-        // Read once per turn: `None` on every non-ACP transport, which
-        // is what keeps the client-side tools refusing there rather
-        // than reaching for a connection that does not exist.
-        let fs_enabled = state.config.tools.fs.enabled;
-        let shell_enabled = state.config.tools.shell.enabled;
-        // The tools the ACP client provided for this session. A subagent's
-        // loop never sees them: its tool list is cut from the parent's by
-        // `subagent_tool_specs`, which drops them, and its calls would not
-        // be judged by a session the delegate is not part of.
+        // The tools supplied by an ACP client are scoped to the main session.
         let session_tools = if self.subagent_depth == 0 {
             progress.session_tools()
         } else {
             None
         };
-        // Read once per turn, beside the switch and for the same reason it
-        // is: this is what decides whether that switch speaks for this
-        // turn at all. #270's core meaning change — an ACP turn's calls go
-        // to the editor's machine, so the host gate must not fire for
-        // them; a turn with no client gets exactly the old behaviour.
-        // `visible_tool_predicate` applies the same rule to the *offered*
-        // list, and the two must move together or a name is advertised and
-        // then refused on every call.
-        let routed_to_client = progress.acp_client().is_some();
+        let entries: Vec<_> = tool_specs
+            .iter()
+            .map(|spec| crate::tools::policy::ToolEntry::from_spec(spec, &state.config))
+            .collect();
+        let mut origin = progress.origin();
+        // ACP's pinned profile is available here even to test and detached hosts.
+        if let Some(name) = &self.session_profile {
+            match &mut origin {
+                crate::tools::policy::Origin::Acp {
+                    session_profile, ..
+                }
+                | crate::tools::policy::Origin::Channel { session_profile }
+                | crate::tools::policy::Origin::Unattended { session_profile } => {
+                    *session_profile = name.clone()
+                }
+            }
+        }
+        let profile = crate::tools::policy::ResolvedPermission::resolve(&state.config, origin);
         let compression_config = &state.config.compression;
         let mut accumulated_text: Vec<String> = Vec::new();
         // Built once per turn, not once per round: `tool_specs` is fixed
@@ -2863,65 +2872,19 @@ impl TurnLoop<'_> {
                     // simply naming a tool outside it. One check here
                     // closes both, and the same hallucinated-name gap on
                     // the ordinary (non-subagent) path.
-                    let offered: std::collections::HashSet<&str> =
-                        tool_specs.iter().map(|s| s.name.as_ref()).collect();
-                    let mut kinds = self.state.tools.kinds().await;
-                    if let Some(session) = &session_tools {
-                        kinds.extend(session.kinds().await);
-                    }
-                    let origin = progress.origin();
                     let mut permitted: Vec<crate::provider::ToolCall> = Vec::new();
                     let mut refused: Vec<(String, String)> = Vec::new();
                     for call in &tool_calls {
                         use crate::tools::policy::{
-                            Decision, Refusal, host_tool_denied, kind_of, refusal_message,
+                            Allow, Refusal, allow, refusal_message, unavailable_message,
                         };
-
-                        // Three gates, checked in order, only the last of
-                        // which is the origin/kind policy table itself.
-                        //
-                        // `NotOffered` goes first: whether a name is even
-                        // in this round's own `tool_specs` is a fact about
-                        // what *this call* is allowed to see (a subagent's
-                        // `tools:` restriction, `subagent` removed from its
-                        // own nested round, a hallucinated name on an
-                        // ordinary turn) — see `Refusal::NotOffered`'s doc
-                        // — and it has to come before the deployment-wide
-                        // host-machine gate below it, or a name outside
-                        // this round's list but happening to match a host
-                        // tool would be reported as merely unavailable on
-                        // this transport rather than as what it actually
-                        // is: not offered here at all.
-                        //
-                        // The host-machine gate itself sits in front of
-                        // `decide`: it is a fact about the deployment ("may
-                        // this agent touch its own disk at all"), not a
-                        // row in the origin/kind policy table — so it is
-                        // checked, and can refuse, before `decide` is even
-                        // consulted. `routed_to_client` is what scopes that
-                        // fact to the machine it is about: on this turn an
-                        // ACP client means the call lands elsewhere, and
-                        // the editor's own `session/request_permission`
-                        // answer is what governs it instead.
-                        let refusal = if !offered.contains(call.name.as_str()) {
-                            Some(refusal_message(&call.name, Refusal::NotOffered))
-                        } else if host_tool_denied(
-                            &call.name,
-                            fs_enabled,
-                            shell_enabled,
-                            routed_to_client,
-                        ) {
-                            Some(refusal_message(&call.name, Refusal::Unavailable))
-                        } else {
-                            let kind = kind_of(&call.name, &kinds);
-                            let verdict = crate::tools::policy::decide(origin, kind);
-                            match verdict {
-                                Decision::Allow => None,
-                                Decision::Deny => {
-                                    Some(refusal_message(&call.name, Refusal::Unavailable))
-                                }
-                                Decision::Ask => {
-                                    let approval = progress.approve(call, kind).await;
+                        let refusal = match entries.iter().find(|entry| entry.name == call.name) {
+                            None => Some(refusal_message(&call.name, Refusal::NotOffered)),
+                            Some(entry) => match allow(&profile, entry) {
+                                Allow::Allow => None,
+                                Allow::Deny => Some(unavailable_message(&profile, entry)),
+                                Allow::Ask => {
+                                    let approval = progress.approve(call, entry.kind).await;
                                     if approval.allows() {
                                         None
                                     } else {
@@ -2931,7 +2894,7 @@ impl TurnLoop<'_> {
                                         ))
                                     }
                                 }
-                            }
+                            },
                         };
 
                         match refusal {
@@ -3402,8 +3365,10 @@ pub(crate) async fn run_llm_turn(
     // opted this deployment into host access; the two client-side file
     // tools are hidden whenever there is no editor on the other end, or
     // it did not declare the matching `fs` capability.
-    let fs_enabled = state.config.tools.fs.enabled;
-    let shell_enabled = state.config.tools.shell.enabled;
+    let fs_enabled = state.config.group_registered(crate::config::ToolGroup::Fs);
+    let shell_enabled = state
+        .config
+        .group_registered(crate::config::ToolGroup::Shell);
     let has_client = progress.acp_client().is_some();
     let (client_fs_read, client_fs_write) = progress.client_fs_caps();
     let client_terminal = progress.client_terminal_cap();
@@ -3742,6 +3707,8 @@ impl EchoTool {
     pub(crate) fn new() -> Self {
         Self {
             spec: crate::provider::ToolSpec {
+                kind: crate::tools::ToolKind::Read,
+                group: None,
                 name: "echo".into(),
                 description: "Echo the given text back.".into(),
                 input_schema: json!({
@@ -3793,6 +3760,8 @@ impl RiskyTool {
     pub(crate) fn new() -> Self {
         Self {
             spec: crate::provider::ToolSpec {
+                kind: crate::tools::ToolKind::Execute,
+                group: None,
                 name: "risky".into(),
                 description: "Pretend to run a command.".into(),
                 input_schema: json!({ "type": "object", "properties": {} }),
@@ -3826,7 +3795,7 @@ impl crate::tools::Tool for RiskyTool {
 
 /// A minimal named stub, for tests that only care whether a tool's name
 /// survives `specs_filtered` — not what it does. Used to stand in for
-/// the host tools (`crate::tools::policy::HOST_TOOLS`), which the
+/// the host tools (`TEST_HOST_TOOLS`), which the
 /// filtering tests below need present in the set so "not offered"
 /// means the predicate hid them, not that they were never registered.
 #[cfg(test)]
@@ -3836,6 +3805,8 @@ struct NamedStubTool(crate::provider::ToolSpec);
 impl NamedStubTool {
     fn new(name: &str) -> Self {
         Self(crate::provider::ToolSpec {
+            kind: crate::tools::ToolKind::Other,
+            group: None,
             name: name.to_string().into(),
             description: String::new().into(),
             input_schema: json!({ "type": "object", "properties": {} }),
@@ -3877,6 +3848,8 @@ impl AdminProfileProbe {
         Arc::new(Self {
             seen: std::sync::Mutex::new(None),
             spec: crate::provider::ToolSpec {
+                kind: crate::tools::ToolKind::Read,
+                group: None,
                 name: "heartbeat_config".into(),
                 description: "Records the room profile this turn scoped.".into(),
                 input_schema: serde_json::json!({"type": "object", "properties": {}}),
@@ -4254,6 +4227,16 @@ impl ServeState {
                 config.tools.fs.enabled = true;
                 config.tools.shell.enabled = true;
                 config.autonomous.origin = crate::config::AutonomousOrigin::Trusted;
+                config.permission_profiles.insert(
+                    "default".into(),
+                    crate::config::PermissionProfileConfig {
+                        tools: vec![
+                            crate::config::ToolGroup::Fs,
+                            crate::config::ToolGroup::Shell,
+                            crate::config::ToolGroup::Mcp,
+                        ],
+                    },
+                );
             },
         )
     }
@@ -4307,6 +4290,8 @@ rooms    = []
             profile: Some("developer".to_string()),
         });
         config.tools.tool_rounds = rounds;
+        // MCP integration fixtures exercise a host that explicitly enables MCP.
+        config.tools.mcp.enabled = true;
         tweak(&mut config);
         config
             .session_profiles
@@ -4391,6 +4376,19 @@ rooms    = []
 }
 
 #[cfg(test)]
+const TEST_HOST_TOOLS: &[&str] = &[
+    "file_read",
+    "image_read",
+    "attachment_save",
+    "file_write",
+    "file_append",
+    "file_delete",
+    "dir_list",
+    "dir_walk",
+    "shell",
+];
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::acp_session::{EventBody, StoredPart};
@@ -4436,11 +4434,13 @@ mod tests {
             }
             async fn turn_error(&self, _message: &str) {}
             fn origin(&self) -> Origin {
-                Origin::Channel
+                Origin::Channel {
+                    session_profile: "default".into(),
+                }
             }
         }
 
-        // `risky` is Execute, so `Origin::Channel` refuses it. The
+        // The default profile does not grant shell, so the call is refused. The
         // second scripted response is the model carrying on afterwards.
         let state = ServeState::for_test_scripted(
             true,
@@ -4463,7 +4463,9 @@ mod tests {
                 },
             ],
         );
-        let risky = RiskyTool::new();
+        let mut risky = RiskyTool::new();
+        // Offered by name, but the shell group is not granted by default.
+        risky.spec.group = Some(crate::config::ToolGroup::Shell);
         let ran = risky.ran_flag();
         state.tools.register_tool(Box::new(risky)).await;
 
@@ -4692,7 +4694,7 @@ type = "mock"
     /// `[tools.admin].room_profiles = ["ops"]`; the turn is an ACP turn
     /// only by `state.acp_sessions` plus the pin in
     /// `session_profiles`, exactly what `session/new` writes. The
-    /// policy layer is left at the default `Origin::Trusted` so the
+    /// policy layer is left at the default `Origin::Unattended` so the
     /// profile gate is the only permission this call passes through —
     /// if the profile does not reach the tool, the call is refused.
     #[tokio::test]
@@ -4782,7 +4784,7 @@ type = "mock"
         // Windows).
         ctx.set_cache_dir(std::env::temp_dir().join("sapphire-agent-serve-test-cache"));
 
-        let state = ServeState::for_test_scripted(
+        let mut state = ServeState::for_test_scripted(
             true,
             vec![
                 crate::provider::ChatResponse {
@@ -4810,8 +4812,18 @@ type = "mock"
         // point both at the same root.
         std::fs::create_dir_all(root.join(".sapphire-agent")).unwrap();
 
-        let mut config = state.config.clone();
+        let config = &mut Arc::get_mut(&mut state).unwrap().config;
+        config.tools.admin.enabled = true;
         config.tools.admin.room_profiles = profiles;
+        // Permit the call through the new table so these existing tests
+        // continue to exercise the legacy tool-local profile gate.
+        config.permission_profiles.insert(
+            "default".into(),
+            crate::config::PermissionProfileConfig {
+                tools: vec![crate::config::ToolGroup::Admin],
+            },
+        );
+        let config = config.clone();
         let sw = sapphire_framework::workspace::Workspace::from_root(ctx, &root).unwrap();
         let ws = Arc::new(sapphire_framework::workspace::WorkspaceState::open(sw).unwrap());
 
@@ -4925,6 +4937,8 @@ type = "mock"
             .tools
             .register_tool(Box::new(CompletesTasks {
                 spec: ToolSpec {
+                    kind: crate::tools::ToolKind::Read,
+                    group: None,
                     name: "completes".to_string().into(),
                     description: String::new().into(),
                     input_schema: json!({"type": "object"}),
@@ -5159,10 +5173,10 @@ type = "mock"
     /// `subagent` itself is `ToolKind::Other`, which the policy table
     /// groups with `Execute` in the same "risky" bucket in every origin
     /// (see `crate::tools::policy::decide`) — so an origin that
-    /// auto-denies `Execute` (`Origin::Channel`) would auto-deny the
+    /// auto-denies `Execute` (`Origin::Channel { session_profile: "default".into() }`) would auto-deny the
     /// top-level `subagent` call too, before delegation ever ran, which
     /// would make the test pass without exercising `SubagentTool` at
-    /// all. `Origin::Acp(SessionMode::Default)` sends every risky call
+    /// all. `Origin::Acp { mode: SessionMode::Default, session_profile: "default".into() }` sends every risky call
     /// through `approve` instead of denying it outright, so this test
     /// can let the top-level `subagent` call through while having the
     /// very same `approve` reject the nested `risky` call — proving the
@@ -5185,7 +5199,10 @@ type = "mock"
             async fn tool_end(&self, _id: &str, _name: &str) {}
             async fn turn_error(&self, _message: &str) {}
             fn origin(&self) -> Origin {
-                Origin::Acp(SessionMode::Default)
+                Origin::Acp {
+                    mode: SessionMode::Default,
+                    session_profile: "default".into(),
+                }
             }
             async fn approve(
                 &self,
@@ -5300,7 +5317,10 @@ type = "mock"
             async fn tool_end(&self, _id: &str, _name: &str) {}
             async fn turn_error(&self, _message: &str) {}
             fn origin(&self) -> Origin {
-                Origin::Acp(SessionMode::Default)
+                Origin::Acp {
+                    mode: SessionMode::Default,
+                    session_profile: "default".into(),
+                }
             }
             async fn approve(
                 &self,
@@ -5575,7 +5595,7 @@ type = "mock"
     /// A definition's `tools:` restriction is also a promise about what
     /// is *offered*, and needs the same gate: without it, a subagent
     /// could call any tool registered on the shared `ToolSet`, whether
-    /// or not its own definition named it. `Origin::Trusted` is used
+    /// or not its own definition named it. `Origin::Unattended` is used
     /// here specifically because it allows every kind unconditionally —
     /// isolating this from `a_subagent_is_judged_by_the_parents_origin`,
     /// which is about the origin/host gate, not this one.
@@ -5596,7 +5616,7 @@ type = "mock"
                     stop_reason: None,
                 },
                 // Subagent round 1: try a tool outside its own `tools:`
-                // list — registered on the `ToolSet`, and `Origin::Trusted`
+                // list — registered on the `ToolSet`, and `Origin::Unattended`
                 // would allow it unconditionally, but the definition
                 // never named it.
                 crate::provider::ChatResponse {
@@ -5656,7 +5676,7 @@ type = "mock"
         assert_eq!(outcome.text.as_deref(), Some("done"));
         assert!(
             !ran.load(std::sync::atomic::Ordering::SeqCst),
-            "`risky` was registered and `Origin::Trusted` allows every \
+            "`risky` was registered and `Origin::Unattended` allows every \
              kind, so only the `tools:` restriction itself explains a \
              refusal here"
         );
@@ -5674,7 +5694,7 @@ type = "mock"
     /// `shell_start` is the tool named: it isn't in `HOST_TOOLS`, so
     /// the host-machine gate — the *other* thing that could explain a
     /// refusal here — never fires for it, and `NullProgress`'s default
-    /// `origin()` is `Origin::Trusted`, which `decide` allows
+    /// `origin()` is `Origin::Unattended`, which `decide` allows
     /// unconditionally for every kind. The only thing left standing
     /// between the call and `ran` flipping `true` is the offered check
     /// itself: `visible_tool_predicate` excludes `shell_start` from
@@ -5732,6 +5752,8 @@ type = "mock"
             .tools
             .register_tool(Box::new(FakeClientShellStart {
                 spec: crate::provider::ToolSpec {
+                    kind: crate::tools::ToolKind::Execute,
+                    group: None,
                     name: "shell_start".into(),
                     description: "Pretend to run a command on the client.".into(),
                     input_schema: json!({ "type": "object", "properties": {} }),
@@ -5753,7 +5775,7 @@ type = "mock"
         assert!(
             !ran.load(std::sync::atomic::Ordering::SeqCst),
             "`shell_start` is registered, isn't a `HOST_TOOLS` name (so the \
-             host gate never fires), and `Origin::Trusted` \
+             host gate never fires), and `Origin::Unattended` \
              allows every kind unconditionally — only the offered check \
              itself explains a refusal here"
         );
@@ -6030,8 +6052,18 @@ type = "mock"
 
         let (tx, _rx) = mpsc::channel(4);
         let sse = SseProgress::new(tx, json!(1));
-        assert_eq!(sse.origin(), Origin::Trusted);
-        assert_eq!(NullProgress.origin(), Origin::Trusted);
+        assert_eq!(
+            sse.origin(),
+            Origin::Unattended {
+                session_profile: "default".into()
+            }
+        );
+        assert_eq!(
+            NullProgress.origin(),
+            Origin::Unattended {
+                session_profile: "default".into()
+            }
+        );
     }
 
     /// A host that cannot ask must not block the call. The default lets
@@ -6554,6 +6586,8 @@ type = "mock"
         fn new(moved_away: std::path::PathBuf, real_path: std::path::PathBuf) -> Self {
             Self {
                 spec: crate::provider::ToolSpec {
+                    kind: crate::tools::ToolKind::Execute,
+                    group: None,
                     name: "risky".into(),
                     description: "Pretend to run a command.".into(),
                     input_schema: json!({ "type": "object", "properties": {} }),
@@ -7190,7 +7224,7 @@ type = "mock"
             false,
         )
         .await;
-        for n in crate::tools::policy::HOST_TOOLS
+        for n in TEST_HOST_TOOLS
             .iter()
             .filter(|n| !matches!(**n, "image_read" | "attachment_save"))
         {
@@ -7238,12 +7272,12 @@ type = "mock"
     #[tokio::test]
     async fn a_non_acp_turn_is_governed_by_host_access_alone() {
         let off = tool_names_for_turn_without_a_client(false).await;
-        for n in crate::tools::policy::HOST_TOOLS {
+        for n in TEST_HOST_TOOLS {
             assert!(!off.contains(&n.to_string()), "{n} should be hidden");
         }
 
         let on = tool_names_for_turn_without_a_client(true).await;
-        for n in crate::tools::policy::HOST_TOOLS {
+        for n in TEST_HOST_TOOLS {
             assert_eq!(on.contains(&n.to_string()), *n != "attachment_save", "{n}");
         }
 
@@ -7346,7 +7380,9 @@ type = "mock"
                 .register_tool(Box::new(crate::tools::ask_human::AskHumanTool::new()))
                 .await;
             let progress: Arc<dyn TurnHost> = Arc::new(AutonomousHost {
-                origin: crate::tools::policy::Origin::Trusted,
+                origin: crate::tools::policy::Origin::Unattended {
+                    session_profile: "default".into(),
+                },
                 consult,
             });
             let specs = state
@@ -7377,7 +7413,9 @@ type = "mock"
             asked_by: None,
         };
         let host = AutonomousHost {
-            origin: crate::tools::policy::Origin::Trusted,
+            origin: crate::tools::policy::Origin::Unattended {
+                session_profile: "default".into(),
+            },
             consult: Some(id.clone()),
         };
         assert_eq!(host.detached().consult_identity(), Some(id));
@@ -7395,6 +7433,8 @@ type = "mock"
         fn new(kind: crate::tools::ToolKind) -> Self {
             Self {
                 spec: crate::provider::ToolSpec {
+                    kind,
+                    group: Some(crate::config::ToolGroup::Mcp),
                     name: "acp__game__echo".into(),
                     description: "Echo the given text back.".into(),
                     input_schema: json!({"type": "object", "properties": {}}),
@@ -7457,7 +7497,7 @@ type = "mock"
             self.tools.clone()
         }
         fn origin(&self) -> crate::tools::policy::Origin {
-            self.origin
+            self.origin.clone()
         }
         async fn approve(
             &self,
@@ -7501,7 +7541,9 @@ type = "mock"
         );
         let (host, _) = SessionToolsHost::new(
             Some(crate::tools::ToolKind::Read),
-            crate::tools::policy::Origin::Trusted,
+            crate::tools::policy::Origin::Unattended {
+                session_profile: "default".into(),
+            },
         );
         let sid = "s-session-tools".to_string();
         let outcome = run_llm_turn(
@@ -7530,7 +7572,12 @@ type = "mock"
             true,
             vec![session_tool_call(), final_round("done")],
         );
-        let (host, _) = SessionToolsHost::new(None, crate::tools::policy::Origin::Trusted);
+        let (host, _) = SessionToolsHost::new(
+            None,
+            crate::tools::policy::Origin::Unattended {
+                session_profile: "default".into(),
+            },
+        );
         let sid = "s-no-session-tools".to_string();
         let outcome = run_llm_turn(
             Arc::clone(&state),
@@ -7567,8 +7614,13 @@ type = "mock"
         ] {
             let state =
                 ServeState::for_test_scripted(true, vec![session_tool_call(), final_round("done")]);
-            let (host, asked) =
-                SessionToolsHost::new(Some(kind), Origin::Acp(SessionMode::Default));
+            let (host, asked) = SessionToolsHost::new(
+                Some(kind),
+                Origin::Acp {
+                    mode: SessionMode::Default,
+                    session_profile: "default".into(),
+                },
+            );
             let outcome = run_llm_turn(
                 Arc::clone(&state),
                 "s-session-tool-kind".to_string(),
@@ -7601,7 +7653,10 @@ type = "mock"
         async fn tool_end(&self, _id: &str, _name: &str) {}
         async fn turn_error(&self, _message: &str) {}
         fn origin(&self) -> crate::tools::policy::Origin {
-            crate::tools::policy::Origin::Acp(crate::tools::policy::SessionMode::Default)
+            crate::tools::policy::Origin::Acp {
+                mode: crate::tools::policy::SessionMode::Default,
+                session_profile: "default".into(),
+            }
         }
         fn acp_client(&self) -> Option<Arc<dyn crate::tools::acp_client::AcpClient>> {
             self.client.clone()
@@ -7623,6 +7678,8 @@ type = "mock"
         fn new(ran: Arc<std::sync::atomic::AtomicBool>) -> Self {
             Self {
                 spec: crate::provider::ToolSpec {
+                    kind: crate::tools::ToolKind::Read,
+                    group: Some(crate::config::ToolGroup::Fs),
                     name: "file_read".into(),
                     description: "Pretend to read a file.".into(),
                     input_schema: json!({"type": "object", "properties": {}}),
@@ -7654,7 +7711,7 @@ type = "mock"
     /// `routed_to_client` to tell the two apart, so a deployment-wide
     /// switch would have been deciding for a machine it does not own.
     #[tokio::test]
-    async fn an_acp_turn_runs_a_host_named_tool_with_host_access_off() {
+    async fn an_acp_turn_refuses_a_group_when_host_disables_it() {
         let state = ServeState::for_test_scripted(
             true,
             vec![
@@ -7702,9 +7759,8 @@ type = "mock"
 
         assert_eq!(outcome.text.as_deref(), Some("done"));
         assert!(
-            ran.load(std::sync::atomic::Ordering::SeqCst),
-            "an ACP turn reaches the editor's machine, so the deployment's \
-             host_access switch has nothing to refuse here"
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "group access requires the host switch even for an ACP turn"
         );
     }
 
@@ -8160,16 +8216,30 @@ type = "mock"
     #[test]
     fn the_autonomous_host_is_trusted_and_unattended() {
         let host = AutonomousHost {
-            origin: crate::tools::policy::Origin::Trusted,
+            origin: crate::tools::policy::Origin::Unattended {
+                session_profile: "default".into(),
+            },
             consult: None,
         };
-        assert_eq!(host.origin(), crate::tools::policy::Origin::Trusted);
+        assert_eq!(
+            host.origin(),
+            crate::tools::policy::Origin::Unattended {
+                session_profile: "default".into()
+            }
+        );
         assert_eq!(host.round_budget(), RoundBudget::Unattended);
 
         let host = AutonomousHost {
-            origin: crate::tools::policy::Origin::Channel,
+            origin: crate::tools::policy::Origin::Channel {
+                session_profile: "default".into(),
+            },
             consult: None,
         };
-        assert_eq!(host.origin(), crate::tools::policy::Origin::Channel);
+        assert_eq!(
+            host.origin(),
+            crate::tools::policy::Origin::Channel {
+                session_profile: "default".into()
+            }
+        );
     }
 }

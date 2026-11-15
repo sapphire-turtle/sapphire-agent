@@ -597,8 +597,10 @@ impl Agent {
         // host tools (`file_read`, `file_write`, `file_append`,
         // `file_delete`, `dir_list`, `dir_walk`, `shell`, `image_read`), whose
         // agent-side bodies are what this transport runs.
-        let fs_enabled = self.config.tools.fs.enabled;
-        let shell_enabled = self.config.tools.shell.enabled;
+        let fs_enabled = self.config.group_registered(crate::config::ToolGroup::Fs);
+        let shell_enabled = self
+            .config
+            .group_registered(crate::config::ToolGroup::Shell);
         let can_save = fs_enabled && incoming.attachment_owner.is_some();
         let base = crate::serve::visible_tool_predicate(
             fs_enabled,
@@ -813,25 +815,23 @@ impl Agent {
                             (call.id, reason)
                         })
                         .collect();
-                    let kinds = match &tools {
-                        Some(tools) => tools.kinds().await,
-                        None => Vec::new(),
-                    };
-                    // `routed_to_client` is `false`, and it is `false`
-                    // for the whole channel path rather than a value
-                    // read from somewhere: a Matrix/Discord turn never
-                    // has an ACP client, so the host gate speaks for
-                    // every one of these names here exactly as it always
-                    // has. #270 changed the gate's meaning on ACP turns
-                    // only; this path is the control case.
+                    let profile = crate::tools::policy::ResolvedPermission::resolve(
+                        &self.config,
+                        crate::tools::policy::Origin::Channel {
+                            session_profile: self
+                                .config
+                                .session_profile_name(None, &incoming.room_id),
+                        },
+                    );
+                    let entries: Vec<_> = tool_specs
+                        .as_deref()
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|spec| crate::tools::policy::ToolEntry::from_spec(spec, &self.config))
+                        .collect();
                     let (tool_calls, policy_refused) =
                         crate::tools::policy::partition_without_asking(
-                            crate::tools::policy::Origin::Channel,
-                            &offered,
-                            &kinds,
-                            self.config.tools.fs.enabled,
-                            self.config.tools.shell.enabled,
-                            false,
+                            &profile, &offered, &entries,
                         );
                     refused.extend(policy_refused);
                     for (id, reason) in &refused {
@@ -971,7 +971,6 @@ fn build_user_message(text: &str, attachments: &[Attachment]) -> ChatMessage {
 #[cfg(test)]
 mod tests {
     use crate::provider::ToolCall;
-    use crate::tools::ToolKind;
     use crate::tools::policy::{Origin, partition_without_asking};
     use sapphire_framework::workspace::{AppContext, Workspace, WorkspaceState};
     use std::sync::{Arc, Mutex};
@@ -991,10 +990,8 @@ mod tests {
         Arc::new(WorkspaceState::open(ws).unwrap())
     }
 
-    /// Six calls, run through the channel gate under both `host_access`
-    /// states. Shared by both phases below so the two assertions stay
-    /// about the same call list rather than drifting apart.
-    async fn channel_gate_test_calls() -> (Vec<ToolCall>, Vec<(String, ToolKind)>) {
+    /// The actual tool specs are the single source of policy classification.
+    async fn channel_gate_test_calls() -> (Vec<ToolCall>, Vec<crate::provider::ToolSpec>) {
         let tools = crate::tools::default_tool_set(
             test_workspace(),
             Some("test-tavily-key".to_string()),
@@ -1002,13 +999,12 @@ mod tests {
             4,
         )
         .await;
-        let kinds = tools.kinds().await;
-
-        let calls: Vec<ToolCall> = [
+        let specs = tools.specs_filtered(|_| true).await;
+        let calls = [
+            "file_write",
             "shell",
             "web_search",
             "memory_add",
-            "file_read",
             "workspace_sync",
             "mcp__somewhere__do_thing",
         ]
@@ -1020,109 +1016,75 @@ mod tests {
             input: serde_json::json!({}),
         })
         .collect();
-
-        (calls, kinds)
+        (calls, specs)
     }
 
-    /// `shell` (`Execute`) and `workspace_sync`/the MCP tool (`Other`)
-    /// are refused over chat regardless of `host_access` — that is
-    /// `decide`'s risky bucket, which the host switch does not touch.
-    /// `web_search`/`memory_add` (workspace-scoped, not host tools) keep
-    /// working either way. `file_read` is the one call that moves
-    /// between the two phases below: this test pins it with
-    /// `host_access` **on**, matching the pre-host-switch behaviour this
-    /// permission work otherwise preserves; the sibling test below pins
-    /// what changed.
     #[tokio::test]
-    async fn the_channel_gate_refuses_shell_but_keeps_the_chat_tools() {
-        let (calls, kinds) = channel_gate_test_calls().await;
-
-        let (permitted, refused) =
-            partition_without_asking(Origin::Channel, &calls, &kinds, true, true, false);
-
-        let kept: Vec<&str> = permitted.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(
-            kept,
-            vec!["web_search", "memory_add", "file_read"],
-            "the chat bots' own tools must keep working, and file_read is \
-             reachable once host access is on"
+    async fn channel_default_allows_fs_but_not_shell() {
+        use crate::tools::policy::{ResolvedPermission, ToolEntry};
+        let (calls, specs) = channel_gate_test_calls().await;
+        let cfg = crate::config::Config::parse_for_test(
+            "[anthropic]\napi_key = \"test\"\n[tools.fs]\nenabled = true\n[tools.shell]\nenabled = true\n",
         );
-
-        let name_of = |id: &str| {
-            calls
+        let profile = ResolvedPermission::resolve(
+            &cfg,
+            Origin::Channel {
+                session_profile: "default".into(),
+            },
+        );
+        let entries: Vec<_> = specs
+            .iter()
+            .map(|spec| ToolEntry::from_spec(spec, &cfg))
+            .collect();
+        let (permitted, refused) = partition_without_asking(&profile, &calls, &entries);
+        assert_eq!(
+            permitted
                 .iter()
-                .find(|c| c.id == id)
-                .map(|c| c.name.clone())
-                .unwrap()
-        };
-        let blocked: Vec<String> = refused.iter().map(|(id, _)| name_of(id)).collect();
-        assert_eq!(
-            blocked,
-            vec!["shell", "workspace_sync", "mcp__somewhere__do_thing"],
-            "Execute and Other must not be reachable over chat even with host \
-             access on — the switch does not override the risky bucket"
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            ["file_write", "web_search", "memory_add", "workspace_sync"]
         );
-
-        // Every refusal names its tool, so the model can say which call
-        // it lost and why.
-        for (id, reason) in &refused {
-            let name = name_of(id);
-            assert!(reason.contains(&name), "{reason} should name {name}");
-        }
-
-        // Every call is accounted for exactly once: the model is owed a
-        // tool_result for each tool_use, and a call lost here would make
-        // the next provider request fail rather than merely misbehave.
+        assert_eq!(
+            refused
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            ["c1", "c5"]
+        );
+        assert!(refused[0].1.contains("permission_profile.default.tools"));
+        assert!(refused[0].1.contains("[tools.shell].enabled"));
+        assert!(refused[1].1.contains("not available"));
         assert_eq!(permitted.len() + refused.len(), calls.len());
     }
 
-    /// The hole this permission work closes: with `host_access` **off**
-    /// (the default), `file_read` — like the other seven `HOST_TOOLS` —
-    /// is refused over chat too, not just `Execute`/`Other`. Before
-    /// this, `file_write`/`file_delete` (`Edit`/`Delete`) were reachable
-    /// from an unasked Discord message; `file_read` sits in the same
-    /// `HOST_TOOLS` list and is pinned here as the reachable proxy for
-    /// all of them. `shell`/`workspace_sync`/the MCP tool stay refused
-    /// for the unrelated, pre-existing reason (`Execute`/`Other`).
     #[tokio::test]
-    async fn the_channel_gate_also_refuses_host_tools_when_host_access_is_off() {
-        let (calls, kinds) = channel_gate_test_calls().await;
-
-        let (permitted, refused) =
-            partition_without_asking(Origin::Channel, &calls, &kinds, false, false, false);
-
-        let kept: Vec<&str> = permitted.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(
-            kept,
-            vec!["web_search", "memory_add"],
-            "only the non-host workspace tools survive with host access off"
+    async fn channel_default_refuses_disabled_fs_even_when_listed() {
+        use crate::tools::policy::{ResolvedPermission, ToolEntry};
+        let (calls, specs) = channel_gate_test_calls().await;
+        let cfg = crate::config::Config::parse_for_test("[anthropic]\napi_key = \"test\"\n");
+        let profile = ResolvedPermission::resolve(
+            &cfg,
+            Origin::Channel {
+                session_profile: "default".into(),
+            },
         );
-
-        let name_of = |id: &str| {
-            calls
+        let entries: Vec<_> = specs
+            .iter()
+            .map(|spec| ToolEntry::from_spec(spec, &cfg))
+            .collect();
+        let (permitted, refused) = partition_without_asking(&profile, &calls, &entries);
+        assert_eq!(
+            permitted
                 .iter()
-                .find(|c| c.id == id)
-                .map(|c| c.name.clone())
-                .unwrap()
-        };
-        let blocked: Vec<String> = refused.iter().map(|(id, _)| name_of(id)).collect();
-        assert_eq!(
-            blocked,
-            vec![
-                "shell",
-                "file_read",
-                "workspace_sync",
-                "mcp__somewhere__do_thing"
-            ],
-            "file_read joins the refusal list; shell and Other are still \
-             refused for their own, unrelated reason"
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            ["web_search", "memory_add", "workspace_sync"]
         );
-
-        for (id, reason) in &refused {
-            let name = name_of(id);
-            assert!(reason.contains(&name), "{reason} should name {name}");
-        }
-
+        assert!(
+            refused
+                .iter()
+                .any(|(id, reason)| id == "c0" && reason.contains("[tools.fs].enabled"))
+        );
         assert_eq!(permitted.len() + refused.len(), calls.len());
     }
 

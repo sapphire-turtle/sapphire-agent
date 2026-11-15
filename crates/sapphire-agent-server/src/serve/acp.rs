@@ -494,7 +494,10 @@ impl super::TurnHost for AcpProgress {
         } else {
             self.mode
         };
-        crate::tools::policy::Origin::Acp(mode)
+        crate::tools::policy::Origin::Acp {
+            mode,
+            session_profile: self.profile.clone(),
+        }
     }
 
     /// The client-side tools reach the editor through this. Built fresh
@@ -4894,7 +4897,9 @@ mod tests {
     /// allow, refused. The turn's own host keeps its snapshot.
     #[tokio::test]
     async fn a_detached_host_follows_a_later_set_mode() {
-        use crate::tools::policy::{Approval, Decision, Origin, SessionMode, decide};
+        use crate::tools::policy::{
+            Allow, Approval, Origin, ResolvedPermission, SessionMode, ToolEntry, allow,
+        };
         let state = ServeState::for_test(false);
         let live: LiveMode = Arc::new(std::sync::Mutex::new(SessionMode::Bypass));
         let outgoing =
@@ -4917,19 +4922,42 @@ mod tests {
                         Arc::clone(&state.acp_terminals),
                     );
                     let detached = progress.detached();
-                    assert_eq!(detached.origin(), Origin::Acp(SessionMode::Bypass));
+                    assert_eq!(
+                        detached.origin(),
+                        Origin::Acp {
+                            mode: SessionMode::Bypass,
+                            session_profile: "default".into()
+                        }
+                    );
 
                     // What `session/set_mode` does to the session's cell.
                     *live.lock().unwrap() = SessionMode::Default;
-                    assert_eq!(detached.origin(), Origin::Acp(SessionMode::Default));
+                    assert_eq!(
+                        detached.origin(),
+                        Origin::Acp {
+                            mode: SessionMode::Default,
+                            session_profile: "default".into()
+                        }
+                    );
                     assert_eq!(
                         progress.origin(),
-                        Origin::Acp(SessionMode::Bypass),
+                        Origin::Acp {
+                            mode: SessionMode::Bypass,
+                            session_profile: "default".into()
+                        },
                         "the running turn keeps the mode it started with"
                     );
                     assert_eq!(
-                        decide(detached.origin(), crate::tools::ToolKind::Execute),
-                        Decision::Ask
+                        allow(
+                            &ResolvedPermission::resolve(&state.config, detached.origin()),
+                            &ToolEntry {
+                                name: "risky".into(),
+                                kind: crate::tools::ToolKind::Execute,
+                                group: None,
+                                enabled: false
+                            },
+                        ),
+                        Allow::Ask
                     );
 
                     let refused = Arc::new(std::sync::Mutex::new(Vec::new()));
