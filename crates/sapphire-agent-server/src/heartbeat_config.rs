@@ -35,6 +35,9 @@ pub struct HeartbeatTaskMeta {
     pub schedule: String,
     #[serde(default)]
     pub room_id: Option<String>,
+    /// Session profile governing this task; room_id is only a delivery target.
+    #[serde(default)]
+    pub profile: Option<String>,
     /// The device that runs this task, by name or id, when the workspace
     /// is synced with other hosts. Without it the task runs where it can be
     /// delivered (see `placement::heartbeat_runner`).

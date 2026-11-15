@@ -198,6 +198,7 @@ impl Agent {
         task_name: &str,
         prompt: &str,
         room_id: &str,
+        profile: Option<&str>,
     ) -> anyhow::Result<()> {
         let content = format!("[Heartbeat: {task_name}]\n\n{prompt}");
         let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
@@ -212,7 +213,10 @@ impl Agent {
             attachment_owner: None,
             reply_to: None,
         };
-        Arc::clone(self).handle_message(incoming).await
+        let profile = profile.map(str::to_owned);
+        Arc::clone(self)
+            .handle_message_with_origin(incoming, profile)
+            .await
     }
 
     /// Handle channel messages until `shutdown` is cancelled.
@@ -549,6 +553,17 @@ impl Agent {
         self: Arc<Self>,
         incoming: crate::channel::IncomingMessage,
     ) -> anyhow::Result<()> {
+        self.handle_message_with_origin(incoming, None).await
+    }
+
+    async fn handle_message_with_origin(
+        self: Arc<Self>,
+        incoming: crate::channel::IncomingMessage,
+        unattended_profile: Option<String>,
+    ) -> anyhow::Result<()> {
+        let profile_name = unattended_profile
+            .clone()
+            .unwrap_or_else(|| self.config.session_profile_name(None, &incoming.room_id));
         info!("Message from {}: {}", incoming.sender, incoming.content);
 
         let key: ConversationKey = (incoming.room_id.clone(), incoming.thread_id.clone());
@@ -658,7 +673,14 @@ impl Agent {
             }
 
             // Check if context compression is needed
-            let provider = self.provider_for(&incoming.room_id);
+            let provider = if unattended_profile.is_some() {
+                self.config
+                    .profile_for_session(&profile_name)
+                    .map(|name| self.providers.for_profile(&self.config, name))
+                    .unwrap_or_else(|| self.providers.default_provider())
+            } else {
+                self.provider_for(&incoming.room_id)
+            };
             let messages = match maybe_compress(
                 &*provider,
                 system_with_context.as_deref(),
@@ -782,7 +804,7 @@ impl Agent {
                     let tools = self.tools.clone();
                     let ns = self
                         .config
-                        .namespace_for_session(&incoming.room_id)
+                        .namespace_for_session_profile(&profile_name)
                         .to_string();
                     let room_id_for_timer = incoming.room_id.clone();
                     // Permission gate for the channel path.
@@ -817,10 +839,14 @@ impl Agent {
                         .collect();
                     let profile = crate::tools::policy::ResolvedPermission::resolve(
                         &self.config,
-                        crate::tools::policy::Origin::Channel {
-                            session_profile: self
-                                .config
-                                .session_profile_name(None, &incoming.room_id),
+                        if unattended_profile.is_some() {
+                            crate::tools::policy::Origin::Unattended {
+                                session_profile: profile_name.clone(),
+                            }
+                        } else {
+                            crate::tools::policy::Origin::Channel {
+                                session_profile: profile_name.clone(),
+                            }
                         },
                     );
                     let entries: Vec<_> = tool_specs
@@ -844,6 +870,7 @@ impl Agent {
                         let tools = Arc::clone(tools.as_ref().expect("offered tool set"));
                         let ns = ns.clone();
                         let owner = incoming.attachment_owner.clone();
+                        let session_profile = profile_name.clone();
                         let origin = crate::timer::TimerOrigin::Chat {
                             room_id: room_id_for_timer.clone(),
                         };
@@ -852,17 +879,20 @@ impl Agent {
                                 owner,
                                 crate::tools::workspace_tools::scope_memory_namespace(
                                     ns,
-                                    crate::timer::scope_timer_origin(origin, async move {
-                                        info!("Executing tool: {} (id={})", call.name, call.id);
-                                        let output = tools.execute(&call).await;
-                                        info!(
-                                            "Tool {} result ({} image(s) attached): {}",
-                                            call.name,
-                                            output.images.len(),
-                                            output.text
-                                        );
-                                        (call.id, output)
-                                    }),
+                                    crate::tools::config_tools::scope_session_profile(
+                                        Some(session_profile),
+                                        crate::timer::scope_timer_origin(origin, async move {
+                                            info!("Executing tool: {} (id={})", call.name, call.id);
+                                            let output = tools.execute(&call).await;
+                                            info!(
+                                                "Tool {} result ({} image(s) attached): {}",
+                                                call.name,
+                                                output.images.len(),
+                                                output.text
+                                            );
+                                            (call.id, output)
+                                        }),
+                                    ),
                                 ),
                             ),
                         ));
@@ -1809,6 +1839,7 @@ api_key = "test"
                 "test",
                 "owner platform=matrix room_id=test-room; save",
                 "test-room",
+                None,
             )
             .await
             .unwrap();

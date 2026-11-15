@@ -270,13 +270,13 @@ impl AutonomousLoop {
     }
 
     /// Which row of the permission table this loop's turns are judged by.
-    fn origin(&self) -> crate::tools::policy::Origin {
+    fn origin(&self, task: &AutonomousTask) -> crate::tools::policy::Origin {
         match self.state.config.autonomous.origin {
             AutonomousOrigin::Channel => crate::tools::policy::Origin::Channel {
-                session_profile: "default".into(),
+                session_profile: task.profile.clone().unwrap_or_else(|| "default".into()),
             },
             AutonomousOrigin::Trusted => crate::tools::policy::Origin::Unattended {
-                session_profile: "default".into(),
+                session_profile: task.profile.clone().unwrap_or_else(|| "default".into()),
             },
         }
     }
@@ -385,7 +385,9 @@ impl AutonomousLoop {
         store: &Arc<SessionStore>,
         resume: Option<String>,
     ) -> anyhow::Result<()> {
-        let namespace = DEFAULT_NAMESPACE_NAME;
+        let namespace = self.state.config.namespace_for_session_profile(
+            task.profile.as_deref().unwrap_or(DEFAULT_NAMESPACE_NAME),
+        );
         // Only a fresh session gets the body; a resumed one already has it.
         let mut send_body = resume.is_none();
         let (session_id, mut turns) = match resume {
@@ -439,7 +441,7 @@ impl AutonomousLoop {
                 session_id.clone(),
                 ChatMessage::user(text),
                 Arc::new(AutonomousHost {
-                    origin: self.origin(),
+                    origin: self.origin(task),
                     consult: Some(ConsultIdentity {
                         task: task.name.clone(),
                         owner_session: session_id.clone(),
@@ -548,6 +550,7 @@ mod tests {
     fn task(name: &str) -> AutonomousTask {
         AutonomousTask {
             name: name.to_string(),
+            profile: None,
             enabled: true,
             priority: 100,
             cooldown_days: 0,

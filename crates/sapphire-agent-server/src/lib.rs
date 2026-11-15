@@ -401,6 +401,25 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
         // config it would refuse is one it serves without below.
         .and_then(|loaded| {
             if serving {
+                let errors = loaded.config.validate_task_profiles(
+                    &heartbeat_config::load_heartbeat_dir(&loaded.workspace_dir.join("heartbeat")),
+                    &autonomous_config::load_autonomous_dir(
+                        &loaded.workspace_dir.join("autonomous"),
+                    ),
+                );
+                if !errors.is_empty() {
+                    anyhow::bail!(
+                        "invalid task session profile references:\n  - {}",
+                        errors.join("\n  - ")
+                    );
+                }
+                let errors = loaded.config.validate_session_profiles();
+                if !errors.is_empty() {
+                    anyhow::bail!(
+                        "invalid session profile references:\n  - {}",
+                        errors.join("\n  - ")
+                    );
+                }
                 ProviderRegistry::from_config(&loaded.config)
                     .context("Failed to build provider registry")?;
             }
@@ -1484,6 +1503,10 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
         }
         Mode::Verify => {
             let mut profile_errors = config.validate_session_profiles();
+            profile_errors.extend(config.validate_task_profiles(
+                &heartbeat_config::load_heartbeat_dir(&workspace_dir.join("heartbeat")),
+                &autonomous_config::load_autonomous_dir(&workspace_dir.join("autonomous")),
+            ));
             // `serve` refuses to start on what only the registry can see —
             // a profile naming `anthropic` with no API key, or no key and no
             // `[profiles.default]` — so `verify` builds it too.
@@ -2009,6 +2032,64 @@ fn migrate_pre_namespace_layout(workspace_dir: &std::path::Path) -> anyhow::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R1: a heartbeat/autonomous task names the profile that governs its run. An
+    /// unknown one is a startup error, same shape as a subagent definition's.
+    #[test]
+    fn a_task_frontmatter_names_its_session_profile() {
+        let raw = "---\nschedule: \"0 8 * * *\"\nroom_id: \"!a:srv\"\nprofile: \"ops\"\nenabled: true\n---\n\n# Morning Call\n";
+        let (_dir, root, _ws) = tools::config_tools::test_workspace();
+        std::fs::write(root.join("heartbeat/morning_call.md"), raw).unwrap();
+        let tasks = crate::heartbeat_config::load_heartbeat_dir(&root.join("heartbeat"));
+        assert_eq!(tasks[0].meta.profile.as_deref(), Some("ops"));
+        assert_eq!(
+            tasks[0].meta.room_id.as_deref(),
+            Some("!a:srv"),
+            "room_id keeps parsing: delivery-only"
+        );
+        let cfg = config::Config::parse_for_test("[anthropic]\napi_key = \"test\"\n");
+        let errors = cfg.validate_task_profiles(&tasks, &[]);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("'ops'") && e.contains("session_profile")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn task_profiles_validate_every_explicit_and_implicit_name() {
+        let (_dir, root, _ws) = tools::config_tools::test_workspace();
+        std::fs::write(
+            root.join("heartbeat/a.md"),
+            "---\nschedule: '0 8 * * *'\n---\nA\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("autonomous/b.md"), "---\nprofile: ops\n---\nB\n").unwrap();
+        std::fs::write(
+            root.join("autonomous/c.md"),
+            "---\nprofile: missing\n---\nC\n",
+        )
+        .unwrap();
+        let heartbeat = heartbeat_config::load_heartbeat_dir(&root.join("heartbeat"));
+        let autonomous = autonomous_config::load_autonomous_dir(&root.join("autonomous"));
+        assert_eq!(autonomous[0].profile.as_deref(), Some("ops"));
+        let cfg = config::Config::parse_for_test(
+            "[anthropic]\napi_key='test'\n[profiles.dev]\nprovider='anthropic'\n[session_profile.ops]\nprofile='dev'\n",
+        );
+        let errors = cfg.validate_task_profiles(&heartbeat, &autonomous);
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("heartbeat") && e.contains("'default'"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("autonomous") && e.contains("'missing'"))
+        );
+    }
 
     fn consult_config(extra: &str) -> config::Config {
         config::Config::parse_for_test(&format!("[anthropic]\napi_key = \"t\"\n{extra}"))

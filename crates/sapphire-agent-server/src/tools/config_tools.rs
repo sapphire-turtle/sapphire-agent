@@ -200,9 +200,9 @@ pub fn current_permission_profile() -> Option<String> {
 pub(crate) fn current_session_profile_for(config: &Config) -> Option<String> {
     match crate::timer::current_origin() {
         Some(crate::timer::TimerOrigin::Chat { room_id }) => {
-            Some(config.session_profile_name(None, &room_id))
+            current_session_profile().or_else(|| Some(config.session_profile_name(None, &room_id)))
         }
-        Some(crate::timer::TimerOrigin::Voice { .. }) => None,
+        Some(crate::timer::TimerOrigin::Voice { .. }) => current_session_profile(),
         None => current_session_profile(),
     }
 }
@@ -743,13 +743,13 @@ impl TaskTestTool {
 
     /// The permission row this run's turns are judged by — production's
     /// own, from `[autonomous] origin`.
-    fn origin(&self) -> crate::tools::policy::Origin {
+    fn origin(&self, profile: Option<&str>) -> crate::tools::policy::Origin {
         match self.state.config.autonomous.origin {
             crate::config::AutonomousOrigin::Channel => crate::tools::policy::Origin::Channel {
-                session_profile: "default".into(),
+                session_profile: profile.unwrap_or("default").into(),
             },
             crate::config::AutonomousOrigin::Trusted => crate::tools::policy::Origin::Unattended {
-                session_profile: "default".into(),
+                session_profile: profile.unwrap_or("default").into(),
             },
         }
     }
@@ -808,13 +808,13 @@ impl TaskTestTool {
     }
 
     /// One turn, run exactly as production runs it.
-    async fn turn(&self, session_id: &str, text: String) -> LlmTurnOutcome {
+    async fn turn(&self, session_id: &str, text: String, profile: Option<&str>) -> LlmTurnOutcome {
         crate::serve::run_llm_turn(
             Arc::clone(&self.state),
             session_id.to_string(),
             ChatMessage::user(text),
             Arc::new(AutonomousHost {
-                origin: self.origin(),
+                origin: self.origin(profile),
                 consult: None,
             }),
             None,
@@ -869,7 +869,9 @@ impl TaskTestTool {
         let session_id = self.open_session("heartbeat", name)?;
         // The same prefix `Heartbeat::fire_task` puts in front of the body.
         let text = format!("[Heartbeat: {name}]\n\n{}", task.body);
-        let outcome = self.turn(&session_id, text).await;
+        let outcome = self
+            .turn(&session_id, text, task.meta.profile.as_deref())
+            .await;
         self.finish(
             "heartbeat",
             name,
@@ -905,7 +907,7 @@ impl TaskTestTool {
             } else {
                 format!("{}\n{CONTINUE_PROMPT}", marker(name))
             };
-            let outcome = self.turn(&session_id, text).await;
+            let outcome = self.turn(&session_id, text, task.profile.as_deref()).await;
             turns += 1;
             stop = outcome.stop;
             // Kept even when this turn produced no answer, so a run whose

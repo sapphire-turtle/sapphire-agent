@@ -1847,6 +1847,29 @@ api_key = "test"
             .collect()
     }
 
+    /// Validate each unattended task's declared (or implicit default) session profile.
+    pub fn validate_task_profiles(
+        &self,
+        heartbeat: &[crate::heartbeat_config::HeartbeatTask],
+        autonomous: &[crate::autonomous_config::AutonomousTask],
+    ) -> Vec<String> {
+        heartbeat
+            .iter()
+            .map(|t| ("heartbeat", t.name.as_str(), t.meta.profile.as_deref()))
+            .chain(
+                autonomous
+                    .iter()
+                    .map(|t| ("autonomous", t.name.as_str(), t.profile.as_deref())),
+            )
+            .filter_map(|(kind, task, declared)| {
+                let name = declared.unwrap_or(DEFAULT_PROFILE_NAME);
+                (!self.session_profile_defined(name)).then(|| {
+                    format!("{kind} task '{task}' references unknown session_profile '{name}'")
+                })
+            })
+            .collect()
+    }
+
     /// Settings that were removed when device-based auth landed.
     ///
     /// Reported as a hard error at start-up rather than ignored, following the

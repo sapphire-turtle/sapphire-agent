@@ -1722,6 +1722,7 @@ pub(crate) async fn push_voice_text_to_subscriber(
     device_id: String,
     task_name: Option<String>,
     user_text: String,
+    task_profile: Option<String>,
 ) -> Result<(), VoicePushError> {
     // Look up the active subscription up front — if the satellite is
     // offline, surface that without burning an LLM call. The map also
@@ -1793,7 +1794,13 @@ pub(crate) async fn push_voice_text_to_subscriber(
         Arc::clone(&state),
         session_id.clone(),
         injected_msg,
-        Arc::new(NullProgress),
+        match task_profile {
+            Some(session_profile) => Arc::new(AutonomousHost {
+                origin: crate::tools::policy::Origin::Unattended { session_profile },
+                consult: None,
+            }),
+            None => Arc::new(NullProgress),
+        },
         Some(crate::timer::TimerOrigin::Voice {
             device_id: device_id.clone(),
         }),
@@ -1980,6 +1987,11 @@ pub(crate) trait TurnHost: Send + Sync {
         }
     }
 
+    /// Override the session pin for this turn without changing a shared voice session.
+    fn session_profile_override(&self) -> Option<String> {
+        None
+    }
+
     /// The editor on the other end, when there is one.
     ///
     /// `None` by default: `/rpc`, `/a2a`, Matrix, Discord and the voice
@@ -2156,6 +2168,16 @@ impl TurnHost for DetachedHost {
 
     fn consult_identity(&self) -> Option<ConsultIdentity> {
         self.consult.clone()
+    }
+
+    fn session_profile_override(&self) -> Option<String> {
+        match &self.origin {
+            crate::tools::policy::Origin::Unattended { session_profile }
+            | crate::tools::policy::Origin::Channel { session_profile }
+            | crate::tools::policy::Origin::Acp {
+                session_profile, ..
+            } => Some(session_profile.clone()),
+        }
     }
 }
 
@@ -3204,22 +3226,18 @@ pub(crate) async fn run_llm_turn(
         state.pin_session_profile(&session_id, None, room_id).await;
     }
     let is_acp = state.is_acp(&session_id).await;
-    // The room profile this turn's admin-tool grant hangs on. An ACP session
-    // carries the one its bearer token pinned at `session/new` (or
-    // `load`/`resume`); `/rpc`, A2A, voice and the unattended loops name no
-    // profile an operator declared, so they get `None` and the admin tools
-    // refuse there. Channel rooms never reach this function — `Agent::
-    // handle_message` runs its own loop, where the room travels as
-    // `TimerOrigin::Chat` instead.
-    let session_profile = if is_acp {
-        state
+    // Task frontmatter overrides the session pin for this turn only. Voice
+    // sessions keep their subscriber pin for subsequent interactive turns.
+    let task_profile = progress.session_profile_override();
+    let session_profile = match &task_profile {
+        Some(name) => Some(name.clone()),
+        None if is_acp => state
             .session_profiles
             .lock()
             .await
             .get(&session_id)
-            .cloned()
-    } else {
-        None
+            .cloned(),
+        None => None,
     };
 
     // 1. Hydrate history fresh from storage every turn, rather than only
@@ -3265,14 +3283,27 @@ pub(crate) async fn run_llm_turn(
 
     // 2. Resolve provider once per turn — sessions can pin a profile at
     //    initialize-time; absent that, the background provider is used.
-    let provider = state.provider_for_session(&session_id).await;
+    let provider = match task_profile.as_deref() {
+        Some(name) => state
+            .config
+            .profile_for_session(name)
+            .map(|profile| state.registry.for_profile(&state.config, profile))
+            .unwrap_or_else(|| state.registry.default_provider()),
+        None => state.provider_for_session(&session_id).await,
+    };
 
     // 2a. Namespace chain follows the session's pinned session_profile when
     //     set; otherwise the implicit default namespace. Resolved here
     //     so it can be recorded in the session metadata on first chat
     //     (used by the daily-log builder to route NSFW sessions away
     //     from default-namespace rooms).
-    let namespace = match state.session_profiles.lock().await.get(&session_id) {
+    let pinned_profile = state
+        .session_profiles
+        .lock()
+        .await
+        .get(&session_id)
+        .cloned();
+    let namespace = match task_profile.as_ref().or(pinned_profile.as_ref()) {
         Some(rp_name) => state
             .config
             .namespace_for_session_profile(rp_name)

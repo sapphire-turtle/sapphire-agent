@@ -19,6 +19,8 @@ use tracing::warn;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AutonomousTaskMeta {
+    #[serde(default)]
+    profile: Option<String>,
     #[serde(default = "default_true")]
     enabled: bool,
     /// Lower runs first. Default 100, so an un-tuned task queues behind
@@ -51,6 +53,7 @@ fn default_max_turns() -> usize {
 pub struct AutonomousTask {
     /// The file stem, which is also the session's `room_id`.
     pub name: String,
+    pub profile: Option<String>,
     pub enabled: bool,
     pub priority: i64,
     pub cooldown_days: u32,
@@ -114,6 +117,7 @@ fn parse_task(name: String, raw: &str) -> Option<AutonomousTask> {
     }
     Some(AutonomousTask {
         name,
+        profile: meta.profile,
         enabled: meta.enabled,
         priority: meta.priority,
         cooldown_days: meta.cooldown_days,
