@@ -2534,6 +2534,37 @@ profile = "chat"
     }
 
     #[test]
+    fn tasks_resolving_to_an_undefined_default_fail_startup() {
+        let cfg = Config::parse_for_test(
+            "[anthropic]\napi_key = 't'\n[profiles.dev]\nprovider = 'anthropic'\n[session_profile.ops]\nprofile = 'dev'\n",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let heartbeat_dir = dir.path().join("heartbeat");
+        let autonomous_dir = dir.path().join("autonomous");
+        std::fs::create_dir_all(&heartbeat_dir).unwrap();
+        std::fs::create_dir_all(&autonomous_dir).unwrap();
+        std::fs::write(
+            heartbeat_dir.join("morning.md"),
+            "---\nschedule: '0 8 * * *'\n---\nHello\n",
+        )
+        .unwrap();
+        std::fs::write(autonomous_dir.join("journal.md"), "---\n---\nWrite\n").unwrap();
+        let heartbeat = crate::heartbeat_config::load_heartbeat_dir(&heartbeat_dir);
+        let autonomous = crate::autonomous_config::load_autonomous_dir(&autonomous_dir);
+        assert_eq!(heartbeat.len(), 1);
+        assert_eq!(autonomous.len(), 1);
+        assert!(!cfg.session_profile_defined(DEFAULT_PROFILE_NAME));
+        let errors = cfg.validate_task_profiles(&heartbeat, &autonomous);
+        assert_eq!(
+            errors,
+            vec![
+                "heartbeat task 'morning' references unknown session_profile 'default'",
+                "autonomous task 'journal' references unknown session_profile 'default'",
+            ]
+        );
+    }
+
+    #[test]
     fn migration_leftovers_are_named_and_stop_startup() {
         let cfg = Config::parse_for_test(
             "[anthropic]\napi_key = \"test\"\n\n[room_profile.ops]\nprofile = \"dev\"\nrooms = [\"!ops:x\"]\n",

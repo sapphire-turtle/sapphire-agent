@@ -160,12 +160,16 @@ impl ProviderRegistry {
     /// wrapped in a `FallbackProvider` so refusals or errors transparently
     /// retry on the secondary.
     pub fn for_room(&self, config: &Config, room_id: &str) -> Arc<dyn Provider> {
-        let Some(profile_name) =
-            config.profile_for_session(&config.session_profile_name(None, room_id))
-        else {
-            return self.default_provider();
-        };
-        self.for_profile(config, profile_name)
+        self.for_session_profile(config, &config.session_profile_name(None, room_id))
+    }
+
+    /// Resolve a session profile through its LLM profile, with the same
+    /// fallback order used for rooms (including `[profiles.default]`).
+    pub fn for_session_profile(&self, config: &Config, session_profile: &str) -> Arc<dyn Provider> {
+        match config.profile_for_session(session_profile) {
+            Some(profile_name) => self.for_profile(config, profile_name),
+            None => self.default_provider(),
+        }
     }
 
     /// Resolve the provider for a named profile, honouring its primary +
@@ -250,6 +254,19 @@ fn resolve_profile(
 /// configured).
 #[cfg(test)]
 impl ProviderRegistry {
+    pub(crate) fn for_test_distinct(
+        providers: &[(&str, Arc<dyn Provider>)],
+        default: Arc<dyn Provider>,
+    ) -> Self {
+        Self {
+            providers: providers
+                .iter()
+                .map(|(name, provider)| ((*name).to_string(), Arc::clone(provider)))
+                .collect(),
+            default,
+        }
+    }
+
     pub(crate) fn for_test(names: &[&str], provider: Arc<dyn Provider>) -> Self {
         let mut providers: HashMap<String, Arc<dyn Provider>> = HashMap::new();
         for name in names {
@@ -567,6 +584,66 @@ api_key = "test"
             Arc::ptr_eq(&raw_anthropic, &bg),
             "without [profiles.background], background should be plain anthropic"
         );
+    }
+
+    #[test]
+    fn for_session_profile_uses_the_same_routing_and_fallbacks_as_rooms() {
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+[providers.local]
+type = "openai_compatible"
+base_url = "http://127.0.0.1:8080/v1"
+model = "qwen"
+[profiles.default]
+provider = "local"
+[profiles.ops]
+provider = "anthropic"
+fallback_provider = "local"
+[session_profile.ops]
+profile = "ops"
+[discord]
+bot_token = "t"
+[[discord.rooms]]
+room_id = "ops-room"
+profile = "ops"
+[[discord.rooms]]
+room_id = "other-room"
+profile = "unknown"
+"#,
+        );
+        // Deliberately exercise the defensive unknown-session fallback without
+        // asking the startup validator to accept an invalid room binding.
+        let mut valid = cfg.clone();
+        valid.discord.as_mut().unwrap().rooms.pop();
+        let reg = ProviderRegistry::from_config(&valid).unwrap();
+        let ops = reg.for_session_profile(&cfg, "ops");
+        assert_eq!(ops.name(), reg.for_room(&cfg, "ops-room").name());
+        assert!(
+            !Arc::ptr_eq(&ops, &reg.get(ANTHROPIC_PROVIDER_NAME).unwrap()),
+            "fallback wrapper must be preserved"
+        );
+        assert_eq!(reg.for_session_profile(&cfg, "unknown").name(), "local");
+        assert_eq!(
+            reg.for_session_profile(&cfg, "unknown").name(),
+            reg.for_room(&cfg, "other-room").name()
+        );
+
+        let bare = parse("[anthropic]\napi_key = 'test'\n");
+        let bare_reg = ProviderRegistry::from_config(&bare).unwrap();
+        assert_eq!(
+            bare_reg.for_session_profile(&bare, "unknown").name(),
+            bare_reg.default_provider().name()
+        );
+
+        // A stale mapping to a missing provider falls back defensively too.
+        let mut stale = cfg.clone();
+        stale.profiles.get_mut("ops").unwrap().provider = "missing".into();
+        assert!(Arc::ptr_eq(
+            &reg.for_session_profile(&stale, "ops"),
+            &reg.default_provider()
+        ));
     }
 
     #[test]

@@ -33,7 +33,7 @@
 
 use crate::autonomous_config::{AutonomousTask, load_autonomous_dir};
 use crate::background::BackgroundTasks;
-use crate::config::{AutonomousOrigin, DEFAULT_NAMESPACE_NAME};
+use crate::config::{AutonomousOrigin, DEFAULT_PROFILE_NAME};
 use crate::provider::{ChatMessage, ContentPart, Role};
 use crate::serve::{AutonomousHost, ConsultIdentity, ServeState};
 use crate::session::{SessionRow, SessionStore};
@@ -385,9 +385,11 @@ impl AutonomousLoop {
         store: &Arc<SessionStore>,
         resume: Option<String>,
     ) -> anyhow::Result<()> {
-        let namespace = self.state.config.namespace_for_session_profile(
-            task.profile.as_deref().unwrap_or(DEFAULT_NAMESPACE_NAME),
-        );
+        let profile_name = task.profile.as_deref().unwrap_or(DEFAULT_PROFILE_NAME);
+        let namespace = self
+            .state
+            .config
+            .namespace_for_session_profile(profile_name);
         // Only a fresh session gets the body; a resumed one already has it.
         let mut send_body = resume.is_none();
         let (session_id, mut turns) = match resume {
@@ -557,6 +559,56 @@ mod tests {
             max_turns: 1,
             body: "Do the thing.\n".to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn session_namespace_comes_from_the_resolved_task_profile() {
+        let mut state = crate::serve::ServeState::for_test_scripted(
+            false,
+            vec![response("ok"), response("ok")],
+        );
+        let cfg = &mut Arc::get_mut(&mut state).unwrap().config;
+        cfg.session_profiles.insert(
+            "default".into(),
+            crate::config::SessionProfileConfig {
+                profile: "default".into(),
+                memory_namespace: Some("implicit_ns".into()),
+                ..Default::default()
+            },
+        );
+        cfg.session_profiles.insert(
+            "ops".into(),
+            crate::config::SessionProfileConfig {
+                profile: "default".into(),
+                memory_namespace: Some("ops_ns".into()),
+                ..Default::default()
+            },
+        );
+        let store = Arc::clone(&state.autonomous_session_store);
+        let mut lp = AutonomousLoop::new(Arc::clone(&state), None);
+        lp.run_task(&task("implicit"), &store, None).await.unwrap();
+        let mut explicit = task("explicit");
+        explicit.profile = Some("ops".into());
+        lp.run_task(&explicit, &store, None).await.unwrap();
+        let rows = store.session_rows();
+        assert_eq!(
+            rows.iter()
+                .find(|r| r.meta.room_id == "implicit")
+                .unwrap()
+                .meta
+                .namespace
+                .as_deref(),
+            Some("implicit_ns")
+        );
+        assert_eq!(
+            rows.iter()
+                .find(|r| r.meta.room_id == "explicit")
+                .unwrap()
+                .meta
+                .namespace
+                .as_deref(),
+            Some("ops_ns")
+        );
     }
 
     /// The whole idle rule: the newest activity in any *other* store.

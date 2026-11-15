@@ -674,10 +674,8 @@ impl Agent {
 
             // Check if context compression is needed
             let provider = if unattended_profile.is_some() {
-                self.config
-                    .profile_for_session(&profile_name)
-                    .map(|name| self.providers.for_profile(&self.config, name))
-                    .unwrap_or_else(|| self.providers.default_provider())
+                self.providers
+                    .for_session_profile(&self.config, &profile_name)
             } else {
                 self.provider_for(&incoming.room_id)
             };
@@ -870,7 +868,8 @@ impl Agent {
                         let tools = Arc::clone(tools.as_ref().expect("offered tool set"));
                         let ns = ns.clone();
                         let owner = incoming.attachment_owner.clone();
-                        let session_profile = profile_name.clone();
+                        let session_profile =
+                            unattended_profile.as_ref().map(|_| profile_name.clone());
                         let origin = crate::timer::TimerOrigin::Chat {
                             room_id: room_id_for_timer.clone(),
                         };
@@ -880,7 +879,7 @@ impl Agent {
                                 crate::tools::workspace_tools::scope_memory_namespace(
                                     ns,
                                     crate::tools::config_tools::scope_session_profile(
-                                        Some(session_profile),
+                                        session_profile,
                                         crate::timer::scope_timer_origin(origin, async move {
                                             info!("Executing tool: {} (id={})", call.name, call.id);
                                             let output = tools.execute(&call).await;
@@ -1347,6 +1346,136 @@ api_key = "test"
             attachment_owner: None,
             reply_to: None,
         }
+    }
+
+    /// Observe both the raw scope and the config-tool lookup on the real
+    /// channel tool execution path, including the spawned task boundary.
+    struct ProfileScopeProbe {
+        spec: crate::provider::ToolSpec,
+        config: crate::config::Config,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for ProfileScopeProbe {
+        fn spec(&self) -> &crate::provider::ToolSpec {
+            &self.spec
+        }
+
+        async fn execute(&self, _: &serde_json::Value) -> anyhow::Result<String> {
+            Ok(format!(
+                "scope={:?}; resolved={:?}",
+                crate::tools::config_tools::current_session_profile(),
+                crate::tools::config_tools::current_session_profile_for(&self.config)
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn channel_and_heartbeat_scope_only_the_unattended_profile() {
+        let config = crate::config::Config::parse_for_test(
+            "[anthropic]\napi_key='test'\n[discord]\nbot_token='t'\n[[discord.rooms]]\nroom_id='test-room'\nprofile='room'\n",
+        );
+        let tools = Arc::new(crate::tools::ToolSet::new(
+            vec![Box::new(ProfileScopeProbe {
+                spec: crate::provider::ToolSpec {
+                    kind: crate::tools::ToolKind::Read,
+                    group: None,
+                    name: "profile_scope_probe".into(),
+                    description: "Observe profile scope".into(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                },
+                config: config.clone(),
+            })],
+            vec![],
+            &config,
+        ));
+        let script = || {
+            vec![
+                attachment_call("profile_scope_probe", serde_json::json!({})),
+                crate::provider::ChatResponse {
+                    text: Some("done".into()),
+                    tool_calls: vec![],
+                    prompt_usage: None,
+                    stop_reason: None,
+                },
+            ]
+        };
+        let ((agent, _, _), log) =
+            build_test_agent_with_tools(script(), false, Some((config.clone(), tools.clone())));
+        agent.handle_message(incoming("ordinary")).await.unwrap();
+        assert_eq!(
+            result_for(&log, "profile_scope_probe"),
+            "scope=None; resolved=Some(\"room\")"
+        );
+
+        let ((agent, _, _), log) =
+            build_test_agent_with_tools(script(), false, Some((config, tools)));
+        agent
+            .trigger("task", "heartbeat", "test-room", Some("task"))
+            .await
+            .unwrap();
+        assert_eq!(
+            result_for(&log, "profile_scope_probe"),
+            "scope=Some(\"task\"); resolved=Some(\"task\")"
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_chat_uses_the_rooms_registry_fallback_order() {
+        let config = crate::config::Config::parse_for_test(
+            "[anthropic]\napi_key='test'\n[profiles.default]\nprovider='local'\n[discord]\nbot_token='t'\n[[discord.rooms]]\nroom_id='test-room'\nprofile='missing'\n",
+        );
+        let reply = || crate::provider::ChatResponse {
+            text: Some("done".into()),
+            tool_calls: vec![],
+            prompt_usage: None,
+            stop_reason: None,
+        };
+        let anth = crate::serve::StubProvider::new(vec![reply(), reply()]);
+        let local = crate::serve::StubProvider::new(vec![reply(), reply()]);
+        let anth_log = anth.call_log();
+        let local_log = local.call_log();
+        let anth = Arc::new(anth) as Arc<dyn crate::provider::Provider>;
+        let local = Arc::new(local) as Arc<dyn crate::provider::Provider>;
+        let registry = crate::provider::registry::ProviderRegistry::for_test_distinct(
+            &[("anthropic", Arc::clone(&anth)), ("local", local)],
+            anth,
+        );
+        let ((agent, _, _), _) = build_test_agent_with_tools(
+            vec![],
+            false,
+            Some((
+                config,
+                Arc::new(crate::tools::ToolSet::new(
+                    vec![],
+                    vec![],
+                    &crate::config::Config::for_test(),
+                )),
+            )),
+        );
+        let mut agent = Arc::try_unwrap(agent)
+            .ok()
+            .expect("test agent has one owner");
+        agent.providers = Arc::new(registry);
+        let agent = Arc::new(agent);
+        agent
+            .clone()
+            .handle_message(incoming("ordinary"))
+            .await
+            .unwrap();
+        agent
+            .trigger("task", "heartbeat", "test-room", Some("missing"))
+            .await
+            .unwrap();
+        assert_eq!(
+            local_log.calls().len(),
+            2,
+            "both turns route through [profiles.default]"
+        );
+        assert!(
+            anth_log.calls().is_empty(),
+            "the registry default is not the session-profile fallback"
+        );
     }
 
     fn attachment_owner() -> crate::attachment_store::AttachmentOwner {

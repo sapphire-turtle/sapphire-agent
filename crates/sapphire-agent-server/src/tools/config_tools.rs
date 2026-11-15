@@ -165,11 +165,10 @@ pub(crate) fn scope_session_profile<F: std::future::Future>(
 }
 
 /// The session profile scoped around the tool call currently executing, if the
-/// turn came in on a transport that pins one — today only ACP.
+/// turn pins one, including ACP and unattended tasks.
 ///
-/// `None` outside `scope_session_profile` and `None` for a `/rpc`, A2A or
-/// unattended turn, which pins no profile. The two are the same answer on
-/// purpose: neither is a place an operator declared.
+/// `None` outside `scope_session_profile` and for an unpinned turn such as
+/// `/rpc`, A2A, or ordinary channel traffic.
 pub(crate) fn current_session_profile() -> Option<String> {
     SESSION_PROFILE_TL.try_with(Clone::clone).ok().flatten()
 }
@@ -190,13 +189,11 @@ pub fn current_permission_profile() -> Option<String> {
 /// The session profile this call's admin grant is judged by, or `None` when the
 /// transport names no profile an operator could have allowed.
 ///
-/// A channel turn (`Agent::handle_message`, and the heartbeat's chat leg
-/// through it) carries `TimerOrigin::Chat`, so its room resolves to a profile
-/// exactly as its provider does — the grant follows the room, which is why a
-/// heartbeat fired *into* a listed room can call these tools with nobody
-/// present. Voice is a device, not a room or an editor. With no timer origin
-/// the turn is on the serve path: an ACP turn scopes the profile its bearer
-/// token pinned, while `/rpc`, A2A and the unattended loops scope nothing.
+/// An ordinary channel turn carries `TimerOrigin::Chat` without a scoped
+/// profile, so its grant follows the room. A heartbeat's chat leg scopes the
+/// task profile, which takes precedence over its delivery room. Voice is a
+/// device, not a room or an editor. On the serve path, ACP and unattended
+/// turns scope their pinned profile; `/rpc` and A2A scope none.
 pub(crate) fn current_session_profile_for(config: &Config) -> Option<String> {
     match crate::timer::current_origin() {
         Some(crate::timer::TimerOrigin::Chat { room_id }) => {
