@@ -4498,7 +4498,10 @@ mod tests {
                                 name: "gate_probe".into(),
                                 input: json!({}),
                             },
-                        ],
+                        ]
+                        .into_iter()
+                        .filter(|call| runs || call.name != "gate_probe")
+                        .collect(),
                     },
                     final_round("done"),
                 ],
@@ -4536,17 +4539,228 @@ mod tests {
                 None,
             )
             .await;
-            assert_eq!(probe.seen(), Some(("ops".into(), permission.into())));
             assert_eq!(root.join("notes/x.md").exists(), runs);
             if runs {
+                assert_eq!(probe.seen(), Some(("ops".into(), permission.into())));
                 assert_eq!(
                     std::fs::read_to_string(root.join("notes/x.md")).unwrap(),
                     "written"
                 );
             } else {
+                assert_eq!(
+                    probe.seen(),
+                    None,
+                    "the refused call never reached execution"
+                );
                 assert!(state.acp_session_store.history_for_model(&sid).unwrap().iter().flat_map(|m| &m.parts).any(|p| matches!(p, ContentPart::ToolResult { content, .. } if content.contains("permission_profile.chat.tools"))));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn an_unroutable_name_and_an_unregistered_name_are_both_not_offered() {
+        let state = ServeState::for_test_scripted(
+            false,
+            vec![
+                crate::provider::ChatResponse {
+                    prompt_usage: None,
+                    text: None,
+                    tool_calls: vec![
+                        crate::provider::ToolCall {
+                            id: "unroutable".into(),
+                            name: "shell_start".into(),
+                            input: json!({}),
+                        },
+                        crate::provider::ToolCall {
+                            id: "unregistered".into(),
+                            name: "not_registered_here".into(),
+                            input: json!({}),
+                        },
+                    ],
+                    stop_reason: None,
+                },
+                final_round("done"),
+            ],
+        );
+        let unroutable = RiskyTool::new();
+        let ran = unroutable.ran_flag();
+        let mut spec = unroutable.spec.clone();
+        spec.name = "shell_start".into();
+        let mut unroutable = unroutable;
+        unroutable.spec = spec;
+        state.tools.register_tool(Box::new(unroutable)).await;
+
+        run_llm_turn(
+            Arc::clone(&state),
+            "unroutable-and-unregistered".into(),
+            ChatMessage::user("go"),
+            Arc::new(NullProgress),
+            None,
+        )
+        .await;
+
+        let messages = state.sessions.lock().await;
+        let history = messages.get("unroutable-and-unregistered").unwrap();
+        for id in ["unroutable", "unregistered"] {
+            let name = if id == "unroutable" {
+                "shell_start"
+            } else {
+                "not_registered_here"
+            };
+            let expected = crate::tools::policy::refusal_message(
+                name,
+                crate::tools::policy::Refusal::NotOffered,
+            );
+            assert!(
+                history.iter().flat_map(|m| &m.parts).any(|part| {
+                    matches!(part, ContentPart::ToolResult { tool_use_id, content }
+                    if tool_use_id == id && content == &expected)
+                }),
+                "{id}: {history:?}"
+            );
+        }
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn rpc_device_binding_reaches_the_turns_permission_scope() {
+        use axum::http::header;
+
+        let provider = StubProvider::new(vec![
+            crate::provider::ChatResponse {
+                prompt_usage: None,
+                text: None,
+                tool_calls: vec![crate::provider::ToolCall {
+                    id: "probe".into(),
+                    name: "gate_probe".into(),
+                    input: json!({}),
+                }],
+                stop_reason: None,
+            },
+            final_round("done"),
+        ]);
+        let mut state = ServeState::build_for_test(false, provider);
+        {
+            let inner = Arc::get_mut(&mut state).unwrap();
+            inner
+                .config
+                .session_profiles
+                .get_mut("developer")
+                .unwrap()
+                .permission = Some("device_ops".into());
+            inner.config.permission_profiles.insert(
+                "device_ops".into(),
+                crate::config::PermissionProfileConfig { tools: vec![] },
+            );
+            inner.config.session_profiles.insert(
+                "other".into(),
+                crate::config::SessionProfileConfig {
+                    profile: "dev".into(),
+                    permission: Some("chat".into()),
+                    memory_namespace: None,
+                    session_policy: None,
+                    rooms: vec![],
+                    voice_pipeline: None,
+                    api_keys: vec![],
+                    devices: vec![],
+                },
+            );
+        }
+        let probe = GateProbe::new();
+        state
+            .tools
+            .register_tool(Box::new(Arc::clone(&probe)))
+            .await;
+
+        let init = rpc_post(
+            State(Arc::clone(&state)),
+            HeaderMap::from_iter([(
+                header::AUTHORIZATION,
+                HeaderValue::from_static("Bearer sa-acp-token"),
+            )]),
+            Json(JsonRpcRequest {
+                jsonrpc: Some("2.0".into()),
+                id: Some(json!(1)),
+                method: "initialize".into(),
+                params: Some(json!({})),
+            }),
+        )
+        .await
+        .into_response();
+        let sid = init
+            .headers()
+            .get("session-id")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        state
+            .session_profiles
+            .lock()
+            .await
+            .insert(sid.clone(), "other".into());
+        // Re-initialize the same session: the authenticated device binding must
+        // replace a stale pin, not coexist with it as another profile source.
+        let _ = rpc_post(
+            State(Arc::clone(&state)),
+            HeaderMap::from_iter([
+                (
+                    header::AUTHORIZATION,
+                    HeaderValue::from_static("Bearer sa-acp-token"),
+                ),
+                (
+                    header::HeaderName::from_static("session-id"),
+                    HeaderValue::from_str(&sid).unwrap(),
+                ),
+            ]),
+            Json(JsonRpcRequest {
+                jsonrpc: Some("2.0".into()),
+                id: Some(json!(2)),
+                method: "initialize".into(),
+                params: Some(json!({})),
+            }),
+        )
+        .await
+        .into_response();
+
+        let response = rpc_post(
+            State(Arc::clone(&state)),
+            HeaderMap::from_iter([
+                (
+                    header::AUTHORIZATION,
+                    HeaderValue::from_static("Bearer sa-acp-token"),
+                ),
+                (
+                    header::HeaderName::from_static("session-id"),
+                    HeaderValue::from_str(&sid).unwrap(),
+                ),
+            ]),
+            Json(JsonRpcRequest {
+                jsonrpc: Some("2.0".into()),
+                id: Some(json!(3)),
+                method: "chat".into(),
+                params: Some(json!({"content": "go"})),
+            }),
+        )
+        .await
+        .into_response();
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            probe.seen(),
+            Some(("developer".into(), "device_ops".into()))
+        );
+        assert_eq!(
+            state
+                .session_profiles
+                .lock()
+                .await
+                .get(&sid)
+                .map(String::as_str),
+            Some("developer")
+        );
     }
 
     #[tokio::test]

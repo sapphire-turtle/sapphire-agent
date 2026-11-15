@@ -1400,6 +1400,69 @@ api_key = "test"
     }
 
     #[tokio::test]
+    async fn an_unattended_turn_carries_the_profile_its_task_declared() {
+        let cfg = crate::config::Config::parse_for_test(
+            "[anthropic]\napi_key='test'\n[profiles.default]\nprovider='stub'\n\
+             [session_profile.default]\nprofile='default'\npermission='chat'\n\
+             [session_profile.ops]\nprofile='default'\npermission='ops'\n\
+             [permission_profile.chat]\ntools=[]\n[permission_profile.ops]\ntools=['fs']\n\
+             [tools.fs]\nenabled=true\n[tools.shell]\nenabled=true\n[tools.mcp]\nenabled=true\n[tools.admin]\nenabled=true\n",
+        );
+        let ws = test_workspace();
+        let root = ws.workspace.root.clone();
+        std::fs::create_dir_all(root.join("heartbeat")).unwrap();
+        std::fs::write(
+            root.join("heartbeat/morning_call.md"),
+            "---\nschedule: \"0 8 * * *\"\nroom_id: \"test-room\"\nprofile: \"ops\"\nenabled: true\n---\n\n# Morning Call\n",
+        )
+        .unwrap();
+        let tasks = crate::heartbeat_config::load_heartbeat_dir(&root.join("heartbeat"));
+        let task = tasks
+            .iter()
+            .find(|task| task.name == "morning_call")
+            .unwrap();
+
+        let tools = crate::tools::default_tool_set(Arc::clone(&ws), None, &[], 4, &cfg).await;
+        let probe = crate::serve::GateProbe::new();
+        tools.register_tool(Box::new(Arc::clone(&probe))).await;
+        let ((agent, sent, _), log) = build_test_agent_with_tools(
+            vec![
+                crate::provider::ChatResponse {
+                    prompt_usage: None,
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "probe".into(),
+                        name: "gate_probe".into(),
+                        input: serde_json::json!({}),
+                    }],
+                    stop_reason: None,
+                },
+                crate::provider::ChatResponse {
+                    prompt_usage: None,
+                    text: Some("done".into()),
+                    tool_calls: vec![],
+                    stop_reason: None,
+                },
+            ],
+            false,
+            Some((cfg, tools)),
+        );
+        agent
+            .trigger(
+                &task.name,
+                &task.body,
+                task.meta.room_id.as_deref().unwrap(),
+                task.meta.profile.as_deref(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(probe.seen(), Some(("ops".into(), "ops".into())));
+        assert!(log.calls()[0].1.contains(&"gate_probe".into()));
+        assert!(sent.lock().unwrap().iter().any(|m| m.content == "done"));
+    }
+
+    #[tokio::test]
     async fn task6_channel_group_execution_matrix() {
         use serde_json::json;
         for (permission, tool, runs) in [
@@ -1475,6 +1538,59 @@ api_key = "test"
             }
             assert!(sent.lock().unwrap().iter().any(|m| m.content == "done"));
         }
+    }
+
+    #[tokio::test]
+    async fn only_the_dedicated_tool_modifies_a_definition() {
+        use crate::tools::Tool;
+        use serde_json::json;
+
+        let (dir, root, ws) = crate::tools::config_tools::test_workspace();
+        std::fs::create_dir_all(root.join("heartbeat")).unwrap();
+        let task_file = root.join("heartbeat/morning_call.md");
+        let original = "---\nschedule: \"0 8 * * *\"\n---\n\nold\n";
+        let replacement =
+            "---\nschedule: \"0 9 * * *\"\nroom_id: \"test-room\"\nprofile: \"ops\"\n---\n\nnew\n";
+        std::fs::write(&task_file, original).unwrap();
+
+        let write = crate::tools::builtin_tools::FileWriteTool::new(Arc::clone(&ws));
+        let err = write
+            .execute(&json!({"path": "heartbeat/morning_call.md", "content": replacement}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("heartbeat_config"), "{err}");
+        assert_eq!(std::fs::read_to_string(&task_file).unwrap(), original);
+        let read = crate::tools::builtin_tools::FileReadTool::new(Arc::clone(&ws));
+        assert!(
+            read.execute(&json!({"path": "heartbeat/morning_call.md"}))
+                .await
+                .unwrap()
+                .contains("old")
+        );
+
+        let admin = crate::tools::config_tools::ConfigTool::new(
+            crate::tools::config_tools::ConfigDir::Heartbeat,
+            root.clone(),
+            crate::config::Config::parse_for_test(
+                "[tools.admin]\nenabled=true\n[session_profile.default]\nprofile='default'\npermission='admin'\n[permission_profile.admin]\ntools=['admin']\n",
+            ),
+            Arc::clone(&ws),
+            None,
+            std::sync::Weak::new(),
+        );
+        crate::tools::config_tools::scope_session_profile(
+            Some("default".into()),
+            crate::tools::config_tools::scope_permission_profile(
+                "admin".into(),
+                admin.execute(
+                    &json!({"action": "write", "name": "morning_call", "content": replacement}),
+                ),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&task_file).unwrap(), replacement);
+        drop(dir);
     }
 
     #[tokio::test]
@@ -1748,7 +1864,7 @@ profile = "chat"
             .unwrap()
     }
 
-    fn assert_paired_refusal(log: &crate::serve::ChatLog, call: &str) {
+    fn assert_paired_refusal(log: &crate::serve::ChatLog, call: &str, expected: &str) {
         use crate::provider::ContentPart;
         let messages = log.messages();
         let parts: Vec<_> = messages
@@ -1766,10 +1882,7 @@ profile = "chat"
         );
 
         assert_eq!(parts.iter().filter(|p| matches!(p, ContentPart::ToolResult { tool_use_id, .. } if tool_use_id == call)).count(), 1);
-        assert!(
-            result_for(log, call).contains("not available in this conversation")
-                || result_for(log, call).contains("permission_profile")
-        );
+        assert_eq!(result_for(log, call), expected);
         assert!(!parts.iter().any(|p| matches!(p, ContentPart::Image { .. })));
     }
 
@@ -2099,7 +2212,28 @@ profile = "chat"
         agent.handle_message(msg).await.unwrap();
         for call in ["attachment_save", "image_read"] {
             assert!(!log.calls()[0].1.contains(&call.into()));
-            assert_paired_refusal(&log, call);
+            let expected = if call == "image_read" {
+                crate::tools::policy::unavailable_message(
+                    &crate::tools::policy::ResolvedPermission::resolve(
+                        &crate::config::Config::for_test(),
+                        Origin::Channel {
+                            session_profile: "default".into(),
+                        },
+                    ),
+                    &crate::tools::policy::ToolEntry {
+                        name: call.into(),
+                        group: Some(crate::config::ToolGroup::Fs),
+                        enabled: false,
+                        kind: crate::tools::ToolKind::Read,
+                    },
+                )
+            } else {
+                crate::tools::policy::refusal_message(
+                    call,
+                    crate::tools::policy::Refusal::NotOffered,
+                )
+            };
+            assert_paired_refusal(&log, call, &expected);
         }
         assert!(!state.workspace.root.join("saved").exists());
     }
@@ -2181,7 +2315,14 @@ profile = "chat"
             .unwrap();
         assert!(!log.calls()[0].1.contains(&"attachment_save".into()));
         assert!(log.calls()[0].1.contains(&"image_read".into()));
-        assert_paired_refusal(&log, "attachment_save");
+        assert_paired_refusal(
+            &log,
+            "attachment_save",
+            &crate::tools::policy::refusal_message(
+                "attachment_save",
+                crate::tools::policy::Refusal::NotOffered,
+            ),
+        );
         assert!(!state.workspace.root.join("saved").exists());
     }
 

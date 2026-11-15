@@ -180,22 +180,12 @@ pub(crate) fn scope_permission_profile<F: std::future::Future>(
     PERMISSION_PROFILE_TL.scope(profile, fut)
 }
 
-/// The permission profile governing the scoped session, when a turn is active.
+/// The permission profile the turn's one policy resolution placed in execution
+/// scope. This task-local is authoritative: deriving it again from config could
+/// disagree with the decision that admitted the call. Outside a turn it is `None`.
 #[allow(dead_code)] // Execution-scope introspection API, currently consumed by integration probes.
 pub fn current_permission_profile() -> Option<String> {
-    PERMISSION_PROFILE_TL
-        .try_with(Clone::clone)
-        .ok()
-        .or_else(|| {
-            let profile = current_session_profile()?;
-            let context = crate::serve::current_turn_context()?;
-            Some(
-                context
-                    .state
-                    .config
-                    .permission_profile_name_for_session(&profile),
-            )
-        })
+    PERMISSION_PROFILE_TL.try_with(Clone::clone).ok()
 }
 
 /// The scoped session binding, with a room lookup for direct timer callers
