@@ -625,7 +625,22 @@ impl Agent {
             false,
             false,
         );
-        let tool_specs = match &self.tools {
+        let permission = crate::tools::policy::ResolvedPermission::resolve(
+            &self.config,
+            crate::tools::policy::Origin::Channel {
+                session_profile: profile_name.clone(),
+            },
+        );
+        let entries = match &self.tools {
+            Some(tools) => tools
+                .entries()
+                .await
+                .into_iter()
+                .map(|(_, entry)| entry)
+                .collect(),
+            None => Vec::new(),
+        };
+        let mut tool_specs = match &self.tools {
             Some(t) => Some(
                 t.specs_filtered(|name| {
                     if name == "attachment_save" {
@@ -638,6 +653,18 @@ impl Agent {
             ),
             None => None,
         };
+
+        if let Some(specs) = &mut tool_specs {
+            specs.retain(|spec| {
+                entries
+                    .iter()
+                    .find(|e| e.name == spec.name)
+                    .is_some_and(|entry| {
+                        crate::tools::policy::allow(&permission, entry)
+                            != crate::tools::policy::Allow::Deny
+                    })
+            });
+        }
 
         // Context compression config
         let compression_config = &self.config.compression;
@@ -828,34 +855,30 @@ impl Agent {
                     let mut refused: Vec<_> = not_offered
                         .into_iter()
                         .map(|call| {
-                            let reason = crate::tools::policy::refusal_message(
-                                &call.name,
-                                crate::tools::policy::Refusal::NotOffered,
-                            );
+                            let reason = entries
+                                .iter()
+                                .find(|e| e.name == call.name)
+                                .filter(|entry| {
+                                    crate::tools::policy::allow(&permission, entry)
+                                        == crate::tools::policy::Allow::Deny
+                                })
+                                .map(|entry| {
+                                    crate::tools::policy::unavailable_message(&permission, entry)
+                                })
+                                .unwrap_or_else(|| {
+                                    crate::tools::policy::refusal_message(
+                                        &call.name,
+                                        crate::tools::policy::Refusal::NotOffered,
+                                    )
+                                });
                             (call.id, reason)
                         })
                         .collect();
-                    let profile = crate::tools::policy::ResolvedPermission::resolve(
-                        &self.config,
-                        if unattended_profile.is_some() {
-                            crate::tools::policy::Origin::Unattended {
-                                session_profile: profile_name.clone(),
-                            }
-                        } else {
-                            crate::tools::policy::Origin::Channel {
-                                session_profile: profile_name.clone(),
-                            }
-                        },
-                    );
-                    let entries: Vec<_> = tool_specs
-                        .as_deref()
-                        .unwrap_or_default()
-                        .iter()
-                        .map(|spec| crate::tools::policy::ToolEntry::from_spec(spec, &self.config))
-                        .collect();
                     let (tool_calls, policy_refused) =
                         crate::tools::policy::partition_without_asking(
-                            &profile, &offered, &entries,
+                            &permission,
+                            &offered,
+                            &entries,
                         );
                     refused.extend(policy_refused);
                     for (id, reason) in &refused {
@@ -868,8 +891,8 @@ impl Agent {
                         let tools = Arc::clone(tools.as_ref().expect("offered tool set"));
                         let ns = ns.clone();
                         let owner = incoming.attachment_owner.clone();
-                        let session_profile =
-                            unattended_profile.as_ref().map(|_| profile_name.clone());
+                        let session_profile = Some(profile_name.clone());
+                        let permission_profile = permission.permission.clone();
                         let origin = crate::timer::TimerOrigin::Chat {
                             room_id: room_id_for_timer.clone(),
                         };
@@ -880,17 +903,23 @@ impl Agent {
                                     ns,
                                     crate::tools::config_tools::scope_session_profile(
                                         session_profile,
-                                        crate::timer::scope_timer_origin(origin, async move {
-                                            info!("Executing tool: {} (id={})", call.name, call.id);
-                                            let output = tools.execute(&call).await;
-                                            info!(
-                                                "Tool {} result ({} image(s) attached): {}",
-                                                call.name,
-                                                output.images.len(),
-                                                output.text
-                                            );
-                                            (call.id, output)
-                                        }),
+                                        crate::tools::config_tools::scope_permission_profile(
+                                            permission_profile,
+                                            crate::timer::scope_timer_origin(origin, async move {
+                                                info!(
+                                                    "Executing tool: {} (id={})",
+                                                    call.name, call.id
+                                                );
+                                                let output = tools.execute(&call).await;
+                                                info!(
+                                                    "Tool {} result ({} image(s) attached): {}",
+                                                    call.name,
+                                                    output.images.len(),
+                                                    output.text
+                                                );
+                                                (call.id, output)
+                                            }),
+                                        ),
                                     ),
                                 ),
                             ),
@@ -1371,7 +1400,180 @@ api_key = "test"
     }
 
     #[tokio::test]
-    async fn channel_and_heartbeat_scope_only_the_unattended_profile() {
+    async fn task6_channel_group_execution_matrix() {
+        use serde_json::json;
+        for (permission, tool, runs) in [
+            ("default", "file_write", true),
+            ("chat", "file_write", false),
+            ("default", "shell", false),
+            ("admin", "shell", true),
+            ("default", "heartbeat_config", false),
+        ] {
+            let cfg = crate::config::Config::parse_for_test(&format!(
+                "[anthropic]\napi_key='test'\n[session_profile.default]\nprofile='default'\npermission='{permission}'\n[permission_profile.registration]\ntools=['fs','shell','mcp','admin']\n[tools.fs]\nenabled=true\n[tools.shell]\nenabled=true\n[tools.mcp]\nenabled=true\n[tools.admin]\nenabled=true\n"
+            ));
+            let ws = test_workspace();
+            let root = ws.workspace.root.clone();
+            let tools = crate::tools::default_tool_set(Arc::clone(&ws), None, &[], 4, &cfg).await;
+            let probe = crate::serve::GateProbe::new();
+            tools.register_tool(Box::new(Arc::clone(&probe))).await;
+            let admin = crate::tools::config_tools::ConfigTool::new(
+                crate::tools::config_tools::ConfigDir::Heartbeat,
+                root.clone(),
+                cfg.clone(),
+                ws,
+                None,
+                std::sync::Weak::new(),
+            );
+            tools.register_tool(Box::new(admin)).await;
+            let script = vec![
+                crate::provider::ChatResponse {
+                    text: None,
+                    prompt_usage: None,
+                    stop_reason: None,
+                    tool_calls: vec![
+                        ToolCall {
+                            id: "call".into(),
+                            name: tool.into(),
+                            input: if tool == "shell" {
+                                json!({"command":"printf ran > shell-ran"})
+                            } else {
+                                json!({"path":"notes/x.md","content":"written", "action":"list"})
+                            },
+                        },
+                        ToolCall {
+                            id: "probe".into(),
+                            name: "gate_probe".into(),
+                            input: json!({}),
+                        },
+                    ],
+                },
+                crate::provider::ChatResponse {
+                    text: Some("done".into()),
+                    prompt_usage: None,
+                    stop_reason: None,
+                    tool_calls: vec![],
+                },
+            ];
+            let ((agent, sent, _), log) =
+                build_test_agent_with_tools(script, false, Some((cfg, tools)));
+            agent.handle_message(incoming("go")).await.unwrap();
+            assert_eq!(probe.seen(), Some(("default".into(), permission.into())));
+            assert_eq!(log.calls()[0].1.contains(&tool.to_string()), runs);
+            if tool == "file_write" {
+                assert_eq!(root.join("notes/x.md").exists(), runs);
+            }
+            if tool == "shell" {
+                assert_eq!(root.join("shell-ran").exists(), runs);
+            }
+            if !runs {
+                assert!(
+                    result_for(&log, "call").contains("permission_profile"),
+                    "{permission} {tool}: {}",
+                    result_for(&log, "call")
+                );
+            }
+            assert!(sent.lock().unwrap().iter().any(|m| m.content == "done"));
+        }
+    }
+
+    #[tokio::test]
+    async fn task6_channel_profile_scope_and_group_filter() {
+        use crate::config::ToolGroup;
+        use crate::tools::ToolSet;
+        use serde_json::json;
+        let config = crate::config::Config::parse_for_test(
+            r#"
+[anthropic]
+api_key = "test"
+[profiles.default]
+provider = "stub"
+[session_profile.chat]
+profile = "default"
+permission = "chat"
+[permission_profile.chat]
+tools = []
+[tools.fs]
+enabled = true
+[discord]
+bot_token = "t"
+[[discord.rooms]]
+room_id = "test-room"
+profile = "chat"
+"#,
+        );
+        let ws = test_workspace();
+        let root = ws.workspace.root.clone();
+        let tools = Arc::new(ToolSet::new(
+            vec![
+                Box::new(crate::tools::builtin_tools::FileWriteTool::new(ws)),
+                Box::new(ProfileScopeProbe {
+                    spec: crate::provider::ToolSpec {
+                        kind: crate::tools::ToolKind::Read,
+                        group: None,
+                        name: "profile_scope_probe".into(),
+                        description: "scope".into(),
+                        input_schema: json!({}),
+                    },
+                    config: config.clone(),
+                }),
+            ],
+            vec![],
+            &config,
+        ));
+        assert_eq!(
+            tools
+                .entries()
+                .await
+                .iter()
+                .find(|(n, _)| n == "file_write")
+                .unwrap()
+                .1
+                .group,
+            Some(ToolGroup::Fs)
+        );
+        let response = crate::provider::ChatResponse {
+            text: None,
+            prompt_usage: None,
+            stop_reason: None,
+            tool_calls: vec![
+                ToolCall {
+                    id: "write".into(),
+                    name: "file_write".into(),
+                    input: json!({"path":"notes/x.md","content":"no"}),
+                },
+                ToolCall {
+                    id: "probe".into(),
+                    name: "profile_scope_probe".into(),
+                    input: json!({}),
+                },
+            ],
+        };
+        let ((agent, _, _), log) = build_test_agent_with_tools(
+            vec![
+                response,
+                crate::provider::ChatResponse {
+                    text: Some("done".into()),
+                    prompt_usage: None,
+                    stop_reason: None,
+                    tool_calls: vec![],
+                },
+            ],
+            false,
+            Some((config, tools)),
+        );
+        agent.handle_message(incoming("go")).await.unwrap();
+        assert!(!root.join("notes/x.md").exists());
+        assert!(!log.calls()[0].1.contains(&"file_write".to_string()));
+        assert!(result_for(&log, "write").contains("permission_profile"));
+        assert_eq!(
+            result_for(&log, "probe"),
+            "scope=Some(\"chat\"); resolved=Some(\"chat\")"
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_and_heartbeat_scope_their_resolved_profiles() {
         let config = crate::config::Config::parse_for_test(
             "[anthropic]\napi_key='test'\n[discord]\nbot_token='t'\n[[discord.rooms]]\nroom_id='test-room'\nprofile='room'\n",
         );
@@ -1405,7 +1607,7 @@ api_key = "test"
         agent.handle_message(incoming("ordinary")).await.unwrap();
         assert_eq!(
             result_for(&log, "profile_scope_probe"),
-            "scope=None; resolved=Some(\"room\")"
+            "scope=Some(\"room\"); resolved=Some(\"room\")"
         );
 
         let ((agent, _, _), log) =
@@ -1511,6 +1713,9 @@ api_key = "test"
             prompt_usage: None,
             stop_reason: None,
         });
+        let config = crate::config::Config::parse_for_test(&format!(
+            "[anthropic]\napi_key = \"test\"\n[tools.fs]\nenabled = {host}\n[tools.shell]\nenabled = {host}\n"
+        ));
         let tools = Arc::new(crate::tools::ToolSet::new(
             vec![
                 Box::new(crate::tools::attachment_tools::AttachmentSaveTool::new(
@@ -1520,10 +1725,7 @@ api_key = "test"
                 Box::new(crate::tools::attachment_tools::ImageReadTool::new(state)),
             ],
             vec![],
-            &crate::config::Config::for_test(),
-        ));
-        let config = crate::config::Config::parse_for_test(&format!(
-            "[anthropic]\napi_key = \"test\"\n[tools.fs]\nenabled = {host}\n[tools.shell]\nenabled = {host}\n"
+            &config,
         ));
         let ((agent, _, _), log) =
             build_test_agent_with_tools(script, false, Some((config, tools)));
@@ -1562,8 +1764,12 @@ api_key = "test"
                 .count(),
             1
         );
+
         assert_eq!(parts.iter().filter(|p| matches!(p, ContentPart::ToolResult { tool_use_id, .. } if tool_use_id == call)).count(), 1);
-        assert!(result_for(log, call).contains("not available in this conversation"));
+        assert!(
+            result_for(log, call).contains("not available in this conversation")
+                || result_for(log, call).contains("permission_profile")
+        );
         assert!(!parts.iter().any(|p| matches!(p, ContentPart::Image { .. })));
     }
 
@@ -1596,16 +1802,17 @@ api_key = "test"
             .unwrap();
         let image_bytes = encoded.into_inner();
         std::fs::write(state.workspace.root.join("history.png"), &image_bytes).unwrap();
+        let config = crate::config::Config::parse_for_test(
+            "[anthropic]\napi_key = \"test\"\n[tools.fs]\nenabled = true\n[tools.shell]\nenabled = true\n",
+        );
         let tools = Arc::new(crate::tools::ToolSet::new(
             vec![Box::new(
                 crate::tools::attachment_tools::ImageReadTool::new(state),
             )],
             vec![],
-            &crate::config::Config::for_test(),
+            &config,
         ));
-        let config = crate::config::Config::parse_for_test(
-            "[anthropic]\napi_key = \"test\"\n[tools.fs]\nenabled = true\n[tools.shell]\nenabled = true\n",
-        );
+
         let (((agent, _, _), log), session_store) = build_test_agent_with_options(
             vec![
                 attachment_call("image_read", serde_json::json!({"path": "history.png"})),

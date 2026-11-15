@@ -146,10 +146,9 @@ pub(crate) fn definition_path(workspace_root: &Path, dir: &str, name: &str) -> R
 }
 
 tokio::task_local! {
-    /// The session profile an ACP turn runs under, scoped around tool execution
-    /// by `TurnLoop::run` from the profile pinned at `session/new` (or
-    /// `load`/`resume`). `None` on every other serve-path turn.
+    /// The resolved session binding scoped around tool execution by either loop.
     static SESSION_PROFILE_TL: Option<String>;
+    static PERMISSION_PROFILE_TL: String;
 }
 
 /// Run `fut` with the turn's session profile reachable from
@@ -167,33 +166,40 @@ pub(crate) fn scope_session_profile<F: std::future::Future>(
 /// The session profile scoped around the tool call currently executing, if the
 /// turn pins one, including ACP and unattended tasks.
 ///
-/// `None` outside `scope_session_profile` and for an unpinned turn such as
-/// `/rpc`, A2A, or ordinary channel traffic.
+/// `None` only outside `scope_session_profile`. Live turns scope a resolved name.
 pub(crate) fn current_session_profile() -> Option<String> {
     SESSION_PROFILE_TL.try_with(Clone::clone).ok().flatten()
 }
 
-/// The permission profile governing the scoped session, when a turn is active.
-#[allow(dead_code)] // Used by the permission gate in the next task.
-pub fn current_permission_profile() -> Option<String> {
-    let profile = current_session_profile()?;
-    let context = crate::serve::current_turn_context()?;
-    Some(
-        context
-            .state
-            .config
-            .permission_profile_name_for_session(&profile),
-    )
+/// Scope the already-resolved permission name alongside the session name.
+/// Channel turns have no serve `TurnContext`, so they carry this name directly.
+pub(crate) fn scope_permission_profile<F: std::future::Future>(
+    profile: String,
+    fut: F,
+) -> impl std::future::Future<Output = F::Output> {
+    PERMISSION_PROFILE_TL.scope(profile, fut)
 }
 
-/// The session profile this call's admin grant is judged by, or `None` when the
-/// transport names no profile an operator could have allowed.
-///
-/// An ordinary channel turn carries `TimerOrigin::Chat` without a scoped
-/// profile, so its grant follows the room. A heartbeat's chat leg scopes the
-/// task profile, which takes precedence over its delivery room. Voice is a
-/// device, not a room or an editor. On the serve path, ACP and unattended
-/// turns scope their pinned profile; `/rpc` and A2A scope none.
+/// The permission profile governing the scoped session, when a turn is active.
+#[allow(dead_code)] // Execution-scope introspection API, currently consumed by integration probes.
+pub fn current_permission_profile() -> Option<String> {
+    PERMISSION_PROFILE_TL
+        .try_with(Clone::clone)
+        .ok()
+        .or_else(|| {
+            let profile = current_session_profile()?;
+            let context = crate::serve::current_turn_context()?;
+            Some(
+                context
+                    .state
+                    .config
+                    .permission_profile_name_for_session(&profile),
+            )
+        })
+}
+
+/// The scoped session binding, with a room lookup for direct timer callers
+/// outside either turn loop. Live channel and unattended turns scope their name.
 pub(crate) fn current_session_profile_for(config: &Config) -> Option<String> {
     match crate::timer::current_origin() {
         Some(crate::timer::TimerOrigin::Chat { room_id }) => {
@@ -2067,7 +2073,7 @@ You are a reviewer.
             timer_origin: None,
             session_id: None,
             subagent_depth: 0,
-            session_profile: None,
+            session_profile: "default".into(),
         });
         let out = crate::serve::scope_turn_context(
             ctx,

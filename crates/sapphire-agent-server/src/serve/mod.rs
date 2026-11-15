@@ -1987,9 +1987,16 @@ pub(crate) trait TurnHost: Send + Sync {
         }
     }
 
-    /// Override the session pin for this turn without changing a shared voice session.
+    /// The ingress-resolved binding for this turn, when the host carries one.
+    /// ACP uses its connection pin; unattended tasks use their declaration.
     fn session_profile_override(&self) -> Option<String> {
-        None
+        match self.origin() {
+            crate::tools::policy::Origin::Acp {
+                session_profile, ..
+            }
+            | crate::tools::policy::Origin::Channel { session_profile } => Some(session_profile),
+            crate::tools::policy::Origin::Unattended { .. } => None,
+        }
     }
 
     /// The editor on the other end, when there is one.
@@ -2276,6 +2283,18 @@ impl TurnHost for AutonomousHost {
 
     fn origin(&self) -> crate::tools::policy::Origin {
         self.origin.clone()
+    }
+
+    fn session_profile_override(&self) -> Option<String> {
+        match &self.origin {
+            crate::tools::policy::Origin::Acp {
+                session_profile, ..
+            }
+            | crate::tools::policy::Origin::Channel { session_profile }
+            | crate::tools::policy::Origin::Unattended { session_profile } => {
+                Some(session_profile.clone())
+            }
+        }
     }
 
     fn consult_identity(&self) -> Option<ConsultIdentity> {
@@ -2622,17 +2641,9 @@ pub(crate) struct TurnContext {
     /// `tools.subagent.max_depth`, this is what `subagent_tool_specs`
     /// uses to decide whether this turn may delegate further.
     pub subagent_depth: u32,
-    /// The room profile this turn's admin-tool grant hangs on, or `None` on a
-    /// transport that names no profile an operator could have allowed
-    /// (`/rpc`, A2A, voice, the unattended loops). Set by `run_llm_turn` from
-    /// the profile an ACP session pinned, and read through
-    /// `config_tools::current_session_profile_for` while a tool call runs.
-    ///
-    /// Copied straight into the nested `TurnLoop` a delegated subagent builds,
-    /// so a delegation keeps the grant its parent ran under — the grant is the
-    /// session's, not the caller's, the same way `timer_origin` is carried.
-    /// A definition that must not hold it narrows its own `tools:` instead.
-    pub session_profile: Option<String>,
+    /// Ingress-resolved binding, inherited unchanged by delegated turns.
+    /// Every transport carries a name, including the implicit default.
+    pub session_profile: String,
 }
 
 tokio::task_local! {
@@ -2688,10 +2699,8 @@ pub(crate) struct TurnLoop<'a> {
     /// builds its `TurnLoop` with `0`; a nested subagent turn with its
     /// delegator's depth + 1.
     pub subagent_depth: u32,
-    /// The admin-tool grant this loop's tool calls are judged by. Copied into
-    /// every round's `TurnContext` and scoped around tool execution the same
-    /// way `timer_origin` is. See `TurnContext::session_profile`.
-    pub session_profile: Option<String>,
+    /// Resolved session profile, scoped around execution and copied to children.
+    pub session_profile: String,
 }
 
 impl TurnLoop<'_> {
@@ -2711,21 +2720,24 @@ impl TurnLoop<'_> {
         } else {
             None
         };
-        let entries: Vec<_> = tool_specs
-            .iter()
-            .map(|spec| crate::tools::policy::ToolEntry::from_spec(spec, &state.config))
+        let mut entries: Vec<_> = state
+            .tools
+            .entries()
+            .await
+            .into_iter()
+            .map(|(_, entry)| entry)
             .collect();
+        if let Some(session) = &session_tools {
+            entries.extend(session.entries().await.into_iter().map(|(_, entry)| entry));
+        }
         let mut origin = progress.origin();
-        // ACP's pinned profile is available here even to test and detached hosts.
-        if let Some(name) = &self.session_profile {
-            match &mut origin {
-                crate::tools::policy::Origin::Acp {
-                    session_profile, ..
-                }
-                | crate::tools::policy::Origin::Channel { session_profile }
-                | crate::tools::policy::Origin::Unattended { session_profile } => {
-                    *session_profile = name.clone()
-                }
+        match &mut origin {
+            crate::tools::policy::Origin::Acp {
+                session_profile, ..
+            }
+            | crate::tools::policy::Origin::Channel { session_profile }
+            | crate::tools::policy::Origin::Unattended { session_profile } => {
+                *session_profile = self.session_profile.clone()
             }
         }
         let profile = crate::tools::policy::ResolvedPermission::resolve(&state.config, origin);
@@ -2896,6 +2908,12 @@ impl TurnLoop<'_> {
                         };
                         let refusal = match entries.iter().find(|entry| entry.name == call.name) {
                             None => Some(refusal_message(&call.name, Refusal::NotOffered)),
+                            Some(entry)
+                                if !tool_specs.iter().any(|spec| spec.name == call.name)
+                                    && allow(&profile, entry) != Allow::Deny =>
+                            {
+                                Some(refusal_message(&call.name, Refusal::NotOffered))
+                            }
                             Some(entry) => match allow(&profile, entry) {
                                 Allow::Allow => None,
                                 Allow::Deny => Some(unavailable_message(&profile, entry)),
@@ -2975,6 +2993,7 @@ impl TurnLoop<'_> {
                             let turn_ctx = Arc::clone(&turn_ctx);
                             let session_profile = session_profile.clone();
                             let avatar = avatar.clone();
+                            let permission_profile = profile.permission.clone();
                             async move {
                                 let fut = crate::tools::workspace_tools::scope_memory_namespace(
                                     ns,
@@ -3006,12 +3025,13 @@ impl TurnLoop<'_> {
                                 // `config_tools::current_session_profile()`.
                                 // Scoped here rather than inside the match
                                 // below so the four (origin, client) arms do
-                                // not each need their own copy; `None` is a
-                                // meaningful value (no profile to allow), not
-                                // "unset".
+                                // not each need their own copy.
                                 let fut = crate::tools::config_tools::scope_session_profile(
-                                    session_profile.clone(),
-                                    fut,
+                                    Some(session_profile.clone()),
+                                    crate::tools::config_tools::scope_permission_profile(
+                                        permission_profile,
+                                        fut,
+                                    ),
                                 );
                                 // Unconditional for the same reason: `None`
                                 // is the answer the avatar tools refuse on.
@@ -3229,16 +3249,15 @@ pub(crate) async fn run_llm_turn(
     // Task frontmatter overrides the session pin for this turn only. Voice
     // sessions keep their subscriber pin for subsequent interactive turns.
     let task_profile = progress.session_profile_override();
-    let session_profile = match &task_profile {
-        Some(name) => Some(name.clone()),
-        None if is_acp => state
-            .session_profiles
-            .lock()
-            .await
-            .get(&session_id)
-            .cloned(),
-        None => None,
-    };
+    let pin = state
+        .session_profiles
+        .lock()
+        .await
+        .get(&session_id)
+        .cloned();
+    let session_profile = state
+        .config
+        .session_profile_name(task_profile.as_deref().or(pin.as_deref()), "");
 
     // 1. Hydrate history fresh from storage every turn, rather than only
     //    the first time this process touches the session.
@@ -3297,19 +3316,10 @@ pub(crate) async fn run_llm_turn(
     //     so it can be recorded in the session metadata on first chat
     //     (used by the daily-log builder to route NSFW sessions away
     //     from default-namespace rooms).
-    let pinned_profile = state
-        .session_profiles
-        .lock()
-        .await
-        .get(&session_id)
-        .cloned();
-    let namespace = match task_profile.as_ref().or(pinned_profile.as_ref()) {
-        Some(rp_name) => state
-            .config
-            .namespace_for_session_profile(rp_name)
-            .to_string(),
-        None => crate::config::DEFAULT_NAMESPACE_NAME.to_string(),
-    };
+    let namespace = state
+        .config
+        .namespace_for_session_profile(&session_profile)
+        .to_string();
     let namespace_chain = state.config.resolve_namespace_chain(&namespace);
 
     // 2b. Ensure JSONL file exists. If this session was deferred at initialize
@@ -3432,6 +3442,29 @@ pub(crate) async fn run_llm_turn(
             skills_enabled,
         ))
         .await;
+    let mut origin = progress.origin();
+    match &mut origin {
+        crate::tools::policy::Origin::Acp {
+            session_profile: name,
+            ..
+        }
+        | crate::tools::policy::Origin::Channel {
+            session_profile: name,
+        }
+        | crate::tools::policy::Origin::Unattended {
+            session_profile: name,
+        } => *name = session_profile.clone(),
+    }
+    let permission = crate::tools::policy::ResolvedPermission::resolve(&state.config, origin);
+    let entries = state.tools.entries().await;
+    tool_specs.retain(|spec| {
+        entries
+            .iter()
+            .find(|(name, _)| name == &spec.name)
+            .is_some_and(|(_, entry)| {
+                crate::tools::policy::allow(&permission, entry) != crate::tools::policy::Allow::Deny
+            })
+    });
     crate::tools::avatar_tools::specialize_specs(
         &mut tool_specs,
         avatar.as_ref().map(|a| a.caps()),
@@ -3904,6 +3937,45 @@ impl crate::tools::Tool for Arc<AdminProfileProbe> {
         (**self).execute(input).await
     }
 }
+/// Per-instance execution instrument shared by both loop integration tests.
+#[cfg(test)]
+pub(crate) struct GateProbe {
+    spec: ToolSpec,
+    seen: std::sync::Mutex<Option<(String, String)>>,
+}
+#[cfg(test)]
+impl GateProbe {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            spec: ToolSpec {
+                name: "gate_probe".into(),
+                description: "Observe the execution scope".into(),
+                input_schema: json!({}),
+                kind: crate::tools::ToolKind::Read,
+                group: None,
+            },
+            seen: std::sync::Mutex::new(None),
+        })
+    }
+    pub(crate) fn seen(&self) -> Option<(String, String)> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+#[cfg(test)]
+#[async_trait::async_trait]
+impl crate::tools::Tool for Arc<GateProbe> {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+    async fn execute(&self, _: &Value) -> anyhow::Result<String> {
+        *self.seen.lock().unwrap() = Some((
+            crate::tools::config_tools::current_session_profile().expect("session scope"),
+            crate::tools::config_tools::current_permission_profile().expect("permission scope"),
+        ));
+        Ok("probed".into())
+    }
+}
+
 /// Every `chat()` call a [`StubProvider`] has seen, in call order:
 /// `(system, tool names offered)`. `system` is owned (not the borrowed
 /// `Option<&str>` `chat()` receives) so the log outlives the call.
@@ -4402,6 +4474,174 @@ mod tests {
     use crate::acp_session::{EventBody, StoredPart};
     use crate::provider::{Role, UserInputKind};
 
+    #[tokio::test]
+    async fn task6_acp_group_visibility_execution_and_persistence() {
+        for (permission, runs) in [("chat", false), ("default", true)] {
+            let cfg = Config::parse_for_test(&format!(
+                "[anthropic]\napi_key='test'\n[session_profile.ops]\nprofile='default'\npermission='{permission}'\n[tools.fs]\nenabled=true\n"
+            ));
+            let mut state = ServeState::for_test_scripted(
+                true,
+                vec![
+                    crate::provider::ChatResponse {
+                        text: None,
+                        prompt_usage: None,
+                        stop_reason: None,
+                        tool_calls: vec![
+                            crate::provider::ToolCall {
+                                id: "write".into(),
+                                name: "file_write".into(),
+                                input: json!({"path":"notes/x.md","content":"written"}),
+                            },
+                            crate::provider::ToolCall {
+                                id: "probe".into(),
+                                name: "gate_probe".into(),
+                                input: json!({}),
+                            },
+                        ],
+                    },
+                    final_round("done"),
+                ],
+            );
+            let (_dir, root, ws) = crate::tools::config_tools::test_workspace();
+            let tools = crate::tools::default_tool_set(ws, None, &[], 4, &cfg).await;
+            let probe = GateProbe::new();
+            tools.register_tool(Box::new(Arc::clone(&probe))).await;
+            let inner = Arc::get_mut(&mut state).unwrap();
+            inner.config = cfg;
+            inner.tools = tools;
+            let sid = format!("acp-{permission}");
+            state
+                .acp_session_store
+                .create(&sid, "default", "/tmp")
+                .unwrap();
+            state.acp_sessions.lock().await.insert(sid.clone());
+            state
+                .session_profiles
+                .lock()
+                .await
+                .insert(sid.clone(), "ops".into());
+            let host: Arc<dyn TurnHost> = Arc::new(AutonomousHost {
+                origin: crate::tools::policy::Origin::Acp {
+                    mode: crate::tools::policy::SessionMode::Bypass,
+                    session_profile: "ops".into(),
+                },
+                consult: None,
+            });
+            run_llm_turn(
+                Arc::clone(&state),
+                sid.clone(),
+                ChatMessage::user("go"),
+                host,
+                None,
+            )
+            .await;
+            assert_eq!(probe.seen(), Some(("ops".into(), permission.into())));
+            assert_eq!(root.join("notes/x.md").exists(), runs);
+            if runs {
+                assert_eq!(
+                    std::fs::read_to_string(root.join("notes/x.md")).unwrap(),
+                    "written"
+                );
+            } else {
+                assert!(state.acp_session_store.history_for_model(&sid).unwrap().iter().flat_map(|m| &m.parts).any(|p| matches!(p, ContentPart::ToolResult { content, .. } if content.contains("permission_profile.chat.tools"))));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn task6_non_acp_turn_uses_its_pinned_profile() {
+        let mut state = ServeState::for_test_scripted(
+            false,
+            vec![
+                crate::provider::ChatResponse {
+                    prompt_usage: None,
+                    text: None,
+                    tool_calls: vec![crate::provider::ToolCall {
+                        id: "c".into(),
+                        name: "heartbeat_config".into(),
+                        input: json!({}),
+                    }],
+                    stop_reason: None,
+                },
+                final_round("done"),
+            ],
+        );
+        Arc::get_mut(&mut state).unwrap().config = Config::parse_for_test(
+            "[anthropic]\napi_key='test'\n[session_profile.ops]\nprofile='default'\npermission='chat'\n",
+        );
+        let probe = AdminProfileProbe::new();
+        state
+            .tools
+            .register_tool(Box::new(Arc::clone(&probe)))
+            .await;
+        state
+            .session_profiles
+            .lock()
+            .await
+            .insert("rpc-pinned".into(), "ops".into());
+        run_llm_turn(
+            Arc::clone(&state),
+            "rpc-pinned".into(),
+            ChatMessage::user("go"),
+            Arc::new(NullProgress),
+            None,
+        )
+        .await;
+        assert_eq!(probe.seen(), Some(Some("ops".into())));
+    }
+
+    #[tokio::test]
+    async fn task6_acp_connection_profile_beats_shared_session_pin() {
+        use crate::tools::policy::{Origin, SessionMode};
+        let mut state = ServeState::for_test_scripted(
+            true,
+            vec![
+                crate::provider::ChatResponse {
+                    prompt_usage: None,
+                    text: None,
+                    tool_calls: vec![crate::provider::ToolCall {
+                        id: "c".into(),
+                        name: "heartbeat_config".into(),
+                        input: json!({}),
+                    }],
+                    stop_reason: None,
+                },
+                final_round("done"),
+            ],
+        );
+        Arc::get_mut(&mut state).unwrap().config = Config::parse_for_test(
+            "[anthropic]\napi_key='test'\n[session_profile.ops]\nprofile='default'\n[session_profile.other]\nprofile='default'\n",
+        );
+        let probe = AdminProfileProbe::new();
+        state
+            .tools
+            .register_tool(Box::new(Arc::clone(&probe)))
+            .await;
+        state.acp_sessions.lock().await.insert("shared".into());
+        state
+            .session_profiles
+            .lock()
+            .await
+            .insert("shared".into(), "other".into());
+        let host = AutonomousHost {
+            origin: Origin::Acp {
+                mode: SessionMode::Bypass,
+                session_profile: "ops".into(),
+            },
+            consult: None,
+        };
+        run_llm_turn(
+            Arc::clone(&state),
+            "shared".into(),
+            ChatMessage::user("go"),
+            Arc::new(host),
+            None,
+        )
+        .await;
+        assert_eq!(probe.seen(), Some(Some("ops".into())));
+    }
+
     /// Without `[serve]` there is no address, and `run` must neither bind
     /// nor return early: it is what `serve` waits on, so returning before
     /// shutdown would stop the whole agent.
@@ -4574,7 +4814,7 @@ mod tests {
     /// is scoped and the admin tools refuse. Asserting `None` — not merely
     /// "not 'developer'" — keeps the two paths distinguishable.
     #[tokio::test]
-    async fn a_non_acp_turn_scopes_no_session_profile() {
+    async fn a_non_acp_turn_scopes_the_implicit_session_profile() {
         let state = ServeState::for_test_scripted(
             true,
             vec![
@@ -4611,7 +4851,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(probe.seen(), Some(None), "no profile may be scoped here");
+        assert_eq!(
+            probe.seen(),
+            Some(Some("default".into())),
+            "the implicit profile is scoped here"
+        );
     }
 
     #[tokio::test]
@@ -4827,7 +5071,7 @@ type = "mock"
                 name,
                 crate::config::SessionProfileConfig {
                     profile: "default".into(),
-                    permission: Some("default".into()),
+                    permission: Some("admin".into()),
                     ..Default::default()
                 },
             );
@@ -4835,12 +5079,14 @@ type = "mock"
         // Permit the call through the shared table so these tests exercise
         // the profile scoped around the tool execution itself.
         config.permission_profiles.insert(
-            "default".into(),
+            "admin".into(),
             crate::config::PermissionProfileConfig {
                 tools: vec![crate::config::ToolGroup::Admin],
             },
         );
         let config = config.clone();
+        Arc::get_mut(&mut state).unwrap().tools =
+            Arc::new(crate::tools::ToolSet::new(vec![], vec![], &config));
         let sw = sapphire_framework::workspace::Workspace::from_root(ctx, &root).unwrap();
         let ws = Arc::new(sapphire_framework::workspace::WorkspaceState::open(sw).unwrap());
 
@@ -5162,7 +5408,7 @@ type = "mock"
             namespace: crate::config::DEFAULT_NAMESPACE_NAME.to_string(),
             persistence: None,
             subagent_depth: 1,
-            session_profile: None,
+            session_profile: "default".into(),
         }
         .run(&mut history)
         .await;
@@ -7419,7 +7665,7 @@ type = "mock"
             Self {
                 spec: crate::provider::ToolSpec {
                     kind,
-                    group: Some(crate::config::ToolGroup::Mcp),
+                    group: None,
                     name: "acp__game__echo".into(),
                     description: "Echo the given text back.".into(),
                     input_schema: json!({"type": "object", "properties": {}}),

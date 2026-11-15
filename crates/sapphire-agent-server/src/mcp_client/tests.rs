@@ -603,6 +603,26 @@ async fn acp_client_tools_are_prefixed_and_classified() {
     let tools = build_tools_for_client(&client, remote_tools);
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0].spec().name, "acp__game__poke");
+    assert_eq!(
+        tools[0].spec().group,
+        None,
+        "editor capabilities are not outbound MCP grants"
+    );
+    let config = crate::config::Config::for_test();
+    let profile = crate::tools::policy::ResolvedPermission::resolve(
+        &config,
+        crate::tools::policy::Origin::Acp {
+            mode: crate::tools::policy::SessionMode::Bypass,
+            session_profile: "default".into(),
+        },
+    );
+    assert_eq!(
+        crate::tools::policy::allow(
+            &profile,
+            &crate::tools::policy::ToolEntry::from_spec(tools[0].spec(), &config)
+        ),
+        crate::tools::policy::Allow::Allow
+    );
     assert_eq!(tools[0].spec().kind, ToolKind::Read);
     assert!(
         peer.seen()

@@ -488,6 +488,10 @@ impl super::TurnHost for AcpProgress {
         super::RoundBudget::Interactive
     }
 
+    fn session_profile_override(&self) -> Option<String> {
+        Some(self.profile.clone())
+    }
+
     fn origin(&self) -> crate::tools::policy::Origin {
         let mode = if self.follow_live {
             read_mode(&self.live_mode)

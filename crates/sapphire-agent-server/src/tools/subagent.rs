@@ -1437,7 +1437,8 @@ async fn scope_background<F: std::future::Future>(
     fut: F,
 ) -> F::Output {
     let fut = crate::tools::workspace_tools::scope_memory_namespace(namespace, fut);
-    let fut = crate::tools::config_tools::scope_session_profile(ctx.session_profile.clone(), fut);
+    let fut =
+        crate::tools::config_tools::scope_session_profile(Some(ctx.session_profile.clone()), fut);
     let origin = ctx.timer_origin.clone();
     let client = ctx.progress.acp_client();
     let fut = crate::serve::scope_turn_context(ctx, fut);
@@ -2700,7 +2701,7 @@ mod tests {
             // pass because a test handed it a `Some`.
             session_id: None,
             subagent_depth: 0,
-            session_profile: None,
+            session_profile: "default".into(),
         })
     }
 
@@ -2745,7 +2746,7 @@ mod tests {
                 timer_origin: None,
                 session_id: Some("parent-session".to_string()),
                 subagent_depth: 0,
-                session_profile: None,
+                session_profile: "default".into(),
             })
         };
 
@@ -3689,7 +3690,7 @@ mod tests {
             timer_origin: None,
             session_id: session_id.map(str::to_string),
             subagent_depth,
-            session_profile: None,
+            session_profile: "default".into(),
         })
     }
 

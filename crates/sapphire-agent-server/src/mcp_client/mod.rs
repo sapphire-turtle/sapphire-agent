@@ -843,7 +843,8 @@ pub fn build_tools_for_client(
                 client: Arc::clone(client),
                 spec: ToolSpec {
                     kind,
-                    group: Some(ToolGroup::Mcp),
+                    // Editor-provided MCP is an ACP capability, not an outbound host group.
+                    group: if acp { None } else { Some(ToolGroup::Mcp) },
                     name: Cow::Owned(tool_name),
                     description: Cow::Owned(rt.description),
                     input_schema: rt.input_schema,

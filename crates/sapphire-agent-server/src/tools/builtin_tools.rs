@@ -3104,7 +3104,7 @@ mod background_shell_tests {
             timer_origin: None,
             session_id: session.map(str::to_string),
             subagent_depth: depth,
-            session_profile: None,
+            session_profile: "default".into(),
         })
     }
 

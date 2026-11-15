@@ -193,7 +193,7 @@ mod tests {
             timer_origin: None,
             session_id: session.map(str::to_string),
             subagent_depth: 0,
-            session_profile: None,
+            session_profile: "default".into(),
         })
     }
 
