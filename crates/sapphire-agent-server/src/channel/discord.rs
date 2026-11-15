@@ -111,11 +111,7 @@ impl DiscordChannel {
         let channel_ids = cfg
             .rooms
             .iter()
-            .map(|r| {
-                r.room_id
-                    .parse::<u64>()
-                    .context("Invalid Discord channel_id")
-            })
+            .map(|r| r.room_id.parse::<u64>().context("Invalid Discord room_id"))
             .collect::<Result<HashSet<_>>>()?;
 
         let allowed_user_ids = cfg

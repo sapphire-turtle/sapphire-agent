@@ -263,7 +263,7 @@ pub struct SessionProfileConfig {
     /// Permission profile name. Absent means `"default"`.
     #[serde(default)]
     pub permission: Option<String>,
-    /// Capture-only migration field. Rooms now bind on `[[<channel>.rooms]]`.
+    /// Capture-only legacy rooms; the sole reader is `Config::migration_errors`.
     #[serde(default)]
     pub rooms: Vec<String>,
     /// Voice pipeline preset (in `[voice_pipeline.<n>]`) used when the
@@ -271,9 +271,7 @@ pub struct SessionProfileConfig {
     /// Absent means voice is disabled for this room profile.
     #[serde(default)]
     pub voice_pipeline: Option<String>,
-    /// Removed in the device-registry migration; replaced by `devices`.
-    /// Retained so a config that still sets it fails loudly — see
-    /// `Config::migration_errors`.
+    /// Capture-only legacy API keys; the sole reader is `Config::migration_errors`.
     #[serde(default)]
     pub api_keys: Vec<String>,
     /// API keys from before key profiles (by name or id) that run under this
@@ -1026,12 +1024,8 @@ impl Default for SubagentConfig {
     }
 }
 
-/// Whether the agent may touch the machine it runs on.
-///
-/// Off by default. On a self-hosted deployment this is the server, and
-/// "read any file, run any command" is not something a Discord message
-/// should reach by default. Turning it on is a deliberate act; running
-/// the agent in a container is the recommended way to do it.
+/// Host-level enable switch for an fs, shell, MCP or admin tool group.
+/// Disabled by default; session permissions cannot enable a disabled group.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct ToolGroupConfig {
     #[serde(default)]
@@ -1196,11 +1190,15 @@ pub struct MatrixConfig {
     pub access_token: String,
     pub user_id: String,
     pub device_id: String,
+    /// Subscribed rooms, in order; the first is the primary heartbeat target.
     #[serde(default)]
     pub rooms: Vec<RoomConfig>,
     #[serde(default)]
     pub allowed_users: Vec<String>,
+    /// E2EE recovery key (optional).
     pub recovery_key: Option<String>,
+    /// Directory for matrix-sdk state/crypto store. Defaults to
+    /// `~/.local/share/sapphire-agent/matrix`.
     pub state_dir: Option<String>,
 }
 
@@ -1676,7 +1674,7 @@ api_key = "test"
                 ));
             }
         }
-        // Room profile references and uniqueness of room_ids across profiles.
+        // Session profile references.
         for (rp_name, rp) in &self.session_profiles {
             if !self.profiles.contains_key(&rp.profile) {
                 errors.push(format!(
@@ -1702,7 +1700,16 @@ api_key = "test"
                 ));
             }
         }
+        let mut seen_rooms: HashMap<&str, &str> = HashMap::new();
         for (channel, room) in self.channels() {
+            if let Some(prev) = seen_rooms.get(room.room_id.as_str()) {
+                errors.push(format!(
+                    "room '{}' appears in multiple session_profiles: '{prev}' and '{}'",
+                    room.room_id, room.profile
+                ));
+            } else {
+                seen_rooms.insert(&room.room_id, &room.profile);
+            }
             if !self.session_profile_defined(&room.profile) {
                 if room.profile == DEFAULT_PROFILE_NAME {
                     errors.push(format!("{channel} room '{}' resolves to default but no [session_profile.default] is defined", room.room_id));
@@ -2455,10 +2462,43 @@ mod tests {
     }
 
     #[test]
+    fn a_room_bound_in_two_blocks_is_reported() {
+        let cfg = Config::parse_for_test(
+            r#"
+[anthropic]
+api_key = "test"
+[profiles.dev]
+provider = "anthropic"
+[session_profile.ops]
+profile = "dev"
+[session_profile.chat]
+profile = "dev"
+[discord]
+bot_token = "t"
+[[discord.rooms]]
+room_id = "r1"
+profile = "ops"
+[[discord.rooms]]
+room_id = "r1"
+profile = "chat"
+"#,
+        );
+        assert_eq!(
+            cfg.validate_session_profiles(),
+            vec!["room 'r1' appears in multiple session_profiles: 'ops' and 'chat'"]
+        );
+    }
+
+    #[test]
     fn an_explicit_declaration_wins_verbatim_and_an_unknown_one_fails_startup() {
         let cfg = Config::parse_for_test(
             "[anthropic]\napi_key = \"test\"\n\n[session_profile.ops]\nprofile = \"dev\"\npermission = \"admin\"\nmemory_namespace = \"user_ops\"\n",
         );
+        let bound = Config::parse_for_test(
+            "[anthropic]\napi_key = \"test\"\n[discord]\nbot_token = \"t\"\n[[discord.rooms]]\nroom_id = \"r1\"\nprofile = \"chat\"\n",
+        );
+        assert_eq!(bound.session_profile_name(None, "r1"), "chat");
+        assert_eq!(bound.session_profile_name(Some("ops"), "r1"), "ops");
         assert_eq!(cfg.session_profile_name(Some("ops"), "!any:srv"), "ops");
         assert_eq!(cfg.permission_profile_name_for_session("ops"), "admin");
         assert_eq!(cfg.namespace_for_session_profile("ops"), "user_ops");
@@ -2814,7 +2854,7 @@ trust   = "edit"
     #[test]
     fn no_profiles_means_no_resolution() {
         let cfg = parse(MINIMAL);
-        assert!(cfg.profile_for_session("!any:srv").is_none());
+        assert!(cfg.profile_for_session(DEFAULT_PROFILE_NAME).is_none());
         assert!(cfg.validate_session_profiles().is_empty());
     }
 
@@ -2829,7 +2869,10 @@ api_key = "test"
 provider = "anthropic"
 "#,
         );
-        assert_eq!(cfg.profile_for_session("!some:srv"), Some("default"));
+        assert_eq!(
+            cfg.profile_for_session(DEFAULT_PROFILE_NAME),
+            Some("default")
+        );
     }
 
     #[test]
@@ -3752,14 +3795,9 @@ reasoning_effort = "low"
         assert!(loaded.config.timer.retired_presets.is_some());
     }
 
-    /// A key serde accepts under another spelling must not be reported.
-    /// `room_id` is an alias for `room_ids`, and the cheap way to find
-    /// unknown keys — serialize the parsed `Config` back out and diff the
-    /// two documents — would call it unknown, because it round-trips under
-    /// its canonical name. Reading serde's own ignored-key callback is what
-    /// makes aliases, `flatten` and defaulted fields come out right.
+    /// Declaration-side room fields are recognized by the unknown-key collector.
     #[test]
-    fn an_accepted_alias_is_not_reported_as_unknown() {
+    fn a_room_declaration_is_not_reported_as_unknown() {
         let dir = tempfile::tempdir().unwrap();
         let host_path = dir.path().join("config.toml");
         std::fs::write(
@@ -3773,7 +3811,7 @@ reasoning_effort = "low"
         let loaded = Config::load_layered(&host_path).unwrap();
         assert!(
             loaded.unknown.is_empty(),
-            "the `room_id` alias was reported as unknown: {:?}",
+            "the room declaration was reported as unknown: {:?}",
             loaded.unknown
         );
         assert_eq!(
