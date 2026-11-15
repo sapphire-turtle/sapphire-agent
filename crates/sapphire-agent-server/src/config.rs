@@ -1620,11 +1620,11 @@ api_key = "test"
         self.session_profiles.get(name)
     }
 
-    /// Resolve the session policy for a given `room_id`, falling back to
-    /// the global default when no room profile sets one.
-    pub fn session_policy_for(&self, room_id: &str) -> SessionPolicy {
+    /// Resolve the session policy for an already-resolved session profile,
+    /// falling back to the global default when the profile sets none.
+    pub fn session_policy_for_profile(&self, profile_name: &str) -> SessionPolicy {
         self.session_profiles
-            .get(&self.session_profile_name(None, room_id))
+            .get(profile_name)
             .and_then(|rp| rp.session_policy)
             .unwrap_or(self.session_policy)
     }
@@ -2060,8 +2060,8 @@ api_key = "test"
             .unwrap_or(DEFAULT_NAMESPACE_NAME)
     }
 
-    /// Resolve the memory namespace for a given `room_id`. Rooms not
-    /// present in any room profile fall through to `"default"`.
+    /// Resolve the memory namespace through a room's declared session-profile
+    /// binding. Unbound rooms use the implicit `default` session profile.
     pub fn namespace_for_session(&self, room_id: &str) -> &str {
         self.session_profiles
             .get(&self.session_profile_name(None, room_id))

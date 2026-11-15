@@ -264,7 +264,7 @@ impl Agent {
     // -----------------------------------------------------------------------
 
     /// Return the active session_id for `key`, creating a new session file if needed.
-    async fn get_or_create_session(&self, key: &ConversationKey) -> String {
+    async fn get_or_create_session(&self, key: &ConversationKey, profile_name: &str) -> String {
         let mut sessions = self.active_sessions.lock().await;
         if let Some(id) = sessions.get(key) {
             return id.clone();
@@ -280,7 +280,10 @@ impl Agent {
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "unknown".to_string())
             });
-        let namespace = self.config.namespace_for_session(&key.0).to_string();
+        let namespace = self
+            .config
+            .namespace_for_session_profile(profile_name)
+            .to_string();
         match self
             .session_store
             .create_session(key, &channel_name, &namespace)
@@ -336,10 +339,10 @@ impl Agent {
     /// Dispatch the configured day-boundary action for `key` when the local
     /// date on the active session file is older than today. Each policy is
     /// idempotent within a day via `boundary_handled`.
-    async fn maybe_handle_day_boundary(&self, key: &ConversationKey) {
+    async fn maybe_handle_day_boundary(&self, key: &ConversationKey, profile_name: &str) {
         let boundary = self.config.day_boundary_hour;
         let today = local_date_for_timestamp(Local::now(), boundary);
-        let policy = self.config.session_policy_for(&key.0);
+        let policy = self.config.session_policy_for_profile(profile_name);
 
         if policy == SessionPolicy::None {
             return;
@@ -385,7 +388,8 @@ impl Agent {
                 // the new session will have today's created_at.
             }
             SessionPolicy::Compact => {
-                self.compact_at_boundary(key, &session_id).await;
+                self.compact_at_boundary(key, &session_id, profile_name)
+                    .await;
                 self.boundary_handled
                     .lock()
                     .await
@@ -398,7 +402,12 @@ impl Agent {
     /// Force-summarize the current in-memory history for `key` and replace
     /// it with a summary stub so the session can keep growing into the new
     /// day without re-sending stale context to the model.
-    async fn compact_at_boundary(&self, key: &ConversationKey, session_id: &str) {
+    async fn compact_at_boundary(
+        &self,
+        key: &ConversationKey,
+        session_id: &str,
+        profile_name: &str,
+    ) {
         let messages = {
             let history = self.history.lock().await;
             history.get(key).cloned().unwrap_or_default()
@@ -416,7 +425,9 @@ impl Agent {
 
         info!("Day boundary crossed for {key:?}; compacting session {session_id}");
 
-        let provider = self.provider_for(&key.0);
+        let provider = self
+            .providers
+            .for_session_profile(&self.config, profile_name);
         let summary = match generate_summary(&*provider, &messages).await {
             Ok(s) if !s.trim().is_empty() => s,
             Ok(_) => {
@@ -446,7 +457,7 @@ impl Agent {
     // -----------------------------------------------------------------------
 
     /// Return the system prompt for `key`, rebuilding if the local date has changed.
-    async fn get_system_prompt(&self, key: &ConversationKey) -> Option<String> {
+    async fn get_system_prompt(&self, key: &ConversationKey, profile_name: &str) -> Option<String> {
         let boundary = self.config.day_boundary_hour;
         let today = local_date_for_timestamp(Local::now(), boundary);
 
@@ -463,7 +474,7 @@ impl Agent {
             }
         }
 
-        let namespace = self.config.namespace_for_session(&key.0);
+        let namespace = self.config.namespace_for_session_profile(profile_name);
         let chain = self.config.resolve_namespace_chain(namespace);
         // Best-effort: a missing or unreachable RoomInfo just leaves the
         // "# Current Room" block out — never blocks the turn.
@@ -569,12 +580,12 @@ impl Agent {
         let key: ConversationKey = (incoming.room_id.clone(), incoming.thread_id.clone());
 
         // Check for day boundary → dispatch configured session policy
-        self.maybe_handle_day_boundary(&key).await;
+        self.maybe_handle_day_boundary(&key, &profile_name).await;
 
-        let session_id = self.get_or_create_session(&key).await;
+        let session_id = self.get_or_create_session(&key, &profile_name).await;
 
         // Get system prompt (snapshot: rebuilt at most once per local day per key)
-        let system = self.get_system_prompt(&key).await;
+        let system = self.get_system_prompt(&key, &profile_name).await;
 
         // Inject prefetch context from previous turn (if any)
         let prefetch_result = self.prefetch_cache.lock().await.remove(&key);
@@ -1739,6 +1750,105 @@ profile = "chat"
     }
 
     #[tokio::test]
+    async fn one_resolved_profile_governs_history_prompt_and_day_boundary() {
+        for unattended in [false, true] {
+            let config = crate::config::Config::parse_for_test(
+                "[anthropic]\napi_key='test'\n[profiles.default]\nprovider='stub'\n\
+                 [discord]\nbot_token='t'\n[[discord.rooms]]\nroom_id='test-room'\nprofile='room'\n\
+                 [session_profile.room]\nprofile='default'\nmemory_namespace='room_memory'\nsession_policy='none'\n\
+                 [session_profile.task]\nprofile='default'\nmemory_namespace='task_memory'\nsession_policy='reset'\n",
+            );
+            let tools = Arc::new(crate::tools::ToolSet::new(vec![], vec![], &config));
+            let reply = || crate::provider::ChatResponse {
+                text: Some("done".into()),
+                tool_calls: vec![],
+                prompt_usage: None,
+                stop_reason: None,
+            };
+            let (((agent, _, _), _), store) = build_test_agent_with_options(
+                vec![reply(), reply()],
+                false,
+                Some((config, tools)),
+                None,
+            );
+            for namespace in ["room_memory", "task_memory"] {
+                let dir = agent.workspace.dir().join("memory").join(namespace);
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join("MEMORY.md"), format!("{namespace} marker")).unwrap();
+            }
+            let turn = || async {
+                if unattended {
+                    agent
+                        .trigger("task", "heartbeat", "test-room", Some("task"))
+                        .await
+                        .unwrap();
+                } else {
+                    Arc::clone(&agent)
+                        .handle_message(incoming("ordinary"))
+                        .await
+                        .unwrap();
+                }
+            };
+            turn().await;
+            let expected = if unattended {
+                "task_memory"
+            } else {
+                "room_memory"
+            };
+            let key = ("test-room".to_string(), None);
+            let id = agent.active_sessions.lock().await[&key].clone();
+            let meta = store
+                .list_sessions()
+                .into_iter()
+                .find(|m| m.session_id == id)
+                .unwrap();
+            assert_eq!(
+                meta.namespace.as_deref(),
+                Some(expected),
+                "unattended={unattended}"
+            );
+            let snapshots = agent.snapshots.lock().await;
+            let prompt = &snapshots[&key].system_prompt;
+            assert!(prompt.contains(&format!("{expected} marker")), "{prompt}");
+            let other = if unattended {
+                "room_memory"
+            } else {
+                "task_memory"
+            };
+            assert!(!prompt.contains(&format!("{other} marker")), "{prompt}");
+            drop(snapshots);
+
+            // Make the persisted session old enough to exercise the real boundary path.
+            let path = store.absolute_path_for(&id).unwrap().join("session.md");
+            let raw = std::fs::read_to_string(&path).unwrap();
+            let old = chrono::Utc::now() - chrono::Duration::days(3);
+            let raw = raw
+                .lines()
+                .map(|line| {
+                    if line.starts_with("created_at:") {
+                        format!("created_at: {}", old.to_rfc3339())
+                    } else {
+                        line.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            std::fs::write(path, raw).unwrap();
+            turn().await;
+            let next_id = agent.active_sessions.lock().await[&key].clone();
+            assert_eq!(
+                next_id != id,
+                unattended,
+                "only the task profile resets at the boundary"
+            );
+            assert_eq!(
+                agent.history.lock().await[&key].len(),
+                if unattended { 2 } else { 4 }
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn heartbeat_chat_uses_the_rooms_registry_fallback_order() {
         let config = crate::config::Config::parse_for_test(
             "[anthropic]\napi_key='test'\n[profiles.default]\nprovider='local'\n[discord]\nbot_token='t'\n[[discord.rooms]]\nroom_id='test-room'\nprofile='missing'\n",
@@ -1966,7 +2076,7 @@ profile = "chat"
         let sha256 = crate::image_cache::sha256_hex(&image_bytes);
         let marker = format!("[image: image/png sha256={sha256}]");
         let session_id = agent
-            .get_or_create_session(&("test-room".into(), None))
+            .get_or_create_session(&("test-room".into(), None), "default")
             .await;
 
         // Agent appends before the end-of-turn scrub, exactly as production
@@ -2594,14 +2704,17 @@ profile = "chat"
 
         let key: crate::session::ConversationKey = ("test-room".to_string(), None);
         let first = agent
-            .get_system_prompt(&key)
+            .get_system_prompt(&key, "default")
             .await
             .expect("AGENTS.md exists, so the prompt is non-empty");
         assert!(first.contains("first content."), "{first}");
 
         // pin とスナップショットの両方が v1 を保持している状態で編集する
         std::fs::write(dir.join("AGENTS.md"), "second content.\n").unwrap();
-        let pinned = agent.get_system_prompt(&key).await.expect("pinned prompt");
+        let pinned = agent
+            .get_system_prompt(&key, "default")
+            .await
+            .expect("pinned prompt");
         assert!(
             pinned.contains("first content."),
             "ピンとスナップショット中は編集が反映されない"
@@ -2610,7 +2723,10 @@ profile = "chat"
 
         agent.invalidate_system_prompts().await;
 
-        let refreshed = agent.get_system_prompt(&key).await.expect("rebuilt prompt");
+        let refreshed = agent
+            .get_system_prompt(&key, "default")
+            .await
+            .expect("rebuilt prompt");
         assert!(
             refreshed.contains("second content."),
             "両方のキャッシュが消えた後は編集が反映される"

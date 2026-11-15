@@ -95,7 +95,7 @@ tools only look at or harmlessly change its own state can annotate them and
 have them run without a prompt.
 
 An "always allow" granted for an `acp__…` tool is kept like any other: per
-room profile, by tool name, in the agent's ACP permissions store. So it also
+session profile, by tool name, in the agent's ACP permissions store. So it also
 covers a later session whose client offers a tool of the same name.
 
 This trusts annotations that the outbound MCP servers do not get trusted
