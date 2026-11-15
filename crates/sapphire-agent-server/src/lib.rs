@@ -607,6 +607,7 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
                 config.tools.tavily_api_key.clone(),
                 &config.tools.mcp_servers,
                 config.day_boundary_hour,
+                &config,
             )
             .await;
 
@@ -644,7 +645,7 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
             // `src/agent.rs`, stay untouched by this feature. Registered
             // when at least one definition loaded — a tool with nobody to
             // delegate to has no reason to be offered — and also when
-            // `[tools.admin].room_profiles` names a profile: `agent_config` can
+            // `admin` is registered: `agent_config` can
             // create a definition while the process is running.
             let agent_defs = agents::load_agents_dir(&workspace_dir.join("agents"));
             // Taken before `new` moves the list: an empty list is not an
@@ -658,7 +659,7 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
                 );
             }
             // Registered when there is something to delegate to, and also
-            // when `[tools.admin].room_profiles` names a profile: `agent_config`
+            // when `admin` is registered: `agent_config`
             // can create a definition while the process is running. `Arc` rather
             // than a bare `Box` because `agent_config` holds a `Weak` to it —
             // same shape `SkillTool` uses.
@@ -666,7 +667,7 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
                 agent_defs,
                 config.tools.background.max_per_session > 0,
             ));
-            if !no_agent_defs || config.config_tools_enabled() {
+            if !no_agent_defs || config.group_registered(config::ToolGroup::Admin) {
                 tool_set
                     .register_tool(Box::new(Arc::clone(&subagent)))
                     .await;
@@ -1118,8 +1119,7 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
 
             // ── Config tools ────────────────────────────────────────────────
             // The agent's own heartbeat / autonomous / subagent definitions,
-            // editable from a chat room an operator names in
-            // `[tools.admin].room_profiles`. Registered here rather than in
+            // editable through the `admin` group. Registered here rather than in
             // `default_tool_set` because `task_test` needs `serve_state`,
             // which is built above, and because a `session_profiles` that names
             // nobody must register none of the four at all — see

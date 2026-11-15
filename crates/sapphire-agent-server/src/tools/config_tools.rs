@@ -6,20 +6,9 @@
 //! three times with only the directory differing, is what lets a chat
 //! room read and write them.
 //!
-//! Two properties hold the design together:
-//!
-//! - **A room profile must be named.** `[tools.admin].room_profiles` is a
-//!   host-layer list of room-profile names, and every action refuses in a
-//!   session whose profile is not on it. A channel room resolves to its
-//!   profile the same way its provider does; an ACP session carries the
-//!   profile its bearer token pinned at `session/new` (or `load`/`resume`),
-//!   which is what lets an editor manage definitions at all — ACP has no
-//!   room id. The transports that name no profile (`/rpc`, A2A, voice, the
-//!   unattended loops) get `None`, which is a refusal.
-//! - **The write side refuses what the loader would drop.** `parse_definition`
-//!   is the loader's own parse, failing instead of skipping, so a
-//!   definition that would never fire cannot be written and then puzzled
-//!   over.
+//! The `admin` group governs both registration and per-turn access through
+//! the shared permission decision. The write side also refuses content the
+//! loaders would drop, so an unusable definition cannot silently be installed.
 
 use crate::autonomous::{CONTINUE_PROMPT, marker};
 use crate::config::ToolGroup;
@@ -27,6 +16,8 @@ use crate::config::{Config, DEFAULT_NAMESPACE_NAME};
 use crate::provider::ChatMessage;
 use crate::provider::ToolSpec;
 use crate::serve::{AutonomousHost, LlmTurnOutcome, ServeState, TurnStop};
+use crate::tools::builtin_tools::{PROTECTED_CONFIG_FILES, lexically_normalize};
+use crate::tools::policy::{Allow, Origin, ResolvedPermission, ToolEntry, allow};
 use crate::tools::subagent::SubagentTool;
 use crate::tools::{Tool, ToolKind, ToolSet};
 use crate::workspace::slash_path;
@@ -84,6 +75,45 @@ impl ConfigDir {
     }
 }
 
+/// The dedicated owner of a definition on the path the writer will open.
+/// Compare raw and lexically collapsed paths so missing `nope/..` detours
+/// cannot bypass the guard. Reads remain unrestricted.
+pub(crate) fn definition_owner(abs: &Path, workspace_root: &Path) -> Option<&'static str> {
+    let raw = abs.to_path_buf();
+    let collapsed = lexically_normalize(abs);
+    let workspace_root = lexically_normalize(workspace_root);
+    for candidate in [&raw, &collapsed] {
+        let Ok(rel) = candidate.strip_prefix(&workspace_root) else {
+            continue;
+        };
+        if rel
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("md"))
+            && let Some(first) = rel.iter().next().and_then(|part| part.to_str())
+            && let Some(dir) = ConfigDir::ALL.iter().find(|dir| dir.dir_name() == first)
+        {
+            return Some(dir.tool_name());
+        }
+        if PROTECTED_CONFIG_FILES
+            .iter()
+            .any(|f| rel.file_name().is_some_and(|n| n == *f))
+        {
+            return Some("the config definition file");
+        }
+    }
+    None
+}
+
+/// Direct calls use the same group decision as both loops. ACP mode approval
+/// already happened before execution; this defense-in-depth check never asks.
+fn admin_allowed(config: &Config, spec: &ToolSpec) -> bool {
+    let Some(session_profile) = current_session_profile_for(config) else {
+        return false;
+    };
+    let profile = ResolvedPermission::resolve(config, Origin::Channel { session_profile });
+    allow(&profile, &ToolEntry::from_spec(spec, config)) == Allow::Allow
+}
+
 /// Resolve a definition name to `<workspace_root>/<dir>/<stem>.md`.
 ///
 /// The name has to be a bare file stem. `file_write` accepts absolute
@@ -116,13 +146,13 @@ pub(crate) fn definition_path(workspace_root: &Path, dir: &str, name: &str) -> R
 }
 
 tokio::task_local! {
-    /// The room profile an ACP turn runs under, scoped around tool execution
+    /// The session profile an ACP turn runs under, scoped around tool execution
     /// by `TurnLoop::run` from the profile pinned at `session/new` (or
     /// `load`/`resume`). `None` on every other serve-path turn.
     static SESSION_PROFILE_TL: Option<String>;
 }
 
-/// Run `fut` with the turn's room profile reachable from
+/// Run `fut` with the turn's session profile reachable from
 /// [`current_session_profile`]. Called once per round by
 /// `TurnLoop::run`, wrapping the same tool execution the timer and ACP-client
 /// scopes wrap.
@@ -134,7 +164,7 @@ pub(crate) fn scope_session_profile<F: std::future::Future>(
     SESSION_PROFILE_TL.scope(profile, fut)
 }
 
-/// The room profile scoped around the tool call currently executing, if the
+/// The session profile scoped around the tool call currently executing, if the
 /// turn came in on a transport that pins one — today only ACP.
 ///
 /// `None` outside `scope_session_profile` and `None` for a `/rpc`, A2A or
@@ -157,7 +187,7 @@ pub fn current_permission_profile() -> Option<String> {
     )
 }
 
-/// The room profile this call's admin grant is judged by, or `None` when the
+/// The session profile this call's admin grant is judged by, or `None` when the
 /// transport names no profile an operator could have allowed.
 ///
 /// A channel turn (`Agent::handle_message`, and the heartbeat's chat leg
@@ -177,13 +207,12 @@ pub(crate) fn current_session_profile_for(config: &Config) -> Option<String> {
     }
 }
 
-/// What every action answers with when the calling session profile is not on
-/// `[tools.admin].room_profiles`.
+/// What every action answers with when the session lacks an enabled `admin` grant.
 ///
 /// The wording names the config key on purpose: a model that is refused has
 /// no other way to find out, and an operator being told by the agent *which*
 /// setting to change is the whole reason the refusal is not just "denied".
-pub(crate) const ROOM_REFUSAL: &str = "Permission denied: the config tools are not available for this session profile. An operator can allow them with `[tools.admin].room_profiles` in the host config.";
+pub(crate) const ROOM_REFUSAL: &str = "Permission denied: the config tools are not available for this session profile. An operator must list `admin` in `[permission_profile.<name>].tools` and enable `[tools.admin].enabled` on this host.";
 
 /// The *effective* `enabled` value of a definition, as the loaders read
 /// it: `enabled:` when present, `true` when absent (both loaders declare
@@ -275,9 +304,9 @@ impl ConfigTool {
             );
         }
         description.push_str(
-            " These tools are available only in sessions whose room profile an operator \
-             listed in `[tools.admin].room_profiles`; anywhere else, every action including \
-             `list` is refused.",
+            " These tools are available only in sessions whose permission profile lists \
+             `admin` in `[permission_profile.<name>].tools` and this host enables \
+             `[tools.admin]`; anywhere else, every action including `list` is refused.",
         );
 
         let spec = ToolSpec {
@@ -346,14 +375,9 @@ impl ConfigTool {
             .map_err(|_| anyhow!("refusing to touch {}: outside the workspace", abs.display()))
     }
 
-    /// The profile gate. A refusal here is the only permission check these
-    /// tools have — they are `ToolKind::Edit` and deliberately outside
-    /// `ToolPolicy`, because the grant that matters is the host's room-profile
-    /// list, not a per-tool policy the workspace can set.
+    /// Defense in depth for direct callers: use the shared permission decision.
     fn gate(&self) -> Result<()> {
-        if current_session_profile_for(&self.config)
-            .is_some_and(|name| self.config.admin_allows_room_profile(&name))
-        {
+        if admin_allowed(&self.config, &self.spec) {
             Ok(())
         } else {
             Err(anyhow!(ROOM_REFUSAL))
@@ -685,8 +709,7 @@ impl TaskTestTool {
                  prompt and is always exactly one turn. Delivery is not verified: a heartbeat \
                  task's `room_id:` / `voice:` targets are ignored, because what this tool \
                  checks is the prompt and how the task ends, not where a result would go. \
-                 These tools are available only in sessions whose room profile an operator \
-                 listed in `[tools.admin].room_profiles`."
+                 These tools are available only in sessions whose permission profile lists `admin` in `[permission_profile.<name>].tools`."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -731,7 +754,7 @@ impl TaskTestTool {
         }
     }
 
-    /// The namespace the test session lands in: the calling room profile's, so
+    /// The namespace the test session lands in: the calling session profile's, so
     /// the report is readable where the operator already is. `None` is the
     /// lookup's answer on every path with neither a timer origin nor a
     /// task-local profile — voice-origin turns, turns that pin no profile
@@ -908,13 +931,11 @@ impl Tool for TaskTestTool {
     }
 
     async fn execute(&self, input: &serde_json::Value) -> Result<String> {
-        // Before the arguments are even read: the room-profile gate every
+        // Before the arguments are even read: the session-profile gate every
         // config tool shares. A run is the most powerful thing on this
         // surface — it drives a whole turn — so it is refused as firmly as a
         // write.
-        if !current_session_profile_for(&self.state.config)
-            .is_some_and(|name| self.state.config.admin_allows_room_profile(&name))
-        {
+        if !admin_allowed(&self.state.config, &self.spec) {
             anyhow::bail!(ROOM_REFUSAL);
         }
         let kind = input["kind"]
@@ -947,17 +968,9 @@ impl Tool for TaskTestTool {
     }
 }
 
-/// Register the four admin tools when the deployment has named a room profile.
-///
-/// Extracted from `lib.rs` so the condition is testable, because the
-/// condition *is* the grant: with `[tools.admin].room_profiles` empty, `serve`
-/// must register nothing at all — four tools that always refuse would
-/// still tell the model they exist, and "exists but never works" is a
-/// worse answer than "does not exist". The run-time gate in
-/// [`ConfigTool::gate`] and [`TaskTestTool::execute`] is the second half
-/// of the same grant, for the transports that have no room of their own.
-///
-/// Called once `serve_state` exists, since `task_test` needs it.
+/// Register all four dedicated tools only when the host enables `admin` and an
+/// effective permission profile lists it. `task_test` needs `serve_state`, so
+/// registration happens after the default set is built.
 pub(crate) async fn register_admin_tools(
     tool_set: &Arc<ToolSet>,
     workspace_root: &Path,
@@ -966,7 +979,7 @@ pub(crate) async fn register_admin_tools(
     subagent: Option<&Arc<SubagentTool>>,
     serve_state: Arc<ServeState>,
 ) {
-    if !config.config_tools_enabled() {
+    if !config.group_registered(ToolGroup::Admin) {
         return;
     }
     // `agent_config` refreshes the spec `ToolSet::specs` advertises, and
@@ -996,28 +1009,221 @@ pub(crate) async fn register_admin_tools(
 }
 
 #[cfg(test)]
+/// A workspace with the three definition directories created, plus a
+/// `TempDir` the caller must hold on to for the files to survive.
+pub(crate) fn test_workspace() -> (tempfile::TempDir, PathBuf, Arc<WorkspaceState>) {
+    use sapphire_framework::workspace::{AppContext, Workspace};
+    static TEST_CTX: AppContext = AppContext::new("sapphire-agent").allow_external_paths();
+    TEST_CTX.set_cache_dir(std::env::temp_dir().join("sapphire-agent-config-tools-test-cache"));
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    std::fs::create_dir_all(root.join(".sapphire-agent")).unwrap();
+    for sub in ["heartbeat", "autonomous", "agents"] {
+        std::fs::create_dir_all(root.join(sub)).unwrap();
+    }
+    let ws = Workspace::from_root(&TEST_CTX, &root).unwrap();
+    let state = Arc::new(WorkspaceState::open(ws).unwrap());
+    (dir, root, state)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::provider::ChatResponse;
     use crate::timer::{TimerOrigin, scope_timer_origin};
-    use sapphire_framework::workspace::{AppContext, Workspace, WorkspaceState};
+    use crate::tools::config_tools;
     use serde_json::json;
     use std::future::Future;
 
-    /// A workspace with the three definition directories created, plus a
-    /// `TempDir` the caller must hold on to for the files to survive.
-    fn test_workspace() -> (tempfile::TempDir, PathBuf, Arc<WorkspaceState>) {
-        static TEST_CTX: AppContext = AppContext::new("sapphire-agent").allow_external_paths();
-        TEST_CTX.set_cache_dir(std::env::temp_dir().join("sapphire-agent-config-tools-test-cache"));
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().to_path_buf();
-        std::fs::create_dir_all(root.join(".sapphire-agent")).unwrap();
-        for sub in ["heartbeat", "autonomous", "agents"] {
-            std::fs::create_dir_all(root.join(sub)).unwrap();
+    /// R6: every definition file is the `admin` group's land — modifiable only by the
+    /// dedicated tool that owns it, on every spelling the writer will open it with.
+    #[tokio::test]
+    async fn a_fs_write_tool_refuses_a_definition_file_naming_its_owner() {
+        let (_dir, root, ws) = config_tools::test_workspace();
+        std::fs::create_dir_all(root.join("heartbeat")).unwrap();
+        std::fs::write(root.join("heartbeat/morning_call.md"), "---\n---\n\nold\n").unwrap();
+        let write = crate::tools::builtin_tools::FileWriteTool::new(Arc::clone(&ws));
+        // The path the writer opens is what is compared: `expand_path`'s output (so a
+        // `~/...` and a workspace-relative one are the same file to it) and
+        // `lexically_normalize`'s (so `nope/../` and `./` and a `..` detour are).
+        for spelling in [
+            "heartbeat/morning_call.md".to_string(),
+            "./heartbeat/./morning_call.md".to_string(),
+            "nope/../heartbeat/../heartbeat/morning_call.md".to_string(),
+            root.join("heartbeat/morning_call.md")
+                .to_string_lossy()
+                .to_string(),
+        ] {
+            let err = write
+                .execute(&json!({"path": spelling, "content": "new"}))
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("heartbeat_config"),
+                "{spelling} -> {err}"
+            );
         }
-        let ws = Workspace::from_root(&TEST_CTX, &root).unwrap();
-        let state = Arc::new(WorkspaceState::open(ws).unwrap());
-        (dir, root, state)
+        // The config definition files are covered too, by the same comparison.
+        assert!(
+            write
+                .execute(&json!({"path": ".sapphire-agent/config.toml", "content": ""}))
+                .await
+                .is_err()
+        );
+        // And the read half keeps reading them — reading one's own task is not a rewrite risk.
+        let read = crate::tools::builtin_tools::FileReadTool::new(Arc::clone(&ws));
+        assert!(
+            read.execute(&json!({"path": "heartbeat/morning_call.md"}))
+                .await
+                .unwrap()
+                .contains("old")
+        );
+    }
+
+    /// Every local write verb protects all definition domains without changing
+    /// normal fs writes or reads. Tilde paths are expanded by the writer itself.
+    #[tokio::test]
+    async fn all_fs_write_verbs_protect_all_definitions_and_keep_normal_files_working() {
+        use crate::tools::builtin_tools::{FileAppendTool, FileDeleteTool, FileWriteTool};
+        let (_dir, root, ws) = test_workspace();
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(FileWriteTool::new(Arc::clone(&ws))),
+            Box::new(FileAppendTool::new(Arc::clone(&ws))),
+            Box::new(FileDeleteTool::new(Arc::clone(&ws))),
+        ];
+        let mut definitions = vec![];
+        for dir in ConfigDir::ALL {
+            definitions.push((format!("{}/task.MD", dir.dir_name()), dir.tool_name()));
+        }
+        for name in PROTECTED_CONFIG_FILES {
+            definitions.push((
+                format!(".sapphire-agent/{name}"),
+                "the config definition file",
+            ));
+        }
+        for (rel, owner) in definitions {
+            let abs = root.join(&rel);
+            std::fs::write(&abs, "old").unwrap();
+            let mut spellings = vec![
+                rel.clone(),
+                format!("./{rel}"),
+                format!("nope/../{rel}"),
+                abs.to_string_lossy().into_owned(),
+            ];
+            if let Some(home) = directories::BaseDirs::new()
+                && let Ok(home_rel) = abs.strip_prefix(home.home_dir())
+            {
+                spellings.push(format!("~/{}", home_rel.display()));
+            }
+            for tool in &tools {
+                for spelling in &spellings {
+                    let err = tool
+                        .execute(&json!({"path": spelling, "content": "new"}))
+                        .await
+                        .unwrap_err();
+                    assert!(
+                        err.to_string().contains(owner),
+                        "{}: {spelling}: {err}",
+                        tool.spec().name
+                    );
+                    assert_eq!(std::fs::read_to_string(&abs).unwrap(), "old");
+                }
+            }
+        }
+        let ordinary = "notes/ordinary.md";
+        tools[0]
+            .execute(&json!({"path": ordinary, "content": "hello"}))
+            .await
+            .unwrap();
+        tools[1]
+            .execute(&json!({"path": ordinary, "content": " world"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join(ordinary)).unwrap(),
+            "hello world"
+        );
+        tools[2].execute(&json!({"path": ordinary})).await.unwrap();
+        assert!(!root.join(ordinary).exists());
+        // A raw path outside the root can collapse back into it; do not return
+        // early before checking the collapsed spelling.
+        let detour = root
+            .parent()
+            .unwrap()
+            .join("nope/..")
+            .join(root.file_name().unwrap())
+            .join("heartbeat/task.md");
+        assert_eq!(definition_owner(&detour, &root), Some("heartbeat_config"));
+        assert_eq!(definition_owner(&root.join("notes/task.md"), &root), None);
+        assert_eq!(
+            definition_owner(&root.join("heartbeat/task.txt"), &root),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn tilde_expansion_names_the_same_definition_for_every_write_verb() {
+        use crate::tools::builtin_tools::{FileAppendTool, FileDeleteTool, FileWriteTool};
+        let home = directories::BaseDirs::new().unwrap();
+        let dir = tempfile::tempdir_in(home.home_dir()).unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".sapphire-agent")).unwrap();
+        std::fs::create_dir_all(root.join("heartbeat")).unwrap();
+        let path = root.join("heartbeat/task.md");
+        std::fs::write(&path, "old").unwrap();
+        let expanded_rel = path.strip_prefix(home.home_dir()).unwrap();
+        let spelling = format!("~/{}", expanded_rel.display());
+        static CTX: sapphire_framework::workspace::AppContext =
+            sapphire_framework::workspace::AppContext::new("sapphire-agent").allow_external_paths();
+        CTX.set_cache_dir(std::env::temp_dir().join("sapphire-agent-config-tilde-test-cache"));
+        let state = Arc::new(
+            WorkspaceState::open(
+                sapphire_framework::workspace::Workspace::from_root(&CTX, root).unwrap(),
+            )
+            .unwrap(),
+        );
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(FileWriteTool::new(Arc::clone(&state))),
+            Box::new(FileAppendTool::new(Arc::clone(&state))),
+            Box::new(FileDeleteTool::new(state)),
+        ];
+        for tool in tools {
+            let err = tool
+                .execute(&json!({"path": spelling, "content": "new"}))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("heartbeat_config"), "{err}");
+        }
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "old");
+    }
+
+    #[tokio::test]
+    async fn enabled_admin_listed_by_no_effective_profile_registers_nothing() {
+        let (_dir, root, ws) = test_workspace();
+        let state = test_state(vec![]);
+        let set = Arc::new(ToolSet::new(vec![], vec![], &Config::for_test()));
+        let cfg = Config::parse_for_test("[tools.admin]\nenabled = true\n");
+        assert!(!cfg.group_registered(ToolGroup::Admin));
+        register_admin_tools(&set, &root, cfg, ws, None, state).await;
+        assert!(set.entries().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn direct_admin_calls_require_the_host_key_and_profile_listing() {
+        for enabled in [false, true] {
+            let mut f = fixture(ConfigDir::Agents);
+            f.tool.config.tools.admin.enabled = enabled;
+            for permission in ["chat", "admin"] {
+                f.tool
+                    .config
+                    .session_profiles
+                    .get_mut("ops")
+                    .unwrap()
+                    .permission = Some(permission.into());
+                let result = call(&f.tool, json!({"action": "list"})).await;
+                assert_eq!(result.is_ok(), enabled && permission == "admin");
+            }
+        }
     }
 
     struct Fixture {
@@ -1026,14 +1232,14 @@ mod tests {
         tool: ConfigTool,
     }
 
-    /// The tool as the deployment wires it: `[tools.admin].room_profiles =
-    /// ["ops"]`, `[session_profile.ops]` claiming `!ops:x`, the three
+    /// The tool as the deployment wires it: `admin` enabled and listed by
+    /// `[session_profile.ops]` for room `!ops:x`, the three
     /// directories present, no subagent / tool set back-reference (that is
     /// the agents-directory wiring, tested where it exists).
     fn fixture(dir: ConfigDir) -> Fixture {
         let (d, root, ws) = test_workspace();
         let mut config = Config::for_test();
-        config.tools.admin.room_profiles = vec!["ops".to_string()];
+        config.tools.admin.enabled = true;
         config.discord = Some(crate::config::DiscordConfig {
             bot_token: "test".into(),
             rooms: vec![
@@ -1054,6 +1260,7 @@ mod tests {
             "ops".to_string(),
             crate::config::SessionProfileConfig {
                 profile: "dev".to_string(),
+                permission: Some("admin".to_string()),
                 ..Default::default()
             },
         );
@@ -1283,7 +1490,7 @@ mod tests {
         assert!(err.contains("Permission denied"), "{err}");
     }
 
-    /// The ACP path: an editor's session carries the room profile its bearer
+    /// The ACP path: an editor's session carries the session profile its bearer
     /// token pinned, with no room id anywhere. Listing that profile is what
     /// lets `agent_config` manage subagent definitions from Zed — the whole
     /// reason this grant is no longer written in room ids.
@@ -1308,7 +1515,7 @@ mod tests {
                 .unwrap_err()
                 .to_string();
             assert!(err.contains("Permission denied"), "{profile:?}: {err}");
-            assert!(err.contains("room_profiles"), "{profile:?}: {err}");
+            assert!(err.contains("permission_profile"), "{profile:?}: {err}");
         }
     }
 
@@ -1320,7 +1527,7 @@ mod tests {
     async fn a_channel_room_is_gated_by_its_resolved_session_profile() {
         let (d, root, ws) = test_workspace();
         let mut config = Config::for_test();
-        config.tools.admin.room_profiles = vec!["ops".to_string()];
+        config.tools.admin.enabled = true;
         config.discord = Some(crate::config::DiscordConfig {
             bot_token: "test".into(),
             rooms: vec![
@@ -1342,6 +1549,7 @@ mod tests {
                 name.to_string(),
                 crate::config::SessionProfileConfig {
                     profile: "dev".to_string(),
+                    permission: Some(if name == "ops" { "admin" } else { "chat" }.to_string()),
                     ..Default::default()
                 },
             );
@@ -1376,7 +1584,7 @@ mod tests {
         assert!(err.contains("Permission denied"), "{err}");
     }
 
-    /// The test session lands under the calling room profile's memory
+    /// The test session lands under the calling session profile's memory
     /// namespace, resolved from the profile rather than from a room id — so
     /// an ACP call writes its report where the operator already reads.
     #[tokio::test]
@@ -1386,7 +1594,7 @@ mod tests {
             let config = &mut Arc::get_mut(&mut state)
                 .expect("uniquely owned immediately after construction")
                 .config;
-            config.tools.admin.room_profiles = vec!["ops".to_string()];
+            config.tools.admin.enabled = true;
             config.discord = Some(crate::config::DiscordConfig {
                 bot_token: "test".into(),
                 rooms: vec![
@@ -1407,6 +1615,7 @@ mod tests {
                 "ops".to_string(),
                 crate::config::SessionProfileConfig {
                     profile: "dev".to_string(),
+                    permission: Some("admin".to_string()),
                     memory_namespace: Some("ops_ns".to_string()),
                     ..Default::default()
                 },
@@ -1461,14 +1670,14 @@ mod tests {
     }
 
     /// A `ServeState` whose scripted provider answers with `responses`, with
-    /// the `ops` room profile allow-listed so the tool's gate is passable.
+    /// the `ops` session profile allow-listed so the tool's gate is passable.
     fn test_state(responses: Vec<ChatResponse>) -> Arc<ServeState> {
         let mut state = ServeState::for_test_scripted(false, responses);
         {
             let config = &mut Arc::get_mut(&mut state)
                 .expect("uniquely owned immediately after construction")
                 .config;
-            config.tools.admin.room_profiles = vec!["ops".to_string()];
+            config.tools.admin.enabled = true;
             config.discord = Some(crate::config::DiscordConfig {
                 bot_token: "test".into(),
                 rooms: vec![
@@ -1489,6 +1698,7 @@ mod tests {
                 "ops".to_string(),
                 crate::config::SessionProfileConfig {
                     profile: "dev".to_string(),
+                    permission: Some("admin".to_string()),
                     ..Default::default()
                 },
             );
@@ -1656,37 +1866,45 @@ mod tests {
             assert!(err.contains("non-negative integer"), "{bad}: {err}");
         }
     }
-    /// A `rooms` that names nobody registers nothing — not four tools that
+    /// A disabled group registers nothing — not four tools that
     /// always refuse. The difference matters: the model cannot ask for a
     /// tool it was never offered, and a refusal it can discover still tells
     /// it that this surface exists.
     #[tokio::test]
-    async fn no_room_means_no_registration() {
+    async fn disabled_admin_means_no_registration() {
         let (_dir, root, ws) = test_workspace();
         let serve_state = test_state(vec![test_response("ok")]);
-        let set = Arc::new(ToolSet::new(Vec::new(), Vec::new()));
+        let set = Arc::new(ToolSet::new(
+            Vec::new(),
+            Vec::new(),
+            &crate::config::Config::for_test(),
+        ));
         let mut config = Config::for_test();
-        config.tools.admin.room_profiles = Vec::new();
-        assert!(!config.config_tools_enabled());
+        config.tools.admin.enabled = false;
+        assert!(!config.group_registered(ToolGroup::Admin));
 
         register_admin_tools(&set, &root, config, ws, None, serve_state).await;
 
         assert!(
             set.specs_filtered(|_| true).await.is_empty(),
-            "no room names one: none of the admin tools may be registered"
+            "admin is disabled: none of the admin tools may be registered"
         );
     }
 
-    /// One room is all it takes, and it registers exactly four tools: the
+    /// One effective listing is all it takes, registering exactly four tools: the
     /// three `ConfigTool`s (`ConfigDir::ALL`) plus `task_test`. Check the
     /// specs for both unique names and their edit classification.
     #[tokio::test]
-    async fn one_room_registers_all_four() {
+    async fn a_listed_enabled_admin_registers_all_four() {
         let (_dir, root, ws) = test_workspace();
         let serve_state = test_state(vec![test_response("ok")]);
-        let set = Arc::new(ToolSet::new(Vec::new(), Vec::new()));
+        let set = Arc::new(ToolSet::new(
+            Vec::new(),
+            Vec::new(),
+            &crate::config::Config::for_test(),
+        ));
         let mut config = Config::for_test();
-        config.tools.admin.room_profiles = vec!["ops".to_string()];
+        config.tools.admin.enabled = true;
         config.discord = Some(crate::config::DiscordConfig {
             bot_token: "test".into(),
             rooms: vec![
@@ -1703,6 +1921,13 @@ mod tests {
             ],
             allowed_users: vec![],
         });
+
+        config.permission_profiles.insert(
+            "ops".to_string(),
+            crate::config::PermissionProfileConfig {
+                tools: vec![ToolGroup::Admin],
+            },
+        );
 
         register_admin_tools(&set, &root, config, ws, None, serve_state).await;
 
@@ -1745,9 +1970,10 @@ mod tests {
         let set = Arc::new(ToolSet::new(
             vec![Box::new(Arc::clone(&subagent)) as Box<dyn Tool>],
             Vec::new(),
+            &crate::config::Config::for_test(),
         ));
         let mut config = Config::for_test();
-        config.tools.admin.room_profiles = vec!["ops".to_string()];
+        config.tools.admin.enabled = true;
         config.discord = Some(crate::config::DiscordConfig {
             bot_token: "test".into(),
             rooms: vec![
@@ -1768,6 +1994,7 @@ mod tests {
             "ops".to_string(),
             crate::config::SessionProfileConfig {
                 profile: "dev".to_string(),
+                permission: Some("admin".to_string()),
                 ..Default::default()
             },
         );

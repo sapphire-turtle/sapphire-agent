@@ -997,6 +997,7 @@ mod tests {
             Some("test-tavily-key".to_string()),
             &[],
             4,
+            &crate::config::Config::parse_for_test("[tools.fs]\nenabled = true\n[tools.shell]\nenabled = true\n[permission_profile.test]\ntools = [\"shell\"]\n"),
         )
         .await;
         let specs = tools.specs_filtered(|_| true).await;
@@ -1259,6 +1260,7 @@ api_key = "test"
         let tools = Arc::new(crate::tools::ToolSet::new(
             vec![Box::new(crate::serve::EchoTool::new())],
             Vec::new(),
+            &crate::config::Config::for_test(),
         ));
 
         let (config, tools) = custom.unwrap_or((config, tools));
@@ -1359,6 +1361,7 @@ api_key = "test"
                 Box::new(crate::tools::attachment_tools::ImageReadTool::new(state)),
             ],
             vec![],
+            &crate::config::Config::for_test(),
         ));
         let config = crate::config::Config::parse_for_test(&format!(
             "[anthropic]\napi_key = \"test\"\n[tools.fs]\nenabled = {host}\n[tools.shell]\nenabled = {host}\n"
@@ -1439,6 +1442,7 @@ api_key = "test"
                 crate::tools::attachment_tools::ImageReadTool::new(state),
             )],
             vec![],
+            &crate::config::Config::for_test(),
         ));
         let config = crate::config::Config::parse_for_test(
             "[anthropic]\napi_key = \"test\"\n[tools.fs]\nenabled = true\n[tools.shell]\nenabled = true\n",

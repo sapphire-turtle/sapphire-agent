@@ -4299,13 +4299,17 @@ rooms    = []
         );
 
         Arc::new(Self {
-            config,
+            config: config.clone(),
             registry: Arc::new(registry),
             workspace: Arc::new(Workspace::new(
                 workspace_dir,
                 crate::config::DigestConfig::default(),
             )),
-            tools: Arc::new(ToolSet::new(vec![Box::new(EchoTool::new())], Vec::new())),
+            tools: Arc::new(ToolSet::new(
+                vec![Box::new(EchoTool::new())],
+                Vec::new(),
+                &config,
+            )),
             permissions: Arc::new(acp_permissions::PermissionStore::open(
                 base.join("acp-permissions.json"),
             )),
@@ -4664,7 +4668,7 @@ type = "mock"
     /// pinned one) must fail here, the way Task 4's probe would.
     ///
     /// The tool is a real `ConfigTool` over a real workspace with
-    /// `[tools.admin].room_profiles = ["ops"]`; the turn is an ACP turn
+    /// `admin` enabled and listed by its permission profile; the turn is an ACP turn
     /// only by `state.acp_sessions` plus the pin in
     /// `session_profiles`, exactly what `session/new` writes. The
     /// policy layer is left at the default `Origin::Unattended` so the
@@ -4729,7 +4733,7 @@ type = "mock"
 
         let result = tool_result_for(&state, &sid, "call-1").await;
         assert!(
-            result.contains("Permission denied") && result.contains("room_profiles"),
+            result.contains("Permission denied") && result.contains("permission_profile"),
             "a /rpc turn must be refused by the profile gate: got {result}"
         );
     }
@@ -4737,7 +4741,7 @@ type = "mock"
     /// The state + real `agent_config` tool the two wiring tests above
     /// share: a scripted one-round-then-answer provider, and a
     /// `ConfigTool` over `state.workspace` itself with
-    /// `[tools.admin].room_profiles` set to `profiles`. The framework
+    /// `admin` enabled and listed for `profiles`. The framework
     /// workspace the tool writes through is opened over the same
     /// directory (`Workspace::from_root` needs the `.sapphire-agent`
     /// marker), with a shared cache dir under the system temp dir.
@@ -4787,9 +4791,18 @@ type = "mock"
 
         let config = &mut Arc::get_mut(&mut state).unwrap().config;
         config.tools.admin.enabled = true;
-        config.tools.admin.room_profiles = profiles;
-        // Permit the call through the new table so these existing tests
-        // continue to exercise the legacy tool-local profile gate.
+        for name in profiles {
+            config.session_profiles.insert(
+                name,
+                crate::config::SessionProfileConfig {
+                    profile: "default".into(),
+                    permission: Some("default".into()),
+                    ..Default::default()
+                },
+            );
+        }
+        // Permit the call through the shared table so these tests exercise
+        // the profile scoped around the tool execution itself.
         config.permission_profiles.insert(
             "default".into(),
             crate::config::PermissionProfileConfig {
@@ -6981,7 +6994,7 @@ type = "mock"
             crate::tools::client_tools::ClientShellOutput::new(),
         ));
         tools.push(Box::new(crate::tools::client_tools::ClientShellKill::new()));
-        ToolSet::new(tools, Vec::new())
+        ToolSet::new(tools, Vec::new(), &crate::config::Config::for_test())
     }
 
     /// The tool names an ACP turn with an editor declaring `caps` would
@@ -7412,6 +7425,7 @@ type = "mock"
                 Arc::new(crate::tools::ToolSet::new(
                     vec![Box::new(SessionEcho::new(k))],
                     Vec::new(),
+                    &crate::config::Config::for_test(),
                 ))
             });
             (

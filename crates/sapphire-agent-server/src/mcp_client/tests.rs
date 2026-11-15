@@ -710,7 +710,11 @@ async fn an_acp_tool_list_subscription_outlives_the_request_timeout() {
     );
     peer.script("subscriptions/listen", FakeReply::Hang);
     let client = Arc::new(McpClient::over_acp("game", "game:1", peer.clone(), "/tmp"));
-    let set = crate::tools::ToolSet::new(Vec::new(), vec![Arc::clone(&client)]);
+    let set = crate::tools::ToolSet::new(
+        Vec::new(),
+        vec![Arc::clone(&client)],
+        &crate::config::Config::for_test(),
+    );
     set.install_client_tools(&client, client.list_tools().await.unwrap())
         .await;
 

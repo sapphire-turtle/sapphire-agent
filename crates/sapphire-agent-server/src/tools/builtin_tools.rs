@@ -178,7 +178,7 @@ static SENSITIVE_PREFIXES: &[&str] = &[
 /// When `workspace_dir` is unset the workspace root *is* the config
 /// file's own directory, so blocking the directory would refuse every
 /// write in the workspace on a default install.
-static PROTECTED_CONFIG_FILES: &[&str] = &["acp-permissions.json", "config.toml"];
+pub(crate) static PROTECTED_CONFIG_FILES: &[&str] = &["acp-permissions.json", "config.toml"];
 
 /// The agent's own config directory, if this host has one.
 fn agent_config_dir() -> Option<PathBuf> {
@@ -199,7 +199,7 @@ fn agent_config_dir() -> Option<PathBuf> {
 /// with the kernel whenever a symlink sits in the path, because the
 /// kernel resolves the link first. That direction is accepted — see
 /// `protected_leaf`, which does not rely on the whole path matching.
-fn lexically_normalize(path: &Path) -> PathBuf {
+pub(crate) fn lexically_normalize(path: &Path) -> PathBuf {
     use std::path::Component;
 
     let mut out = PathBuf::new();
@@ -542,6 +542,13 @@ impl Tool for FileWriteTool {
         let path = expand_path(path_str);
         let workspace_root = self.state.workspace.root.clone();
         refuse_if_sensitive(&path, Some(&workspace_root), "Writing to")?;
+        let abs = workspace_root.join(&path);
+        if let Some(owner) = super::config_tools::definition_owner(&abs, &workspace_root) {
+            anyhow::bail!(
+                "Writing to '{}' is a definition file, owned by {owner}: use it.",
+                path.display()
+            );
+        }
 
         self.state
             .write_file(&path, content)
@@ -615,6 +622,13 @@ impl Tool for FileDeleteTool {
 
         let workspace_root = self.state.workspace.root.clone();
         refuse_if_sensitive(&path, Some(&workspace_root), "Deleting")?;
+        let abs = workspace_root.join(&path);
+        if let Some(owner) = super::config_tools::definition_owner(&abs, &workspace_root) {
+            anyhow::bail!(
+                "Deleting '{}' is a definition file, owned by {owner}: use it.",
+                path.display()
+            );
+        }
 
         self.state
             .delete_file(&path)
@@ -690,6 +704,13 @@ impl Tool for FileAppendTool {
         let path = expand_path(path_str);
         let workspace_root = self.state.workspace.root.clone();
         refuse_if_sensitive(&path, Some(&workspace_root), "Writing to")?;
+        let abs = workspace_root.join(&path);
+        if let Some(owner) = super::config_tools::definition_owner(&abs, &workspace_root) {
+            anyhow::bail!(
+                "Writing to '{}' is a definition file, owned by {owner}: use it.",
+                path.display()
+            );
+        }
 
         self.state
             .append_file(&path, content)
@@ -2437,6 +2458,7 @@ mod refresh_system_prompt_tests {
         let set = ToolSet::new(
             vec![Box::new(RefreshSystemPromptTool::new(weak)) as Box<dyn Tool>],
             Vec::new(),
+            &crate::config::Config::for_test(),
         );
 
         let names: Vec<String> = set

@@ -1935,31 +1935,6 @@ api_key = "test"
         errors
     }
 
-    /// True when `name` is one of the room profiles declared in
-    /// `[tools.admin].room_profiles`.
-    ///
-    /// The name is a `[session_profile.<n>]` key, resolved from the calling
-    /// transport rather than typed by the caller: a channel room through
-    /// [`Self::session_profile_name`], an ACP session through the
-    /// profile its bearer token pinned. The transports that name no profile —
-    /// voice, `/rpc`, A2A, the unattended loops — never reach this with a
-    /// value, which is the point: the endpoint a client reaches first, before
-    /// any profile is pinned, must not be the one that can author unattended
-    /// work.
-    pub fn admin_allows_room_profile(&self, name: &str) -> bool {
-        self.tools
-            .admin
-            .room_profiles
-            .iter()
-            .any(|allowed| allowed == name)
-    }
-
-    /// True when `[tools.admin].room_profiles` names at least one session
-    /// profile, i.e. the config-file management tools are registered at all.
-    pub fn config_tools_enabled(&self) -> bool {
-        !self.tools.admin.room_profiles.is_empty()
-    }
-
     /// True if `name` is either the implicit `"default"` namespace or has a
     /// `[memory_namespace.<name>]` block.
     fn namespace_is_defined(&self, name: &str) -> bool {
@@ -2606,32 +2581,16 @@ profile = "chat"
         Config::parse_for_test(s)
     }
 
-    /// The default is off: no room profile is named, so none of the four
-    /// tools is ever registered.
+    /// Admin registration needs both a host key and an effective profile listing.
     #[test]
-    fn config_tools_are_off_until_a_session_profile_is_named() {
-        let cfg = parse("[anthropic]\napi_key = \"test\"\n");
-        assert!(!cfg.config_tools_enabled());
-        assert!(!cfg.admin_allows_room_profile("ops"));
-        assert!(!cfg.admin_allows_room_profile("default"));
-    }
-
-    /// A named room profile is the grant, and the name is the session_profile
-    /// key — not a room id.
-    #[test]
-    fn config_tools_are_allowed_in_a_named_session_profile() {
-        let cfg = parse(
-            "[anthropic]\napi_key = \"test\"\n\n[tools.admin]\n\
-             room_profiles = [\"ops\", \"developer\"]\n",
-        );
-        assert!(cfg.config_tools_enabled());
-        assert!(cfg.admin_allows_room_profile("ops"));
-        assert!(cfg.admin_allows_room_profile("developer"));
-        assert!(!cfg.admin_allows_room_profile("guest"));
-        assert!(
-            !cfg.admin_allows_room_profile("!ops:x"),
-            "a room id is not a session profile name"
-        );
+    fn config_tools_need_an_enabled_group_and_an_effective_listing() {
+        let off = parse("");
+        assert!(!off.group_registered(ToolGroup::Admin));
+        let enabled_only = parse("[tools.admin]\nenabled = true\n");
+        assert!(!enabled_only.group_registered(ToolGroup::Admin));
+        let both =
+            parse("[tools.admin]\nenabled = true\n[permission_profile.ops]\ntools = [\"admin\"]\n");
+        assert!(both.group_registered(ToolGroup::Admin));
     }
 
     /// A channel room resolves to the profile the rest of the config uses:
@@ -2655,17 +2614,14 @@ profile = "chat"
         );
     }
 
-    /// Listing the implicit `"default"` profile is what an operator writes to
-    /// allow every room no profile claims — a broad grant, and the reason the
-    /// docs say so.
+    /// An operator can grant admin to the implicit default session explicitly.
     #[test]
-    fn default_profile_is_allowed_by_name() {
+    fn default_permission_profile_can_explicitly_list_admin() {
         let cfg = parse(
-            "[anthropic]\napi_key = \"test\"\n\n[tools.admin]\n\
-             room_profiles = [\"default\"]\n",
+            "[tools.admin]\nenabled = true\n[permission_profile.default]\ntools = [\"admin\"]\n",
         );
-        assert!(cfg.config_tools_enabled());
-        assert!(cfg.admin_allows_room_profile("default"));
+        assert!(cfg.group_registered(ToolGroup::Admin));
+        assert!(cfg.permission_profile("default").lists(ToolGroup::Admin));
     }
 
     /// `rooms` is gone: a config that still sets it must not start, because
@@ -4379,10 +4335,17 @@ model = "m"
         );
     }
     #[test]
-    fn existing_admin_room_profiles_key_still_grants_access() {
+    fn legacy_admin_room_profiles_key_no_longer_grants_access() {
         let cfg = Config::parse_for_test("[tools.admin]\nroom_profiles = [\"ops\"]\n");
-        assert!(cfg.config_tools_enabled());
-        assert!(cfg.admin_allows_room_profile("ops"));
-        assert!(!cfg.admin_allows_room_profile("guest"));
+        assert!(!cfg.group_registered(ToolGroup::Admin));
+        assert!(
+            !cfg.permission_profile(&cfg.permission_profile_name_for_session("ops"))
+                .lists(ToolGroup::Admin)
+        );
+        assert!(
+            cfg.migration_errors()
+                .iter()
+                .any(|e| e.contains("room_profiles"))
+        );
     }
 }

@@ -15,12 +15,13 @@ pub mod skill_tools;
 pub mod subagent;
 pub mod workspace_tools;
 
-use crate::config::McpServerConfig;
+use crate::config::{Config, McpServerConfig, ToolGroup};
 use crate::mcp_client::{self, McpClient, build_tools_for_client};
 use crate::provider::{ToolCall, ToolSpec};
 pub use agent_client_protocol::v1::schema::ToolKind;
 use anyhow::Result;
 use async_trait::async_trait;
+use policy::ToolEntry;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
@@ -84,6 +85,8 @@ pub struct ToolSet {
     inner: RwLock<ToolSetInner>,
     /// MCP clients whose `tools_changed` flag is checked before each turn.
     mcp_clients: Vec<Arc<McpClient>>,
+    #[allow(dead_code)] // Read by entries; turn-loop adoption follows in Task 6.
+    config: Config,
 }
 
 struct ToolSetInner {
@@ -92,7 +95,11 @@ struct ToolSetInner {
 }
 
 impl ToolSet {
-    pub fn new(tools: Vec<Box<dyn Tool>>, mcp_clients: Vec<Arc<McpClient>>) -> Self {
+    pub fn new(
+        tools: Vec<Box<dyn Tool>>,
+        mcp_clients: Vec<Arc<McpClient>>,
+        config: &Config,
+    ) -> Self {
         let specs = tools.iter().map(|t| t.spec().clone()).collect();
         // `Box` at the public API (every call site already builds one),
         // `Arc` in storage — see `execute` below for why: a tool's
@@ -102,6 +109,7 @@ impl ToolSet {
         Self {
             inner: RwLock::new(ToolSetInner { tools, specs }),
             mcp_clients,
+            config: config.clone(),
         }
     }
 
@@ -119,6 +127,23 @@ impl ToolSet {
             .iter()
             .filter(|s| keep(&s.name))
             .cloned()
+            .collect()
+    }
+
+    /// Registration metadata, read from the same live specs discovery advertises.
+    #[allow(dead_code)] // Turn-loop adoption follows in Task 6.
+    pub async fn entries(&self) -> Vec<(String, ToolEntry)> {
+        self.inner
+            .read()
+            .await
+            .specs
+            .iter()
+            .map(|spec| {
+                (
+                    spec.name.to_string(),
+                    ToolEntry::from_spec(spec, &self.config),
+                )
+            })
             .collect()
     }
 
@@ -299,11 +324,13 @@ impl ToolSet {
 /// naming convention `mcp__<name>__<tool_name>`.
 /// `day_boundary_hour`: what `current_time` reports as the agent's
 /// logical day.
+/// `config`: only enabled groups listed by an effective profile are registered.
 pub async fn default_tool_set(
     state: Arc<sapphire_framework::workspace::WorkspaceState>,
     tavily_api_key: Option<String>,
     mcp_servers: &[McpServerConfig],
     day_boundary_hour: u8,
+    config: &Config,
 ) -> Arc<ToolSet> {
     use attachment_tools::ImageReadTool;
     use builtin_tools::*;
@@ -322,19 +349,26 @@ pub async fn default_tool_set(
         Box::new(MemoryRemoveTool::new(Arc::clone(&state))),
         Box::new(WorkspaceSearchTool::new(Arc::clone(&state))),
         Box::new(WorkspaceSyncTool::new(Arc::clone(&state))),
-        Box::new(FileReadTool::new(Arc::clone(&state))),
-        Box::new(ImageReadTool::new(Arc::clone(&state))),
-        Box::new(FileWriteTool::new(Arc::clone(&state))),
-        Box::new(FileAppendTool::new(Arc::clone(&state))),
-        Box::new(FileDeleteTool::new(Arc::clone(&state))),
-        Box::new(DirListTool::new(Arc::clone(&state))),
-        Box::new(DirWalkTool::new(Arc::clone(&state))),
-        Box::new(ShellTool::new(workspace_root.clone())),
         Box::new(ClientShellStart::new()),
         Box::new(ClientShellOutput::new()),
         Box::new(ClientShellKill::new()),
         Box::new(WeatherTool::new()),
     ];
+
+    if config.group_registered(ToolGroup::Fs) {
+        tools.extend(vec![
+            Box::new(FileReadTool::new(Arc::clone(&state))) as Box<dyn Tool>,
+            Box::new(ImageReadTool::new(Arc::clone(&state))),
+            Box::new(FileWriteTool::new(Arc::clone(&state))),
+            Box::new(FileAppendTool::new(Arc::clone(&state))),
+            Box::new(FileDeleteTool::new(Arc::clone(&state))),
+            Box::new(DirListTool::new(Arc::clone(&state))),
+            Box::new(DirWalkTool::new(Arc::clone(&state))),
+        ]);
+    }
+    if config.group_registered(ToolGroup::Shell) {
+        tools.push(Box::new(ShellTool::new(workspace_root.clone())));
+    }
 
     if let Some(key) = tavily_api_key {
         tools.push(Box::new(WebSearchTool::new(key)));
@@ -342,7 +376,7 @@ pub async fn default_tool_set(
 
     // External MCP server tools
     let mut mcp_clients = Vec::new();
-    if !mcp_servers.is_empty() {
+    if config.group_registered(ToolGroup::Mcp) && !mcp_servers.is_empty() {
         let workspace_root_str = workspace_root.to_string_lossy();
         let (mcp_tools, clients) =
             mcp_client::create_mcp_tools(mcp_servers, &workspace_root_str).await;
@@ -350,10 +384,10 @@ pub async fn default_tool_set(
         mcp_clients = clients;
     }
 
-    let tool_set = Arc::new(ToolSet::new(tools, mcp_clients));
+    let tool_set = Arc::new(ToolSet::new(tools, mcp_clients, config));
 
     // Register the reconnect tool only if at least one MCP server is configured.
-    if !mcp_servers.is_empty() {
+    if config.group_registered(ToolGroup::Mcp) && !mcp_servers.is_empty() {
         let reconnect = Box::new(builtin_tools::McpReconnectTool::new(Arc::downgrade(
             &tool_set,
         )));
@@ -439,6 +473,176 @@ mod tests {
         Arc::new(WorkspaceState::open(ws).unwrap())
     }
 
+    fn all_groups_config() -> Config {
+        Config::parse_for_test(
+            "[tools.fs]\nenabled = true\n[tools.shell]\nenabled = true\n\
+             [tools.mcp]\nenabled = true\n[tools.admin]\nenabled = true\n\
+             [permission_profile.ops]\ntools = [\"fs\", \"shell\", \"mcp\", \"admin\"]\n",
+        )
+    }
+
+    /// Decision 4/7: every tool is registered with the group that decides whether it is
+    /// offered at all, and the kind that drives the mode's asking. A tool added without a
+    /// `group` lands outside the table — so does one added without a `kind`, in `Other`,
+    /// the strictest bucket.
+    #[tokio::test]
+    async fn every_tool_declares_its_group_and_kind() {
+        let cfg = all_groups_config();
+        let ws = test_workspace();
+        let tools = default_tool_set(
+            Arc::clone(&ws),
+            Some("test-tavily-key".to_string()),
+            &[],
+            4,
+            &cfg,
+        )
+        .await;
+        // These tools are registered later at startup, not by the default set.
+        tools
+            .register_tool(Box::new(builtin_tools::McpReconnectTool::new(
+                Arc::downgrade(&tools),
+            )))
+            .await;
+        let state = crate::serve::ServeState::for_test_scripted(false, vec![]);
+        config_tools::register_admin_tools(
+            &tools,
+            &ws.workspace.root,
+            cfg.clone(),
+            Arc::clone(&ws),
+            None,
+            state,
+        )
+        .await;
+        tools
+            .register_tool(Box::new(skill_tools::SkillTool::new()))
+            .await;
+        tools
+            .register_tool(Box::new(subagent::SubagentTool::new(vec![], false)))
+            .await;
+        let entries = tools.entries().await;
+        let want: Vec<(&str, ToolKind, Option<ToolGroup>)> = vec![
+            ("file_append", ToolKind::Edit, Some(ToolGroup::Fs)),
+            ("file_delete", ToolKind::Delete, Some(ToolGroup::Fs)),
+            ("file_read", ToolKind::Read, Some(ToolGroup::Fs)),
+            ("file_write", ToolKind::Edit, Some(ToolGroup::Fs)),
+            ("dir_list", ToolKind::Search, Some(ToolGroup::Fs)),
+            ("dir_walk", ToolKind::Search, Some(ToolGroup::Fs)),
+            ("image_read", ToolKind::Read, Some(ToolGroup::Fs)),
+            ("shell", ToolKind::Execute, Some(ToolGroup::Shell)),
+            ("mcp_reconnect", ToolKind::Other, Some(ToolGroup::Mcp)),
+            ("task_test", ToolKind::Edit, Some(ToolGroup::Admin)),
+            ("current_time", ToolKind::Read, None),
+            ("memory_add", ToolKind::Edit, None),
+            ("workspace_search", ToolKind::Search, None),
+            ("skill", ToolKind::Read, None),
+            ("subagent", ToolKind::Other, None),
+        ];
+        for (name, kind, group) in want {
+            let (_, entry) = entries.iter().find(|(n, _)| n == name).expect(name);
+            assert_eq!(entry.kind, kind, "{name}");
+            assert_eq!(entry.group, group, "{name}");
+        }
+    }
+
+    /// Registration is workspace-wide; neither an unused preset nor an enabled
+    /// switch alone may expose tools. Ungrouped tools keep their own registration.
+    #[tokio::test]
+    async fn default_registration_requires_both_group_keys() {
+        for (toml, fs, shell) in [
+            ("", false, false),
+            ("[tools.fs]\nenabled = true\n", true, false),
+            (
+                "[tools.fs]\nenabled = true\n[permission_profile.default]\ntools = []\n",
+                false,
+                false,
+            ),
+            ("[tools.shell]\nenabled = true\n", false, false),
+            (
+                "[permission_profile.ops]\ntools = [\"shell\"]\n",
+                false,
+                false,
+            ),
+            (
+                "[tools.shell]\nenabled = true\n[permission_profile.ops]\ntools = [\"shell\"]\n",
+                false,
+                true,
+            ),
+        ] {
+            let cfg = Config::parse_for_test(toml);
+            let tools = default_tool_set(test_workspace(), None, &[], 4, &cfg).await;
+            let entries = tools.entries().await;
+            assert_eq!(
+                entries
+                    .iter()
+                    .filter(|(_, e)| e.group == Some(ToolGroup::Fs))
+                    .count(),
+                if fs { 7 } else { 0 },
+                "{toml}"
+            );
+            assert_eq!(
+                entries.iter().any(|(name, _)| name == "shell"),
+                shell,
+                "{toml}"
+            );
+            assert!(
+                entries
+                    .iter()
+                    .all(|(_, entry)| entry.group.is_none() || entry.enabled)
+            );
+            assert!(entries.iter().any(|(name, _)| name == "memory_add"));
+            assert!(
+                entries.iter().any(|(name, _)| name == "shell_start"),
+                "ACP-only capabilities are orthogonal: {toml}"
+            );
+            assert!(
+                !entries.iter().any(|(name, _)| name == "mcp_reconnect"),
+                "no server configured"
+            );
+        }
+    }
+
+    /// A disabled/unlisted MCP group must not even launch configured servers.
+    #[tokio::test]
+    async fn unregistered_mcp_does_not_launch_a_server_or_register_reconnect() {
+        let cfg = all_groups_config();
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = dir.path().join("must-not-launch");
+        let servers = vec![McpServerConfig {
+            name: "never".into(),
+            trust: Default::default(),
+            transport: crate::config::McpTransportConfig::Stdio {
+                command: "touch".into(),
+                args: vec![sentinel.to_string_lossy().into_owned()],
+                env: Default::default(),
+            },
+        }];
+        for (enabled, listed) in [(false, false), (false, true), (true, false)] {
+            let mut cfg = cfg.clone();
+            cfg.tools.mcp.enabled = enabled;
+            if !listed {
+                cfg.permission_profiles
+                    .get_mut("ops")
+                    .unwrap()
+                    .tools
+                    .retain(|g| *g != ToolGroup::Mcp);
+            }
+            cfg.permission_profiles.insert(
+                "default".into(),
+                crate::config::PermissionProfileConfig { tools: vec![] },
+            );
+            let tools = default_tool_set(test_workspace(), None, &servers, 4, &cfg).await;
+            assert!(!sentinel.exists());
+            assert!(tools.mcp_server_names().is_empty());
+            assert!(
+                tools
+                    .entries()
+                    .await
+                    .iter()
+                    .all(|(_, e)| e.group != Some(ToolGroup::Mcp))
+            );
+        }
+    }
+
     /// Every registered spec declares what the tool does. This table failing
     /// on a newly added tool is the intended prompt to classify it.
     #[tokio::test]
@@ -448,6 +652,7 @@ mod tests {
             Some("test-tavily-key".to_string()),
             &[],
             4,
+            &all_groups_config(),
         )
         .await;
 
@@ -492,7 +697,7 @@ mod tests {
     #[tokio::test]
     async fn attachment_save_can_be_registered_with_store() {
         let state = test_workspace();
-        let tools = default_tool_set(Arc::clone(&state), None, &[], 4).await;
+        let tools = default_tool_set(Arc::clone(&state), None, &[], 4, &Config::for_test()).await;
         assert!(
             !tools
                 .specs_filtered(|_| true)
@@ -568,7 +773,7 @@ mod tests {
         /// want to exercise `register_tool` / `specs_filtered` without
         /// building a real workspace.
         fn new_empty_for_test() -> Self {
-            ToolSet::new(Vec::new(), Vec::new())
+            ToolSet::new(Vec::new(), Vec::new(), &crate::config::Config::for_test())
         }
     }
 
@@ -602,6 +807,7 @@ mod tests {
                     as Box<dyn Tool>,
             ],
             Vec::new(),
+            &crate::config::Config::for_test(),
         );
         let mut swapped = set.specs_filtered(|_| true).await[0].clone();
         swapped.description = "swapped".into();
@@ -616,7 +822,7 @@ mod tests {
     /// complete.
     #[tokio::test]
     async fn replace_spec_does_not_add_an_unknown_name() {
-        let set = ToolSet::new(Vec::new(), Vec::new());
+        let set = ToolSet::new(Vec::new(), Vec::new(), &crate::config::Config::for_test());
         set.replace_spec(
             "nope",
             crate::provider::ToolSpec {
@@ -833,7 +1039,11 @@ mod truncation_tests {
     /// one path every tool result actually travels through.
     #[tokio::test]
     async fn tool_set_execute_applies_the_cap() {
-        let tool_set = ToolSet::new(vec![Box::new(HugeOutputTool::new())], Vec::new());
+        let tool_set = ToolSet::new(
+            vec![Box::new(HugeOutputTool::new())],
+            Vec::new(),
+            &crate::config::Config::for_test(),
+        );
         let call = ToolCall {
             id: "call-1".to_string(),
             name: "huge_output".to_string(),

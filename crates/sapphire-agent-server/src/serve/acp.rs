@@ -1329,6 +1329,7 @@ async fn adopt_session(
         sessions.mcp_peer(connection),
         &cwd.to_string_lossy(),
         &id,
+        &state.config,
     ));
     let already_held = {
         let mut guard = sessions.inner.lock().await;
@@ -1532,6 +1533,7 @@ pub(crate) async fn serve_connection<O, I>(
                         sessions.mcp_peer(&connection),
                         &cwd_string,
                         &agent_session_id,
+                        &state.config,
                     ));
 
                     let session_id = SessionId::new(agent_session_id.clone());
@@ -5184,6 +5186,7 @@ mod tests {
                         sessions.mcp_peer(&connection),
                         "/work",
                         "s-close",
+                        &crate::config::Config::for_test(),
                     );
                     let tools = client_mcp.tools().await;
 
