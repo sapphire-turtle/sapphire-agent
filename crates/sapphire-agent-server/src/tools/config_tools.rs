@@ -16,7 +16,11 @@ use crate::config::{Config, DEFAULT_NAMESPACE_NAME};
 use crate::provider::ChatMessage;
 use crate::provider::ToolSpec;
 use crate::serve::{AutonomousHost, LlmTurnOutcome, ServeState, TurnStop};
-use crate::tools::builtin_tools::{PROTECTED_CONFIG_FILES, lexically_normalize};
+// The builtin_tools <-> config_tools sibling-module cycle is accepted: the
+// plan places the definition guard here, alongside the dedicated owners.
+use crate::tools::builtin_tools::{
+    PROTECTED_CONFIG_FILES, lexically_normalize, opened_filename, resolve_as_far_as_possible,
+};
 use crate::tools::policy::{Allow, Origin, ResolvedPermission, ToolEntry, allow};
 use crate::tools::subagent::SubagentTool;
 use crate::tools::{Tool, ToolKind, ToolSet};
@@ -76,16 +80,12 @@ impl ConfigDir {
 }
 
 /// The dedicated owner of a definition on the path the writer will open.
-/// Compare raw and lexically collapsed paths so missing `nope/..` detours
-/// cannot bypass the guard. Reads remain unrestricted.
+/// Check raw and collapsed paths, then resolve existing parent directories and
+/// follow symlinked leaves (including dangling links), as `protected_leaf` does.
+/// Reads remain unrestricted.
 pub(crate) fn definition_owner(abs: &Path, workspace_root: &Path) -> Option<&'static str> {
-    let raw = abs.to_path_buf();
-    let collapsed = lexically_normalize(abs);
-    let workspace_root = lexically_normalize(workspace_root);
-    for candidate in [&raw, &collapsed] {
-        let Ok(rel) = candidate.strip_prefix(&workspace_root) else {
-            continue;
-        };
+    fn owner(candidate: &Path, root: &Path) -> Option<&'static str> {
+        let rel = candidate.strip_prefix(root).ok()?;
         if rel
             .extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("md"))
@@ -94,14 +94,47 @@ pub(crate) fn definition_owner(abs: &Path, workspace_root: &Path) -> Option<&'st
         {
             return Some(dir.tool_name());
         }
-        if PROTECTED_CONFIG_FILES
-            .iter()
-            .any(|f| rel.file_name().is_some_and(|n| n == *f))
+        if rel.starts_with(".sapphire-agent")
+            && PROTECTED_CONFIG_FILES
+                .iter()
+                .any(|f| rel.file_name().is_some_and(|n| n == *f))
         {
             return Some("the config definition file");
         }
+        None
     }
-    None
+
+    let root = lexically_normalize(workspace_root);
+    let mut candidate = abs.to_path_buf();
+    let resolved_root = resolve_as_far_as_possible(&root);
+    for _ in 0..40 {
+        if let Some(found) = owner(&candidate, &root) {
+            return Some(found);
+        }
+        let collapsed = lexically_normalize(&candidate);
+        if let Some(found) = owner(&collapsed, &root) {
+            return Some(found);
+        }
+        let (Some(parent), Some(leaf)) = (collapsed.parent(), collapsed.file_name()) else {
+            return None;
+        };
+        let resolved_parent = resolve_as_far_as_possible(parent);
+        let name = opened_filename(leaf)?;
+        let target = resolved_parent.join(name);
+        if let Some(found) = owner(&target, &resolved_root) {
+            return Some(found);
+        }
+        match std::fs::symlink_metadata(&target) {
+            Ok(meta) if meta.file_type().is_symlink() => match std::fs::read_link(&target) {
+                Ok(dest) if dest.is_absolute() => candidate = dest,
+                Ok(dest) => candidate = resolved_parent.join(dest),
+                Err(_) => return None,
+            },
+            _ => return None,
+        }
+    }
+    // As in protected_leaf, refuse rather than give up on an excessive chain.
+    Some("a symlink chain too long to follow")
 }
 
 /// Direct calls use the same group decision as both loops. ACP mode approval
@@ -1157,10 +1190,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ordinary_config_names_remain_writable_outside_agent_config_dir() {
+        use crate::tools::builtin_tools::{FileAppendTool, FileDeleteTool, FileWriteTool};
+        let (_dir, root, ws) = test_workspace();
+        let write = FileWriteTool::new(Arc::clone(&ws));
+        let append = FileAppendTool::new(Arc::clone(&ws));
+        let delete = FileDeleteTool::new(ws);
+        for path in [
+            "config.toml",
+            "project/config.toml",
+            "project/acp-permissions.json",
+        ] {
+            write
+                .execute(&json!({"path": path, "content": "old"}))
+                .await
+                .unwrap();
+            append
+                .execute(&json!({"path": path, "content": " new"}))
+                .await
+                .unwrap();
+            assert_eq!(std::fs::read_to_string(root.join(path)).unwrap(), "old new");
+            delete.execute(&json!({"path": path})).await.unwrap();
+            assert!(!root.join(path).exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_aliases_to_definitions_are_protected_for_all_write_verbs() {
+        use crate::tools::builtin_tools::{FileAppendTool, FileDeleteTool, FileWriteTool};
+        use std::os::unix::fs::symlink;
+        let (_dir, root, ws) = test_workspace();
+        std::fs::write(root.join("heartbeat/task.md"), "old").unwrap();
+        std::fs::write(root.join(".sapphire-agent/config.toml"), "old").unwrap();
+        symlink("heartbeat/task.md", root.join("alias")).unwrap();
+        symlink("alias", root.join("chain")).unwrap();
+        symlink("heartbeat/missing.md", root.join("dangling")).unwrap();
+        symlink(".sapphire-agent/config.toml", root.join("config-alias")).unwrap();
+        symlink("heartbeat", root.join("alias-dir")).unwrap();
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(FileWriteTool::new(Arc::clone(&ws))),
+            Box::new(FileAppendTool::new(Arc::clone(&ws))),
+            Box::new(FileDeleteTool::new(ws)),
+        ];
+        for (path, owner) in [
+            ("alias", "heartbeat_config"),
+            ("chain", "heartbeat_config"),
+            ("dangling", "heartbeat_config"),
+            ("config-alias", "the config definition file"),
+            ("alias-dir/task.md", "heartbeat_config"),
+        ] {
+            for tool in &tools {
+                let err = tool
+                    .execute(&json!({"path": path, "content": "new"}))
+                    .await
+                    .unwrap_err();
+                assert!(
+                    err.to_string().contains(owner),
+                    "{}: {path}: {err}",
+                    tool.spec().name
+                );
+            }
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.join("heartbeat/task.md")).unwrap(),
+            "old"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(".sapphire-agent/config.toml")).unwrap(),
+            "old"
+        );
+        assert!(!root.join("heartbeat/missing.md").exists());
+    }
+
+    #[tokio::test]
     async fn tilde_expansion_names_the_same_definition_for_every_write_verb() {
         use crate::tools::builtin_tools::{FileAppendTool, FileDeleteTool, FileWriteTool};
-        let home = directories::BaseDirs::new().unwrap();
-        let dir = tempfile::tempdir_in(home.home_dir()).unwrap();
+        let Some(home) = directories::BaseDirs::new() else {
+            return;
+        };
+        let Ok(dir) = tempfile::tempdir_in(home.home_dir()) else {
+            return; // HOME can be read-only in CI.
+        };
         let root = dir.path();
         std::fs::create_dir_all(root.join(".sapphire-agent")).unwrap();
         std::fs::create_dir_all(root.join("heartbeat")).unwrap();

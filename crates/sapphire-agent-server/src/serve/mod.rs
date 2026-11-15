@@ -4547,11 +4547,9 @@ mod tests {
                     "written"
                 );
             } else {
-                assert_eq!(
-                    probe.seen(),
-                    None,
-                    "the refused call never reached execution"
-                );
+                // The probe was not requested in this leg; filesystem absence and
+                // the persisted refusal below demonstrate the denied write instead.
+                assert_eq!(probe.seen(), None);
                 assert!(state.acp_session_store.history_for_model(&sid).unwrap().iter().flat_map(|m| &m.parts).any(|p| matches!(p, ContentPart::ToolResult { content, .. } if content.contains("permission_profile.chat.tools"))));
             }
         }

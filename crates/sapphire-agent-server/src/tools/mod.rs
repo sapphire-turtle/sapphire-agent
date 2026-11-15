@@ -602,6 +602,7 @@ mod tests {
     }
 
     /// A disabled/unlisted MCP group must not even launch configured servers.
+    #[cfg(unix)] // The sentinel command below uses Unix `touch`.
     #[tokio::test]
     async fn unregistered_mcp_does_not_launch_a_server_or_register_reconnect() {
         let cfg = all_groups_config();

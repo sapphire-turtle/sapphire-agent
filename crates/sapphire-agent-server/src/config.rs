@@ -2124,10 +2124,7 @@ api_key = "test"
             .unwrap_or_else(|| DEFAULT_PROFILE_NAME.to_string())
     }
 
-    /// R2: whether this host hands the agent that key. Today every group answers with
-    /// the one switch that exists until Task 2 splits it per group —
-    /// `[tools.host_access].enabled` — a fact about the deployment, not a row in the table.
-    #[allow(dead_code)] // Consumed by the upcoming permission gate.
+    /// R2: whether this host enables the group via its `[tools.<group>].enabled` switch.
     pub fn group_enabled(&self, group: ToolGroup) -> bool {
         match group {
             ToolGroup::Fs => self.tools.fs.enabled,
@@ -2139,7 +2136,6 @@ api_key = "test"
 
     /// R7: registered at all ⇔ enabled here ∧ listed by at least one effective
     /// permission profile (presets and operator sections alike).
-    #[allow(dead_code)] // Consumed by the upcoming permission gate.
     pub fn group_registered(&self, group: ToolGroup) -> bool {
         self.group_enabled(group)
             && self
@@ -2150,7 +2146,6 @@ api_key = "test"
 
     /// Operator sections and the permission profiles used by declared sessions,
     /// including the implicit default session. Unused presets grant nothing.
-    #[allow(dead_code)] // Consumed by the upcoming permission gate.
     pub(crate) fn effective_permission_profiles(&self) -> Vec<PermissionProfileConfig> {
         let mut out = self
             .permission_profiles

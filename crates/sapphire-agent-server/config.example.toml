@@ -415,22 +415,15 @@ system_prompt = "You are a helpful personal assistant."
 #     server block above: that lets external AIs call sapphire-agent;
 #     this lets sapphire-agent call external MCP servers.
 #     MCP servers an ACP client provides over ACP need no entry here; see docs/sapphire-agent-tools.md.
-#   - `[tools.admin].room_profiles` — the session profiles whose sessions may
-#     use the config-file management tools (`heartbeat`, `autonomous`,
-#     `agents`), which add and edit the definitions under the workspace
-#     that the unattended loops later run. Values are `[session_profile.<name>]`
-#     keys, not room ids: a channel turn is judged by the profile its room
-#     resolves to, an ACP session by the profile its bearer token pinned, and
-#     voice / `/rpc` / A2A / the unattended loops by nothing (refused). Empty
-#     (the default) leaves all of them unregistered, the same shape as
-#     host group switches. These switches are host-local.
+#   - `[tools.admin].enabled` is the host-local switch for the admin group.
+#     A turn also needs its session profile's `permission` to name a
+#     `[permission_profile.<name>]` whose `tools` lists `admin`. Registration
+#     requires the enabled host switch and at least one effective profile
+#     listing the group. The built-in default permission does not list admin.
+#     Admin access can rewrite unattended work; restrict API keys and channel
+#     `allowed_users` for sessions granted it. The old `room_profiles` key is
+#     rejected at startup.
 #
-#     `room_profiles = ["default"]` is the broad one: it names the implicit
-#     profile that every room no other profile claims falls through to, so
-#     list the profiles you actually mean. Anyone who can reach a session of
-#     a listed profile can rewrite, through the agent, what runs unattended
-#     — pair this with the profile's `devices` or the room's `allowed_users`.
-
 # Each `[[tools.mcp_servers]]` entry has a `name` (used as the tool
 # prefix) and a `type` selecting one of two transports:
 #
@@ -487,11 +480,14 @@ system_prompt = "You are a helpful personal assistant."
 # [tools.background]
 # max_per_session = 4                       # 0 = no background execution
 #
-# # Example: let the `ops` and `developer` session profiles manage the
-# # heartbeat/autonomous/agents definitions. Empty by default (all four
-# # tools unregistered).
+# # Example: let the ops session profile manage task definitions.
+# [session_profile.ops]
+# profile = "default"
+# permission = "ops"
+# [permission_profile.ops]
+# tools = ["fs", "admin"]
 # [tools.admin]
-# room_profiles = ["ops", "developer"]
+# enabled = true
 #
 # # Example: HTTP transport to a remote MCP server.
 # [[tools.mcp_servers]]

@@ -1018,42 +1018,35 @@ through four tools:
   immediately, without restarting the agent; one you hand-edit under
   `agents/` still needs a restart, as [Subagents](#subagents) describes.
 
-**A session profile has to be named, in the host config.** The tools are registered
-only when `[tools.admin].room_profiles` lists at least one session profile, and every
-action — including the read-only `list` — is refused in a session whose profile is
-not on it:
+**Grant admin in a permission profile and enable it on the host.** Both keys
+are required for every action, including `list`:
 
 ```toml
+[session_profile.ops]
+profile = "default"
+permission = "ops"
+
+[permission_profile.ops]
+tools = ["fs", "admin"]
+
 [tools.admin]
-room_profiles = ["ops", "developer"]   # [session_profile.<name>] keys, not room ids
+enabled = true
 ```
 
-With `room_profiles` absent or empty the four tools are **not registered at all** —
-the model is never told they exist. A tool that is offered and then always refuses
-is the worse answer: it invites a retry loop against a wall.
+A group is registered only when its host-local `[tools.<group>].enabled` switch
+is true and at least one effective permission profile lists it. Each turn may use
+only the groups listed by its resolved permission profile. The built-in `default`
+permission profile lists `fs` and `mcp`, not `admin`; the built-in `admin` preset
+lists every group. An operator-defined section overrides the preset of that name.
 
-A **channel** turn is judged by the profile its room resolves to — the same
-resolution that picks its provider and memory namespace, so an explicit listing in a
-`[[discord.rooms]]` / `[[matrix.rooms]]` block wins and `[session_profile.default]` catches every
-room no profile claims. An **ACP** session (Zed and other editors) is judged by the
-profile its bearer token pinned at `session/new`, which is what makes these tools
-usable from an editor at all: ACP has no room id. Note what `room_profiles =
-["default"]` therefore means — every room no other profile claims — and list the
-specific profiles you mean unless that is what you want.
-
-Voice, `/rpc`, A2A and the unattended loops (heartbeat, autonomous) name no profile
-an operator declared, so the tools are refused there even when the list is not empty.
-A heartbeat or autonomous task that fires *into* a room of a listed profile is the
-exception, and the reason a listed profile's rooms should not also be a task's
-delivery target: the grant follows the room, not the caller, so such a turn can
-author unattended work with nobody watching.
-
-The `[tools.admin]` switch is host-local; the workspace layer may supply tool
-listings but cannot enable this host switch. Guard workspace write access accordingly: a listed profile
-can rewrite, through the agent, what runs unattended. **Pair it with that profile's own API keys
-or the room's `allowed_users`**, or everyone who can reach a session of that profile
-can author code-adjacent work that runs with nobody watching. `[tools.admin].rooms`
-from an earlier build is rejected at startup and names `room_profiles` in the error.
+Channel rooms bind a session profile in their `[[discord.rooms]]` or
+`[[matrix.rooms]]` declaration; API keys pin one for ACP, RPC and A2A. Tasks may
+declare their own profile; otherwise they use the implicit `default` session
+profile. Grant carefully: anyone who can reach a session with admin permission
+can change work that later runs unattended. Restrict API keys and channel
+`allowed_users` accordingly. Group enable switches are host-local; synced
+workspace config cannot enable them. The retired `[tools.admin].room_profiles`
+and `[tools.admin].rooms` keys are rejected at startup.
 
 **Trying a task before enabling it.** `task_test` runs one heartbeat or
 autonomous definition once, in a throwaway session, so a task can be

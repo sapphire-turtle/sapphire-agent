@@ -240,7 +240,7 @@ pub(crate) fn lexically_normalize(path: &Path) -> PathBuf {
 ///
 /// Returns `None` when nothing is left, which is not a filename any
 /// spelling of a protected file can reduce to.
-fn opened_filename(name: &std::ffi::OsStr) -> Option<String> {
+pub(crate) fn opened_filename(name: &std::ffi::OsStr) -> Option<String> {
     let name = name.to_string_lossy();
     if !cfg!(windows) {
         return Some(name.into_owned());
@@ -259,7 +259,7 @@ fn opened_filename(name: &std::ffi::OsStr) -> Option<String> {
 /// is what let two earlier versions of this guard be talked past, so
 /// this never gives up: it finds the deepest existing ancestor and
 /// re-attaches everything below it.
-fn resolve_as_far_as_possible(path: &Path) -> PathBuf {
+pub(crate) fn resolve_as_far_as_possible(path: &Path) -> PathBuf {
     let mut suffix: Vec<std::ffi::OsString> = Vec::new();
     let mut cursor = path.to_path_buf();
 
