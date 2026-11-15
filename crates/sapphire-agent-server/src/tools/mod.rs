@@ -63,18 +63,6 @@ pub trait Tool: Send + Sync {
     /// The spec advertised to the LLM.
     fn spec(&self) -> &ToolSpec;
 
-    /// What this tool does, in ACP's vocabulary. Drives both the
-    /// `session/update` display and the permission policy, so there is
-    /// exactly one classification rather than two that drift apart.
-    ///
-    /// The default is `Other` — the strictest bucket — so a tool added
-    /// without a `kind()` fails safe: it asks (ACP) or is refused
-    /// (channels) rather than silently running unguarded.
-    #[allow(dead_code)] // Retained for tool implementations; policy reads the spec.
-    fn kind(&self) -> ToolKind {
-        ToolKind::Other
-    }
-
     /// Execute the tool with the given JSON input. Used by all tools
     /// that return only text — which is most of them.
     async fn execute(&self, input: &serde_json::Value) -> Result<String>;
@@ -131,20 +119,6 @@ impl ToolSet {
             .iter()
             .filter(|s| keep(&s.name))
             .cloned()
-            .collect()
-    }
-
-    /// Every registered tool's name and kind. Exists so the policy test
-    /// can pin the whole classification table in one assertion rather
-    /// than constructing each tool by hand.
-    #[cfg(test)]
-    pub async fn kinds(&self) -> Vec<(String, ToolKind)> {
-        self.inner
-            .read()
-            .await
-            .tools
-            .iter()
-            .map(|t| (t.spec().name.to_string(), t.kind()))
             .collect()
     }
 
@@ -465,8 +439,7 @@ mod tests {
         Arc::new(WorkspaceState::open(ws).unwrap())
     }
 
-    /// Every tool declares what it does. A tool added without a `kind()`
-    /// lands in `Other` — the strictest bucket — so this table failing
+    /// Every registered spec declares what the tool does. This table failing
     /// on a newly added tool is the intended prompt to classify it.
     #[tokio::test]
     async fn every_tool_declares_its_kind() {
@@ -478,7 +451,12 @@ mod tests {
         )
         .await;
 
-        let mut got = tools.kinds().await;
+        let mut got: Vec<_> = tools
+            .specs_filtered(|_| true)
+            .await
+            .into_iter()
+            .map(|s| (s.name.to_string(), s.kind))
+            .collect();
         got.sort_by(|a, b| a.0.cmp(&b.0));
         let got_refs: Vec<(&str, ToolKind)> = got.iter().map(|(n, k)| (n.as_str(), *k)).collect();
 
@@ -532,9 +510,10 @@ mod tests {
             .await;
         assert!(
             tools
-                .kinds()
+                .specs_filtered(|_| true)
                 .await
-                .contains(&("attachment_save".into(), ToolKind::Edit))
+                .iter()
+                .any(|s| s.name == "attachment_save" && s.kind == ToolKind::Edit)
         );
         assert!(
             !tools
@@ -549,44 +528,17 @@ mod tests {
 
     /// `mcp_reconnect` is registered only when an MCP server is
     /// configured, so `every_tool_declares_its_kind` never sees it —
-    /// and it is the one tool that deliberately relies on the *default*
-    /// `Other` rather than declaring a kind. That makes it the case a
-    /// careless `kind()` could silently soften with nothing noticing.
+    /// and its explicitly declared `Other` must stay strict.
     #[test]
     fn mcp_reconnect_stays_in_the_strict_bucket() {
         let tool = builtin_tools::McpReconnectTool::new(std::sync::Weak::new());
         assert_eq!(tool.spec().name, "mcp_reconnect");
-        assert_eq!(tool.kind(), ToolKind::Other);
-    }
-
-    /// A tool that does not override `kind()` must land in the strictest
-    /// bucket, so forgetting to classify one fails safe.
-    #[test]
-    fn the_default_kind_is_other() {
-        struct Bare(ToolSpec);
-        #[async_trait]
-        impl Tool for Bare {
-            fn spec(&self) -> &ToolSpec {
-                &self.0
-            }
-            async fn execute(&self, _input: &serde_json::Value) -> Result<String> {
-                Ok(String::new())
-            }
-        }
-        let bare = Bare(ToolSpec {
-            kind: crate::tools::ToolKind::Other,
-            group: None,
-            name: "bare".into(),
-            description: String::new().into(),
-            input_schema: serde_json::json!({}),
-        });
-        assert_eq!(bare.kind(), ToolKind::Other);
+        assert_eq!(tool.spec().kind, ToolKind::Other);
     }
 
     /// A minimal named stub for tests that only care about a tool's
-    /// name being present in a spec list — modeled on `Bare` above, but
-    /// keeping the name so `specs_filtered`'s predicate has something
-    /// to match against.
+    /// name being present in a spec list, so `specs_filtered`'s
+    /// predicate has something to match against.
     struct NamedStub(ToolSpec);
 
     impl NamedStub {

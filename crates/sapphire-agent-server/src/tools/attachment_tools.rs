@@ -66,9 +66,6 @@ impl Tool for AttachmentSaveTool {
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
-    fn kind(&self) -> ToolKind {
-        ToolKind::Edit
-    }
     async fn execute(&self, input: &serde_json::Value) -> Result<String> {
         anyhow::ensure!(
             crate::tools::acp_client::current_acp_client().is_none(),
@@ -172,10 +169,6 @@ fn resolve_image_path(state: &WorkspaceState, path: &Path) -> Result<PathBuf> {
 impl Tool for ImageReadTool {
     fn spec(&self) -> &ToolSpec {
         &self.spec
-    }
-
-    fn kind(&self) -> ToolKind {
-        ToolKind::Read
     }
 
     async fn execute(&self, input: &serde_json::Value) -> Result<String> {
@@ -296,7 +289,7 @@ mod tests {
     async fn attachment_save_copies_original_and_overwrites() {
         let (_dir, store, state, meta) = save_fixture();
         let tool = AttachmentSaveTool::new(store.clone(), state.clone());
-        assert_eq!(tool.kind(), ToolKind::Edit);
+        assert_eq!(tool.spec().kind, ToolKind::Edit);
         assert_eq!(
             tool.spec().input_schema,
             json!({

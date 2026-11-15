@@ -86,10 +86,6 @@ impl TranscriptReadTool {
 
 #[async_trait]
 impl Tool for TranscriptReadTool {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Read
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -157,10 +153,6 @@ impl SpeakerCandidatesTool {
 
 #[async_trait]
 impl Tool for SpeakerCandidatesTool {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Search
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -233,10 +225,6 @@ impl SpeakerPromoteTool {
 
 #[async_trait]
 impl Tool for SpeakerPromoteTool {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Edit
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }

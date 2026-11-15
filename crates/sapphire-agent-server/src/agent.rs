@@ -1060,7 +1060,12 @@ mod tests {
     #[tokio::test]
     async fn channel_default_refuses_disabled_fs_even_when_listed() {
         use crate::tools::policy::{ResolvedPermission, ToolEntry};
-        let (calls, specs) = channel_gate_test_calls().await;
+        let (mut calls, specs) = channel_gate_test_calls().await;
+        calls.push(ToolCall {
+            id: "delete".into(),
+            name: "file_delete".into(),
+            input: serde_json::json!({}),
+        });
         let cfg = crate::config::Config::parse_for_test("[anthropic]\napi_key = \"test\"\n");
         let profile = ResolvedPermission::resolve(
             &cfg,
@@ -1085,6 +1090,9 @@ mod tests {
                 .iter()
                 .any(|(id, reason)| id == "c0" && reason.contains("[tools.fs].enabled"))
         );
+        assert!(refused.iter().any(|(id, reason)| id == "delete"
+            && reason.contains("file_delete")
+            && reason.contains("[tools.fs].enabled")));
         assert_eq!(permitted.len() + refused.len(), calls.len());
     }
 

@@ -1968,15 +1968,12 @@ pub(crate) trait TurnHost: Send + Sync {
         RoundBudget::Unattended
     }
 
-    /// Which row of the permission table this turn is judged by.
+    /// The origin and session profile used to resolve this turn's permissions.
     ///
-    /// `Trusted` by default: `/rpc`, `/a2a` and the voice pipeline were
-    /// authenticated before the turn started and have no UI to ask
-    /// through, so they must keep running everything.
-    ///
-    /// The heartbeat only reaches this default on its *voice* leg. Its
-    /// chat leg goes through `Agent::handle_message`, which does not use
-    /// `TurnHost` at all and judges itself under a channel origin.
+    /// Defaults to unattended with the default session profile: `/rpc`, `/a2a`
+    /// and voice have no UI to ask through. The profile's group grants and
+    /// host switches still apply. The heartbeat's chat leg uses the channel
+    /// loop instead and does not use `TurnHost`.
     fn origin(&self) -> crate::tools::policy::Origin {
         crate::tools::policy::Origin::Unattended {
             session_profile: "default".into(),
@@ -2065,7 +2062,7 @@ pub(crate) trait TurnHost: Send + Sync {
         let _ = id;
     }
 
-    /// Called only when `decide` returned `Ask`.
+    /// Called only when `policy::allow` returned `Allow::Ask`.
     ///
     /// The default answers `AllowOnce` — a host that never returns an
     /// asking `origin()` can never reach this, so the default exists
@@ -2386,13 +2383,10 @@ fn turn_tool_predicate(
 /// implement `fs/read_text_file` without `fs/write_text_file` (or vice
 /// versa), so those two are read independently.
 ///
-/// The one gate that is not about capabilities is
-/// `policy::host_tool_denied`, and #270 is what moved it inside: it now
-/// receives `has_client` as its `routed_to_client`, so on an ACP turn the
-/// seven unified names are decided by capability alone — the same seven
-/// names on a non-ACP turn are decided by `host_access` alone, which is
-/// the deployment switch's entire domain. `Agent::handle_message` calls
-/// this with every client flag false for exactly that reason.
+/// Host-only fs and shell names are filtered by the corresponding host
+/// registration flags when there is no client. Client-routed names are
+/// filtered by client capabilities instead. The turn's permission gate still
+/// checks group grants and host enabled flags using `policy::allow`.
 pub(crate) fn visible_tool_predicate(
     fs_enabled: bool,
     shell_enabled: bool,
@@ -2853,7 +2847,7 @@ impl TurnLoop<'_> {
 
                     // Permission gate.
                     //
-                    // Serial on purpose. `decide` is a cheap pure call, but
+                    // Serial on purpose. `policy::allow` is a cheap pure call, but
                     // `approve` puts a dialog in front of a human, and
                     // firing several at once would stack them on the poor
                     // soul in the editor. Execution below stays concurrent.
@@ -3728,15 +3722,6 @@ impl crate::tools::Tool for EchoTool {
         &self.spec
     }
 
-    /// A test fixture standing in for an ordinary read-only tool.
-    /// Deliberately NOT `Other`: that is the ask-me bucket, and the
-    /// pre-existing ACP tests drive turns with a helper that answers no
-    /// permission requests, so leaving this unclassified would make them
-    /// hang rather than fail once the permission gate lands.
-    fn kind(&self) -> crate::tools::ToolKind {
-        crate::tools::ToolKind::Read
-    }
-
     async fn execute(&self, input: &Value) -> anyhow::Result<String> {
         Ok(input["text"].as_str().unwrap_or_default().to_string())
     }
@@ -3781,10 +3766,6 @@ impl RiskyTool {
 impl crate::tools::Tool for RiskyTool {
     fn spec(&self) -> &crate::provider::ToolSpec {
         &self.spec
-    }
-
-    fn kind(&self) -> crate::tools::ToolKind {
-        crate::tools::ToolKind::Execute
     }
 
     async fn execute(&self, _input: &Value) -> anyhow::Result<String> {
@@ -3870,10 +3851,6 @@ impl crate::tools::Tool for AdminProfileProbe {
         &self.spec
     }
 
-    fn kind(&self) -> crate::tools::ToolKind {
-        crate::tools::ToolKind::Read
-    }
-
     async fn execute(&self, _input: &serde_json::Value) -> anyhow::Result<String> {
         *self.seen.lock().unwrap() = Some(crate::tools::config_tools::current_session_profile());
         Ok("probed".to_string())
@@ -3890,10 +3867,6 @@ impl crate::tools::Tool for AdminProfileProbe {
 impl crate::tools::Tool for Arc<AdminProfileProbe> {
     fn spec(&self) -> &crate::provider::ToolSpec {
         (**self).spec()
-    }
-
-    fn kind(&self) -> crate::tools::ToolKind {
-        (**self).kind()
     }
 
     async fn execute(&self, input: &serde_json::Value) -> anyhow::Result<String> {
@@ -4916,9 +4889,6 @@ type = "mock"
         fn spec(&self) -> &ToolSpec {
             &self.spec
         }
-        fn kind(&self) -> crate::tools::ToolKind {
-            crate::tools::ToolKind::Read
-        }
         async fn execute(&self, _input: &Value) -> anyhow::Result<String> {
             let state = self.state.upgrade().unwrap();
             for (id, text) in &self.tasks {
@@ -5170,18 +5140,9 @@ type = "mock"
     /// what the parent was refused. Anything else would make "ask a
     /// subagent" a way around the permission gate.
     ///
-    /// `subagent` itself is `ToolKind::Other`, which the policy table
-    /// groups with `Execute` in the same "risky" bucket in every origin
-    /// (see `crate::tools::policy::decide`) — so an origin that
-    /// auto-denies `Execute` (`Origin::Channel { session_profile: "default".into() }`) would auto-deny the
-    /// top-level `subagent` call too, before delegation ever ran, which
-    /// would make the test pass without exercising `SubagentTool` at
-    /// all. `Origin::Acp { mode: SessionMode::Default, session_profile: "default".into() }` sends every risky call
-    /// through `approve` instead of denying it outright, so this test
-    /// can let the top-level `subagent` call through while having the
-    /// very same `approve` reject the nested `risky` call — proving the
-    /// nested call is judged by the *parent's* host, not a laxer one
-    /// standing in for it.
+    /// Both `subagent` and the nested risky call ask under ACP default mode.
+    /// Approving only the top-level call proves that the nested call is judged
+    /// by the parent's host rather than a laxer one.
     #[tokio::test]
     async fn a_subagent_is_judged_by_the_parents_origin() {
         use crate::tools::policy::{Approval, Origin, SessionMode};
@@ -5684,23 +5645,12 @@ type = "mock"
 
     /// `Refusal::NotOffered` closes the same hole on the *ordinary*
     /// (non-subagent) path — every test above exercises it only through
-    /// `subagent`. A name the model invents (or gets right, but this
-    /// round happens not to offer) that still matches something
-    /// registered on the shared `ToolSet` must be refused before
-    /// `ToolSet::execute` ever dispatches on it — see `TurnLoop::run`'s
-    /// permission gate, which checks `offered` first, ahead of the
-    /// host-machine gate and `decide` both.
+    /// `subagent`. The offered-name check precedes `policy::allow` and
+    /// `ToolSet::execute` even for a name registered on the shared set.
     ///
-    /// `shell_start` is the tool named: it isn't in `HOST_TOOLS`, so
-    /// the host-machine gate — the *other* thing that could explain a
-    /// refusal here — never fires for it, and `NullProgress`'s default
-    /// `origin()` is `Origin::Unattended`, which `decide` allows
-    /// unconditionally for every kind. The only thing left standing
-    /// between the call and `ran` flipping `true` is the offered check
-    /// itself: `visible_tool_predicate` excludes `shell_start` from
-    /// this round's own `tool_specs` because `NullProgress` reports no
-    /// ACP client (`has_client` is `false`), even though the tool stays
-    /// registered and visible to `state.tools.kinds()`.
+    /// `shell_start` is ungrouped, so the default unattended profile would
+    /// allow it. The predicate hides it from this clientless turn, even
+    /// though it remains registered in `state.tools.specs_filtered`.
     #[tokio::test]
     async fn a_registered_but_unoffered_tool_is_refused_on_an_ordinary_turn() {
         struct FakeClientShellStart {
@@ -5711,9 +5661,6 @@ type = "mock"
         impl crate::tools::Tool for FakeClientShellStart {
             fn spec(&self) -> &crate::provider::ToolSpec {
                 &self.spec
-            }
-            fn kind(&self) -> crate::tools::ToolKind {
-                crate::tools::ToolKind::Execute
             }
             async fn execute(&self, _input: &Value) -> anyhow::Result<String> {
                 self.ran.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -6043,9 +5990,8 @@ type = "mock"
         );
     }
 
-    /// The pre-existing transports keep today's behaviour. `Trusted` is
-    /// what makes that true: `decide` allows everything for it, so no
-    /// `/rpc`, voice or heartbeat turn can start asking for permission.
+    /// Existing unattended transports resolve the default session profile
+    /// without an ACP mode, so they do not prompt; group restrictions apply.
     #[test]
     fn existing_transports_are_trusted() {
         use crate::tools::policy::Origin;
@@ -6602,10 +6548,6 @@ type = "mock"
     impl crate::tools::Tool for RestoringTool {
         fn spec(&self) -> &crate::provider::ToolSpec {
             &self.spec
-        }
-
-        fn kind(&self) -> crate::tools::ToolKind {
-            crate::tools::ToolKind::Execute
         }
 
         async fn execute(&self, _input: &Value) -> anyhow::Result<String> {
@@ -7426,7 +7368,6 @@ type = "mock"
     /// `text` input.
     struct SessionEcho {
         spec: crate::provider::ToolSpec,
-        kind: crate::tools::ToolKind,
     }
 
     impl SessionEcho {
@@ -7439,7 +7380,6 @@ type = "mock"
                     description: "Echo the given text back.".into(),
                     input_schema: json!({"type": "object", "properties": {}}),
                 },
-                kind,
             }
         }
     }
@@ -7448,9 +7388,6 @@ type = "mock"
     impl crate::tools::Tool for SessionEcho {
         fn spec(&self) -> &crate::provider::ToolSpec {
             &self.spec
-        }
-        fn kind(&self) -> crate::tools::ToolKind {
-            self.kind
         }
         async fn execute(&self, input: &Value) -> anyhow::Result<String> {
             Ok(input["text"].as_str().unwrap_or_default().to_string())
@@ -7693,9 +7630,6 @@ type = "mock"
     impl crate::tools::Tool for FakeFileRead {
         fn spec(&self) -> &crate::provider::ToolSpec {
             &self.spec
-        }
-        fn kind(&self) -> crate::tools::ToolKind {
-            crate::tools::ToolKind::Read
         }
         async fn execute(&self, _input: &Value) -> anyhow::Result<String> {
             self.ran.store(true, std::sync::atomic::Ordering::SeqCst);

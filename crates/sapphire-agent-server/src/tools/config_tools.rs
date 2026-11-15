@@ -177,7 +177,7 @@ pub(crate) fn current_session_profile_for(config: &Config) -> Option<String> {
     }
 }
 
-/// What every action answers with when the calling room profile is not on
+/// What every action answers with when the calling session profile is not on
 /// `[tools.admin].room_profiles`.
 ///
 /// The wording names the config key on purpose: a model that is refused has
@@ -570,10 +570,6 @@ impl ConfigTool {
 
 #[async_trait]
 impl Tool for ConfigTool {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Edit
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -907,10 +903,6 @@ impl TaskTestTool {
 
 #[async_trait]
 impl Tool for TaskTestTool {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Edit
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -1448,7 +1440,7 @@ mod tests {
     async fn the_admin_tools_are_edits() {
         for dir in ConfigDir::ALL {
             let f = fixture(dir);
-            assert_eq!(f.tool.kind(), ToolKind::Edit, "{:?}", dir.tool_name());
+            assert_eq!(f.tool.spec().kind, ToolKind::Edit, "{:?}", dir.tool_name());
             assert_eq!(f.tool.spec().name, dir.tool_name());
         }
         assert_eq!(
@@ -1683,14 +1675,11 @@ mod tests {
             set.specs_filtered(|_| true).await.is_empty(),
             "no room names one: none of the admin tools may be registered"
         );
-        assert!(set.kinds().await.is_empty());
     }
 
     /// One room is all it takes, and it registers exactly four tools: the
-    /// three `ConfigTool`s (`ConfigDir::ALL`) plus `task_test`. `kinds()`
-    /// is checked for length as well as the specs are for their names, so a
-    /// directory registered twice — or a spec pushed without its tool —
-    /// fails here rather than at the first call.
+    /// three `ConfigTool`s (`ConfigDir::ALL`) plus `task_test`. Check the
+    /// specs for both unique names and their edit classification.
     #[tokio::test]
     async fn one_room_registers_all_four() {
         let (_dir, root, ws) = test_workspace();
@@ -1734,11 +1723,11 @@ mod tests {
             ]
         );
 
-        let kinds = set.kinds().await;
-        assert_eq!(kinds.len(), 4, "each name registered once: {kinds:?}");
+        let specs = set.specs_filtered(|_| true).await;
+        assert_eq!(specs.len(), 4, "each name registered once");
         assert!(
-            kinds.iter().all(|(_, kind)| *kind == ToolKind::Edit),
-            "every admin tool is an edit: {kinds:?}"
+            specs.iter().all(|spec| spec.kind == ToolKind::Edit),
+            "every admin tool is an edit"
         );
     }
 

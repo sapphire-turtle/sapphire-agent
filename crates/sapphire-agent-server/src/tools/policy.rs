@@ -229,7 +229,7 @@ pub fn refusal_message(tool: &str, why: Refusal) -> String {
             group,
         } => format!(
             "Permission denied: the '{tool}' tool is unavailable for session profile '{session}'; check permission_profile.{permission}.tools and [tools.{}].enabled.",
-            format!("{group:?}").to_lowercase()
+            group.as_str()
         ),
         // Deliberately not "Permission denied": for a name this round
         // never offered — a typo, a hallucination, or `subagent`
@@ -292,6 +292,118 @@ pub fn partition_without_asking(
 mod tests {
     use super::*;
     use crate::config::{Config, ToolGroup};
+
+    #[test]
+    fn middle_row_kinds_follow_all_acp_modes() {
+        let mut profile = ResolvedPermission {
+            name: "default".into(),
+            permission: "default".into(),
+            groups: vec![],
+            mode: None,
+        };
+        for kind in [
+            ToolKind::Edit,
+            ToolKind::Delete,
+            ToolKind::Move,
+            ToolKind::SwitchMode,
+        ] {
+            let entry = ToolEntry {
+                name: "middle".into(),
+                group: None,
+                enabled: false,
+                kind,
+            };
+            for (mode, expected) in [
+                (SessionMode::Default, Allow::Ask),
+                (SessionMode::AcceptEdits, Allow::Allow),
+                (SessionMode::Bypass, Allow::Allow),
+            ] {
+                profile.mode = Some(mode);
+                assert_eq!(allow(&profile, &entry), expected, "{kind:?} {mode:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn partition_refuses_rather_than_allows_an_ask() {
+        let cfg = Config::for_test();
+        let profile = ResolvedPermission::resolve(
+            &cfg,
+            Origin::Acp {
+                mode: SessionMode::Default,
+                session_profile: "default".into(),
+            },
+        );
+        let entries = [ToolEntry {
+            name: "memory_add".into(),
+            group: None,
+            enabled: false,
+            kind: ToolKind::Edit,
+        }];
+        let calls = [crate::provider::ToolCall {
+            id: "c1".into(),
+            name: "memory_add".into(),
+            input: serde_json::json!({}),
+        }];
+        let (permitted, refused) = partition_without_asking(&profile, &calls, &entries);
+        assert!(permitted.is_empty());
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].0, "c1");
+        assert!(refused[0].1.contains("memory_add"), "{}", refused[0].1);
+        assert_eq!(
+            refused[0].1,
+            refusal_message("memory_add", Refusal::NeedsApproval)
+        );
+    }
+
+    #[test]
+    fn refusal_messages_name_the_tool_and_the_reason() {
+        let declined = refusal_message("shell", Refusal::UserDeclined);
+        let not_offered = refusal_message("shell", Refusal::NotOffered);
+        let needs_approval = refusal_message("shell", Refusal::NeedsApproval);
+        for message in [&declined, &not_offered, &needs_approval] {
+            assert!(message.contains("shell"), "{message}");
+        }
+        assert!(declined.contains("declined"), "{declined}");
+        assert!(
+            !not_offered.starts_with("Permission denied"),
+            "{not_offered}"
+        );
+        assert_ne!(declined, needs_approval);
+    }
+
+    #[test]
+    fn mode_ids_round_trip() {
+        assert_eq!(SessionMode::ALL.len(), 3);
+        for mode in SessionMode::ALL {
+            assert_eq!(SessionMode::from_id(mode.id()), Some(mode));
+        }
+        assert_eq!(SessionMode::from_id("plan"), None);
+    }
+
+    #[test]
+    fn tool_group_names_are_config_section_names() {
+        for (group, expected) in [
+            (ToolGroup::Fs, "fs"),
+            (ToolGroup::Shell, "shell"),
+            (ToolGroup::Mcp, "mcp"),
+            (ToolGroup::Admin, "admin"),
+        ] {
+            assert_eq!(group.as_str(), expected);
+            let message = refusal_message(
+                "tool",
+                Refusal::Unavailable {
+                    session: "session".into(),
+                    permission: "grant".into(),
+                    group,
+                },
+            );
+            assert!(
+                message.contains(&format!("[tools.{expected}].enabled")),
+                "{message}"
+            );
+        }
+    }
 
     /// R2/R9: the table is group × permission profile, and the mode is what decides
     /// whether an *offered* one asks, from `kind` — today's `decide` rows, unchanged,

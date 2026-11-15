@@ -83,10 +83,6 @@ impl FileReadTool {
 
 #[async_trait]
 impl Tool for FileReadTool {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Read
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -529,10 +525,6 @@ impl FileWriteTool {
 
 #[async_trait]
 impl Tool for FileWriteTool {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Edit
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -607,10 +599,6 @@ impl FileDeleteTool {
 
 #[async_trait]
 impl Tool for FileDeleteTool {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Delete
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -684,10 +672,6 @@ impl FileAppendTool {
 
 #[async_trait]
 impl Tool for FileAppendTool {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Edit
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -759,10 +743,6 @@ impl DirListTool {
 
 #[async_trait]
 impl Tool for DirListTool {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Search
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -904,10 +884,6 @@ fn walk_recurse(
 
 #[async_trait]
 impl Tool for DirWalkTool {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Search
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -1270,10 +1246,6 @@ impl ShellTool {
 
 #[async_trait]
 impl Tool for ShellTool {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Execute
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -1501,10 +1473,6 @@ fn wmo_code_description(code: i64) -> &'static str {
 
 #[async_trait]
 impl Tool for WeatherTool {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Fetch
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -1727,10 +1695,6 @@ impl WebSearchTool {
 
 #[async_trait]
 impl Tool for WebSearchTool {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Fetch
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -1908,10 +1872,6 @@ impl RecallImageTool {
 
 #[async_trait]
 impl Tool for RecallImageTool {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Read
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -2488,7 +2448,7 @@ mod refresh_system_prompt_tests {
         assert_eq!(names, vec!["refresh_system_prompt".to_string()]);
 
         let tool = RefreshSystemPromptTool::new(Arc::downgrade(&agent));
-        assert_eq!(tool.kind(), ToolKind::Other);
+        assert_eq!(tool.spec().kind, ToolKind::Other);
         assert_eq!(tool.spec().name, "refresh_system_prompt");
         assert!(
             tool.spec().input_schema["properties"]

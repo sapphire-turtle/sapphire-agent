@@ -773,10 +773,6 @@ impl Tool for SubagentTool {
         &self.spec
     }
 
-    fn kind(&self) -> ToolKind {
-        ToolKind::Other
-    }
-
     /// Synchronous only: a background child has to own the tool it runs
     /// on after this call returns, which `&self` cannot give it. The
     /// registered tool is the `Arc<SubagentTool>` below, which can.
@@ -846,10 +842,6 @@ impl<'a> Request<'a> {
 /// written at run time would have nowhere to be swapped into (#265).
 #[async_trait]
 impl Tool for Arc<SubagentTool> {
-    fn kind(&self) -> ToolKind {
-        (**self).kind()
-    }
-
     fn spec(&self) -> &ToolSpec {
         (**self).spec()
     }
@@ -1741,7 +1733,10 @@ mod tests {
 
     #[test]
     fn the_kind_is_other() {
-        assert_eq!(SubagentTool::new(defs(), false).kind(), ToolKind::Other);
+        assert_eq!(
+            SubagentTool::new(defs(), false).spec().kind,
+            ToolKind::Other
+        );
     }
 
     /// A definition written after the tool was constructed is callable
@@ -3368,12 +3363,6 @@ mod tests {
             &self.0
         }
 
-        fn kind(&self) -> ToolKind {
-            // Allowed from every origin, so the call actually runs — and
-            // hangs — rather than being refused before it starts.
-            ToolKind::Read
-        }
-
         async fn execute(&self, _input: &serde_json::Value) -> anyhow::Result<String> {
             std::future::pending().await
         }
@@ -3664,10 +3653,6 @@ mod tests {
     impl Tool for OtherTool {
         fn spec(&self) -> &ToolSpec {
             &self.0
-        }
-
-        fn kind(&self) -> ToolKind {
-            ToolKind::Other
         }
 
         async fn execute(&self, _input: &serde_json::Value) -> anyhow::Result<String> {

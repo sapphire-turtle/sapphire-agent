@@ -750,10 +750,6 @@ impl Tool for McpTool {
         &self.spec
     }
 
-    fn kind(&self) -> ToolKind {
-        self.spec.kind
-    }
-
     async fn execute(&self, input: &serde_json::Value) -> Result<String> {
         let result = self.client.call_tool(&self.remote_tool_name, input).await?;
         if let Some(observer) = self.client.observer.get() {
@@ -846,8 +842,8 @@ pub fn build_tools_for_client(
             Box::new(McpTool {
                 client: Arc::clone(client),
                 spec: ToolSpec {
-                kind,
-                group: Some(ToolGroup::Mcp),
+                    kind,
+                    group: Some(ToolGroup::Mcp),
                     name: Cow::Owned(tool_name),
                     description: Cow::Owned(rt.description),
                     input_schema: rt.input_schema,

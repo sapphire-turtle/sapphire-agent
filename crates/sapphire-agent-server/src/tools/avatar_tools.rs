@@ -170,12 +170,6 @@ impl Tool for SetExpressionTool {
         &SET_EXPRESSION_SPEC
     }
 
-    /// `Think`: it changes nothing anywhere but the avatar's face, so it
-    /// must run without a permission prompt on every origin.
-    fn kind(&self) -> ToolKind {
-        ToolKind::Think
-    }
-
     async fn execute(&self, input: &Value) -> Result<String> {
         let turn = avatar_turn()?;
         let name = declared_name(input, "expression", &turn.caps.expressions)?;
@@ -218,11 +212,6 @@ impl Tool for PlayActionTool {
         &PLAY_ACTION_SPEC
     }
 
-    /// `Think`, as for `set_expression`.
-    fn kind(&self) -> ToolKind {
-        ToolKind::Think
-    }
-
     async fn execute(&self, input: &Value) -> Result<String> {
         let turn = avatar_turn()?;
         // Validated before the gesture is spent, so a misspelt name does
@@ -261,11 +250,6 @@ pub(crate) struct SetPoseTool;
 impl Tool for SetPoseTool {
     fn spec(&self) -> &ToolSpec {
         &SET_POSE_SPEC
-    }
-
-    /// `Think`, as for `set_expression`.
-    fn kind(&self) -> ToolKind {
-        ToolKind::Think
     }
 
     async fn execute(&self, input: &Value) -> Result<String> {

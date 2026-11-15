@@ -62,10 +62,6 @@ impl CurrentTimeTool {
 
 #[async_trait]
 impl Tool for CurrentTimeTool {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Read
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -231,10 +227,6 @@ impl SessionListTool {
 
 #[async_trait]
 impl Tool for SessionListTool {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Read
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -462,10 +454,6 @@ fn push_block(out: &mut Vec<String>, prefix: &str, text: &str) {
 
 #[async_trait]
 impl Tool for SessionReadTool {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Read
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }

@@ -296,10 +296,6 @@ fn build_spec() -> ToolSpec {
 
 #[async_trait]
 impl Tool for SkillTool {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Read
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -337,10 +333,6 @@ impl Tool for SkillTool {
 /// copy of `SkillTool`.
 #[async_trait]
 impl Tool for Arc<SkillTool> {
-    fn kind(&self) -> ToolKind {
-        (**self).kind()
-    }
-
     fn spec(&self) -> &ToolSpec {
         (**self).spec()
     }
@@ -604,10 +596,6 @@ fn build_install_spec() -> ToolSpec {
 
 #[async_trait]
 impl Tool for SkillInstallTool {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Execute
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -766,10 +754,6 @@ fn build_update_spec() -> ToolSpec {
 
 #[async_trait]
 impl Tool for SkillUpdateTool {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Execute
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -898,10 +882,6 @@ fn build_uninstall_spec() -> ToolSpec {
 
 #[async_trait]
 impl Tool for SkillUninstallTool {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Delete
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -1253,7 +1233,7 @@ mod tests {
 
     #[test]
     fn the_kind_is_read() {
-        assert_eq!(SkillTool::new().kind(), ToolKind::Read);
+        assert_eq!(SkillTool::new().spec().kind, ToolKind::Read);
     }
 
     /// `invalidate_cache` is Task 4's hook for making a freshly
@@ -1920,15 +1900,19 @@ mod tests {
     #[test]
     fn the_kinds_are_set_deliberately() {
         assert_eq!(
-            SkillInstallTool::new(Arc::new(SkillTool::new())).kind(),
+            SkillInstallTool::new(Arc::new(SkillTool::new()))
+                .spec()
+                .kind,
             ToolKind::Execute
         );
         assert_eq!(
-            SkillUpdateTool::new(Arc::new(SkillTool::new())).kind(),
+            SkillUpdateTool::new(Arc::new(SkillTool::new())).spec().kind,
             ToolKind::Execute
         );
         assert_eq!(
-            SkillUninstallTool::new(Arc::new(SkillTool::new())).kind(),
+            SkillUninstallTool::new(Arc::new(SkillTool::new()))
+                .spec()
+                .kind,
             ToolKind::Delete
         );
     }

@@ -57,10 +57,6 @@ impl AskHumanTool {
 
 #[async_trait]
 impl Tool for AskHumanTool {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Think
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }

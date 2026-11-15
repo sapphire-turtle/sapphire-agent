@@ -48,7 +48,7 @@ fn kinds_for(trust: McpTrust) -> Vec<(String, ToolKind)> {
     let client = client_with(trust);
     build_tools_for_client(&client, vec![remote("list"), remote("record")])
         .iter()
-        .map(|t| (t.spec().name.to_string(), t.kind()))
+        .map(|t| (t.spec().name.to_string(), t.spec().kind))
         .collect()
 }
 
@@ -603,7 +603,7 @@ async fn acp_client_tools_are_prefixed_and_classified() {
     let tools = build_tools_for_client(&client, remote_tools);
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0].spec().name, "acp__game__poke");
-    assert_eq!(tools[0].kind(), ToolKind::Read);
+    assert_eq!(tools[0].spec().kind, ToolKind::Read);
     assert!(
         peer.seen()
             .iter()

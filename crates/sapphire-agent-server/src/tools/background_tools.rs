@@ -79,10 +79,6 @@ fn session_tasks() -> Result<(String, std::sync::Arc<BackgroundTasks>)> {
 
 #[async_trait]
 impl Tool for BackgroundTaskTool {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Think
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }

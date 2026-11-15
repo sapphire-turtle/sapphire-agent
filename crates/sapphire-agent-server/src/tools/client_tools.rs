@@ -687,10 +687,6 @@ impl Default for ClientShellStart {
 
 #[async_trait]
 impl Tool for ClientShellStart {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Execute
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -797,10 +793,6 @@ impl Default for ClientShellOutput {
 
 #[async_trait]
 impl Tool for ClientShellOutput {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Read
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -892,10 +884,6 @@ impl Default for ClientShellKill {
 
 #[async_trait]
 impl Tool for ClientShellKill {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Execute
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }

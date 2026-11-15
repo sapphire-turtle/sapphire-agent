@@ -196,10 +196,6 @@ impl MemoryAddTool {
 
 #[async_trait]
 impl Tool for MemoryAddTool {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Edit
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -255,10 +251,6 @@ impl MemoryUpdateTool {
 
 #[async_trait]
 impl Tool for MemoryUpdateTool {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Edit
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -319,10 +311,6 @@ impl MemoryAppendTool {
 
 #[async_trait]
 impl Tool for MemoryAppendTool {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Edit
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -401,10 +389,6 @@ impl MemoryReadTool {
 
 #[async_trait]
 impl Tool for MemoryReadTool {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Read
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -453,10 +437,6 @@ impl MemoryRemoveTool {
 
 #[async_trait]
 impl Tool for MemoryRemoveTool {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Delete
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -524,10 +504,6 @@ impl WorkspaceSearchTool {
 
 #[async_trait]
 impl Tool for WorkspaceSearchTool {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Search
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }

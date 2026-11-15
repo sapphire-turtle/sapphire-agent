@@ -211,6 +211,18 @@ pub enum ToolGroup {
     Admin,
 }
 
+impl ToolGroup {
+    /// The name of this group's `[tools.<group>]` configuration section.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fs => "fs",
+            Self::Shell => "shell",
+            Self::Mcp => "mcp",
+            Self::Admin => "admin",
+        }
+    }
+}
+
 /// `[permission_profile.<n>]` — which groups a session may use (decision 3).
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct PermissionProfileConfig {
@@ -1495,17 +1507,10 @@ pub struct AutonomousConfig {
     /// edited task file takes effect.
     #[serde(default = "default_autonomous_poll_seconds")]
     pub poll_seconds: u64,
-    /// Which row of the permission table an autonomous turn is judged by.
-    ///
-    /// `Channel` by default — the safe default, the same row the
-    /// heartbeat's chat leg runs on: reads and unapproved edits, no
-    /// `Execute`/`Other`. An operator who wants the agent to run `shell`
-    /// on its own (filing issues, committing) sets `origin = "trusted"`
-    ///; see decision 10.
-    ///
-    /// Note this is only half the gate — `[tools] host_access.enabled`
-    /// has to be on too, or `host_tool_denied` refuses `shell` and
-    /// `file_write` before the table is consulted at all.
+    /// Transport origin used by autonomous turns. `channel` and `trusted`
+    /// select `Origin::Channel` and `Origin::Unattended`, respectively.
+    /// Both currently resolve the default session profile with no ACP mode;
+    /// the permission profile and each group's host enabled flag still gate calls.
     #[serde(default)]
     pub origin: AutonomousOrigin,
     /// Chat room where autonomous sessions post questions for a human to
@@ -1546,13 +1551,10 @@ fn default_autonomous_poll_seconds() -> u64 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AutonomousOrigin {
-    /// `Origin::Channel`: reads and unapproved edits; `Execute` and
-    /// `Other` refused. The heartbeat's chat leg's row. The default —
-    /// the safe row; `trusted` is opt-in.
+    /// Use `Origin::Channel` with the default session profile.
     #[default]
     Channel,
-    /// `Origin::Trusted`: `/rpc`, voice and `/a2a`'s row. Everything,
-    /// subject to `host_access`.
+    /// Use `Origin::Unattended` with the default session profile.
     Trusted,
 }
 
