@@ -101,17 +101,17 @@ impl Agent {
         let allowed_rooms: std::collections::HashSet<String> = {
             let mut set = std::collections::HashSet::new();
             if let Some(m) = &config.matrix {
-                if m.room_ids.is_empty() {
+                if m.rooms.is_empty() {
                     wildcard = true;
                 } else {
-                    set.extend(m.room_ids.iter().cloned());
+                    set.extend(m.rooms.iter().map(|r| r.room_id.clone()));
                 }
             }
             if let Some(d) = &config.discord {
-                if d.channel_ids.is_empty() {
+                if d.rooms.is_empty() {
                     wildcard = true;
                 } else {
-                    set.extend(d.channel_ids.iter().cloned());
+                    set.extend(d.rooms.iter().map(|r| r.room_id.clone()));
                 }
             }
             set
@@ -198,6 +198,7 @@ impl Agent {
         task_name: &str,
         prompt: &str,
         room_id: &str,
+        profile: Option<&str>,
     ) -> anyhow::Result<()> {
         let content = format!("[Heartbeat: {task_name}]\n\n{prompt}");
         let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
@@ -212,7 +213,10 @@ impl Agent {
             attachment_owner: None,
             reply_to: None,
         };
-        Arc::clone(self).handle_message(incoming).await
+        let profile = profile.map(str::to_owned);
+        Arc::clone(self)
+            .handle_message_with_origin(incoming, profile)
+            .await
     }
 
     /// Handle channel messages until `shutdown` is cancelled.
@@ -260,7 +264,7 @@ impl Agent {
     // -----------------------------------------------------------------------
 
     /// Return the active session_id for `key`, creating a new session file if needed.
-    async fn get_or_create_session(&self, key: &ConversationKey) -> String {
+    async fn get_or_create_session(&self, key: &ConversationKey, profile_name: &str) -> String {
         let mut sessions = self.active_sessions.lock().await;
         if let Some(id) = sessions.get(key) {
             return id.clone();
@@ -276,7 +280,10 @@ impl Agent {
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "unknown".to_string())
             });
-        let namespace = self.config.namespace_for_room(&key.0).to_string();
+        let namespace = self
+            .config
+            .namespace_for_session_profile(profile_name)
+            .to_string();
         match self
             .session_store
             .create_session(key, &channel_name, &namespace)
@@ -332,10 +339,10 @@ impl Agent {
     /// Dispatch the configured day-boundary action for `key` when the local
     /// date on the active session file is older than today. Each policy is
     /// idempotent within a day via `boundary_handled`.
-    async fn maybe_handle_day_boundary(&self, key: &ConversationKey) {
+    async fn maybe_handle_day_boundary(&self, key: &ConversationKey, profile_name: &str) {
         let boundary = self.config.day_boundary_hour;
         let today = local_date_for_timestamp(Local::now(), boundary);
-        let policy = self.config.session_policy_for(&key.0);
+        let policy = self.config.session_policy_for_profile(profile_name);
 
         if policy == SessionPolicy::None {
             return;
@@ -381,7 +388,8 @@ impl Agent {
                 // the new session will have today's created_at.
             }
             SessionPolicy::Compact => {
-                self.compact_at_boundary(key, &session_id).await;
+                self.compact_at_boundary(key, &session_id, profile_name)
+                    .await;
                 self.boundary_handled
                     .lock()
                     .await
@@ -394,7 +402,12 @@ impl Agent {
     /// Force-summarize the current in-memory history for `key` and replace
     /// it with a summary stub so the session can keep growing into the new
     /// day without re-sending stale context to the model.
-    async fn compact_at_boundary(&self, key: &ConversationKey, session_id: &str) {
+    async fn compact_at_boundary(
+        &self,
+        key: &ConversationKey,
+        session_id: &str,
+        profile_name: &str,
+    ) {
         let messages = {
             let history = self.history.lock().await;
             history.get(key).cloned().unwrap_or_default()
@@ -412,7 +425,9 @@ impl Agent {
 
         info!("Day boundary crossed for {key:?}; compacting session {session_id}");
 
-        let provider = self.provider_for(&key.0);
+        let provider = self
+            .providers
+            .for_session_profile(&self.config, profile_name);
         let summary = match generate_summary(&*provider, &messages).await {
             Ok(s) if !s.trim().is_empty() => s,
             Ok(_) => {
@@ -442,7 +457,7 @@ impl Agent {
     // -----------------------------------------------------------------------
 
     /// Return the system prompt for `key`, rebuilding if the local date has changed.
-    async fn get_system_prompt(&self, key: &ConversationKey) -> Option<String> {
+    async fn get_system_prompt(&self, key: &ConversationKey, profile_name: &str) -> Option<String> {
         let boundary = self.config.day_boundary_hour;
         let today = local_date_for_timestamp(Local::now(), boundary);
 
@@ -459,7 +474,7 @@ impl Agent {
             }
         }
 
-        let namespace = self.config.namespace_for_room(&key.0);
+        let namespace = self.config.namespace_for_session_profile(profile_name);
         let chain = self.config.resolve_namespace_chain(namespace);
         // Best-effort: a missing or unreachable RoomInfo just leaves the
         // "# Current Room" block out — never blocks the turn.
@@ -549,17 +564,28 @@ impl Agent {
         self: Arc<Self>,
         incoming: crate::channel::IncomingMessage,
     ) -> anyhow::Result<()> {
+        self.handle_message_with_origin(incoming, None).await
+    }
+
+    async fn handle_message_with_origin(
+        self: Arc<Self>,
+        incoming: crate::channel::IncomingMessage,
+        unattended_profile: Option<String>,
+    ) -> anyhow::Result<()> {
+        let profile_name = unattended_profile
+            .clone()
+            .unwrap_or_else(|| self.config.session_profile_name(None, &incoming.room_id));
         info!("Message from {}: {}", incoming.sender, incoming.content);
 
         let key: ConversationKey = (incoming.room_id.clone(), incoming.thread_id.clone());
 
         // Check for day boundary → dispatch configured session policy
-        self.maybe_handle_day_boundary(&key).await;
+        self.maybe_handle_day_boundary(&key, &profile_name).await;
 
-        let session_id = self.get_or_create_session(&key).await;
+        let session_id = self.get_or_create_session(&key, &profile_name).await;
 
         // Get system prompt (snapshot: rebuilt at most once per local day per key)
-        let system = self.get_system_prompt(&key).await;
+        let system = self.get_system_prompt(&key, &profile_name).await;
 
         // Inject prefetch context from previous turn (if any)
         let prefetch_result = self.prefetch_cache.lock().await.remove(&key);
@@ -597,11 +623,35 @@ impl Agent {
         // host tools (`file_read`, `file_write`, `file_append`,
         // `file_delete`, `dir_list`, `dir_walk`, `shell`, `image_read`), whose
         // agent-side bodies are what this transport runs.
-        let host_access_enabled = self.config.tools.host_access.enabled;
-        let can_save = host_access_enabled && incoming.attachment_owner.is_some();
-        let base =
-            crate::serve::visible_tool_predicate(host_access_enabled, false, false, false, false);
-        let tool_specs = match &self.tools {
+        let fs_enabled = self.config.group_registered(crate::config::ToolGroup::Fs);
+        let shell_enabled = self
+            .config
+            .group_registered(crate::config::ToolGroup::Shell);
+        let can_save = fs_enabled && incoming.attachment_owner.is_some();
+        let base = crate::serve::visible_tool_predicate(
+            fs_enabled,
+            shell_enabled,
+            false,
+            false,
+            false,
+            false,
+        );
+        let permission = crate::tools::policy::ResolvedPermission::resolve(
+            &self.config,
+            crate::tools::policy::Origin::Channel {
+                session_profile: profile_name.clone(),
+            },
+        );
+        let entries = match &self.tools {
+            Some(tools) => tools
+                .entries()
+                .await
+                .into_iter()
+                .map(|(_, entry)| entry)
+                .collect(),
+            None => Vec::new(),
+        };
+        let mut tool_specs = match &self.tools {
             Some(t) => Some(
                 t.specs_filtered(|name| {
                     if name == "attachment_save" {
@@ -614,6 +664,18 @@ impl Agent {
             ),
             None => None,
         };
+
+        if let Some(specs) = &mut tool_specs {
+            specs.retain(|spec| {
+                entries
+                    .iter()
+                    .find(|e| e.name == spec.name)
+                    .is_some_and(|entry| {
+                        crate::tools::policy::allow(&permission, entry)
+                            != crate::tools::policy::Allow::Deny
+                    })
+            });
+        }
 
         // Context compression config
         let compression_config = &self.config.compression;
@@ -649,7 +711,12 @@ impl Agent {
             }
 
             // Check if context compression is needed
-            let provider = self.provider_for(&incoming.room_id);
+            let provider = if unattended_profile.is_some() {
+                self.providers
+                    .for_session_profile(&self.config, &profile_name)
+            } else {
+                self.provider_for(&incoming.room_id)
+            };
             let messages = match maybe_compress(
                 &*provider,
                 system_with_context.as_deref(),
@@ -773,7 +840,7 @@ impl Agent {
                     let tools = self.tools.clone();
                     let ns = self
                         .config
-                        .namespace_for_room(&incoming.room_id)
+                        .namespace_for_session_profile(&profile_name)
                         .to_string();
                     let room_id_for_timer = incoming.room_id.clone();
                     // Permission gate for the channel path.
@@ -799,31 +866,30 @@ impl Agent {
                     let mut refused: Vec<_> = not_offered
                         .into_iter()
                         .map(|call| {
-                            let reason = crate::tools::policy::refusal_message(
-                                &call.name,
-                                crate::tools::policy::Refusal::NotOffered,
-                            );
+                            let reason = entries
+                                .iter()
+                                .find(|e| e.name == call.name)
+                                .filter(|entry| {
+                                    crate::tools::policy::allow(&permission, entry)
+                                        == crate::tools::policy::Allow::Deny
+                                })
+                                .map(|entry| {
+                                    crate::tools::policy::unavailable_message(&permission, entry)
+                                })
+                                .unwrap_or_else(|| {
+                                    crate::tools::policy::refusal_message(
+                                        &call.name,
+                                        crate::tools::policy::Refusal::NotOffered,
+                                    )
+                                });
                             (call.id, reason)
                         })
                         .collect();
-                    let kinds = match &tools {
-                        Some(tools) => tools.kinds().await,
-                        None => Vec::new(),
-                    };
-                    // `routed_to_client` is `false`, and it is `false`
-                    // for the whole channel path rather than a value
-                    // read from somewhere: a Matrix/Discord turn never
-                    // has an ACP client, so the host gate speaks for
-                    // every one of these names here exactly as it always
-                    // has. #270 changed the gate's meaning on ACP turns
-                    // only; this path is the control case.
                     let (tool_calls, policy_refused) =
                         crate::tools::policy::partition_without_asking(
-                            crate::tools::policy::Origin::Channel,
+                            &permission,
                             &offered,
-                            &kinds,
-                            self.config.tools.host_access.enabled,
-                            false,
+                            &entries,
                         );
                     refused.extend(policy_refused);
                     for (id, reason) in &refused {
@@ -836,6 +902,8 @@ impl Agent {
                         let tools = Arc::clone(tools.as_ref().expect("offered tool set"));
                         let ns = ns.clone();
                         let owner = incoming.attachment_owner.clone();
+                        let session_profile = Some(profile_name.clone());
+                        let permission_profile = permission.permission.clone();
                         let origin = crate::timer::TimerOrigin::Chat {
                             room_id: room_id_for_timer.clone(),
                         };
@@ -844,17 +912,26 @@ impl Agent {
                                 owner,
                                 crate::tools::workspace_tools::scope_memory_namespace(
                                     ns,
-                                    crate::timer::scope_timer_origin(origin, async move {
-                                        info!("Executing tool: {} (id={})", call.name, call.id);
-                                        let output = tools.execute(&call).await;
-                                        info!(
-                                            "Tool {} result ({} image(s) attached): {}",
-                                            call.name,
-                                            output.images.len(),
-                                            output.text
-                                        );
-                                        (call.id, output)
-                                    }),
+                                    crate::tools::config_tools::scope_session_profile(
+                                        session_profile,
+                                        crate::tools::config_tools::scope_permission_profile(
+                                            permission_profile,
+                                            crate::timer::scope_timer_origin(origin, async move {
+                                                info!(
+                                                    "Executing tool: {} (id={})",
+                                                    call.name, call.id
+                                                );
+                                                let output = tools.execute(&call).await;
+                                                info!(
+                                                    "Tool {} result ({} image(s) attached): {}",
+                                                    call.name,
+                                                    output.images.len(),
+                                                    output.text
+                                                );
+                                                (call.id, output)
+                                            }),
+                                        ),
+                                    ),
                                 ),
                             ),
                         ));
@@ -963,7 +1040,6 @@ fn build_user_message(text: &str, attachments: &[Attachment]) -> ChatMessage {
 #[cfg(test)]
 mod tests {
     use crate::provider::ToolCall;
-    use crate::tools::ToolKind;
     use crate::tools::policy::{Origin, partition_without_asking};
     use sapphire_framework::workspace::{AppContext, Workspace, WorkspaceState};
     use std::sync::{Arc, Mutex};
@@ -983,24 +1059,22 @@ mod tests {
         Arc::new(WorkspaceState::open(ws).unwrap())
     }
 
-    /// Six calls, run through the channel gate under both `host_access`
-    /// states. Shared by both phases below so the two assertions stay
-    /// about the same call list rather than drifting apart.
-    async fn channel_gate_test_calls() -> (Vec<ToolCall>, Vec<(String, ToolKind)>) {
+    /// The actual tool specs are the single source of policy classification.
+    async fn channel_gate_test_calls() -> (Vec<ToolCall>, Vec<crate::provider::ToolSpec>) {
         let tools = crate::tools::default_tool_set(
             test_workspace(),
             Some("test-tavily-key".to_string()),
             &[],
             4,
+            &crate::config::Config::parse_for_test("[tools.fs]\nenabled = true\n[tools.shell]\nenabled = true\n[permission_profile.test]\ntools = [\"shell\"]\n"),
         )
         .await;
-        let kinds = tools.kinds().await;
-
-        let calls: Vec<ToolCall> = [
+        let specs = tools.specs_filtered(|_| true).await;
+        let calls = [
+            "file_write",
             "shell",
             "web_search",
             "memory_add",
-            "file_read",
             "workspace_sync",
             "mcp__somewhere__do_thing",
         ]
@@ -1012,109 +1086,83 @@ mod tests {
             input: serde_json::json!({}),
         })
         .collect();
-
-        (calls, kinds)
+        (calls, specs)
     }
 
-    /// `shell` (`Execute`) and `workspace_sync`/the MCP tool (`Other`)
-    /// are refused over chat regardless of `host_access` — that is
-    /// `decide`'s risky bucket, which the host switch does not touch.
-    /// `web_search`/`memory_add` (workspace-scoped, not host tools) keep
-    /// working either way. `file_read` is the one call that moves
-    /// between the two phases below: this test pins it with
-    /// `host_access` **on**, matching the pre-host-switch behaviour this
-    /// permission work otherwise preserves; the sibling test below pins
-    /// what changed.
     #[tokio::test]
-    async fn the_channel_gate_refuses_shell_but_keeps_the_chat_tools() {
-        let (calls, kinds) = channel_gate_test_calls().await;
-
-        let (permitted, refused) =
-            partition_without_asking(Origin::Channel, &calls, &kinds, true, false);
-
-        let kept: Vec<&str> = permitted.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(
-            kept,
-            vec!["web_search", "memory_add", "file_read"],
-            "the chat bots' own tools must keep working, and file_read is \
-             reachable once host access is on"
+    async fn channel_default_allows_fs_but_not_shell() {
+        use crate::tools::policy::{ResolvedPermission, ToolEntry};
+        let (calls, specs) = channel_gate_test_calls().await;
+        let cfg = crate::config::Config::parse_for_test(
+            "[anthropic]\napi_key = \"test\"\n[tools.fs]\nenabled = true\n[tools.shell]\nenabled = true\n",
         );
-
-        let name_of = |id: &str| {
-            calls
+        let profile = ResolvedPermission::resolve(
+            &cfg,
+            Origin::Channel {
+                session_profile: "default".into(),
+            },
+        );
+        let entries: Vec<_> = specs
+            .iter()
+            .map(|spec| ToolEntry::from_spec(spec, &cfg))
+            .collect();
+        let (permitted, refused) = partition_without_asking(&profile, &calls, &entries);
+        assert_eq!(
+            permitted
                 .iter()
-                .find(|c| c.id == id)
-                .map(|c| c.name.clone())
-                .unwrap()
-        };
-        let blocked: Vec<String> = refused.iter().map(|(id, _)| name_of(id)).collect();
-        assert_eq!(
-            blocked,
-            vec!["shell", "workspace_sync", "mcp__somewhere__do_thing"],
-            "Execute and Other must not be reachable over chat even with host \
-             access on — the switch does not override the risky bucket"
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            ["file_write", "web_search", "memory_add", "workspace_sync"]
         );
-
-        // Every refusal names its tool, so the model can say which call
-        // it lost and why.
-        for (id, reason) in &refused {
-            let name = name_of(id);
-            assert!(reason.contains(&name), "{reason} should name {name}");
-        }
-
-        // Every call is accounted for exactly once: the model is owed a
-        // tool_result for each tool_use, and a call lost here would make
-        // the next provider request fail rather than merely misbehave.
+        assert_eq!(
+            refused
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            ["c1", "c5"]
+        );
+        assert!(refused[0].1.contains("permission_profile.default.tools"));
+        assert!(refused[0].1.contains("[tools.shell].enabled"));
+        assert!(refused[1].1.contains("not available"));
         assert_eq!(permitted.len() + refused.len(), calls.len());
     }
 
-    /// The hole this permission work closes: with `host_access` **off**
-    /// (the default), `file_read` — like the other seven `HOST_TOOLS` —
-    /// is refused over chat too, not just `Execute`/`Other`. Before
-    /// this, `file_write`/`file_delete` (`Edit`/`Delete`) were reachable
-    /// from an unasked Discord message; `file_read` sits in the same
-    /// `HOST_TOOLS` list and is pinned here as the reachable proxy for
-    /// all of them. `shell`/`workspace_sync`/the MCP tool stay refused
-    /// for the unrelated, pre-existing reason (`Execute`/`Other`).
     #[tokio::test]
-    async fn the_channel_gate_also_refuses_host_tools_when_host_access_is_off() {
-        let (calls, kinds) = channel_gate_test_calls().await;
-
-        let (permitted, refused) =
-            partition_without_asking(Origin::Channel, &calls, &kinds, false, false);
-
-        let kept: Vec<&str> = permitted.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(
-            kept,
-            vec!["web_search", "memory_add"],
-            "only the non-host workspace tools survive with host access off"
+    async fn channel_default_refuses_disabled_fs_even_when_listed() {
+        use crate::tools::policy::{ResolvedPermission, ToolEntry};
+        let (mut calls, specs) = channel_gate_test_calls().await;
+        calls.push(ToolCall {
+            id: "delete".into(),
+            name: "file_delete".into(),
+            input: serde_json::json!({}),
+        });
+        let cfg = crate::config::Config::parse_for_test("[anthropic]\napi_key = \"test\"\n");
+        let profile = ResolvedPermission::resolve(
+            &cfg,
+            Origin::Channel {
+                session_profile: "default".into(),
+            },
         );
-
-        let name_of = |id: &str| {
-            calls
+        let entries: Vec<_> = specs
+            .iter()
+            .map(|spec| ToolEntry::from_spec(spec, &cfg))
+            .collect();
+        let (permitted, refused) = partition_without_asking(&profile, &calls, &entries);
+        assert_eq!(
+            permitted
                 .iter()
-                .find(|c| c.id == id)
-                .map(|c| c.name.clone())
-                .unwrap()
-        };
-        let blocked: Vec<String> = refused.iter().map(|(id, _)| name_of(id)).collect();
-        assert_eq!(
-            blocked,
-            vec![
-                "shell",
-                "file_read",
-                "workspace_sync",
-                "mcp__somewhere__do_thing"
-            ],
-            "file_read joins the refusal list; shell and Other are still \
-             refused for their own, unrelated reason"
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            ["web_search", "memory_add", "workspace_sync"]
         );
-
-        for (id, reason) in &refused {
-            let name = name_of(id);
-            assert!(reason.contains(&name), "{reason} should name {name}");
-        }
-
+        assert!(
+            refused
+                .iter()
+                .any(|(id, reason)| id == "c0" && reason.contains("[tools.fs].enabled"))
+        );
+        assert!(refused.iter().any(|(id, reason)| id == "delete"
+            && reason.contains("file_delete")
+            && reason.contains("[tools.fs].enabled")));
         assert_eq!(permitted.len() + refused.len(), calls.len());
     }
 
@@ -1233,7 +1281,7 @@ mod tests {
         let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
         let base = dir.path().to_path_buf();
 
-        // Minimal config: no room_profile mapping for the test room, so
+        // Minimal config: no session_profile mapping for the test room, so
         // `ProviderRegistry::for_room` falls through to the "anthropic"
         // key — which `for_test` below points at the same stub.
         let config = crate::config::Config::parse_for_test(
@@ -1246,7 +1294,7 @@ api_key = "test"
         let provider = crate::serve::StubProvider::new(responses);
         let log = provider.call_log();
         // Registered under both names, as `ServeState::build_for_test_with`
-        // does: the fallback path (no room_profile match) resolves the
+        // does: the fallback path (no session_profile match) resolves the
         // built-in "anthropic" key.
         let registry = crate::provider::registry::ProviderRegistry::for_test(
             &["anthropic", "stub"],
@@ -1281,6 +1329,7 @@ api_key = "test"
         let tools = Arc::new(crate::tools::ToolSet::new(
             vec![Box::new(crate::serve::EchoTool::new())],
             Vec::new(),
+            &crate::config::Config::for_test(),
         ));
 
         let (config, tools) = custom.unwrap_or((config, tools));
@@ -1339,6 +1388,524 @@ api_key = "test"
         }
     }
 
+    /// Observe both the raw scope and the config-tool lookup on the real
+    /// channel tool execution path, including the spawned task boundary.
+    struct ProfileScopeProbe {
+        spec: crate::provider::ToolSpec,
+        config: crate::config::Config,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for ProfileScopeProbe {
+        fn spec(&self) -> &crate::provider::ToolSpec {
+            &self.spec
+        }
+
+        async fn execute(&self, _: &serde_json::Value) -> anyhow::Result<String> {
+            Ok(format!(
+                "scope={:?}; resolved={:?}",
+                crate::tools::config_tools::current_session_profile(),
+                crate::tools::config_tools::current_session_profile_for(&self.config)
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unattended_turn_carries_the_profile_its_task_declared() {
+        let cfg = crate::config::Config::parse_for_test(
+            "[anthropic]\napi_key='test'\n[profiles.default]\nprovider='stub'\n\
+             [session_profile.default]\nprofile='default'\npermission='chat'\n\
+             [session_profile.ops]\nprofile='default'\npermission='ops'\n\
+             [permission_profile.chat]\ntools=[]\n[permission_profile.ops]\ntools=['fs']\n\
+             [tools.fs]\nenabled=true\n[tools.shell]\nenabled=true\n[tools.mcp]\nenabled=true\n[tools.admin]\nenabled=true\n",
+        );
+        let ws = test_workspace();
+        let root = ws.workspace.root.clone();
+        std::fs::create_dir_all(root.join("heartbeat")).unwrap();
+        std::fs::write(
+            root.join("heartbeat/morning_call.md"),
+            "---\nschedule: \"0 8 * * *\"\nroom_id: \"test-room\"\nprofile: \"ops\"\nenabled: true\n---\n\n# Morning Call\n",
+        )
+        .unwrap();
+        let tasks = crate::heartbeat_config::load_heartbeat_dir(&root.join("heartbeat"));
+        let task = tasks
+            .iter()
+            .find(|task| task.name == "morning_call")
+            .unwrap();
+
+        let tools = crate::tools::default_tool_set(Arc::clone(&ws), None, &[], 4, &cfg).await;
+        let probe = crate::serve::GateProbe::new();
+        tools.register_tool(Box::new(Arc::clone(&probe))).await;
+        let ((agent, sent, _), log) = build_test_agent_with_tools(
+            vec![
+                crate::provider::ChatResponse {
+                    prompt_usage: None,
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "probe".into(),
+                        name: "gate_probe".into(),
+                        input: serde_json::json!({}),
+                    }],
+                    stop_reason: None,
+                },
+                crate::provider::ChatResponse {
+                    prompt_usage: None,
+                    text: Some("done".into()),
+                    tool_calls: vec![],
+                    stop_reason: None,
+                },
+            ],
+            false,
+            Some((cfg, tools)),
+        );
+        agent
+            .trigger(
+                &task.name,
+                &task.body,
+                task.meta.room_id.as_deref().unwrap(),
+                task.meta.profile.as_deref(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(probe.seen(), Some(("ops".into(), "ops".into())));
+        assert!(log.calls()[0].1.contains(&"gate_probe".into()));
+        assert!(sent.lock().unwrap().iter().any(|m| m.content == "done"));
+    }
+
+    #[tokio::test]
+    async fn task6_channel_group_execution_matrix() {
+        use serde_json::json;
+        for (permission, tool, runs) in [
+            ("default", "file_write", true),
+            ("chat", "file_write", false),
+            ("default", "shell", false),
+            ("admin", "shell", true),
+            ("default", "heartbeat_config", false),
+        ] {
+            let cfg = crate::config::Config::parse_for_test(&format!(
+                "[anthropic]\napi_key='test'\n[session_profile.default]\nprofile='default'\npermission='{permission}'\n[permission_profile.registration]\ntools=['fs','shell','mcp','admin']\n[tools.fs]\nenabled=true\n[tools.shell]\nenabled=true\n[tools.mcp]\nenabled=true\n[tools.admin]\nenabled=true\n"
+            ));
+            let ws = test_workspace();
+            let root = ws.workspace.root.clone();
+            let tools = crate::tools::default_tool_set(Arc::clone(&ws), None, &[], 4, &cfg).await;
+            let probe = crate::serve::GateProbe::new();
+            tools.register_tool(Box::new(Arc::clone(&probe))).await;
+            let admin = crate::tools::config_tools::ConfigTool::new(
+                crate::tools::config_tools::ConfigDir::Heartbeat,
+                root.clone(),
+                cfg.clone(),
+                ws,
+                None,
+                std::sync::Weak::new(),
+            );
+            tools.register_tool(Box::new(admin)).await;
+            let script = vec![
+                crate::provider::ChatResponse {
+                    text: None,
+                    prompt_usage: None,
+                    stop_reason: None,
+                    tool_calls: vec![
+                        ToolCall {
+                            id: "call".into(),
+                            name: tool.into(),
+                            input: if tool == "shell" {
+                                json!({"command":"printf ran > shell-ran"})
+                            } else {
+                                json!({"path":"notes/x.md","content":"written", "action":"list"})
+                            },
+                        },
+                        ToolCall {
+                            id: "probe".into(),
+                            name: "gate_probe".into(),
+                            input: json!({}),
+                        },
+                    ],
+                },
+                crate::provider::ChatResponse {
+                    text: Some("done".into()),
+                    prompt_usage: None,
+                    stop_reason: None,
+                    tool_calls: vec![],
+                },
+            ];
+            let ((agent, sent, _), log) =
+                build_test_agent_with_tools(script, false, Some((cfg, tools)));
+            agent.handle_message(incoming("go")).await.unwrap();
+            assert_eq!(probe.seen(), Some(("default".into(), permission.into())));
+            assert_eq!(log.calls()[0].1.contains(&tool.to_string()), runs);
+            if tool == "file_write" {
+                assert_eq!(root.join("notes/x.md").exists(), runs);
+            }
+            if tool == "shell" {
+                assert_eq!(root.join("shell-ran").exists(), runs);
+            }
+            if !runs {
+                assert!(
+                    result_for(&log, "call").contains("permission_profile"),
+                    "{permission} {tool}: {}",
+                    result_for(&log, "call")
+                );
+            }
+            assert!(sent.lock().unwrap().iter().any(|m| m.content == "done"));
+        }
+    }
+
+    #[tokio::test]
+    async fn only_the_dedicated_tool_modifies_a_definition() {
+        use crate::tools::Tool;
+        use serde_json::json;
+
+        let (dir, root, ws) = crate::tools::config_tools::test_workspace();
+        std::fs::create_dir_all(root.join("heartbeat")).unwrap();
+        let task_file = root.join("heartbeat/morning_call.md");
+        let original = "---\nschedule: \"0 8 * * *\"\n---\n\nold\n";
+        let replacement =
+            "---\nschedule: \"0 9 * * *\"\nroom_id: \"test-room\"\nprofile: \"ops\"\n---\n\nnew\n";
+        std::fs::write(&task_file, original).unwrap();
+
+        let write = crate::tools::builtin_tools::FileWriteTool::new(Arc::clone(&ws));
+        let err = write
+            .execute(&json!({"path": "heartbeat/morning_call.md", "content": replacement}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("heartbeat_config"), "{err}");
+        assert_eq!(std::fs::read_to_string(&task_file).unwrap(), original);
+        let read = crate::tools::builtin_tools::FileReadTool::new(Arc::clone(&ws));
+        assert!(
+            read.execute(&json!({"path": "heartbeat/morning_call.md"}))
+                .await
+                .unwrap()
+                .contains("old")
+        );
+
+        let admin = crate::tools::config_tools::ConfigTool::new(
+            crate::tools::config_tools::ConfigDir::Heartbeat,
+            root.clone(),
+            crate::config::Config::parse_for_test(
+                "[tools.admin]\nenabled=true\n[session_profile.default]\nprofile='default'\npermission='admin'\n[permission_profile.admin]\ntools=['admin']\n",
+            ),
+            Arc::clone(&ws),
+            None,
+            std::sync::Weak::new(),
+        );
+        crate::tools::config_tools::scope_session_profile(
+            Some("default".into()),
+            crate::tools::config_tools::scope_permission_profile(
+                "admin".into(),
+                admin.execute(
+                    &json!({"action": "write", "name": "morning_call", "content": replacement}),
+                ),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&task_file).unwrap(), replacement);
+        drop(dir);
+    }
+
+    #[tokio::test]
+    async fn task6_channel_profile_scope_and_group_filter() {
+        use crate::config::ToolGroup;
+        use crate::tools::ToolSet;
+        use serde_json::json;
+        let config = crate::config::Config::parse_for_test(
+            r#"
+[anthropic]
+api_key = "test"
+[profiles.default]
+provider = "stub"
+[session_profile.chat]
+profile = "default"
+permission = "chat"
+[permission_profile.chat]
+tools = []
+[tools.fs]
+enabled = true
+[discord]
+bot_token = "t"
+[[discord.rooms]]
+room_id = "test-room"
+profile = "chat"
+"#,
+        );
+        let ws = test_workspace();
+        let root = ws.workspace.root.clone();
+        let tools = Arc::new(ToolSet::new(
+            vec![
+                Box::new(crate::tools::builtin_tools::FileWriteTool::new(ws)),
+                Box::new(ProfileScopeProbe {
+                    spec: crate::provider::ToolSpec {
+                        kind: crate::tools::ToolKind::Read,
+                        group: None,
+                        name: "profile_scope_probe".into(),
+                        description: "scope".into(),
+                        input_schema: json!({}),
+                    },
+                    config: config.clone(),
+                }),
+            ],
+            vec![],
+            &config,
+        ));
+        assert_eq!(
+            tools
+                .entries()
+                .await
+                .iter()
+                .find(|(n, _)| n == "file_write")
+                .unwrap()
+                .1
+                .group,
+            Some(ToolGroup::Fs)
+        );
+        let response = crate::provider::ChatResponse {
+            text: None,
+            prompt_usage: None,
+            stop_reason: None,
+            tool_calls: vec![
+                ToolCall {
+                    id: "write".into(),
+                    name: "file_write".into(),
+                    input: json!({"path":"notes/x.md","content":"no"}),
+                },
+                ToolCall {
+                    id: "probe".into(),
+                    name: "profile_scope_probe".into(),
+                    input: json!({}),
+                },
+            ],
+        };
+        let ((agent, _, _), log) = build_test_agent_with_tools(
+            vec![
+                response,
+                crate::provider::ChatResponse {
+                    text: Some("done".into()),
+                    prompt_usage: None,
+                    stop_reason: None,
+                    tool_calls: vec![],
+                },
+            ],
+            false,
+            Some((config, tools)),
+        );
+        agent.handle_message(incoming("go")).await.unwrap();
+        assert!(!root.join("notes/x.md").exists());
+        assert!(!log.calls()[0].1.contains(&"file_write".to_string()));
+        assert!(result_for(&log, "write").contains("permission_profile"));
+        assert_eq!(
+            result_for(&log, "probe"),
+            "scope=Some(\"chat\"); resolved=Some(\"chat\")"
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_and_heartbeat_scope_their_resolved_profiles() {
+        let config = crate::config::Config::parse_for_test(
+            "[anthropic]\napi_key='test'\n[discord]\nbot_token='t'\n[[discord.rooms]]\nroom_id='test-room'\nprofile='room'\n",
+        );
+        let tools = Arc::new(crate::tools::ToolSet::new(
+            vec![Box::new(ProfileScopeProbe {
+                spec: crate::provider::ToolSpec {
+                    kind: crate::tools::ToolKind::Read,
+                    group: None,
+                    name: "profile_scope_probe".into(),
+                    description: "Observe profile scope".into(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                },
+                config: config.clone(),
+            })],
+            vec![],
+            &config,
+        ));
+        let script = || {
+            vec![
+                attachment_call("profile_scope_probe", serde_json::json!({})),
+                crate::provider::ChatResponse {
+                    text: Some("done".into()),
+                    tool_calls: vec![],
+                    prompt_usage: None,
+                    stop_reason: None,
+                },
+            ]
+        };
+        let ((agent, _, _), log) =
+            build_test_agent_with_tools(script(), false, Some((config.clone(), tools.clone())));
+        agent.handle_message(incoming("ordinary")).await.unwrap();
+        assert_eq!(
+            result_for(&log, "profile_scope_probe"),
+            "scope=Some(\"room\"); resolved=Some(\"room\")"
+        );
+
+        let ((agent, _, _), log) =
+            build_test_agent_with_tools(script(), false, Some((config, tools)));
+        agent
+            .trigger("task", "heartbeat", "test-room", Some("task"))
+            .await
+            .unwrap();
+        assert_eq!(
+            result_for(&log, "profile_scope_probe"),
+            "scope=Some(\"task\"); resolved=Some(\"task\")"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_resolved_profile_governs_history_prompt_and_day_boundary() {
+        for unattended in [false, true] {
+            let config = crate::config::Config::parse_for_test(
+                "[anthropic]\napi_key='test'\n[profiles.default]\nprovider='stub'\n\
+                 [discord]\nbot_token='t'\n[[discord.rooms]]\nroom_id='test-room'\nprofile='room'\n\
+                 [session_profile.room]\nprofile='default'\nmemory_namespace='room_memory'\nsession_policy='none'\n\
+                 [session_profile.task]\nprofile='default'\nmemory_namespace='task_memory'\nsession_policy='reset'\n",
+            );
+            let tools = Arc::new(crate::tools::ToolSet::new(vec![], vec![], &config));
+            let reply = || crate::provider::ChatResponse {
+                text: Some("done".into()),
+                tool_calls: vec![],
+                prompt_usage: None,
+                stop_reason: None,
+            };
+            let (((agent, _, _), _), store) = build_test_agent_with_options(
+                vec![reply(), reply()],
+                false,
+                Some((config, tools)),
+                None,
+            );
+            for namespace in ["room_memory", "task_memory"] {
+                let dir = agent.workspace.dir().join("memory").join(namespace);
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join("MEMORY.md"), format!("{namespace} marker")).unwrap();
+            }
+            let turn = || async {
+                if unattended {
+                    agent
+                        .trigger("task", "heartbeat", "test-room", Some("task"))
+                        .await
+                        .unwrap();
+                } else {
+                    Arc::clone(&agent)
+                        .handle_message(incoming("ordinary"))
+                        .await
+                        .unwrap();
+                }
+            };
+            turn().await;
+            let expected = if unattended {
+                "task_memory"
+            } else {
+                "room_memory"
+            };
+            let key = ("test-room".to_string(), None);
+            let id = agent.active_sessions.lock().await[&key].clone();
+            let meta = store
+                .list_sessions()
+                .into_iter()
+                .find(|m| m.session_id == id)
+                .unwrap();
+            assert_eq!(
+                meta.namespace.as_deref(),
+                Some(expected),
+                "unattended={unattended}"
+            );
+            let snapshots = agent.snapshots.lock().await;
+            let prompt = &snapshots[&key].system_prompt;
+            assert!(prompt.contains(&format!("{expected} marker")), "{prompt}");
+            let other = if unattended {
+                "room_memory"
+            } else {
+                "task_memory"
+            };
+            assert!(!prompt.contains(&format!("{other} marker")), "{prompt}");
+            drop(snapshots);
+
+            // Make the persisted session old enough to exercise the real boundary path.
+            let path = store.absolute_path_for(&id).unwrap().join("session.md");
+            let raw = std::fs::read_to_string(&path).unwrap();
+            let old = chrono::Utc::now() - chrono::Duration::days(3);
+            let raw = raw
+                .lines()
+                .map(|line| {
+                    if line.starts_with("created_at:") {
+                        format!("created_at: {}", old.to_rfc3339())
+                    } else {
+                        line.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            std::fs::write(path, raw).unwrap();
+            turn().await;
+            let next_id = agent.active_sessions.lock().await[&key].clone();
+            assert_eq!(
+                next_id != id,
+                unattended,
+                "only the task profile resets at the boundary"
+            );
+            assert_eq!(
+                agent.history.lock().await[&key].len(),
+                if unattended { 2 } else { 4 }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_chat_uses_the_rooms_registry_fallback_order() {
+        let config = crate::config::Config::parse_for_test(
+            "[anthropic]\napi_key='test'\n[profiles.default]\nprovider='local'\n[discord]\nbot_token='t'\n[[discord.rooms]]\nroom_id='test-room'\nprofile='missing'\n",
+        );
+        let reply = || crate::provider::ChatResponse {
+            text: Some("done".into()),
+            tool_calls: vec![],
+            prompt_usage: None,
+            stop_reason: None,
+        };
+        let anth = crate::serve::StubProvider::new(vec![reply(), reply()]);
+        let local = crate::serve::StubProvider::new(vec![reply(), reply()]);
+        let anth_log = anth.call_log();
+        let local_log = local.call_log();
+        let anth = Arc::new(anth) as Arc<dyn crate::provider::Provider>;
+        let local = Arc::new(local) as Arc<dyn crate::provider::Provider>;
+        let registry = crate::provider::registry::ProviderRegistry::for_test_distinct(
+            &[("anthropic", Arc::clone(&anth)), ("local", local)],
+            anth,
+        );
+        let ((agent, _, _), _) = build_test_agent_with_tools(
+            vec![],
+            false,
+            Some((
+                config,
+                Arc::new(crate::tools::ToolSet::new(
+                    vec![],
+                    vec![],
+                    &crate::config::Config::for_test(),
+                )),
+            )),
+        );
+        let mut agent = Arc::try_unwrap(agent)
+            .ok()
+            .expect("test agent has one owner");
+        agent.providers = Arc::new(registry);
+        let agent = Arc::new(agent);
+        agent
+            .clone()
+            .handle_message(incoming("ordinary"))
+            .await
+            .unwrap();
+        agent
+            .trigger("task", "heartbeat", "test-room", Some("missing"))
+            .await
+            .unwrap();
+        assert_eq!(
+            local_log.calls().len(),
+            2,
+            "both turns route through [profiles.default]"
+        );
+        assert!(
+            anth_log.calls().is_empty(),
+            "the registry default is not the session-profile fallback"
+        );
+    }
+
     fn attachment_owner() -> crate::attachment_store::AttachmentOwner {
         crate::attachment_store::AttachmentOwner {
             platform: "matrix".into(),
@@ -1372,6 +1939,9 @@ api_key = "test"
             prompt_usage: None,
             stop_reason: None,
         });
+        let config = crate::config::Config::parse_for_test(&format!(
+            "[anthropic]\napi_key = \"test\"\n[tools.fs]\nenabled = {host}\n[tools.shell]\nenabled = {host}\n"
+        ));
         let tools = Arc::new(crate::tools::ToolSet::new(
             vec![
                 Box::new(crate::tools::attachment_tools::AttachmentSaveTool::new(
@@ -1381,9 +1951,7 @@ api_key = "test"
                 Box::new(crate::tools::attachment_tools::ImageReadTool::new(state)),
             ],
             vec![],
-        ));
-        let config = crate::config::Config::parse_for_test(&format!(
-            "[anthropic]\napi_key = \"test\"\n[tools.host_access]\nenabled = {host}\n"
+            &config,
         ));
         let ((agent, _, _), log) =
             build_test_agent_with_tools(script, false, Some((config, tools)));
@@ -1406,7 +1974,7 @@ api_key = "test"
             .unwrap()
     }
 
-    fn assert_paired_refusal(log: &crate::serve::ChatLog, call: &str) {
+    fn assert_paired_refusal(log: &crate::serve::ChatLog, call: &str, expected: &str) {
         use crate::provider::ContentPart;
         let messages = log.messages();
         let parts: Vec<_> = messages
@@ -1422,8 +1990,9 @@ api_key = "test"
                 .count(),
             1
         );
+
         assert_eq!(parts.iter().filter(|p| matches!(p, ContentPart::ToolResult { tool_use_id, .. } if tool_use_id == call)).count(), 1);
-        assert!(result_for(log, call).contains("not available in this conversation"));
+        assert_eq!(result_for(log, call), expected);
         assert!(!parts.iter().any(|p| matches!(p, ContentPart::Image { .. })));
     }
 
@@ -1456,15 +2025,17 @@ api_key = "test"
             .unwrap();
         let image_bytes = encoded.into_inner();
         std::fs::write(state.workspace.root.join("history.png"), &image_bytes).unwrap();
+        let config = crate::config::Config::parse_for_test(
+            "[anthropic]\napi_key = \"test\"\n[tools.fs]\nenabled = true\n[tools.shell]\nenabled = true\n",
+        );
         let tools = Arc::new(crate::tools::ToolSet::new(
             vec![Box::new(
                 crate::tools::attachment_tools::ImageReadTool::new(state),
             )],
             vec![],
+            &config,
         ));
-        let config = crate::config::Config::parse_for_test(
-            "[anthropic]\napi_key = \"test\"\n[tools.host_access]\nenabled = true\n",
-        );
+
         let (((agent, _, _), log), session_store) = build_test_agent_with_options(
             vec![
                 attachment_call("image_read", serde_json::json!({"path": "history.png"})),
@@ -1505,7 +2076,7 @@ api_key = "test"
         let sha256 = crate::image_cache::sha256_hex(&image_bytes);
         let marker = format!("[image: image/png sha256={sha256}]");
         let session_id = agent
-            .get_or_create_session(&("test-room".into(), None))
+            .get_or_create_session(&("test-room".into(), None), "default")
             .await;
 
         // Agent appends before the end-of-turn scrub, exactly as production
@@ -1751,7 +2322,28 @@ api_key = "test"
         agent.handle_message(msg).await.unwrap();
         for call in ["attachment_save", "image_read"] {
             assert!(!log.calls()[0].1.contains(&call.into()));
-            assert_paired_refusal(&log, call);
+            let expected = if call == "image_read" {
+                crate::tools::policy::unavailable_message(
+                    &crate::tools::policy::ResolvedPermission::resolve(
+                        &crate::config::Config::for_test(),
+                        Origin::Channel {
+                            session_profile: "default".into(),
+                        },
+                    ),
+                    &crate::tools::policy::ToolEntry {
+                        name: call.into(),
+                        group: Some(crate::config::ToolGroup::Fs),
+                        enabled: false,
+                        kind: crate::tools::ToolKind::Read,
+                    },
+                )
+            } else {
+                crate::tools::policy::refusal_message(
+                    call,
+                    crate::tools::policy::Refusal::NotOffered,
+                )
+            };
+            assert_paired_refusal(&log, call, &expected);
         }
         assert!(!state.workspace.root.join("saved").exists());
     }
@@ -1827,12 +2419,20 @@ api_key = "test"
                 "test",
                 "owner platform=matrix room_id=test-room; save",
                 "test-room",
+                None,
             )
             .await
             .unwrap();
         assert!(!log.calls()[0].1.contains(&"attachment_save".into()));
         assert!(log.calls()[0].1.contains(&"image_read".into()));
-        assert_paired_refusal(&log, "attachment_save");
+        assert_paired_refusal(
+            &log,
+            "attachment_save",
+            &crate::tools::policy::refusal_message(
+                "attachment_save",
+                crate::tools::policy::Refusal::NotOffered,
+            ),
+        );
         assert!(!state.workspace.root.join("saved").exists());
     }
 
@@ -2104,14 +2704,17 @@ api_key = "test"
 
         let key: crate::session::ConversationKey = ("test-room".to_string(), None);
         let first = agent
-            .get_system_prompt(&key)
+            .get_system_prompt(&key, "default")
             .await
             .expect("AGENTS.md exists, so the prompt is non-empty");
         assert!(first.contains("first content."), "{first}");
 
         // pin とスナップショットの両方が v1 を保持している状態で編集する
         std::fs::write(dir.join("AGENTS.md"), "second content.\n").unwrap();
-        let pinned = agent.get_system_prompt(&key).await.expect("pinned prompt");
+        let pinned = agent
+            .get_system_prompt(&key, "default")
+            .await
+            .expect("pinned prompt");
         assert!(
             pinned.contains("first content."),
             "ピンとスナップショット中は編集が反映されない"
@@ -2120,7 +2723,10 @@ api_key = "test"
 
         agent.invalidate_system_prompts().await;
 
-        let refreshed = agent.get_system_prompt(&key).await.expect("rebuilt prompt");
+        let refreshed = agent
+            .get_system_prompt(&key, "default")
+            .await
+            .expect("rebuilt prompt");
         assert!(
             refreshed.contains("second content."),
             "両方のキャッシュが消えた後は編集が反映される"

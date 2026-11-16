@@ -29,6 +29,8 @@ impl BackgroundTaskTool {
     pub fn new() -> Self {
         Self {
             spec: ToolSpec {
+                kind: ToolKind::Think,
+                group: None,
                 name: "background_task".into(),
                 description: "List, peek at or cancel the background tasks this \
                     session has running (for example subagents and shell commands \
@@ -77,10 +79,6 @@ fn session_tasks() -> Result<(String, std::sync::Arc<BackgroundTasks>)> {
 
 #[async_trait]
 impl Tool for BackgroundTaskTool {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Think
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -195,7 +193,7 @@ mod tests {
             timer_origin: None,
             session_id: session.map(str::to_string),
             subagent_depth: 0,
-            admin_room_profile: None,
+            session_profile: "default".into(),
         })
     }
 

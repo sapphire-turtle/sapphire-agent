@@ -229,6 +229,7 @@ impl ClientMcp {
         peer: Arc<dyn McpOverAcpPeer>,
         workspace_root: &str,
         session_id: &str,
+        config: &crate::config::Config,
     ) -> Self {
         let offered: Vec<_> = servers
             .iter()
@@ -266,6 +267,7 @@ impl ClientMcp {
         let tools = Arc::new(ToolSet::new(
             Vec::new(),
             clients.iter().map(|(_, c)| Arc::clone(c)).collect(),
+            config,
         ));
         let (ready_tx, ready) = watch::channel(clients.is_empty());
         if clients.is_empty() {
@@ -512,7 +514,11 @@ mod tests {
             peer.clone(),
             "/work",
         ));
-        let set = ToolSet::new(Vec::new(), vec![Arc::clone(&a), Arc::clone(&ab)]);
+        let set = ToolSet::new(
+            Vec::new(),
+            vec![Arc::clone(&a), Arc::clone(&ab)],
+            &crate::config::Config::for_test(),
+        );
         set.install_client_tools(&ab, ab.list_tools().await.unwrap())
             .await;
         set.install_client_tools(&a, a.list_tools().await.unwrap())
@@ -532,7 +538,13 @@ mod tests {
             McpServer::Http(McpServerHttp::new("remote", "http://127.0.0.1:9/mcp")),
             acp("game", "game:1"),
         ];
-        let client = ClientMcp::start(&servers, peer.clone(), "/work", "s-1");
+        let client = ClientMcp::start(
+            &servers,
+            peer.clone(),
+            "/work",
+            "s-1",
+            &crate::config::Config::for_test(),
+        );
         let tools = client.tools().await;
 
         // Only the ACP server became a client; the stdio and http ones
@@ -559,7 +571,13 @@ mod tests {
     async fn a_prompt_does_not_wait_past_the_ready_timeout() {
         let peer = FakePeer::new();
         peer.script("tools/list", FakeReply::Hang);
-        let client = ClientMcp::start(&[acp("game", "game:1")], peer.clone(), "/work", "s-1");
+        let client = ClientMcp::start(
+            &[acp("game", "game:1")],
+            peer.clone(),
+            "/work",
+            "s-1",
+            &crate::config::Config::for_test(),
+        );
 
         let started = tokio::time::Instant::now();
         let tools = client.tools().await;
@@ -586,7 +604,13 @@ mod tests {
             }]
         }));
         peer.script("tools/list", FakeReply::Held(Arc::clone(&gate), listed));
-        let client = ClientMcp::start(&[acp("game", "game:1")], peer.clone(), "/work", "s-1");
+        let client = ClientMcp::start(
+            &[acp("game", "game:1")],
+            peer.clone(),
+            "/work",
+            "s-1",
+            &crate::config::Config::for_test(),
+        );
 
         let first = client.tools().await;
         assert!(tool_names(&first).await.is_empty());
@@ -617,7 +641,11 @@ mod tests {
     async fn installing_a_clients_tools_twice_leaves_one_copy() {
         let peer = FakePeer::new();
         let client = Arc::new(McpClient::over_acp("game", "game:1", peer.clone(), "/work"));
-        let set = ToolSet::new(Vec::new(), vec![Arc::clone(&client)]);
+        let set = ToolSet::new(
+            Vec::new(),
+            vec![Arc::clone(&client)],
+            &crate::config::Config::for_test(),
+        );
         for _ in 0..2 {
             let specs = client.list_tools().await.unwrap();
             set.install_client_tools(&client, specs).await;
@@ -635,7 +663,13 @@ mod tests {
         peer.script("server/discover", missing.clone());
         peer.script("tools/list", missing);
 
-        let client = ClientMcp::start(&[acp("game", "game:1")], peer.clone(), "/work", "s-1");
+        let client = ClientMcp::start(
+            &[acp("game", "game:1")],
+            peer.clone(),
+            "/work",
+            "s-1",
+            &crate::config::Config::for_test(),
+        );
         let tools = tokio::time::timeout(Duration::from_secs(5), client.tools())
             .await
             .expect("a failed listing is ready at once, not after the timeout");

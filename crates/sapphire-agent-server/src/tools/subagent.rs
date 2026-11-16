@@ -272,6 +272,8 @@ fn build_spec(agents: &[AgentDef], background: bool) -> ToolSpec {
     }
 
     let mut spec = ToolSpec {
+        kind: ToolKind::Other,
+        group: None,
         name: SUBAGENT_TOOL_NAME.into(),
         description: description.into(),
         input_schema: json!({
@@ -771,10 +773,6 @@ impl Tool for SubagentTool {
         &self.spec
     }
 
-    fn kind(&self) -> ToolKind {
-        ToolKind::Other
-    }
-
     /// Synchronous only: a background child has to own the tool it runs
     /// on after this call returns, which `&self` cannot give it. The
     /// registered tool is the `Arc<SubagentTool>` below, which can.
@@ -844,10 +842,6 @@ impl<'a> Request<'a> {
 /// written at run time would have nowhere to be swapped into (#265).
 #[async_trait]
 impl Tool for Arc<SubagentTool> {
-    fn kind(&self) -> ToolKind {
-        (**self).kind()
-    }
-
     fn spec(&self) -> &ToolSpec {
         (**self).spec()
     }
@@ -996,7 +990,7 @@ impl SubagentTool {
             timer_origin: ctx.timer_origin.clone(),
             session_id: ctx.session_id.clone(),
             subagent_depth: ctx.subagent_depth,
-            admin_room_profile: ctx.admin_room_profile.clone(),
+            session_profile: ctx.session_profile.clone(),
         });
         let refused = Arc::new(std::sync::Mutex::new(Vec::new()));
         let progress: Arc<dyn crate::serve::TurnHost> = Arc::new(BackgroundSubagentHost::new(
@@ -1322,7 +1316,7 @@ impl SubagentTool {
             tool_specs: &specs,
             progress: &progress,
             timer_origin: ctx.timer_origin.clone(),
-            admin_room_profile: ctx.admin_room_profile.clone(),
+            session_profile: ctx.session_profile.clone(),
             namespace,
             // This nested turn sits one level below whoever delegated to
             // it, so it can delegate further exactly when
@@ -1444,7 +1438,7 @@ async fn scope_background<F: std::future::Future>(
 ) -> F::Output {
     let fut = crate::tools::workspace_tools::scope_memory_namespace(namespace, fut);
     let fut =
-        crate::tools::config_tools::scope_admin_room_profile(ctx.admin_room_profile.clone(), fut);
+        crate::tools::config_tools::scope_session_profile(Some(ctx.session_profile.clone()), fut);
     let origin = ctx.timer_origin.clone();
     let client = ctx.progress.acp_client();
     let fut = crate::serve::scope_turn_context(ctx, fut);
@@ -1740,7 +1734,10 @@ mod tests {
 
     #[test]
     fn the_kind_is_other() {
-        assert_eq!(SubagentTool::new(defs(), false).kind(), ToolKind::Other);
+        assert_eq!(
+            SubagentTool::new(defs(), false).spec().kind,
+            ToolKind::Other
+        );
     }
 
     /// A definition written after the tool was constructed is callable
@@ -2007,6 +2004,8 @@ mod tests {
 
     fn spec_named(name: &str) -> crate::provider::ToolSpec {
         crate::provider::ToolSpec {
+            kind: crate::tools::ToolKind::Other,
+            group: None,
             name: name.to_string().into(),
             description: "…".into(),
             input_schema: serde_json::json!({"type": "object"}),
@@ -2091,7 +2090,9 @@ mod tests {
             self.turn_errors.lock().unwrap().push(message.to_string());
         }
         fn origin(&self) -> crate::tools::policy::Origin {
-            crate::tools::policy::Origin::Channel
+            crate::tools::policy::Origin::Channel {
+                session_profile: "default".into(),
+            }
         }
     }
 
@@ -2176,7 +2177,9 @@ mod tests {
 
         assert_eq!(
             crate::serve::TurnHost::origin(&wrapped),
-            crate::tools::policy::Origin::Channel,
+            crate::tools::policy::Origin::Channel {
+                session_profile: "default".into()
+            },
             "origin() must be the parent's own, unchanged"
         );
 
@@ -2282,7 +2285,10 @@ mod tests {
         async fn tool_end(&self, _id: &str, _name: &str) {}
         async fn turn_error(&self, _message: &str) {}
         fn origin(&self) -> crate::tools::policy::Origin {
-            crate::tools::policy::Origin::Acp(crate::tools::policy::SessionMode::Default)
+            crate::tools::policy::Origin::Acp {
+                mode: crate::tools::policy::SessionMode::Default,
+                session_profile: "default".into(),
+            }
         }
         async fn standing_approval(
             &self,
@@ -2325,7 +2331,9 @@ mod tests {
             asked_by: None,
         };
         let parent: std::sync::Arc<dyn TurnHost> = std::sync::Arc::new(AutonomousHost {
-            origin: crate::tools::policy::Origin::Trusted,
+            origin: crate::tools::policy::Origin::Unattended {
+                session_profile: "default".into(),
+            },
             consult: Some(parent_id.clone()),
         });
         let host = BackgroundSubagentHost::new(parent, Default::default(), "h-9".into());
@@ -2453,7 +2461,10 @@ mod tests {
 
         assert_eq!(
             crate::serve::TurnHost::origin(&host),
-            crate::tools::policy::Origin::Acp(crate::tools::policy::SessionMode::Default)
+            crate::tools::policy::Origin::Acp {
+                mode: crate::tools::policy::SessionMode::Default,
+                session_profile: "default".into()
+            }
         );
         crate::serve::TurnHost::tool_start(&host, "bg-call-1", "shell", &json!({})).await;
         assert!(
@@ -2690,7 +2701,7 @@ mod tests {
             // pass because a test handed it a `Some`.
             session_id: None,
             subagent_depth: 0,
-            admin_room_profile: None,
+            session_profile: "default".into(),
         })
     }
 
@@ -2735,7 +2746,7 @@ mod tests {
                 timer_origin: None,
                 session_id: Some("parent-session".to_string()),
                 subagent_depth: 0,
-                admin_room_profile: None,
+                session_profile: "default".into(),
             })
         };
 
@@ -3353,12 +3364,6 @@ mod tests {
             &self.0
         }
 
-        fn kind(&self) -> ToolKind {
-            // Allowed from every origin, so the call actually runs — and
-            // hangs — rather than being refused before it starts.
-            ToolKind::Read
-        }
-
         async fn execute(&self, _input: &serde_json::Value) -> anyhow::Result<String> {
             std::future::pending().await
         }
@@ -3651,10 +3656,6 @@ mod tests {
             &self.0
         }
 
-        fn kind(&self) -> ToolKind {
-            ToolKind::Other
-        }
-
         async fn execute(&self, _input: &serde_json::Value) -> anyhow::Result<String> {
             Ok("ran".to_string())
         }
@@ -3689,7 +3690,7 @@ mod tests {
             timer_origin: None,
             session_id: session_id.map(str::to_string),
             subagent_depth,
-            admin_room_profile: None,
+            session_profile: "default".into(),
         })
     }
 
@@ -3728,7 +3729,9 @@ mod tests {
     /// An autonomous turn's host, able to ask in the consult room.
     fn asking_host() -> std::sync::Arc<dyn crate::serve::TurnHost> {
         std::sync::Arc::new(crate::serve::AutonomousHost {
-            origin: crate::tools::policy::Origin::Trusted,
+            origin: crate::tools::policy::Origin::Unattended {
+                session_profile: "default".into(),
+            },
             consult: Some(crate::serve::ConsultIdentity {
                 task: "t".into(),
                 owner_session: "s-ask".into(),
@@ -4219,7 +4222,10 @@ mod tests {
         let detached = crate::serve::TurnHost::detached(&parent);
         assert_eq!(
             detached.origin(),
-            crate::tools::policy::Origin::Acp(crate::tools::policy::SessionMode::Default)
+            crate::tools::policy::Origin::Acp {
+                mode: crate::tools::policy::SessionMode::Default,
+                session_profile: "default".into()
+            }
         );
         assert!(detached.acp_client().is_none());
     }

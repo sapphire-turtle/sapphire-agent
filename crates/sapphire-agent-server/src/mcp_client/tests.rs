@@ -48,7 +48,7 @@ fn kinds_for(trust: McpTrust) -> Vec<(String, ToolKind)> {
     let client = client_with(trust);
     build_tools_for_client(&client, vec![remote("list"), remote("record")])
         .iter()
-        .map(|t| (t.spec().name.to_string(), t.kind()))
+        .map(|t| (t.spec().name.to_string(), t.spec().kind))
         .collect()
 }
 
@@ -76,38 +76,39 @@ fn an_edit_trusted_server_classifies_its_tools_as_edit() {
     }
 }
 
-/// The point of the field, stated as the policy outcome rather than
-/// the classification: an untrusted server stays unreachable from a
-/// channel — which is the heartbeat's chat leg too — and a trusted
-/// one becomes reachable, without `decide` changing at all.
+/// Trust controls the ACP asking mode after the MCP group has been granted;
+/// it no longer removes an enabled, listed MCP group from channel turns.
 #[test]
-fn trust_decides_whether_a_channel_can_reach_the_server() {
-    use crate::tools::policy::{Decision, Origin, SessionMode, decide};
-
-    let kind = |kinds: Vec<(String, ToolKind)>| kinds[0].1;
-
-    let untrusted = kind(kinds_for(McpTrust::None));
-    assert_eq!(decide(Origin::Channel, untrusted), Decision::Deny);
-
-    let read = kind(kinds_for(McpTrust::Read));
-    assert_eq!(decide(Origin::Channel, read), Decision::Allow);
-    assert_eq!(
-        decide(Origin::Acp(SessionMode::Default), read),
-        Decision::Allow,
-        "a read is safe on every origin"
+fn trust_classifies_mcp_tools_for_acp_approval() {
+    use crate::tools::policy::{Allow, Origin, ResolvedPermission, SessionMode, ToolEntry, allow};
+    let cfg = crate::config::Config::parse_for_test(
+        "[anthropic]\napi_key = \"test\"\n[tools.mcp]\nenabled = true\n",
     );
-
-    let edit = kind(kinds_for(McpTrust::Edit));
-    assert_eq!(
-        decide(Origin::Channel, edit),
-        Decision::Allow,
-        "chat-driven recording is the case this unblocks"
+    let channel = ResolvedPermission::resolve(
+        &cfg,
+        Origin::Channel {
+            session_profile: "default".into(),
+        },
     );
-    assert_eq!(
-        decide(Origin::Acp(SessionMode::Default), edit),
-        Decision::Ask,
-        "an editor still asks before a write, as it does for file_write"
+    let acp = ResolvedPermission::resolve(
+        &cfg,
+        Origin::Acp {
+            mode: SessionMode::Default,
+            session_profile: "default".into(),
+        },
     );
+    for (trust, expected) in [
+        (McpTrust::None, Allow::Ask),
+        (McpTrust::Read, Allow::Allow),
+        (McpTrust::Edit, Allow::Ask),
+    ] {
+        let client = client_with(trust);
+        let tools = build_tools_for_client(&client, vec![remote("list")]);
+        let entry = ToolEntry::from_spec(tools[0].spec(), &cfg);
+        assert_eq!(entry.group, Some(crate::config::ToolGroup::Mcp));
+        assert_eq!(allow(&channel, &entry), Allow::Allow);
+        assert_eq!(allow(&acp, &entry), expected);
+    }
 }
 
 /// The classification is per server, not per tool: `trust` is coarse
@@ -602,7 +603,27 @@ async fn acp_client_tools_are_prefixed_and_classified() {
     let tools = build_tools_for_client(&client, remote_tools);
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0].spec().name, "acp__game__poke");
-    assert_eq!(tools[0].kind(), ToolKind::Read);
+    assert_eq!(
+        tools[0].spec().group,
+        None,
+        "editor capabilities are not outbound MCP grants"
+    );
+    let config = crate::config::Config::for_test();
+    let profile = crate::tools::policy::ResolvedPermission::resolve(
+        &config,
+        crate::tools::policy::Origin::Acp {
+            mode: crate::tools::policy::SessionMode::Bypass,
+            session_profile: "default".into(),
+        },
+    );
+    assert_eq!(
+        crate::tools::policy::allow(
+            &profile,
+            &crate::tools::policy::ToolEntry::from_spec(tools[0].spec(), &config)
+        ),
+        crate::tools::policy::Allow::Allow
+    );
+    assert_eq!(tools[0].spec().kind, ToolKind::Read);
     assert!(
         peer.seen()
             .iter()
@@ -709,7 +730,11 @@ async fn an_acp_tool_list_subscription_outlives_the_request_timeout() {
     );
     peer.script("subscriptions/listen", FakeReply::Hang);
     let client = Arc::new(McpClient::over_acp("game", "game:1", peer.clone(), "/tmp"));
-    let set = crate::tools::ToolSet::new(Vec::new(), vec![Arc::clone(&client)]);
+    let set = crate::tools::ToolSet::new(
+        Vec::new(),
+        vec![Arc::clone(&client)],
+        &crate::config::Config::for_test(),
+    );
     set.install_client_tools(&client, client.list_tools().await.unwrap())
         .await;
 

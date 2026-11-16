@@ -344,7 +344,7 @@ impl TimerDispatch for ChannelDispatch {
                     let prompt = prompt.to_string();
                     let room_id = room_id.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = agent.trigger(&task_name, &prompt, &room_id).await {
+                        if let Err(e) = agent.trigger(&task_name, &prompt, &room_id, None).await {
                             warn!("Timer fire (chat) failed for {task_name} -> {room_id}: {e:#}");
                         }
                     });
@@ -365,6 +365,7 @@ impl TimerDispatch for ChannelDispatch {
                                 device_id.clone(),
                                 Some(task_name.clone()),
                                 prompt,
+                                None,
                             )
                             .await
                             {

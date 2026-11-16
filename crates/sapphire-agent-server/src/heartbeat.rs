@@ -39,6 +39,7 @@ struct DueTask {
     body: String,
     /// Per-task chat room override; falls through to `default_room_id`.
     room_id: Option<String>,
+    profile: Option<String>,
     /// Voice satellite target, when this task should be delivered as
     /// TTS audio instead of (or in addition to, on failure) chat.
     voice: Option<HeartbeatVoiceTarget>,
@@ -81,7 +82,7 @@ pub struct Heartbeat {
 
 impl Heartbeat {
     /// Resolve which namespace a session belongs to. Matrix/Discord rooms
-    /// follow `Config::namespace_for_room`. Device-default sessions
+    /// follow `Config::namespace_for_session`. Device-default sessions
     /// (channel=`"device-default"`) and cross-device sessions
     /// (channel=`"rpc"`) persist their resolved namespace in the JSONL
     /// meta — trust that first, falling back to the default namespace
@@ -92,7 +93,7 @@ impl Heartbeat {
                 .clone()
                 .unwrap_or_else(|| crate::config::DEFAULT_NAMESPACE_NAME.to_string())
         } else {
-            self.config.namespace_for_room(&meta.room_id).to_string()
+            self.config.namespace_for_session(&meta.room_id).to_string()
         }
     }
 
@@ -376,6 +377,7 @@ impl Heartbeat {
                                 name: t.name.clone(),
                                 body: t.body.clone(),
                                 room_id: t.meta.room_id.clone(),
+                                profile: t.meta.profile.clone(),
                                 voice: t.meta.voice.clone(),
                                 device: t.meta.device.clone(),
                             })
@@ -454,6 +456,7 @@ impl Heartbeat {
             name,
             body,
             room_id,
+            profile,
             voice,
             ..
         } = task;
@@ -471,6 +474,12 @@ impl Heartbeat {
                 voice.device_id.clone(),
                 Some(name.clone()),
                 prompt,
+                Some(
+                    profile
+                        .as_deref()
+                        .unwrap_or(crate::config::DEFAULT_PROFILE_NAME)
+                        .to_string(),
+                ),
             )
             .await
             {
@@ -496,7 +505,7 @@ impl Heartbeat {
                 }
                 Err(crate::serve::VoicePushError::NotConfigured) => {
                     warn!(
-                        "Heartbeat cron: subscribed satellite's room_profile has no voice_pipeline; falling back to chat for {name}"
+                        "Heartbeat cron: subscribed satellite's session_profile has no voice_pipeline; falling back to chat for {name}"
                     );
                 }
                 Err(crate::serve::VoicePushError::Other(msg)) => {
@@ -519,7 +528,19 @@ impl Heartbeat {
                     );
                     return;
                 };
-                if let Err(e) = agent.trigger(&name, &body, &room).await {
+                if let Err(e) = agent
+                    .trigger(
+                        &name,
+                        &body,
+                        &room,
+                        Some(
+                            profile
+                                .as_deref()
+                                .unwrap_or(crate::config::DEFAULT_PROFILE_NAME),
+                        ),
+                    )
+                    .await
+                {
                     warn!("Heartbeat cron: task {name} failed: {e:#}");
                 }
             }

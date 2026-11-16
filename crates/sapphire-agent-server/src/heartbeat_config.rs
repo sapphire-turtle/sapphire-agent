@@ -29,12 +29,16 @@ use std::str::FromStr;
 use tracing::warn;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HeartbeatTaskMeta {
     /// Cron expression. The `cron` crate uses 6- or 7-field syntax (with seconds).
     /// We accept the standard 5-field form and prefix `"0 "` for seconds.
     pub schedule: String,
     #[serde(default)]
     pub room_id: Option<String>,
+    /// Session profile governing this task; room_id is only a delivery target.
+    #[serde(default)]
+    pub profile: Option<String>,
     /// The device that runs this task, by name or id, when the workspace
     /// is synced with other hosts. Without it the task runs where it can be
     /// delivered (see `placement::heartbeat_runner`).
@@ -51,11 +55,10 @@ pub struct HeartbeatTaskMeta {
     pub voice: Option<HeartbeatVoiceTarget>,
 }
 
-/// Voice satellite target, identified by `device_id`. The
-/// `room_profile` to use is reverse-looked-up from the active
-/// `voice/subscribe` registration, so heartbeat tasks don't have to
-/// duplicate it. A device only ever has one active voice session at a
-/// time, which makes the lookup unambiguous.
+/// Voice satellite target, identified by `device_id`. Delivery uses the
+/// active `voice/subscribe` registration for that device; the task's
+/// declared session profile governs the turn. A device only ever has
+/// one active voice session at a time, making delivery unambiguous.
 #[derive(Debug, Clone, Deserialize)]
 pub struct HeartbeatVoiceTarget {
     pub device_id: String,
@@ -224,6 +227,22 @@ mod tests {
         let err = parse_definition("broken", "# no frontmatter\n").unwrap_err();
         assert!(err.contains("frontmatter"), "{err}");
         assert!(parse_definition("broken", "---\nschedule: [oops\n---\nHi\n").is_err());
+    }
+
+    #[test]
+    fn misspelled_profile_is_rejected() {
+        let raw = "---\nschedule: '@hourly'\nprofiel: ops\n---\nbody";
+        assert!(parse_definition("typo", raw).is_err());
+        assert!(parse_task("typo".into(), raw).is_none());
+        let valid = raw.replace("profiel", "profile");
+        assert_eq!(
+            parse_definition("valid", &valid)
+                .unwrap()
+                .meta
+                .profile
+                .as_deref(),
+            Some("ops")
+        );
     }
 
     #[test]

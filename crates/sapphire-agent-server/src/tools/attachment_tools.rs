@@ -1,3 +1,4 @@
+use crate::config::ToolGroup;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -39,6 +40,8 @@ impl AttachmentSaveTool {
             store,
             state,
             spec: ToolSpec {
+                kind: ToolKind::Edit,
+                group: None,
                 name: "attachment_save".into(),
                 description: "Save an attachment's original bytes from this same conversation. \
                     Cached originals expire after 7 days. Requires an explicit path; overwrites \
@@ -62,9 +65,6 @@ impl AttachmentSaveTool {
 impl Tool for AttachmentSaveTool {
     fn spec(&self) -> &ToolSpec {
         &self.spec
-    }
-    fn kind(&self) -> ToolKind {
-        ToolKind::Edit
     }
     async fn execute(&self, input: &serde_json::Value) -> Result<String> {
         anyhow::ensure!(
@@ -115,6 +115,8 @@ impl ImageReadTool {
         Self {
             state,
             spec: ToolSpec {
+                kind: ToolKind::Read,
+                group: Some(ToolGroup::Fs),
                 name: "image_read".into(),
                 description: "Read one JPEG, PNG, GIF or WebP image from this agent's machine \
                     and attach it to the result. Input is limited to 32 MiB; images over \
@@ -167,10 +169,6 @@ fn resolve_image_path(state: &WorkspaceState, path: &Path) -> Result<PathBuf> {
 impl Tool for ImageReadTool {
     fn spec(&self) -> &ToolSpec {
         &self.spec
-    }
-
-    fn kind(&self) -> ToolKind {
-        ToolKind::Read
     }
 
     async fn execute(&self, input: &serde_json::Value) -> Result<String> {
@@ -291,7 +289,7 @@ mod tests {
     async fn attachment_save_copies_original_and_overwrites() {
         let (_dir, store, state, meta) = save_fixture();
         let tool = AttachmentSaveTool::new(store.clone(), state.clone());
-        assert_eq!(tool.kind(), ToolKind::Edit);
+        assert_eq!(tool.spec().kind, ToolKind::Edit);
         assert_eq!(
             tool.spec().input_schema,
             json!({

@@ -12,6 +12,7 @@
 
 pub mod acp_transport;
 
+use crate::config::ToolGroup;
 use acp_transport::{AcpMcpTransport, McpOverAcpPeer};
 
 use crate::config::{McpServerConfig, McpTransportConfig, McpTrust};
@@ -741,20 +742,12 @@ pub struct McpTool {
     client: Arc<McpClient>,
     spec: ToolSpec,
     remote_tool_name: String,
-    /// Resolved from the server's `trust` at build time rather than read
-    /// from the client on every call: the classification must not change
-    /// under a tool that is already mid-permission-check.
-    kind: ToolKind,
 }
 
 #[async_trait]
 impl Tool for McpTool {
     fn spec(&self) -> &ToolSpec {
         &self.spec
-    }
-
-    fn kind(&self) -> ToolKind {
-        self.kind
     }
 
     async fn execute(&self, input: &serde_json::Value) -> Result<String> {
@@ -849,12 +842,14 @@ pub fn build_tools_for_client(
             Box::new(McpTool {
                 client: Arc::clone(client),
                 spec: ToolSpec {
+                    kind,
+                    // Editor-provided MCP is an ACP capability, not an outbound host group.
+                    group: if acp { None } else { Some(ToolGroup::Mcp) },
                     name: Cow::Owned(tool_name),
                     description: Cow::Owned(rt.description),
                     input_schema: rt.input_schema,
                 },
                 remote_tool_name: rt.name,
-                kind,
             }) as Box<dyn Tool>
         })
         .collect()

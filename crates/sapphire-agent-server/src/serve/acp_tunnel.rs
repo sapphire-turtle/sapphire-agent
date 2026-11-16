@@ -32,7 +32,7 @@
 //!
 //! There is no token on this path. The IPC endpoint admits only the OS user
 //! that runs the server, and the room profile a token would have picked is
-//! named by `[acp].stdio_room_profile` instead.
+//! named by `[acp].stdio_session_profile` instead.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -173,10 +173,10 @@ impl AcpTunnel {
             .config
             .acp
             .as_ref()
-            .and_then(|a| a.stdio_room_profile.clone())
+            .and_then(|a| a.stdio_session_profile.clone())
         else {
             return Err(failed(
-                "ACP on stdio needs a room profile: set [acp].stdio_room_profile in this host's \
+                "ACP on stdio needs a room profile: set [acp].stdio_session_profile in this host's \
                  config.toml",
             ));
         };
@@ -731,7 +731,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn without_a_stdio_room_profile_the_relay_says_what_to_set() {
+    async fn without_a_stdio_session_profile_the_relay_says_what_to_set() {
         let mut state = ServeState::for_test(false);
         Arc::get_mut(&mut state)
             .unwrap()
@@ -739,14 +739,14 @@ mod tests {
             .acp
             .as_mut()
             .unwrap()
-            .stdio_room_profile = None;
+            .stdio_session_profile = None;
         let tunnel = AcpTunnel::default();
         tunnel.attach(state);
         let editor = Editor::start(connected(&tunnel).await);
 
         let err = editor.relay.await.unwrap().unwrap_err();
         assert!(
-            format!("{err:#}").contains("[acp].stdio_room_profile"),
+            format!("{err:#}").contains("[acp].stdio_session_profile"),
             "got {err:#}"
         );
     }

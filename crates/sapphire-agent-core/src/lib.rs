@@ -8,7 +8,8 @@
 //! side lives in the agent's `serve::chat_ipc`.
 //!
 //! - [`OPEN`] `{session?}` resumes the session with that public id, or
-//!   reserves a new one: `{session_id, public_id?, is_new, room_profile}`.
+//!   reserves a new one: `{session_id, public_id?, is_new, room_profile}`;
+//!   the legacy `room_profile` wire key contains the session profile name.
 //! - [`SEND`] `{session_id, content, attachments?, client?}` runs one turn
 //!   and answers `{content}` once it is done. `attachments` are
 //!   [`Attachment`]s (`{mime, data}`, base64) sent with the message, and
@@ -31,7 +32,7 @@
 //!   a file.
 //!
 //! There is no token: the IPC endpoint admits only the OS user that runs
-//! the server, and the agent's `[cli].room_profile` names the room profile.
+//! the server, and the agent's `[cli].profile` names the room profile.
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use base64::Engine as _;

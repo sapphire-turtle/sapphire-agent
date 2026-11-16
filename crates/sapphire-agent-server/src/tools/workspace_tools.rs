@@ -184,6 +184,8 @@ impl MemoryAddTool {
         Self {
             state,
             spec: ToolSpec {
+                kind: ToolKind::Edit,
+                group: None,
                 name: "memory_add".into(),
                 description: description.into(),
                 input_schema: memory_entry_schema(true),
@@ -194,10 +196,6 @@ impl MemoryAddTool {
 
 #[async_trait]
 impl Tool for MemoryAddTool {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Edit
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -238,6 +236,8 @@ impl MemoryUpdateTool {
         Self {
             state,
             spec: ToolSpec {
+                kind: ToolKind::Edit,
+                group: None,
                 name: "memory_update".into(),
                 description: "Overwrite an existing memory entry at \
                     memory/<category>/<slug>.md. Fails if the file does not exist \
@@ -251,10 +251,6 @@ impl MemoryUpdateTool {
 
 #[async_trait]
 impl Tool for MemoryUpdateTool {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Edit
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -295,6 +291,8 @@ impl MemoryAppendTool {
         Self {
             state,
             spec: ToolSpec {
+                kind: ToolKind::Edit,
+                group: None,
                 name: "memory_append".into(),
                 description: "Append content to the end of a memory entry at \
                     memory/<category>/<slug>.md, creating the file if it does \
@@ -313,10 +311,6 @@ impl MemoryAppendTool {
 
 #[async_trait]
 impl Tool for MemoryAppendTool {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Edit
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -378,6 +372,8 @@ impl MemoryReadTool {
         Self {
             state,
             spec: ToolSpec {
+                kind: ToolKind::Read,
+                group: None,
                 name: "memory_read".into(),
                 description: "Read a memory entry at memory/<category>/<slug>.md \
                     and return its body. Side effect: updates the file's \
@@ -393,10 +389,6 @@ impl MemoryReadTool {
 
 #[async_trait]
 impl Tool for MemoryReadTool {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Read
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -433,6 +425,8 @@ impl MemoryRemoveTool {
         Self {
             state,
             spec: ToolSpec {
+                kind: ToolKind::Delete,
+                group: None,
                 name: "memory_remove".into(),
                 description: "Delete a memory entry at memory/<category>/<slug>.md.".into(),
                 input_schema: memory_entry_schema(false),
@@ -443,10 +437,6 @@ impl MemoryRemoveTool {
 
 #[async_trait]
 impl Tool for MemoryRemoveTool {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Delete
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -478,6 +468,8 @@ impl WorkspaceSearchTool {
         Self {
             state,
             spec: ToolSpec {
+                kind: ToolKind::Search,
+                group: None,
                 name: "workspace_search".into(),
                 description: "Search across all indexed files in the workspace. \
                     Two modes are available: \
@@ -512,10 +504,6 @@ impl WorkspaceSearchTool {
 
 #[async_trait]
 impl Tool for WorkspaceSearchTool {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Search
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -583,6 +571,8 @@ impl WorkspaceSyncTool {
         Self {
             state,
             spec: ToolSpec {
+                kind: ToolKind::Other,
+                group: None,
                 name: "workspace_sync".into(),
                 description: "Re-index the workspace so files changed outside \
                     the agent become searchable. Does not touch git."

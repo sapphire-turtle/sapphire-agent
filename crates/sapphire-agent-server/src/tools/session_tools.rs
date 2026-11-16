@@ -40,6 +40,8 @@ impl CurrentTimeTool {
         Self {
             boundary_hour,
             spec: ToolSpec {
+                kind: ToolKind::Read,
+                group: None,
                 name: "current_time".into(),
                 description: "Current date and time on the agent host, in local time, \
                     UTC, and as the agent's logical day (which starts at the configured \
@@ -60,10 +62,6 @@ impl CurrentTimeTool {
 
 #[async_trait]
 impl Tool for CurrentTimeTool {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Read
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -135,7 +133,7 @@ impl SessionSources {
     fn namespace_of(&self, meta: &SessionMeta) -> String {
         meta.namespace
             .clone()
-            .unwrap_or_else(|| self.config.namespace_for_room(&meta.room_id).to_string())
+            .unwrap_or_else(|| self.config.namespace_for_session(&meta.room_id).to_string())
     }
 
     /// Every row from every store, unfiltered.
@@ -192,6 +190,8 @@ impl SessionListTool {
         Self {
             sources,
             spec: ToolSpec {
+                kind: ToolKind::Read,
+                group: None,
                 name: "session_list".into(),
                 description: "List the agent's own conversation sessions — chat rooms, \
                     voice satellites, API clients and editor (ACP) sessions — that have \
@@ -227,10 +227,6 @@ impl SessionListTool {
 
 #[async_trait]
 impl Tool for SessionListTool {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Read
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -305,6 +301,8 @@ impl SessionReadTool {
         Self {
             sources,
             spec: ToolSpec {
+                kind: ToolKind::Read,
+                group: None,
                 name: "session_read".into(),
                 description: "Read what was said in one of the agent's own sessions \
                     (find its session_id with `session_list`). \
@@ -456,10 +454,6 @@ fn push_block(out: &mut Vec<String>, prefix: &str, text: &str) {
 
 #[async_trait]
 impl Tool for SessionReadTool {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Read
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -552,7 +546,7 @@ api_key = "test"
 [memory_namespace.work]
 include = []
 
-[room_profile.work]
+[session_profile.work]
 profile = "default"
 memory_namespace = "work"
 rooms = ["!work:example.org"]

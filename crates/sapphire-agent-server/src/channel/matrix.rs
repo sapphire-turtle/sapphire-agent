@@ -58,7 +58,7 @@ impl MatrixChannel {
             access_token: cfg.access_token.clone(),
             user_id: cfg.user_id.clone(),
             device_id: cfg.device_id.clone(),
-            room_ids: cfg.room_ids.iter().cloned().collect(),
+            room_ids: cfg.rooms.iter().map(|r| r.room_id.clone()).collect(),
             allowed_users: cfg.allowed_users.iter().cloned().collect(),
             recovery_key: cfg.recovery_key.clone(),
             state_dir: cfg.resolved_state_dir(),

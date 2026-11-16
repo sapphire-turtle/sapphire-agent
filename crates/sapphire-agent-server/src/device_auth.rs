@@ -8,7 +8,7 @@
 //! framework's `WorkspaceKeyVerifier`, which caches a success for a short while.
 //!
 //! **A key's profile is its room profile.** The agent offers its
-//! `[room_profile.<n>]` names as the key profiles
+//! `[session_profile.<n>]` names as the key profiles
 //! ([`room_key_profiles`]), so `api-key add <name> --profile <room profile>`
 //! makes a key that runs under that room profile, and nothing else needs
 //! configuring. A key whose profile is a room profile the config no longer has
@@ -17,7 +17,7 @@
 //! **Keys from before profiles.** Keys made before sapphire-framework 0.24 —
 //! the workgroup's external devices the framework imported into the
 //! workspace — carry the framework's migrated profile, `read-only`. For those,
-//! and only those, `[room_profile.<n>].devices` (a key by name or id) still
+//! and only those, `[session_profile.<n>].devices` (a key by name or id) still
 //! decides the room profile, so an existing device keeps working unchanged
 //! until it is re-issued with a room profile. A `devices` entry never moves a
 //! key that has a room profile of its own.
@@ -34,21 +34,21 @@ use sapphire_framework::keys::{
 };
 use sapphire_framework::server::api_keys::WorkspaceKeyVerifier;
 
-use crate::config::{Config, RoomProfileConfig};
+use crate::config::{Config, SessionProfileConfig};
 
 /// What a presented token resolved to.
 #[derive(Debug, Clone)]
 pub struct Resolved {
     pub device: Authenticated,
     /// Never empty: a key bound to no room profile is refused.
-    pub room_profile: String,
+    pub session_profile: String,
 }
 
 /// Why a token did not resolve.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthError {
     /// The token is unknown or retired, or it is a key from before profiles
-    /// that no `[room_profile.<n>].devices` lists. Answer 401.
+    /// that no `[session_profile.<n>].devices` lists. Answer 401.
     Refused,
     /// The token's key has a profile this agent does not offer (a room
     /// profile removed from the config, say). Answer 403: the key is fine,
@@ -56,13 +56,13 @@ pub enum AuthError {
     Forbidden,
 }
 
-/// The key profiles for `room_profiles`: one per room profile, each allowed
+/// The key profiles for `session_profiles`: one per room profile, each allowed
 /// to write — a room profile runs chat turns, which change sessions and
 /// memory. The framework's migrated `read-only` is resolved too (to read),
 /// though not offered for new keys, so keys from before profiles still
 /// authenticate and reach the `devices` fallback.
-pub fn room_key_profiles(room_profiles: &HashMap<String, RoomProfileConfig>) -> KeyProfiles {
-    let names: Arc<BTreeSet<String>> = Arc::new(room_profiles.keys().cloned().collect());
+pub fn room_key_profiles(session_profiles: &HashMap<String, SessionProfileConfig>) -> KeyProfiles {
+    let names: Arc<BTreeSet<String>> = Arc::new(session_profiles.keys().cloned().collect());
     let listed = Arc::clone(&names);
     KeyProfiles::new(
         move || profiles_of(&listed),
@@ -114,7 +114,7 @@ impl ConfiguredNames {
             .and_then(|_| crate::app_server::selection().ok().flatten())
             .map(|s| s.root);
         let names: BTreeSet<String> = match Config::load_layered_in(&self.path, root.as_deref()) {
-            Ok(loaded) => loaded.config.room_profiles.into_keys().collect(),
+            Ok(loaded) => loaded.config.session_profiles.into_keys().collect(),
             Err(err) => {
                 tracing::debug!("no room profiles to offer as key profiles: {err:#}");
                 BTreeSet::new()
@@ -151,8 +151,8 @@ pub struct DeviceAuth {
     verifier: Arc<dyn Verifier>,
     /// The configured room profiles: a key whose profile is one of them runs
     /// under it.
-    room_profiles: BTreeSet<String>,
-    /// `[room_profile.<n>].devices` entries that name a key -> room profile.
+    session_profiles: BTreeSet<String>,
+    /// `[session_profile.<n>].devices` entries that name a key -> room profile.
     /// Only for keys with the migrated profile.
     by_name: HashMap<String, String>,
     /// The entries that read as a grain-id -> room profile.
@@ -162,7 +162,7 @@ pub struct DeviceAuth {
 impl std::fmt::Debug for DeviceAuth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DeviceAuth")
-            .field("room_profiles", &self.room_profiles)
+            .field("session_profiles", &self.session_profiles)
             .field("by_name", &self.by_name)
             .field("by_id", &self.by_id)
             .finish_non_exhaustive()
@@ -171,13 +171,13 @@ impl std::fmt::Debug for DeviceAuth {
 
 impl DeviceAuth {
     /// Authenticate against the API keys of the workspace this agent serves.
-    pub fn workspace(room_profiles: &HashMap<String, RoomProfileConfig>) -> Result<Self> {
+    pub fn workspace(session_profiles: &HashMap<String, SessionProfileConfig>) -> Result<Self> {
         let verifier = WorkspaceKeyVerifier::for_app(&crate::APP_CTX)
-            .profiles(room_key_profiles(room_profiles));
-        Self::new(Arc::new(verifier), room_profiles)
+            .profiles(room_key_profiles(session_profiles));
+        Self::new(Arc::new(verifier), session_profiles)
     }
 
-    /// Build the routing from `room_profiles` and check that the legacy
+    /// Build the routing from `session_profiles` and check that the legacy
     /// `devices` fallback is unambiguous: one key, one room profile.
     ///
     /// Each selector is taken both as a name and, when it reads as one, as a
@@ -187,11 +187,11 @@ impl DeviceAuth {
     /// device's LLM profile and memory namespace.
     pub fn new(
         verifier: Arc<dyn Verifier>,
-        room_profiles: &HashMap<String, RoomProfileConfig>,
+        session_profiles: &HashMap<String, SessionProfileConfig>,
     ) -> Result<Self> {
         // Sorted, so a name in an error is the same one on every run rather
         // than whichever `HashMap` order surfaced.
-        let mut ordered: Vec<(&String, &RoomProfileConfig)> = room_profiles.iter().collect();
+        let mut ordered: Vec<(&String, &SessionProfileConfig)> = session_profiles.iter().collect();
         ordered.sort_by(|a, b| a.0.cmp(b.0));
 
         let mut by_name: HashMap<String, String> = HashMap::new();
@@ -200,13 +200,13 @@ impl DeviceAuth {
             for selector in &rp.devices {
                 let selector = selector.trim();
                 if selector.is_empty() {
-                    bail!("room_profile '{rp_name}' lists an empty device selector");
+                    bail!("session_profile '{rp_name}' lists an empty device selector");
                 }
                 if let Some(prev) = by_name.get(selector)
                     && prev != rp_name
                 {
                     bail!(
-                        "device {selector:?} appears in room_profiles '{prev}' and '{rp_name}'; \
+                        "device {selector:?} appears in session_profiles '{prev}' and '{rp_name}'; \
                          a device runs under exactly one room profile, which is what decides \
                          its LLM profile and memory namespace"
                     );
@@ -217,7 +217,7 @@ impl DeviceAuth {
                         && prev != rp_name
                     {
                         bail!(
-                            "device id {id} appears in room_profiles '{prev}' and '{rp_name}'; \
+                            "device id {id} appears in session_profiles '{prev}' and '{rp_name}'; \
                              a device runs under exactly one room profile"
                         );
                     }
@@ -228,7 +228,7 @@ impl DeviceAuth {
 
         Ok(Self {
             verifier,
-            room_profiles: room_profiles.keys().cloned().collect(),
+            session_profiles: session_profiles.keys().cloned().collect(),
             by_name,
             by_id,
         })
@@ -255,15 +255,15 @@ impl DeviceAuth {
                 return Err(AuthError::Forbidden);
             }
         };
-        match self.room_profile_for(&device) {
-            Some(room_profile) => Ok(Resolved {
-                room_profile: room_profile.to_owned(),
+        match self.session_profile_for_room(&device) {
+            Some(session_profile) => Ok(Resolved {
+                session_profile: session_profile.to_owned(),
                 device,
             }),
             None if device.profile.as_str() == MIGRATED => {
                 tracing::warn!(
                     "device auth: API key '{}' ({}) is from before key profiles and no \
-                     [room_profile.<name>].devices lists it; re-issue it with \
+                     [session_profile.<name>].devices lists it; re-issue it with \
                      `sapphire-agent api-key add <name> --profile <room profile>`",
                     device.name,
                     device.id
@@ -287,8 +287,8 @@ impl DeviceAuth {
     /// The room profile `device` runs under: its profile when that is a room
     /// profile; for a key from before profiles, the `devices` entry naming
     /// it, its name winning over its id.
-    fn room_profile_for(&self, device: &Authenticated) -> Option<&str> {
-        if let Some(rp) = self.room_profiles.get(device.profile.as_str()) {
+    fn session_profile_for_room(&self, device: &Authenticated) -> Option<&str> {
+        if let Some(rp) = self.session_profiles.get(device.profile.as_str()) {
             return Some(rp);
         }
         if device.profile.as_str() != MIGRATED {
@@ -297,7 +297,7 @@ impl DeviceAuth {
         self.legacy_binding(device.id.as_str(), &device.name)
     }
 
-    /// The room profile `[room_profile.<n>].devices` routes the key `id` /
+    /// The room profile `[session_profile.<n>].devices` routes the key `id` /
     /// `name` to. For `verify`, and the fallback above.
     pub fn legacy_binding(&self, id: &str, name: &str) -> Option<&str> {
         self.by_name
@@ -312,11 +312,11 @@ impl DeviceAuth {
     }
 
     /// Whether `profile` is one of the configured room profiles.
-    pub fn is_room_profile(&self, profile: &str) -> bool {
-        self.room_profiles.contains(profile)
+    pub fn is_session_profile(&self, profile: &str) -> bool {
+        self.session_profiles.contains(profile)
     }
 
-    /// `(selector, room_profile)` pairs of the `devices` fallback, sorted by
+    /// `(selector, session_profile)` pairs of the `devices` fallback, sorted by
     /// selector. For `verify`.
     pub fn bindings(&self) -> Vec<(&str, &str)> {
         let mut rows: Vec<(&str, &str)> = self
@@ -381,7 +381,7 @@ pub mod testing {
     }
 
     /// `(token, key name)` pairs: keys from before profiles (`read-only`),
-    /// routed by `[room_profile.<n>].devices`.
+    /// routed by `[session_profile.<n>].devices`.
     pub fn verifier(devices: &[(&str, &str)]) -> Arc<StaticVerifier> {
         let keys: Vec<(&str, &str, &str)> = devices
             .iter()
@@ -393,9 +393,9 @@ pub mod testing {
     /// A `DeviceAuth` over `verifier(devices)`.
     pub fn device_auth(
         devices: &[(&str, &str)],
-        room_profiles: &HashMap<String, RoomProfileConfig>,
+        session_profiles: &HashMap<String, SessionProfileConfig>,
     ) -> Arc<DeviceAuth> {
-        Arc::new(DeviceAuth::new(verifier(devices), room_profiles).unwrap())
+        Arc::new(DeviceAuth::new(verifier(devices), session_profiles).unwrap())
     }
 }
 
@@ -404,11 +404,11 @@ mod tests {
     use super::testing::{StaticVerifier, verifier, verifier_with_profiles};
     use super::*;
 
-    fn rps(bindings: &[(&str, &str)]) -> HashMap<String, RoomProfileConfig> {
-        let mut out: HashMap<String, RoomProfileConfig> = HashMap::new();
+    fn rps(bindings: &[(&str, &str)]) -> HashMap<String, SessionProfileConfig> {
+        let mut out: HashMap<String, SessionProfileConfig> = HashMap::new();
         for (selector, rp) in bindings {
             out.entry((*rp).to_string())
-                .or_insert_with(|| RoomProfileConfig {
+                .or_insert_with(|| SessionProfileConfig {
                     profile: "sonnet".into(),
                     ..Default::default()
                 })
@@ -418,13 +418,13 @@ mod tests {
         out
     }
 
-    fn room(names: &[&str]) -> HashMap<String, RoomProfileConfig> {
+    fn room(names: &[&str]) -> HashMap<String, SessionProfileConfig> {
         names
             .iter()
             .map(|n| {
                 (
                     (*n).to_string(),
-                    RoomProfileConfig {
+                    SessionProfileConfig {
                         profile: "sonnet".into(),
                         ..Default::default()
                     },
@@ -444,17 +444,17 @@ mod tests {
         let resolved = auth.resolve("tok").await.expect("should resolve");
 
         assert_eq!(resolved.device.name, "pendant");
-        assert_eq!(resolved.room_profile, "home");
+        assert_eq!(resolved.session_profile, "home");
     }
 
     #[tokio::test]
-    async fn devices_does_not_move_a_key_with_a_room_profile() {
+    async fn devices_does_not_move_a_key_with_a_session_profile() {
         let mut rp = rps(&[("pendant", "work")]);
         rp.extend(room(&["home"]));
         let auth =
             DeviceAuth::new(verifier_with_profiles(&[("tok", "pendant", "home")]), &rp).unwrap();
 
-        assert_eq!(auth.resolve("tok").await.unwrap().room_profile, "home");
+        assert_eq!(auth.resolve("tok").await.unwrap().session_profile, "home");
     }
 
     #[tokio::test]
@@ -468,7 +468,7 @@ mod tests {
         let resolved = auth.resolve("tok").await.expect("should resolve");
 
         assert_eq!(resolved.device.name, "pendant");
-        assert_eq!(resolved.room_profile, "home");
+        assert_eq!(resolved.session_profile, "home");
     }
 
     #[tokio::test]
@@ -477,7 +477,7 @@ mod tests {
         let id = v.tokens["tok"].id.to_string();
         let auth = DeviceAuth::new(v, &rps(&[(&id, "home")])).unwrap();
 
-        assert_eq!(auth.resolve("tok").await.unwrap().room_profile, "home");
+        assert_eq!(auth.resolve("tok").await.unwrap().session_profile, "home");
     }
 
     #[tokio::test]
@@ -486,7 +486,7 @@ mod tests {
         let id = v.tokens["tok"].id.to_string();
         let auth = DeviceAuth::new(v, &rps(&[("pendant", "home"), (&id, "work")])).unwrap();
 
-        assert_eq!(auth.resolve("tok").await.unwrap().room_profile, "home");
+        assert_eq!(auth.resolve("tok").await.unwrap().session_profile, "home");
     }
 
     #[tokio::test]
@@ -501,7 +501,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refuses_a_migrated_key_bound_to_no_room_profile() {
+    async fn refuses_a_migrated_key_bound_to_no_session_profile() {
         let auth =
             DeviceAuth::new(verifier(&[("tok", "stray")]), &rps(&[("pendant", "home")])).unwrap();
 
@@ -544,7 +544,7 @@ mod tests {
     }
 
     #[test]
-    fn the_key_profiles_are_the_room_profiles() {
+    fn the_key_profiles_are_the_session_profiles() {
         let profiles = room_key_profiles(&room(&["work", "home"]));
         let ids: Vec<String> = profiles
             .list()
@@ -563,7 +563,7 @@ mod tests {
     fn configured_key_profiles_read_the_config() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        std::fs::write(&path, "[room_profile.home]\nprofile = \"sonnet\"\n").unwrap();
+        std::fs::write(&path, "[session_profile.home]\nprofile = \"sonnet\"\n").unwrap();
         let profiles = configured_key_profiles(Some(path));
         let ids: Vec<String> = profiles
             .list()
@@ -574,7 +574,7 @@ mod tests {
     }
 
     #[test]
-    fn new_rejects_a_device_bound_to_two_room_profiles() {
+    fn new_rejects_a_device_bound_to_two_session_profiles() {
         let err = DeviceAuth::new(
             verifier(&[]),
             &rps(&[("pendant", "home"), ("pendant", "work")]),
@@ -589,7 +589,7 @@ mod tests {
     }
 
     #[test]
-    fn new_rejects_one_id_spelled_two_ways_in_two_room_profiles() {
+    fn new_rejects_one_id_spelled_two_ways_in_two_session_profiles() {
         let id = GrainId::random().to_string();
         let err = DeviceAuth::new(
             verifier(&[]),
@@ -601,7 +601,7 @@ mod tests {
     }
 
     #[test]
-    fn a_selector_repeated_within_one_room_profile_is_fine() {
+    fn a_selector_repeated_within_one_session_profile_is_fine() {
         assert!(
             DeviceAuth::new(
                 verifier(&[]),

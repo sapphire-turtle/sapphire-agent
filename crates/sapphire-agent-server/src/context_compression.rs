@@ -766,6 +766,8 @@ mod tests {
 
     fn big_tool_spec(name: &'static str) -> ToolSpec {
         ToolSpec {
+            kind: crate::tools::ToolKind::Other,
+            group: None,
             name: name.into(),
             description: "d".repeat(4_000).into(),
             input_schema: serde_json::json!({ "type": "object", "blurb": "s".repeat(4_000) }),

@@ -320,14 +320,14 @@ pub fn local_channels(config: &crate::config::Config) -> Vec<ClaimedChannel> {
         out.push(ClaimedChannel {
             kind: "matrix".to_owned(),
             account: m.user_id.clone(),
-            rooms: m.room_ids.clone(),
+            rooms: m.rooms.iter().map(|r| r.room_id.clone()).collect(),
         });
     }
     if let Some(d) = &config.discord {
         out.push(ClaimedChannel {
             kind: "discord".to_owned(),
             account: token_fingerprint(&d.bot_token),
-            rooms: d.channel_ids.clone(),
+            rooms: d.rooms.iter().map(|r| r.room_id.clone()).collect(),
         });
     }
     out
@@ -707,7 +707,11 @@ mod tests {
         let mut config = crate::config::Config::for_test();
         config.discord = Some(crate::config::DiscordConfig {
             bot_token: "SECRET-TOKEN".into(),
-            channel_ids: vec!["123".into()],
+            rooms: vec![crate::config::RoomConfig {
+                room_id: "123".into(),
+                profile: "default".into(),
+                voice_pipeline: None,
+            }],
             allowed_users: vec![],
         });
         let channels = local_channels(&config);

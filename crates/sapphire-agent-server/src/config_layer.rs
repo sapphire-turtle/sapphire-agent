@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 /// (`GITHUB_TOKEN = "…"`).
 pub const CREDENTIAL_KEYS: &[&str] = &[
     "api_key",
-    // `[room_profile.<n>].api_keys`, the removed raw-token list.
+    // `[session_profile.<n>].api_keys`, the removed raw-token list.
     "api_keys",
     "token",
     "secret",
@@ -42,14 +42,20 @@ pub const CREDENTIAL_SUFFIXES: &[&str] = &["_api_key", "_token", "_secret", "_pa
 /// - `workspace_dir` locates the workspace config, so a workspace config
 ///   naming it is circular — and the path is one machine's, which another
 ///   host syncing the same workspace does not have.
-/// - `tools.host_access` hands the agent this machine's shell and
+/// - `tools.fs` hands the agent this machine's shell and
 ///   filesystem. Whether a device grants that is the device's own decision,
 ///   not one a synced file makes for every host at once.
 /// - `serve` is the HTTP bind address, which belongs to one machine and one
 ///   OS user: two agents syncing the same workspace on one host would
 ///   otherwise both try to listen on the port it names.
-pub const HOST_ONLY_PATHS: &[&[&str]] =
-    &[&["workspace_dir"], &["tools", "host_access"], &["serve"]];
+pub const HOST_ONLY_PATHS: &[&[&str]] = &[
+    &["workspace_dir"],
+    &["tools", "fs"],
+    &["tools", "shell"],
+    &["tools", "mcp"],
+    &["tools", "admin"],
+    &["serve"],
+];
 
 /// True when `key` names a credential. See [`CREDENTIAL_KEYS`].
 pub fn is_credential_key(key: &str) -> bool {
@@ -310,9 +316,9 @@ mod tests {
 
     #[test]
     fn layer_of_reads_an_exact_leaf() {
-        let p = provenance(&[("room_profile.default.skills", Layer::Host)]);
+        let p = provenance(&[("session_profile.default.skills", Layer::Host)]);
         assert_eq!(
-            layer_of("room_profile.default.skills", &p),
+            layer_of("session_profile.default.skills", &p),
             Some(Layer::Host)
         );
     }
@@ -361,9 +367,9 @@ mod tests {
         assert!(path_allowed(&["providers", "local", "model"]));
         assert!(path_allowed(&["providers", "local", "max_tokens"]));
         assert!(path_allowed(&["profiles", "default", "provider"]));
-        assert!(path_allowed(&["room_profile", "work", "devices"]));
+        assert!(path_allowed(&["session_profile", "work", "devices"]));
         assert!(path_allowed(&["tools", "mcp_servers"]));
-        assert!(path_allowed(&["tools", "admin", "room_profiles"]));
+        assert!(!path_allowed(&["tools", "admin", "session_profiles"]));
         assert!(path_allowed(&["stt_provider", "whisper", "model"]));
         assert!(path_allowed(&["matrix", "homeserver"]));
         // The name of an env var holding a key is not the key.
@@ -376,7 +382,7 @@ mod tests {
         assert!(!path_allowed(&["providers", "local", "api_key"]));
         assert!(!path_allowed(&["tools", "tavily_api_key"]));
         assert!(!path_allowed(&["tools", "mcp_servers", "0", "api_key"]));
-        assert!(!path_allowed(&["room_profile", "work", "api_keys"]));
+        assert!(!path_allowed(&["session_profile", "work", "api_keys"]));
         assert!(!path_allowed(&["matrix", "access_token"]));
         assert!(!path_allowed(&["matrix", "recovery_key"]));
         assert!(!path_allowed(&["discord", "bot_token"]));
@@ -404,8 +410,8 @@ mod tests {
     #[test]
     fn host_only_paths_are_refused_with_everything_beneath_them() {
         assert!(!path_allowed(&["workspace_dir"]));
-        assert!(!path_allowed(&["tools", "host_access"]));
-        assert!(!path_allowed(&["tools", "host_access", "enabled"]));
+        assert!(!path_allowed(&["tools", "fs"]));
+        assert!(!path_allowed(&["tools", "fs", "enabled"]));
         assert!(!path_allowed(&["serve", "port"]));
         assert!(!path_allowed(&["serve", "host"]));
         // The rest of `[tools]` is shared.
@@ -416,15 +422,15 @@ mod tests {
     fn a_host_access_table_is_rejected_as_a_whole() {
         let (kept, rejected) = filter_allowed(parse(
             r#"
-[tools.host_access]
+[tools.fs]
 enabled = true
 
 [tools.tool_rounds]
 unattended = 100
 "#,
         ));
-        assert_eq!(rejected, vec!["tools.host_access".to_string()]);
-        assert!(kept["tools"].get("host_access").is_none());
+        assert_eq!(rejected, vec!["tools.fs".to_string()]);
+        assert!(kept["tools"].get("fs").is_none());
         assert_eq!(
             kept["tools"]["tool_rounds"]["unattended"].as_integer(),
             Some(100)
@@ -502,18 +508,18 @@ api_key = "sk-secret"
     fn a_whole_array_of_credentials_is_rejected_as_a_unit() {
         let (kept, rejected) = filter_allowed(parse(
             r#"
-[room_profile.work]
+[session_profile.work]
 profile = "default"
 rooms = ["!a:example.org"]
 api_keys = ["sa-secret"]
 "#,
         ));
-        assert_eq!(rejected, vec!["room_profile.work.api_keys".to_string()]);
+        assert_eq!(rejected, vec!["session_profile.work.api_keys".to_string()]);
         assert_eq!(
-            kept["room_profile"]["work"]["profile"].as_str(),
+            kept["session_profile"]["work"]["profile"].as_str(),
             Some("default")
         );
-        assert!(kept["room_profile"]["work"].get("api_keys").is_none());
+        assert!(kept["session_profile"]["work"].get("api_keys").is_none());
     }
 
     #[test]
@@ -598,24 +604,24 @@ access_token = "t"
         let merged = deep_merge(
             parse(
                 r#"
-[room_profile.work]
+[session_profile.work]
 profile = "default"
 rooms = ["!a:example.org"]
 "#,
             ),
             parse(
                 r#"
-[room_profile.work]
+[session_profile.work]
 api_keys = ["sa-host-only"]
 "#,
             ),
         );
         assert_eq!(
-            merged["room_profile"]["work"]["profile"].as_str(),
+            merged["session_profile"]["work"]["profile"].as_str(),
             Some("default")
         );
         assert_eq!(
-            merged["room_profile"]["work"]["api_keys"][0].as_str(),
+            merged["session_profile"]["work"]["api_keys"][0].as_str(),
             Some("sa-host-only")
         );
     }
@@ -625,15 +631,17 @@ api_keys = ["sa-host-only"]
         // Concatenation cannot express removal, so the host replaces.
         let merged = deep_merge(
             parse(
-                r#"[room_profile.work]
+                r#"[session_profile.work]
 rooms = ["!a:example.org", "!b:example.org"]"#,
             ),
             parse(
-                r#"[room_profile.work]
+                r#"[session_profile.work]
 rooms = ["!c:example.org"]"#,
             ),
         );
-        let rooms = merged["room_profile"]["work"]["rooms"].as_array().unwrap();
+        let rooms = merged["session_profile"]["work"]["rooms"]
+            .as_array()
+            .unwrap();
         assert_eq!(rooms.len(), 1);
         assert_eq!(rooms[0].as_str(), Some("!c:example.org"));
     }
@@ -723,7 +731,7 @@ fallback_provider = "local"
 include = ["default"]
 background_profile = "default"
 
-[room_profile.work]
+[session_profile.work]
 profile = "default"
 memory_namespace = "work"
 rooms = ["!a:example.org"]

@@ -535,13 +535,13 @@ impl Channels {
 pub fn seed_routing_from_config(config: &crate::config::Config) -> HashMap<String, String> {
     let mut seed = HashMap::new();
     if let Some(m) = &config.matrix {
-        for r in &m.room_ids {
-            seed.insert(r.clone(), "matrix".to_string());
+        for r in &m.rooms {
+            seed.insert(r.room_id.clone(), "matrix".to_string());
         }
     }
     if let Some(d) = &config.discord {
-        for c in &d.channel_ids {
-            seed.insert(c.clone(), "discord".to_string());
+        for c in &d.rooms {
+            seed.insert(c.room_id.clone(), "discord".to_string());
         }
     }
     seed

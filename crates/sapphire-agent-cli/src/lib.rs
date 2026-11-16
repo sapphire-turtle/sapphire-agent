@@ -64,10 +64,10 @@ pub enum Command {
     Verify,
     /// Speak ACP on stdio, for an editor to start as its agent: relayed to
     /// the agent running on this host, which runs the conversation. Needs
-    /// `[acp].stdio_room_profile` in the host config.
+    /// `[acp].stdio_session_profile` in the host config.
     Acp,
     /// Chat with the agent running on this host: a REPL, or one message
-    /// with `-m`. Needs `[cli].room_profile` in the host config.
+    /// with `-m`. Needs `[cli].profile` in the host config.
     Chat {
         /// Grain-id of an existing session to resume (e.g. a3b7k9p).
         #[arg(long)]

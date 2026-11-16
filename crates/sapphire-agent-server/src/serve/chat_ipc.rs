@@ -15,7 +15,7 @@
 //!
 //! There is no token on this path. The IPC endpoint admits only the OS user
 //! that runs the server, and the room profile a token would have picked is
-//! named by `[cli].room_profile` instead.
+//! named by `[cli].profile` instead.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -219,15 +219,10 @@ impl ChatTunnel {
         let state = self.agent()?;
         let params: OpenParams = serde_json::from_value(ctx.params)
             .map_err(|e| invalid(format!("bad {OPEN} parameters: {e}")))?;
-        let Some(profile) = state
-            .config
-            .cli
-            .as_ref()
-            .and_then(|c| c.room_profile.clone())
-        else {
+        let Some(profile) = state.config.cli.as_ref().and_then(|c| c.profile.clone()) else {
             return Err(failed(
                 "local chat clients (`sapphire-agent chat`, sapphire-agent-desktop) need a room \
-                 profile: set [cli].room_profile in this host's config.toml",
+                 profile: set [cli].profile in this host's config.toml",
             ));
         };
         let opened = open_session(&state, None, params.session.as_deref(), profile, None)
@@ -240,7 +235,7 @@ impl ChatTunnel {
         info!(
             "chat: session {} opened for room profile '{}' (pid {})",
             opened.public_id.as_deref().unwrap_or(&opened.session_id),
-            opened.room_profile,
+            opened.session_profile,
             ctx.peer.client().pid
         );
         Ok(opened.to_json())
@@ -255,7 +250,7 @@ impl ChatTunnel {
         // Only a session `open` pinned to a room profile: a stale id (from
         // before a restart, say) would otherwise run under no profile.
         if !state
-            .session_room_profiles
+            .session_profiles
             .lock()
             .await
             .contains_key(&params.session_id)
@@ -465,7 +460,7 @@ pub(super) mod tests {
         }
     }
 
-    /// open → send → history → sessions, over IPC, under `[cli].room_profile`.
+    /// open → send → history → sessions, over IPC, under `[cli].profile`.
     #[tokio::test]
     async fn a_turn_round_trips_over_ipc() {
         let tunnel = ChatTunnel::default();
@@ -482,13 +477,13 @@ pub(super) mod tests {
         );
         assert_eq!(
             state
-                .session_room_profiles
+                .session_profiles
                 .lock()
                 .await
                 .get(&opened.session_id)
                 .map(String::as_str),
             Some("developer"),
-            "the session runs under [cli].room_profile"
+            "the session runs under [cli].profile"
         );
 
         let reply = chat
