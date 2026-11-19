@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, bail};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use tokio::task::AbortHandle;
 use tracing::warn;
@@ -45,7 +45,7 @@ pub(crate) enum TaskKind {
         message_ids: Vec<String>,
         question: String,
         asked_by: Option<String>,
-        deadline: DateTime<Utc>,
+        deadline: Timestamp,
     },
     /// A shell command run in the background. `timeout_secs` is its run time
     /// limit; `on` says whose machine it runs on.
@@ -91,7 +91,7 @@ pub(crate) struct PendingTask {
     pub id: TaskId,
     pub kind: TaskKind,
     pub label: String,
-    pub started_at: DateTime<Utc>,
+    pub started_at: Timestamp,
 }
 
 /// A tool call the subagent wanted to make but could not, because nobody was
@@ -142,7 +142,7 @@ pub(crate) struct Completion {
     pub task_id: TaskId,
     pub kind: TaskKind,
     pub outcome: Outcome,
-    pub finished_at: DateTime<Utc>,
+    pub finished_at: Timestamp,
 }
 
 /// What is written for one session. `inbox` includes in-flight entries.
@@ -263,7 +263,7 @@ impl BackgroundTasks {
                     closed_questions: persisted.closed_questions,
                     ..Default::default()
                 };
-                let now = Utc::now();
+                let now = Timestamp::now();
                 for p in persisted.pending {
                     if is_question(&p) {
                         // Nothing ran in the process: the question is still
@@ -387,7 +387,7 @@ impl BackgroundTasks {
                 id: id.clone(),
                 kind,
                 label,
-                started_at: Utc::now(),
+                started_at: Timestamp::now(),
             },
             abort: None,
         });
@@ -419,7 +419,7 @@ impl BackgroundTasks {
                 id: id.clone(),
                 kind,
                 label,
-                started_at: Utc::now(),
+                started_at: Timestamp::now(),
             },
             abort: None,
         });
@@ -490,7 +490,7 @@ impl BackgroundTasks {
             task_id: r.task.id,
             kind: r.task.kind,
             outcome,
-            finished_at: Utc::now(),
+            finished_at: Timestamp::now(),
         });
         self.persist(session, s);
         true
@@ -521,7 +521,7 @@ impl BackgroundTasks {
             task_id,
             kind,
             outcome: Outcome::FollowUp { text, from },
-            finished_at: Utc::now(),
+            finished_at: Timestamp::now(),
         });
         self.persist(session, s);
         true
@@ -576,7 +576,7 @@ impl BackgroundTasks {
             task_id: r.task.id,
             kind: r.task.kind,
             outcome,
-            finished_at: Utc::now(),
+            finished_at: Timestamp::now(),
         });
         self.persist(session, s);
         true
@@ -708,7 +708,7 @@ impl BackgroundTasks {
             task_id: r.task.id,
             kind: r.task.kind,
             outcome: Outcome::Cancelled,
-            finished_at: Utc::now(),
+            finished_at: Timestamp::now(),
         });
     }
 }
@@ -982,7 +982,7 @@ mod tests {
             task_id: "bg-1".into(),
             kind: kind("h1"),
             outcome,
-            finished_at: Utc::now(),
+            finished_at: Timestamp::now(),
         };
         let s = render(
             &mk(Outcome::Finished {
@@ -1100,7 +1100,7 @@ mod tests {
             task_id: "bg-1".into(),
             kind: shell("cargo test\n--workspace"),
             outcome,
-            finished_at: Utc::now(),
+            finished_at: Timestamp::now(),
         };
         let exited = |exit_code, timed_out| Outcome::Exited {
             exit_code,
@@ -1241,7 +1241,7 @@ mod tests {
             message_ids: vec![mid.into()],
             question: text.into(),
             asked_by: asked_by.map(Into::into),
-            deadline: Utc::now() + chrono::Duration::hours(24),
+            deadline: Timestamp::now() + jiff::SignedDuration::from_hours(24),
         }
     }
 
@@ -1397,7 +1397,7 @@ mod tests {
             task_id: "bg-1".into(),
             kind: question("!r", "m1", "Ship it?\nsecond line", asked_by),
             outcome,
-            finished_at: Utc::now(),
+            finished_at: Timestamp::now(),
         };
         let s = render(
             &mk(

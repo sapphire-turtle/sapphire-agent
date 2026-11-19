@@ -21,8 +21,9 @@
 //! satellite is offline. The body is used verbatim as the trigger
 //! prompt fed to the agent.
 
-use chrono::{DateTime, Local};
 use cron::Schedule;
+use jiff::ZonedDateTime;
+use jiff::tz::TimeZone;
 use serde::Deserialize;
 use std::path::Path;
 use std::str::FromStr;
@@ -95,8 +96,19 @@ impl HeartbeatTask {
         }
     }
 
-    pub fn next_after(&self, after: DateTime<Local>) -> Option<DateTime<Local>> {
-        self.parsed_schedule()?.after(&after).next()
+    /// The first run after `after`, in this host's time zone.
+    ///
+    /// The `cron` crate schedules on chrono, so `after` crosses to chrono
+    /// and back here.
+    pub fn next_after(&self, after: &ZonedDateTime) -> Option<ZonedDateTime> {
+        let ts = after.timestamp();
+        let after =
+            chrono::DateTime::from_timestamp(ts.as_second(), ts.subsec_nanosecond() as u32)?
+                .with_timezone(&chrono::Local);
+        let next = self.parsed_schedule()?.after(&after).next()?;
+        let next =
+            jiff::Timestamp::new(next.timestamp(), next.timestamp_subsec_nanos() as i32).ok()?;
+        Some(next.to_zoned_datetime(TimeZone::system()))
     }
 }
 
@@ -195,13 +207,13 @@ pub fn parse_definition(name: &str, raw: &str) -> Result<HeartbeatTask, String> 
 /// Tasks scheduled within a 1-second window are batched together.
 pub fn next_due(
     tasks: &[HeartbeatTask],
-    now: DateTime<Local>,
-) -> Option<(DateTime<Local>, Vec<&HeartbeatTask>)> {
-    let mut earliest: Option<DateTime<Local>> = None;
-    let mut next_for: Vec<(DateTime<Local>, &HeartbeatTask)> = Vec::new();
+    now: ZonedDateTime,
+) -> Option<(ZonedDateTime, Vec<&HeartbeatTask>)> {
+    let mut earliest: Option<ZonedDateTime> = None;
+    let mut next_for: Vec<(ZonedDateTime, &HeartbeatTask)> = Vec::new();
     for t in tasks {
-        if let Some(next) = t.next_after(now) {
-            next_for.push((next, t));
+        if let Some(next) = t.next_after(&now) {
+            next_for.push((next.clone(), t));
             earliest = Some(match earliest {
                 Some(e) if e <= next => e,
                 _ => next,
@@ -211,7 +223,13 @@ pub fn next_due(
     let earliest = earliest?;
     let due: Vec<&HeartbeatTask> = next_for
         .into_iter()
-        .filter(|(t, _)| (*t - earliest).num_seconds().abs() <= 1)
+        .filter(|(t, _)| {
+            t.timestamp()
+                .duration_since(earliest.timestamp())
+                .as_secs()
+                .abs()
+                <= 1
+        })
         .map(|(_, t)| t)
         .collect();
     Some((earliest, due))

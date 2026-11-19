@@ -21,7 +21,9 @@ use crate::session::{SessionMeta, SessionRow, SessionStore, StoredMessage, day_w
 use crate::tools::{Tool, ToolKind};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use chrono::{DateTime, Local, Utc};
+use jiff::Timestamp;
+use jiff::ZonedDateTime;
+use jiff::tz::TimeZone;
 use serde_json::json;
 use std::sync::Arc;
 
@@ -67,13 +69,13 @@ impl Tool for CurrentTimeTool {
     }
 
     async fn execute(&self, _input: &serde_json::Value) -> Result<String> {
-        let now = Local::now();
-        let logical = crate::session::local_date_for_timestamp(now, self.boundary_hour);
+        let now = ZonedDateTime::now();
+        let logical = crate::session::local_date_for_timestamp(now.clone(), self.boundary_hour);
         Ok(format!(
             "Local: {} ({})\nUTC:   {}\nAgent day: {} (day boundary {:02}:00 local)",
-            now.format("%Y-%m-%d %H:%M:%S %z"),
-            now.format("%A"),
-            now.with_timezone(&Utc).format("%Y-%m-%dT%H:%M:%SZ"),
+            now.strftime("%Y-%m-%d %H:%M:%S %z"),
+            now.strftime("%A"),
+            now.timestamp().strftime("%Y-%m-%dT%H:%M:%SZ"),
             logical,
             self.boundary_hour,
         ))
@@ -171,8 +173,10 @@ fn session_label(meta: &SessionMeta) -> String {
     format!("{} session", meta.channel)
 }
 
-fn local_hm(at: DateTime<Utc>) -> String {
-    at.with_timezone(&Local).format("%m-%d %H:%M").to_string()
+fn local_hm(at: Timestamp) -> String {
+    at.to_zoned_datetime(TimeZone::system())
+        .strftime("%m-%d %H:%M")
+        .to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -236,8 +240,8 @@ impl Tool for SessionListTool {
         let include_closed = input["include_closed"].as_bool().unwrap_or(false);
 
         let boundary = self.sources.config.day_boundary_hour;
-        let today = crate::session::local_date_for_timestamp(Local::now(), boundary);
-        let first_day = today - chrono::Duration::days(days as i64 - 1);
+        let today = crate::session::local_date_for_timestamp(ZonedDateTime::now(), boundary);
+        let first_day = today - jiff::SignedDuration::from_hours(24 * (days as i64 - 1));
         let (since, _) = day_window(first_day, boundary);
 
         let visible = self.sources.visible_namespaces();
@@ -383,7 +387,10 @@ fn store_transcript(messages: &[StoredMessage]) -> Vec<String> {
             Role::User => "user",
             Role::Assistant => "assistant",
         };
-        let stamp = msg.timestamp.with_timezone(&Local).format("%m-%d %H:%M");
+        let stamp = msg
+            .timestamp
+            .to_zoned_datetime(TimeZone::system())
+            .strftime("%m-%d %H:%M");
         for part in &msg.parts {
             match part {
                 ContentPart::Text(t) if !t.trim().is_empty() => {
@@ -407,7 +414,10 @@ fn acp_transcript(store: &AcpSessionStore, session_id: &str) -> Option<Vec<Strin
     let events = store.events(session_id)?;
     let mut out = Vec::new();
     for event in events {
-        let stamp = event.at.with_timezone(&Local).format("%m-%d %H:%M");
+        let stamp = event
+            .at
+            .to_zoned_datetime(TimeZone::system())
+            .strftime("%m-%d %H:%M");
         match &event.body {
             EventBody::Message { role, parts } => {
                 let role = match role {
@@ -602,7 +612,7 @@ provider = "anthropic"
     async fn current_time_reports_the_agents_logical_day() {
         let tool = CurrentTimeTool::new(4);
         let out = tool.execute(&json!({})).await.unwrap();
-        let expected = crate::session::local_date_for_timestamp(Local::now(), 4);
+        let expected = crate::session::local_date_for_timestamp(ZonedDateTime::now(), 4);
         assert!(
             out.contains(&format!("Agent day: {expected}")),
             "the logical day must be the day-boundary one, not the naive date: {out}"

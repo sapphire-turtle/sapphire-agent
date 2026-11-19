@@ -30,7 +30,6 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use chrono::Utc;
 use serde_json::{Value, json};
 
 use super::{ServeState, extract_bearer};
@@ -330,7 +329,8 @@ async fn handle_send_message(
         status: TaskStatus {
             state: state_enum,
             message: Some(reply_message),
-            timestamp: Some(Utc::now()),
+            // The a2a crate's types are on chrono.
+            timestamp: Some(chrono::Utc::now()),
         },
         artifacts: None,
         history: None,

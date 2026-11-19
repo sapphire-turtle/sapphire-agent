@@ -10,6 +10,11 @@ Changes up to `0.8.0`, when this crate was a binary of its own, are recorded in
 
 ## [Unreleased]
 
+### Changed
+
+- Times are jiff's, not chrono's, which is unmaintained (RUSTSEC-2026-0543). Session logs, transcripts and caches read and write as before (RFC 3339). chrono is left only where a dependency's API takes it: the `cron` crate's schedules (`HeartbeatTask::next_after` converts at the edge) and the A2A message timestamp.
+- sapphire-framework 0.29, corundum-framework 0.13.
+
 ## [0.13.1](https://github.com/sapphire-turtle/sapphire-agent/compare/sapphire-agent-server-v0.13.0...sapphire-agent-server-v0.13.1) - 2026-11-09
 
 ### Added

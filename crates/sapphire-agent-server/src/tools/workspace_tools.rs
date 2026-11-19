@@ -2,7 +2,7 @@ use crate::provider::ToolSpec;
 use crate::tools::{Tool, ToolKind};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use sapphire_framework::workspace::{FtsQuery, VectorQuery, WorkspaceState};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -102,11 +102,11 @@ fn memory_entry_path(
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct MemoryMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    created_at: Option<DateTime<Utc>>,
+    created_at: Option<Timestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    updated_at: Option<DateTime<Utc>>,
+    updated_at: Option<Timestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    last_read_at: Option<DateTime<Utc>>,
+    last_read_at: Option<Timestamp>,
     #[serde(default)]
     read_count: u64,
 }
@@ -208,7 +208,7 @@ impl Tool for MemoryAddTool {
         if abs.exists() {
             anyhow::bail!("{rel} already exists; use memory_update to overwrite");
         }
-        let now = Utc::now();
+        let now = Timestamp::now();
         let meta = MemoryMeta {
             created_at: Some(now),
             updated_at: Some(now),
@@ -265,7 +265,7 @@ impl Tool for MemoryUpdateTool {
         }
         let raw = std::fs::read_to_string(&abs).with_context(|| format!("Failed to read {rel}"))?;
         let (mut meta, _old_body) = parse_memory_file(&raw);
-        let now = Utc::now();
+        let now = Timestamp::now();
         meta.updated_at = Some(now);
         if meta.created_at.is_none() {
             meta.created_at = Some(now);
@@ -320,7 +320,7 @@ impl Tool for MemoryAppendTool {
         let slug = input["slug"].as_str().context("missing 'slug'")?;
         let content = input["content"].as_str().context("missing 'content'")?;
         let (rel, abs) = memory_entry_path(&self.state, category, slug)?;
-        let now = Utc::now();
+        let now = Timestamp::now();
 
         let (meta, new_body, created) = if abs.exists() {
             let raw =
@@ -402,7 +402,7 @@ impl Tool for MemoryReadTool {
         }
         let raw = std::fs::read_to_string(&abs).with_context(|| format!("Failed to read {rel}"))?;
         let (mut meta, body) = parse_memory_file(&raw);
-        meta.last_read_at = Some(Utc::now());
+        meta.last_read_at = Some(Timestamp::now());
         meta.read_count = meta.read_count.saturating_add(1);
         let serialized = serialize_memory_file(&meta, &body)?;
         if let Err(e) = lock(&self.state).write_file(Path::new(&rel), &serialized) {

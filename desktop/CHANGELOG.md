@@ -14,6 +14,10 @@ and predate any user-facing release of this binary.
 
 ## [Unreleased]
 
+### Changed
+
+- sapphire-framework 0.29, corundum-framework 0.13.
+
 ## [0.13.1](https://github.com/sapphire-turtle/sapphire-agent/compare/v0.13.0...v0.13.1) - 2026-11-09
 
 ### Added

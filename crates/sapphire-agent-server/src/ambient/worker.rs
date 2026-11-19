@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use chrono::Local;
+use jiff::tz::TimeZone;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -66,8 +66,10 @@ impl Worker {
             .transcribe(&gated.pcm, self.language.as_deref())
             .await?;
 
-        let day =
-            local_date_for_timestamp(seg.started_at.with_timezone(&Local), self.day_boundary_hour);
+        let day = local_date_for_timestamp(
+            seg.started_at.to_zoned_datetime(TimeZone::system()),
+            self.day_boundary_hour,
+        );
 
         let (speaker, speaker_score) = if gated.speech_ms < self.min_embed_ms {
             // Embeddings from very short utterances are unreliable, and
@@ -104,7 +106,7 @@ impl Worker {
         &mut self,
         embedding: &[f32],
         pcm: &[i16],
-        day: chrono::NaiveDate,
+        day: jiff::civil::Date,
         speech_ms: u32,
         text: &str,
     ) -> Result<(Option<String>, Option<f32>)> {
@@ -201,13 +203,13 @@ mod tests {
     use super::*;
     use crate::ambient::audio::{FixedEmbedder, PassthroughGate, SilentGate};
     use crate::ambient::speaker::registry::SpeakerRegistry;
-    use chrono::Utc;
+    use jiff::Timestamp;
 
     fn seg(pcm_len: usize, live: bool) -> Segment {
         Segment {
             segment: format!("seg-{pcm_len}-{live}"),
             device: "pendant".into(),
-            started_at: Utc::now(),
+            started_at: Timestamp::now(),
             live,
             pcm: vec![0; pcm_len],
         }
@@ -444,7 +446,7 @@ mod tests {
         );
         // One long segment on day one, one on day two.
         let mut a = seg(16_000 * 40, true); // 40 s
-        a.started_at = chrono::Utc::now() - chrono::Duration::days(1);
+        a.started_at = jiff::Timestamp::now() - jiff::SignedDuration::from_hours(24);
         a.segment = "day-one".into();
         h.worker.process(a).await.unwrap();
 

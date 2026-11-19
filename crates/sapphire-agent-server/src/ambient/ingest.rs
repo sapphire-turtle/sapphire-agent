@@ -26,7 +26,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::post;
 use axum::{Json, Router};
-use chrono::{DateTime, TimeZone, Utc};
+use jiff::Timestamp;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::mpsc;
@@ -48,7 +48,7 @@ pub struct Segment {
     /// Resolved from the bearer token, never from the request.
     pub device: String,
     /// When the audio was recorded.
-    pub started_at: DateTime<Utc>,
+    pub started_at: Timestamp,
     /// True only for realtime audio. Replayed spool is false, which is what
     /// keeps a future wake-word path from answering hours-old speech.
     pub live: bool,
@@ -217,7 +217,7 @@ async fn handle_ingest(
         }
     };
 
-    let Some(started_at) = Utc.timestamp_millis_opt(params.started_at).single() else {
+    let Some(started_at) = jiff::Timestamp::from_millisecond(params.started_at).ok() else {
         state.forget(&params.segment);
         return (StatusCode::BAD_REQUEST, "started_at out of range").into_response();
     };
@@ -388,7 +388,7 @@ mod tests {
         assert!(seg.live);
         assert_eq!(seg.pcm.len(), 16_000);
         assert_eq!(
-            seg.started_at.timestamp_millis(),
+            seg.started_at.as_millisecond(),
             1_787_000_000_000,
             "started_at round-trips from the query param, in milliseconds"
         );

@@ -28,7 +28,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use sapphire_framework::frontmatter;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -116,7 +116,7 @@ pub(crate) struct EntryFile<F> {
 /// What every event's front matter carries, whatever else it holds.
 pub(crate) trait Linked {
     fn parent(&self) -> Option<Uuid>;
-    fn at(&self) -> DateTime<Utc>;
+    fn at(&self) -> Timestamp;
 }
 
 /// Write `contents` to `path` through a temporary file in the same
@@ -311,7 +311,7 @@ mod tests {
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     struct Front {
         parent: Option<Uuid>,
-        at: DateTime<Utc>,
+        at: Timestamp,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parts: Option<Vec<BodyOr<crate::provider::ContentPart>>>,
     }
@@ -320,7 +320,7 @@ mod tests {
         fn parent(&self) -> Option<Uuid> {
             self.parent
         }
-        fn at(&self) -> DateTime<Utc> {
+        fn at(&self) -> Timestamp {
             self.at
         }
     }
@@ -328,7 +328,7 @@ mod tests {
     fn front(parent: Option<Uuid>) -> Front {
         Front {
             parent,
-            at: Utc::now(),
+            at: Timestamp::now(),
             parts: None,
         }
     }
@@ -412,7 +412,7 @@ mod tests {
         // `b` claims an earlier clock than `a` but was appended after it.
         write_entry(tmp.path(), a, &front(None), "a").unwrap();
         let mut fb = front(Some(a));
-        fb.at = Utc::now() - chrono::Duration::hours(1);
+        fb.at = Timestamp::now() - jiff::SignedDuration::from_hours(1);
         write_entry(tmp.path(), b, &fb, "b").unwrap();
 
         let entries: Vec<EntryFile<Front>> = read_entries(tmp.path());

@@ -1050,7 +1050,7 @@ impl SubagentTool {
                     task_id,
                     kind,
                     outcome,
-                    finished_at: chrono::Utc::now(),
+                    finished_at: jiff::Timestamp::now(),
                 };
                 let resumable = crate::background::resumable(
                     task_ctx.state.subagent_cache.as_deref(),
@@ -1110,7 +1110,7 @@ impl SubagentTool {
         // outright — no reserved-name collision is possible, and
         // nothing here needs the shorter `simple` rendering.
         let handle = uuid::Uuid::now_v7().to_string();
-        let created_at = chrono::Utc::now();
+        let created_at = jiff::Timestamp::now();
 
         // Nobody else can know a handle this fresh, so the claim always
         // succeeds; it is taken so a background child holds its handle
@@ -1258,7 +1258,7 @@ impl SubagentTool {
         ctx: &crate::serve::TurnContext,
         def: &AgentDef,
         handle: &str,
-        created_at: chrono::DateTime<chrono::Utc>,
+        created_at: jiff::Timestamp,
         history: &mut Vec<ChatMessage>,
         over_cap_reason: &'static str,
         progress: Arc<dyn crate::serve::TurnHost>,
@@ -1394,7 +1394,7 @@ impl SubagentTool {
 struct Prepared {
     def: AgentDef,
     handle: String,
-    created_at: chrono::DateTime<chrono::Utc>,
+    created_at: jiff::Timestamp,
     history: Vec<ChatMessage>,
     over_cap_reason: &'static str,
     guard: ResumeGuard,
@@ -1474,7 +1474,7 @@ fn timed_out(
     ctx: &crate::serve::TurnContext,
     def: &AgentDef,
     handle: &str,
-    created_at: chrono::DateTime<chrono::Utc>,
+    created_at: jiff::Timestamp,
     history: &mut Vec<ChatMessage>,
     over_cap_reason: &'static str,
     limit: std::time::Duration,
@@ -1537,7 +1537,7 @@ fn provider_error(
     ctx: &crate::serve::TurnContext,
     def: &AgentDef,
     handle: &str,
-    created_at: chrono::DateTime<chrono::Utc>,
+    created_at: jiff::Timestamp,
     history: &mut Vec<ChatMessage>,
     over_cap_reason: &'static str,
     message: &str,
@@ -1596,7 +1596,7 @@ fn persist(
     handle: &str,
     agent_name: &str,
     history: Vec<ChatMessage>,
-    created_at: chrono::DateTime<chrono::Utc>,
+    created_at: jiff::Timestamp,
     over_cap_reason: &'static str,
 ) -> Resumability {
     let Some(cache) = cache else {
@@ -1606,7 +1606,7 @@ fn persist(
         agent: agent_name.to_string(),
         history,
         created_at,
-        updated_at: chrono::Utc::now(),
+        updated_at: jiff::Timestamp::now(),
     };
     match cache.put(handle, &child) {
         Ok(true) => Resumability::Resumable(handle.to_string()),
@@ -4347,7 +4347,7 @@ mod tests {
                 handle: handle.clone(),
             },
             outcome: crate::background::Outcome::Interrupted,
-            finished_at: chrono::Utc::now(),
+            finished_at: jiff::Timestamp::now(),
         };
         let resumable = crate::background::resumable(state.subagent_cache.as_deref(), &interrupted);
         assert!(

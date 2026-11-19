@@ -21,7 +21,10 @@
 use crate::provider::{ChatMessage, ContentPart, Role, UserInputKind};
 use crate::session_log::{self, BodyOr, EntryFile, Linked};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use chrono::{DateTime, Duration, Local, NaiveDate, TimeZone, Timelike, Utc};
+use jiff::Timestamp;
+use jiff::ZonedDateTime;
+use jiff::civil::Date;
+use jiff::tz::TimeZone;
 use sapphire_framework::workspace::WorkspaceState;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -46,7 +49,7 @@ pub struct SessionMeta {
     pub room_id: String,
     pub thread_id: Option<String>,
     pub channel: String,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// Human-readable alias (grain-id, 7 chars). Only set for API sessions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub public_id: Option<String>,
@@ -97,7 +100,7 @@ pub struct StoredMessage {
     /// gives each one an id (decision 3.1 of the design doc).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub id: Option<Uuid>,
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: Timestamp,
     pub role: Role,
     pub parts: Vec<ContentPart>,
     /// Input modality for user-role messages. `None` for legacy
@@ -118,7 +121,7 @@ impl StoredMessage {
     pub fn from_chat(msg: &ChatMessage) -> Self {
         Self {
             id: Some(Uuid::now_v7()),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             role: msg.role.clone(),
             parts: msg.parts.clone(),
             input_kind: msg.input_kind.clone(),
@@ -152,7 +155,7 @@ struct MetaLine {
 enum Front {
     Message {
         parent: Option<Uuid>,
-        at: DateTime<Utc>,
+        at: Timestamp,
         role: Role,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         input_kind: Option<UserInputKind>,
@@ -164,18 +167,18 @@ enum Front {
     },
     Summary {
         parent: Option<Uuid>,
-        at: DateTime<Utc>,
+        at: Timestamp,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         covers_through: Option<Uuid>,
     },
     Title {
         parent: Option<Uuid>,
-        at: DateTime<Utc>,
+        at: Timestamp,
         title: String,
     },
     Closed {
         parent: Option<Uuid>,
-        at: DateTime<Utc>,
+        at: Timestamp,
     },
 }
 
@@ -188,7 +191,7 @@ impl Linked for Front {
             | Front::Closed { parent, .. } => *parent,
         }
     }
-    fn at(&self) -> DateTime<Utc> {
+    fn at(&self) -> Timestamp {
         match self {
             Front::Message { at, .. }
             | Front::Summary { at, .. }
@@ -277,14 +280,14 @@ impl Location {
 /// did not absorb, rather than the whole raw history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SummaryLine {
-    pub summary_at: DateTime<Utc>,
+    pub summary_at: Timestamp,
     pub summary: String,
     /// Unused: always written as `None` and read nowhere. `covers_through`
     /// took over its stated job as the restore cursor. Kept (rather than
     /// removed) because removing a field is a format change; don't
     /// implement against this one.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub up_to_timestamp: Option<DateTime<Utc>>,
+    pub up_to_timestamp: Option<Timestamp>,
     /// The last message this summary absorbed. A restore replays the
     /// messages *after* it, prefixed with the summary as a stub — which
     /// reproduces the in-memory state at the moment of compaction rather
@@ -412,7 +415,7 @@ impl SessionStore {
         let dir_name = match self.naming {
             FileNaming::Plain => session_id.to_string(),
             FileNaming::Dated { boundary_hour } => {
-                let date = local_date_for_timestamp(Local::now(), boundary_hour);
+                let date = local_date_for_timestamp(ZonedDateTime::now(), boundary_hour);
                 format!("{date}-{session_id}")
             }
         };
@@ -433,7 +436,7 @@ impl SessionStore {
     }
 
     /// When a session was created, from its metadata alone.
-    pub fn created_at(&self, session_id: &str) -> Option<DateTime<Utc>> {
+    pub fn created_at(&self, session_id: &str) -> Option<Timestamp> {
         meta_at(&self.resolve_path(session_id)?).map(|m| m.created_at)
     }
 
@@ -557,7 +560,7 @@ impl SessionStore {
             room_id: key.0.clone(),
             thread_id: key.1.clone(),
             channel: channel.to_string(),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             public_id: None,
             namespace: Some(namespace.to_string()),
             device_id: None,
@@ -629,13 +632,13 @@ impl SessionStore {
     pub fn append(&self, session_id: &str, msg: &ChatMessage) -> anyhow::Result<()> {
         let scrubbed = self.scrub_for_storage(msg);
         let to_store = scrubbed.as_ref().unwrap_or(msg);
-        self.append_stored(session_id, Utc::now(), to_store)
+        self.append_stored(session_id, Timestamp::now(), to_store)
     }
 
     fn append_stored(
         &self,
         session_id: &str,
-        at: DateTime<Utc>,
+        at: Timestamp,
         msg: &ChatMessage,
     ) -> anyhow::Result<()> {
         let (parts, body) = session_log::split_body(msg.parts.clone(), text_of);
@@ -678,7 +681,7 @@ impl SessionStore {
     pub(crate) fn append_at_for_test(
         &self,
         session_id: &str,
-        at: DateTime<Utc>,
+        at: Timestamp,
         msg: &ChatMessage,
     ) -> anyhow::Result<()> {
         self.append_stored(session_id, at, msg)
@@ -707,7 +710,7 @@ impl SessionStore {
             (
                 Front::Summary {
                     parent,
-                    at: Utc::now(),
+                    at: Timestamp::now(),
                     covers_through,
                 },
                 summary.to_string(),
@@ -723,7 +726,7 @@ impl SessionStore {
             (
                 Front::Closed {
                     parent,
-                    at: Utc::now(),
+                    at: Timestamp::now(),
                 },
                 String::new(),
             )
@@ -885,7 +888,7 @@ impl SessionStore {
             room_id: key.0.clone(),
             thread_id: key.1.clone(),
             channel: channel.to_string(),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             public_id: public_id.clone(),
             namespace: Some(namespace.to_string()),
             device_id: None,
@@ -915,10 +918,10 @@ impl SessionStore {
         namespace: &str,
         boundary_hour: u8,
     ) -> anyhow::Result<String> {
-        let today = local_date_for_timestamp(Local::now(), boundary_hour);
+        let today = local_date_for_timestamp(ZonedDateTime::now(), boundary_hour);
         let (today_start, today_end) = day_window(today, boundary_hour);
 
-        let mut best: Option<(DateTime<Utc>, String)> = None;
+        let mut best: Option<(Timestamp, String)> = None;
         for loc in collect_sessions(&self.base_dir, self.kind) {
             let Some(loaded) = load(&loc) else {
                 continue;
@@ -956,7 +959,7 @@ impl SessionStore {
             room_id: String::new(),
             thread_id: None,
             channel: "device-default".to_string(),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             public_id: None,
             namespace: Some(namespace.to_string()),
             device_id: Some(device_id.to_string()),
@@ -973,7 +976,7 @@ impl SessionStore {
             (
                 Front::Title {
                     parent,
-                    at: Utc::now(),
+                    at: Timestamp::now(),
                     title: title.to_string(),
                 },
                 String::new(),
@@ -1001,7 +1004,7 @@ impl SessionStore {
     /// a permanent record that must not lose what a second writer said.
     pub fn sessions_for_day(
         &self,
-        date: NaiveDate,
+        date: Date,
         boundary_hour: u8,
     ) -> Vec<(SessionMeta, Vec<StoredMessage>)> {
         let (day_start, day_end) = day_window(date, boundary_hour);
@@ -1014,8 +1017,8 @@ impl SessionStore {
             if let Ok(meta_fs) = loc.path().metadata()
                 && let Ok(mtime) = meta_fs.modified()
             {
-                let mtime_utc: DateTime<Utc> = mtime.into();
-                if mtime_utc < day_start - Duration::days(1) {
+                let mtime_utc = Timestamp::try_from(mtime).unwrap_or(Timestamp::UNIX_EPOCH);
+                if mtime_utc < day_start - jiff::SignedDuration::from_hours(24) {
                     continue;
                 }
             }
@@ -1044,7 +1047,7 @@ impl SessionStore {
     /// keeps only rooms mapped to the namespace being generated.
     pub fn sessions_for_day_filtered<F>(
         &self,
-        date: NaiveDate,
+        date: Date,
         boundary_hour: u8,
         predicate: F,
     ) -> Vec<(SessionMeta, Vec<StoredMessage>)>
@@ -1060,7 +1063,7 @@ impl SessionStore {
     /// Like `all_session_dates`, but only counts sessions whose `meta`
     /// satisfies `predicate`. Used so per-namespace daily-log catch-up
     /// only enumerates dates that have at least one in-namespace session.
-    pub fn all_session_dates_filtered<F>(&self, boundary_hour: u8, predicate: F) -> Vec<NaiveDate>
+    pub fn all_session_dates_filtered<F>(&self, boundary_hour: u8, predicate: F) -> Vec<Date>
     where
         F: Fn(&SessionMeta) -> bool,
     {
@@ -1072,13 +1075,13 @@ impl SessionStore {
                     continue;
                 }
                 for msg in loaded.all_messages() {
-                    let local_ts = msg.timestamp.with_timezone(&Local);
+                    let local_ts = msg.timestamp.to_zoned_datetime(TimeZone::system());
                     dates.insert(local_date_for_timestamp(local_ts, boundary_hour));
                 }
             }
         }
 
-        let mut sorted: Vec<NaiveDate> = dates.into_iter().collect();
+        let mut sorted: Vec<Date> = dates.into_iter().collect();
         sorted.sort();
         sorted
     }
@@ -1086,7 +1089,7 @@ impl SessionStore {
     /// Return all local dates for which at least one session message exists.
     /// Used by daily_log to find dates that need a log generated.
     #[allow(dead_code)]
-    pub fn all_session_dates(&self, boundary_hour: u8) -> Vec<NaiveDate> {
+    pub fn all_session_dates(&self, boundary_hour: u8) -> Vec<Date> {
         self.all_session_dates_filtered(boundary_hour, |_| true)
     }
 
@@ -1308,35 +1311,28 @@ pub(crate) fn collect_sessions(base_dir: &Path, kind: &str) -> Vec<Location> {
 /// with a given `boundary_hour`.
 ///
 /// Window: `[date @ boundary_hour:00:00 local, (date+1day) @ boundary_hour:00:00 local)`
-pub(crate) fn day_window(date: NaiveDate, boundary_hour: u8) -> (DateTime<Utc>, DateTime<Utc>) {
-    let start_local = date
-        .and_hms_opt(boundary_hour as u32, 0, 0)
-        .expect("valid time");
-    let end_local = (date + Duration::days(1))
-        .and_hms_opt(boundary_hour as u32, 0, 0)
-        .expect("valid time");
+pub(crate) fn day_window(date: Date, boundary_hour: u8) -> (Timestamp, Timestamp) {
+    let start_local = date.at(boundary_hour as i8, 0, 0, 0);
+    let end_local = date
+        .tomorrow()
+        .expect("a day after")
+        .at(boundary_hour as i8, 0, 0, 0);
 
-    let start_utc = Local
-        .from_local_datetime(&start_local)
-        .single()
-        .unwrap_or_else(|| Local.from_local_datetime(&start_local).earliest().unwrap())
-        .with_timezone(&Utc);
-
-    let end_utc = Local
-        .from_local_datetime(&end_local)
-        .single()
-        .unwrap_or_else(|| Local.from_local_datetime(&end_local).earliest().unwrap())
-        .with_timezone(&Utc);
+    // A boundary a DST change skips or repeats resolves as jiff's `compatible`
+    // does: the earlier of a repeated hour, the later side of a skipped one.
+    let tz = TimeZone::system();
+    let start_utc = tz.to_timestamp(start_local).expect("a local time");
+    let end_utc = tz.to_timestamp(end_local).expect("a local time");
 
     (start_utc, end_utc)
 }
 
 /// Given a local timestamp, return the local date it belongs to for a given
 /// `boundary_hour`. Timestamps before `boundary_hour` belong to the previous day.
-pub fn local_date_for_timestamp(local_ts: DateTime<Local>, boundary_hour: u8) -> NaiveDate {
-    let date = local_ts.date_naive();
-    if local_ts.hour() < boundary_hour as u32 {
-        date - Duration::days(1)
+pub fn local_date_for_timestamp(local_ts: ZonedDateTime, boundary_hour: u8) -> Date {
+    let date = local_ts.date();
+    if local_ts.hour() < boundary_hour as i8 {
+        date.yesterday().unwrap_or(date)
     } else {
         date
     }
@@ -1450,7 +1446,7 @@ fn meta_at(loc: &Location) -> Option<SessionMeta> {
 /// Returns `None` if the file is unreadable or has a malformed first line.
 /// TODO(#284).
 #[allow(clippy::type_complexity)]
-fn read_jsonl(path: &Path) -> Option<(SessionMeta, Vec<(Event, Option<DateTime<Utc>>)>)> {
+fn read_jsonl(path: &Path) -> Option<(SessionMeta, Vec<(Event, Option<Timestamp>)>)> {
     let file = fs::File::open(path).ok()?;
     let mut lines = BufReader::new(file).lines();
 
@@ -1474,7 +1470,7 @@ fn read_jsonl(path: &Path) -> Option<(SessionMeta, Vec<(Event, Option<DateTime<U
         };
 
         if let Some(at) = value.get("closed_at") {
-            let at = serde_json::from_value::<DateTime<Utc>>(at.clone()).ok();
+            let at = serde_json::from_value::<Timestamp>(at.clone()).ok();
             events.push((Event::Closed, at));
         } else if let Some(title) = value.get("session_title").and_then(|v| v.as_str()) {
             events.push((Event::Title(title.to_string()), None));
@@ -1608,7 +1604,7 @@ pub struct SessionRow {
     /// Number of stored messages (both roles, tool traffic included).
     pub message_count: usize,
     /// Timestamp of the last stored message, `None` for an empty session.
-    pub last_at: Option<DateTime<Utc>>,
+    pub last_at: Option<Timestamp>,
     pub is_closed: bool,
 }
 
@@ -1775,7 +1771,7 @@ mod tests {
     fn stored_message_omits_none_fields_on_serialize() {
         let msg = StoredMessage {
             id: None,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             role: Role::Assistant,
             parts: vec![ContentPart::Text("hi".to_string())],
             input_kind: None,
@@ -1796,7 +1792,7 @@ mod tests {
     fn stored_message_text_input_kind_round_trip() {
         let original = StoredMessage {
             id: None,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             role: Role::User,
             parts: vec![ContentPart::Text("hi".to_string())],
             input_kind: Some(UserInputKind::Text),
@@ -1814,7 +1810,7 @@ mod tests {
     fn stored_message_voice_input_kind_round_trip() {
         let original = StoredMessage {
             id: None,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             role: Role::User,
             parts: vec![ContentPart::Text("hello there".to_string())],
             input_kind: Some(UserInputKind::Voice),
@@ -1943,7 +1939,8 @@ mod tests {
 
         // Hand-craft a meta file whose `created_at` falls in yesterday's
         // local-day window so the most-recent scan rejects it.
-        let yesterday_date = local_date_for_timestamp(Local::now(), boundary) - Duration::days(1);
+        let yesterday_date = local_date_for_timestamp(ZonedDateTime::now(), boundary)
+            - jiff::SignedDuration::from_hours(24);
         let (yesterday_start, _) = day_window(yesterday_date, boundary);
         let stale_id = Uuid::now_v7().to_string();
         let stale_dir = tmp.path().join("default").join("device-default");
@@ -1954,7 +1951,7 @@ mod tests {
             room_id: String::new(),
             thread_id: None,
             channel: "device-default".to_string(),
-            created_at: yesterday_start + Duration::hours(2),
+            created_at: yesterday_start + jiff::SignedDuration::from_hours(2),
             public_id: None,
             namespace: Some("default".to_string()),
             device_id: Some("device-a".to_string()),
@@ -2206,7 +2203,7 @@ mod tests {
             .append(&sid, &tool_result_msg("c1", "fn main() {}"))
             .unwrap();
 
-        let today = local_date_for_timestamp(Local::now(), 4);
+        let today = local_date_for_timestamp(ZonedDateTime::now(), 4);
         let days = store.sessions_for_day(today, 4);
         let parts: Vec<&ContentPart> = days
             .iter()
@@ -2565,7 +2562,7 @@ mod tests {
         let sid = legacy_session(&store, &[legacy_message(0, "hi", None)]);
         store.load_session(&sid).unwrap();
         store.session_rows();
-        let today = local_date_for_timestamp(Local::now(), 4);
+        let today = local_date_for_timestamp(ZonedDateTime::now(), 4);
         store.sessions_for_day(today, 4);
         assert!(matches!(store.resolve_path(&sid), Some(Location::Jsonl(_))));
         assert!(
@@ -2596,7 +2593,7 @@ mod tests {
         let model = texts(&store.load_session(&sid).unwrap());
         assert_eq!(model.len(), 2, "one branch: {model:?}");
 
-        let today = local_date_for_timestamp(Local::now(), 4);
+        let today = local_date_for_timestamp(ZonedDateTime::now(), 4);
         let day: Vec<String> = store
             .sessions_for_day(today, 4)
             .into_iter()
@@ -2754,7 +2751,7 @@ mod tests {
             .absolute_path_for(&sid)
             .expect("the file must resolve");
         let name = path.file_name().unwrap().to_str().unwrap();
-        let expected_date = local_date_for_timestamp(Local::now(), 4).to_string();
+        let expected_date = local_date_for_timestamp(ZonedDateTime::now(), 4).to_string();
         assert_eq!(name, format!("{expected_date}-{sid}"));
         assert!(path.starts_with(tmp.path().join("default").join("autonomous")));
 

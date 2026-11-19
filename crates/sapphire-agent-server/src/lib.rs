@@ -950,7 +950,7 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
                 match tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
                     let dir = attachment_store::AttachmentStore::default_dir(&attachment_root)?;
                     let store = attachment_store::AttachmentStore::open(dir)?;
-                    store.sweep(chrono::Utc::now().timestamp_millis().max(0) as u64)?;
+                    store.sweep(jiff::Timestamp::now().as_millisecond().max(0) as u64)?;
                     Ok(store)
                 })
                 .await
@@ -1305,7 +1305,7 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
                 // NSFW namespace can route to its local model up front
                 // instead of bouncing through Anthropic refusal-fallback.
                 let today_local = session::local_date_for_timestamp(
-                    chrono::Local::now(),
+                    jiff::ZonedDateTime::now(),
                     config.day_boundary_hour,
                 );
                 for ns in config.all_memory_namespaces() {
@@ -1448,7 +1448,7 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
                             _ = interval.tick() => {
                                 let store = store.clone();
                                 match tokio::task::spawn_blocking(move || {
-                                    store.sweep(chrono::Utc::now().timestamp_millis().max(0) as u64)
+                                    store.sweep(jiff::Timestamp::now().as_millisecond().max(0) as u64)
                                 }).await {
                                     Ok(Ok(())) => {}
                                     Ok(Err(e)) => tracing::warn!("Attachment sweep failed: {e:#}"),
@@ -2158,7 +2158,7 @@ mod tests {
             room_id: String::new(),
             thread_id: None,
             channel: "acp".to_string(),
-            created_at: chrono::Utc::now(),
+            created_at: jiff::Timestamp::now(),
             public_id: None,
             namespace: Some(namespace.to_string()),
             device_id: None,

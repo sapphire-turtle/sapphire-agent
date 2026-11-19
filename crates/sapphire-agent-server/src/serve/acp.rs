@@ -1609,7 +1609,8 @@ pub(crate) async fn serve_connection<O, I>(
                             let updated_at = store
                                 .absolute_path_for(&summary.header.session_id)
                                 .and_then(|path| std::fs::metadata(&path).and_then(|m| m.modified()).ok())
-                                .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339());
+                                .and_then(|t| jiff::Timestamp::try_from(t).ok())
+                                .map(|t| t.to_string());
                             let mut info = SessionInfo::new(
                                 SessionId::new(summary.header.session_id.clone()),
                                 PathBuf::from(&summary.header.cwd),
