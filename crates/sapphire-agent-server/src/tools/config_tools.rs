@@ -1013,18 +1013,22 @@ mod tests {
     }
 
     /// The tool as the deployment wires it: `[tools.admin].room_profiles =
-    /// ["ops"]`, `[room_profile.ops]` claiming `!ops:x`, the three
+    /// ["ops"]`, `[telegram.rooms."!ops:x"]` naming `ops`, the three
     /// directories present, no subagent / tool set back-reference (that is
     /// the agents-directory wiring, tested where it exists).
     fn fixture(dir: ConfigDir) -> Fixture {
         let (d, root, ws) = test_workspace();
         let mut config = Config::for_test();
         config.tools.admin.room_profiles = vec!["ops".to_string()];
+        config.telegram = Some(crate::config::TelegramConfig {
+            bot_token: "t".into(),
+            allowed_users: vec![],
+            rooms: [("!ops:x".into(), ops_room_block())].into_iter().collect(),
+        });
         config.room_profiles.insert(
             "ops".to_string(),
             crate::config::RoomProfileConfig {
                 profile: "dev".to_string(),
-                rooms: vec!["!ops:x".to_string()],
                 ..Default::default()
             },
         );
@@ -1034,6 +1038,18 @@ mod tests {
             root,
             tool,
         }
+    }
+
+    fn room_block(profile: &str) -> crate::config::RoomBlock {
+        crate::config::RoomBlock {
+            name: None,
+            description: None,
+            profile: Some(profile.to_string()),
+        }
+    }
+
+    fn ops_room_block() -> crate::config::RoomBlock {
+        room_block("ops")
     }
 
     /// Every call goes through the same `TimerOrigin::Chat` scope the
@@ -1292,12 +1308,21 @@ mod tests {
         let (d, root, ws) = test_workspace();
         let mut config = Config::for_test();
         config.tools.admin.room_profiles = vec!["ops".to_string()];
-        for (name, room) in [("ops", "!ops:x"), ("guest", "!lounge:y")] {
+        config.telegram = Some(crate::config::TelegramConfig {
+            bot_token: "t".into(),
+            allowed_users: vec![],
+            rooms: [
+                ("!ops:x".into(), ops_room_block()),
+                ("!lounge:y".into(), room_block("guest")),
+            ]
+            .into_iter()
+            .collect(),
+        });
+        for name in ["ops", "guest"] {
             config.room_profiles.insert(
                 name.to_string(),
                 crate::config::RoomProfileConfig {
                     profile: "dev".to_string(),
-                    rooms: vec![room.to_string()],
                     ..Default::default()
                 },
             );
@@ -1347,7 +1372,6 @@ mod tests {
                 "ops".to_string(),
                 crate::config::RoomProfileConfig {
                     profile: "dev".to_string(),
-                    rooms: vec!["!ops:x".to_string()],
                     memory_namespace: Some("ops_ns".to_string()),
                     ..Default::default()
                 },
@@ -1410,11 +1434,15 @@ mod tests {
                 .expect("uniquely owned immediately after construction")
                 .config;
             config.tools.admin.room_profiles = vec!["ops".to_string()];
+            config.telegram = Some(crate::config::TelegramConfig {
+                bot_token: "t".into(),
+                allowed_users: vec![],
+                rooms: [("!ops:x".into(), ops_room_block())].into_iter().collect(),
+            });
             config.room_profiles.insert(
                 "ops".to_string(),
                 crate::config::RoomProfileConfig {
                     profile: "dev".to_string(),
-                    rooms: vec!["!ops:x".to_string()],
                     ..Default::default()
                 },
             );
@@ -1661,11 +1689,15 @@ mod tests {
         ));
         let mut config = Config::for_test();
         config.tools.admin.room_profiles = vec!["ops".to_string()];
+        config.telegram = Some(crate::config::TelegramConfig {
+            bot_token: "t".into(),
+            allowed_users: vec![],
+            rooms: [("!ops:x".into(), ops_room_block())].into_iter().collect(),
+        });
         config.room_profiles.insert(
             "ops".to_string(),
             crate::config::RoomProfileConfig {
                 profile: "dev".to_string(),
-                rooms: vec!["!ops:x".to_string()],
                 ..Default::default()
             },
         );

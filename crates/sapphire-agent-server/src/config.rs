@@ -1,20 +1,24 @@
 use crate::config_layer::{self, Layer};
 use anyhow::{Context, Result};
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
-    /// Matrix channel configuration. Both `matrix` and `discord` may be
-    /// configured at once — when set, both run concurrently in the
-    /// same `serve` process. Both may also be omitted, in which case the
-    /// agent serves only the HTTP API.
+    /// Matrix channel configuration. Any of `matrix`, `discord` and
+    /// `telegram` may be configured at once — when set, all run concurrently
+    /// in the same `serve` process. All may also be omitted, in which case
+    /// the agent serves only the HTTP API.
     #[serde(default)]
     pub matrix: Option<MatrixConfig>,
-    /// Discord channel configuration. May coexist with `matrix`.
+    /// Discord channel configuration. May coexist with `matrix` and `telegram`.
     #[serde(default)]
     pub discord: Option<DiscordConfig>,
+    /// Telegram channel configuration. May coexist with `matrix` and `discord`.
+    #[serde(default)]
+    pub telegram: Option<TelegramConfig>,
     /// The built-in Anthropic provider. Optional: it is registered only
     /// when an API key resolves (here or in `ANTHROPIC_API_KEY`), and a
     /// deployment that runs entirely on `[providers.<n>]` can leave the
@@ -190,13 +194,12 @@ pub enum SessionPolicy {
     None,
 }
 
-/// Bundle of (chat profile, memory namespace, session policy)
-/// applied to a set of rooms.
+/// Bundle of (chat profile, memory namespace, session policy) applied to
+/// rooms that name it in their channel's per-room block.
 ///
-/// Each `room_id` may appear in at most one room profile. Rooms that
-/// don't appear in any room profile fall back to `[room_profile.default]`
-/// if defined, otherwise the built-in defaults (Anthropic provider,
-/// `"default"` namespace, global `session_policy`).
+/// Rooms without a block or without a block `profile` fall back to
+/// `[room_profile.default]` if defined, otherwise the built-in defaults
+/// (Anthropic provider, `"default"` namespace, global `session_policy`).
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct RoomProfileConfig {
     /// Name of the LLM profile (in `[profiles.<n>]`) that drives chat
@@ -210,9 +213,8 @@ pub struct RoomProfileConfig {
     /// Falls through to `Config.session_policy` when absent.
     #[serde(default)]
     pub session_policy: Option<SessionPolicy>,
-    /// Channel-side room ids this profile applies to. Matrix room ids,
-    /// Discord channel ids, etc. Empty `[]` means the room profile is
-    /// usable from API sessions only — no channel rooms map to it.
+    /// Retained only so `Config::migration_errors` can name a config that
+    /// still sets it. Replaced by per-room blocks' `profile` keys.
     #[serde(default)]
     pub rooms: Vec<String>,
     /// Voice pipeline preset (in `[voice_pipeline.<n>]`) used when the
@@ -1108,17 +1110,46 @@ pub enum McpTransportConfig {
     },
 }
 
+/// A per-room settings block, keyed by room id under a channel section:
+/// `[telegram.rooms."<room_id>"]`. The channel's rooms map is at once the
+/// listen list (empty = all the bot can see), the routing seed, the
+/// display metadata surfaced via `RoomInfo`, and — via `profile` — the
+/// room profile this room runs under. Rooms now name the bundle they belong
+/// to, rather than the bundle listing its rooms.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct RoomBlock {
+    /// Display name for `RoomInfo`. Absent with no `description` means the
+    /// raw room id is shown, as-is.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Free-form room description — the role Matrix's room topic and
+    /// Discord's channel topic play.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// The `[room_profile.<n>]` bundle this room runs under. Absent means
+    /// the existing fallthrough (`[room_profile.default]`, then built-in
+    /// defaults) applies, exactly as today.
+    #[serde(default)]
+    pub profile: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MatrixConfig {
     pub homeserver: String,
     pub access_token: String,
     pub user_id: String,
     pub device_id: String,
-    /// Rooms the bot listens to. Accepts either a TOML array
-    /// (`room_ids = ["!a:srv", "!b:srv"]`) or — for backward compatibility —
-    /// a single string key named `room_id`.
-    #[serde(default, alias = "room_id", deserialize_with = "deserialize_room_ids")]
+    /// Rooms the bot listens to, keyed by Matrix room id. Empty = all rooms
+    /// the bot can see. Each block may bind a room profile and display metadata.
+    #[serde(default)]
+    pub rooms: IndexMap<String, RoomBlock>,
+    /// Retained only so `Config::migration_errors` can name a config that
+    /// still sets it — replaced by `rooms`.
+    #[serde(default)]
     pub room_ids: Vec<String>,
+    /// The legacy singular spelling, likewise retained only for migration errors.
+    #[serde(default)]
+    pub room_id: Option<String>,
     #[serde(default)]
     pub allowed_users: Vec<String>,
     /// E2EE recovery key (optional)
@@ -1128,29 +1159,11 @@ pub struct MatrixConfig {
     pub state_dir: Option<String>,
 }
 
-/// Accept either `"!a:srv"` (legacy single string) or `["!a:srv", "!b:srv"]`
-/// for the `room_ids` / legacy `room_id` field.
-fn deserialize_room_ids<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum OneOrMany {
-        One(String),
-        Many(Vec<String>),
-    }
-    match OneOrMany::deserialize(deserializer)? {
-        OneOrMany::One(s) => Ok(vec![s]),
-        OneOrMany::Many(v) => Ok(v),
-    }
-}
-
 impl MatrixConfig {
     /// Primary room — first configured room. Used as the default target for
     /// heartbeat tasks that don't name a specific room.
     pub fn primary_room_id(&self) -> Option<&str> {
-        self.room_ids.first().map(|s| s.as_str())
+        self.rooms.keys().next().map(String::as_str)
     }
 
     pub fn resolved_state_dir(&self) -> PathBuf {
@@ -1167,10 +1180,27 @@ impl MatrixConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DiscordConfig {
     pub bot_token: String,
-    /// Text channel IDs the bot listens to. Empty = all channels the bot can see.
+    /// Text channels the bot listens to, keyed by channel id. Empty = all
+    /// channels the bot can see.
+    #[serde(default)]
+    pub rooms: IndexMap<String, RoomBlock>,
+    /// Retained only so `Config::migration_errors` can name a config that
+    /// still sets it — replaced by `rooms`.
     #[serde(default)]
     pub channel_ids: Vec<String>,
     /// Discord user IDs allowed to interact. Empty = all users.
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TelegramConfig {
+    pub bot_token: String,
+    /// Rooms the bot listens to, keyed by composite room id (`<chat_id>` or
+    /// `<chat_id>:<message_thread_id>`). Empty = all chats the bot can see.
+    #[serde(default)]
+    pub rooms: IndexMap<String, RoomBlock>,
+    /// Messages from users not in this list are silently ignored. Empty = all.
     #[serde(default)]
     pub allowed_users: Vec<String>,
 }
@@ -1453,7 +1483,9 @@ pub struct AutonomousConfig {
     #[serde(default)]
     pub origin: AutonomousOrigin,
     /// Chat room where autonomous sessions post questions for a human to
-    /// answer by replying (`ask_human`). `None`: the tool is not offered.
+    /// answer by replying (`ask_human`). The room must have a block under
+    /// its channel's `rooms` map (or be visible while Discord's map is empty).
+    /// `None`: the tool is not offered.
     #[serde(default)]
     pub consult_room: Option<String>,
     /// How long a question waits for an answer before the session decides
@@ -1529,16 +1561,28 @@ api_key = "test"
         }
     }
 
+    /// The per-room block for `room_id`, wherever its channel is configured
+    /// (matrix > discord > telegram). A room appears in at most one channel's
+    /// map; this order only matters for the pathological config that breaks that.
+    pub fn room_block_for(&self, room_id: &str) -> Option<&RoomBlock> {
+        self.matrix
+            .as_ref()
+            .and_then(|m| m.rooms.get(room_id))
+            .or_else(|| self.discord.as_ref().and_then(|d| d.rooms.get(room_id)))
+            .or_else(|| self.telegram.as_ref().and_then(|t| t.rooms.get(room_id)))
+    }
+
     /// Find the room profile a `room_id` belongs to.
     ///
-    /// Order: explicit listing in `[room_profile.<n>].rooms` >
-    /// conventional `[room_profile.default]` (catches all unmatched
-    /// rooms) > `None`.
+    /// Order: the room block's `profile` key > conventional
+    /// `[room_profile.default]` (catches all unmatched rooms) > `None`.
     pub fn room_profile_for(&self, room_id: &str) -> Option<(&str, &RoomProfileConfig)> {
-        for (name, rp) in &self.room_profiles {
-            if rp.rooms.iter().any(|r| r == room_id) {
-                return Some((name.as_str(), rp));
-            }
+        if let Some(profile_name) = self
+            .room_block_for(room_id)
+            .and_then(|b| b.profile.as_deref())
+            && let Some((profile, rp)) = self.room_profiles.get_key_value(profile_name)
+        {
+            return Some((profile.as_str(), rp));
         }
         self.room_profiles
             .get_key_value(DEFAULT_PROFILE_NAME)
@@ -1561,7 +1605,7 @@ api_key = "test"
 
     /// Resolve the LLM profile name for a given `room_id`.
     ///
-    /// Order: room profile that contains this room > `[profiles.default]`
+    /// Order: room profile named by this room's block > `[profiles.default]`
     /// if defined > `None` (caller falls back to the built-in Anthropic
     /// provider).
     pub fn profile_for(&self, room_id: &str) -> Option<&str> {
@@ -1606,8 +1650,8 @@ api_key = "test"
                 ));
             }
         }
-        // Room profile references and uniqueness of room_ids across profiles.
-        let mut seen_rooms: HashMap<String, String> = HashMap::new();
+        // Room profile references. Channel-side room bindings now live in
+        // each channel's per-room blocks, checked below.
         for (rp_name, rp) in &self.room_profiles {
             if !self.profiles.contains_key(&rp.profile) {
                 errors.push(format!(
@@ -1622,13 +1666,20 @@ api_key = "test"
                     "room_profile '{rp_name}' references unknown memory_namespace '{ns}'"
                 ));
             }
-            for room in &rp.rooms {
-                if let Some(prev) = seen_rooms.get(room) {
+        }
+        let channels = [
+            ("matrix", self.matrix.as_ref().map(|c| &c.rooms)),
+            ("discord", self.discord.as_ref().map(|c| &c.rooms)),
+            ("telegram", self.telegram.as_ref().map(|c| &c.rooms)),
+        ];
+        for (channel, rooms) in channels {
+            for (room_id, block) in rooms.into_iter().flatten() {
+                if let Some(profile) = block.profile.as_deref()
+                    && !self.room_profiles.contains_key(profile)
+                {
                     errors.push(format!(
-                        "room '{room}' appears in multiple room_profiles: '{prev}' and '{rp_name}'"
+                        "[{channel}.rooms.\"{room_id}\"].profile references unknown room_profile '{profile}'"
                     ));
-                } else {
-                    seen_rooms.insert(room.clone(), rp_name.clone());
                 }
             }
         }
@@ -1762,8 +1813,8 @@ api_key = "test"
                 "[tools.admin].rooms was replaced by `[tools.admin].room_profiles`, which names \
                  room profiles instead of room ids. Delete the `rooms` line and write the room \
                  profile names you mean, e.g. `room_profiles = [\"ops\"]`. For each room, use \
-                 the name of the profile whose `[room_profile.<name>].rooms` array lists that \
-                 room. Leaving `rooms` in place would drop the grant without saying so, so \
+                 the name of the profile that room's channel-side room block names in its \
+                 `profile` key. Leaving `rooms` in place would drop the grant without saying so, so \
                  startup refuses until it is gone."
                     .to_string(),
             );
@@ -1810,6 +1861,45 @@ api_key = "test"
             ));
         }
 
+        if let Some(matrix) = &self.matrix {
+            if !matrix.room_ids.is_empty() || matrix.room_id.is_some() {
+                errors.push(
+                    "matrix.room_ids (and the legacy matrix.room_id) is replaced by \
+                 [matrix.rooms.\"<room_id>\"] blocks. Delete the old key and create one \
+                 block per room; move each room's binding from \
+                 [room_profile.<name>].rooms to that block's `profile` key. \
+                 Startup refuses while the old list remains."
+                        .to_string(),
+                );
+            }
+        }
+        if let Some(discord) = &self.discord
+            && !discord.channel_ids.is_empty()
+        {
+            errors.push(
+                "discord.channel_ids is replaced by [discord.rooms.\"<room_id>\"] blocks. \
+                 Delete the old key and create one block per channel; move each \
+                 channel's binding from [room_profile.<name>].rooms to that block's \
+                 `profile` key. Startup refuses while the old list remains."
+                    .to_string(),
+            );
+        }
+        let mut rp_names: Vec<&String> = self
+            .room_profiles
+            .iter()
+            .filter(|(_, rp)| !rp.rooms.is_empty())
+            .map(|(name, _)| name)
+            .collect();
+        rp_names.sort();
+        for name in rp_names {
+            errors.push(format!(
+                "room_profile.{name}.'rooms' is replaced by per-room blocks' profile \
+                 keys. Delete the `rooms` array and add `profile = \"{name}\"` to each \
+                 room's [<channel>.rooms.\"<room_id>\"] block. Startup refuses while \
+                 the old list remains."
+            ));
+        }
+
         errors
     }
 
@@ -1835,8 +1925,8 @@ api_key = "test"
     /// The room profile a channel `room_id` runs under, by name.
     ///
     /// The same resolution [`Self::profile_for`] and
-    /// [`Self::namespace_for_room`] use — an explicit listing in
-    /// `[room_profile.<n>].rooms` wins, then `[room_profile.default]` catches
+    /// [`Self::namespace_for_room`] use — the room block's `profile` key wins,
+    /// then `[room_profile.default]` catches
     /// every unmatched room, then the implicit `"default"` applies — so a
     /// room's admin grant cannot disagree with the provider it runs on.
     pub fn room_profile_name_for_room(&self, room_id: &str) -> &str {
@@ -2268,6 +2358,96 @@ mod tests {
         Config::parse_for_test(s)
     }
 
+    #[test]
+    fn a_room_block_profile_wins_and_names_the_room() {
+        let cfg = parse(
+            "[anthropic]\napi_key = \"test\"\n\n[profiles.dev]\nprovider = \"stub\"\n\n\
+             [room_profile.dev]\nprofile = \"dev\"\nmemory_namespace = \"ns\"\n\n\
+             [telegram]\nbot_token = \"t\"\n\n\
+             [telegram.rooms.\"-1002000333444555:42\"]\nname = \"dev\"\nprofile = \"dev\"\n",
+        );
+        assert_eq!(
+            cfg.room_profile_name_for_room("-1002000333444555:42"),
+            "dev"
+        );
+        assert_eq!(cfg.namespace_for_room("-1002000333444555:42"), "ns");
+        let block = cfg.room_block_for("-1002000333444555:42").unwrap();
+        assert_eq!(block.name.as_deref(), Some("dev"));
+        assert_eq!(block.description.as_deref(), None);
+    }
+
+    #[test]
+    fn a_block_without_profile_falls_through_exactly_as_today() {
+        // A block with no `profile` key leaves the room matched by nothing:
+        // [room_profile.default] catches it, then the implicit "default".
+        let cfg = parse(
+            "[anthropic]\napi_key = \"test\"\n\n[telegram]\nbot_token = \"t\"\n\
+             [telegram.rooms.\"-1001\"]\nname = \"daily\"\n",
+        );
+        assert_eq!(cfg.room_profile_name_for_room("-1001"), "default");
+    }
+
+    #[test]
+    fn the_first_configured_room_is_the_primary() {
+        // IndexMap keeps document order, so the heartbeat default target is
+        // deterministic across restarts.
+        let cfg = parse(
+            "[anthropic]\napi_key = \"test\"\n\n[matrix]\n\
+             homeserver = \"h\"\naccess_token = \"t\"\nuser_id = \"u\"\ndevice_id = \"d\"\n\
+             [matrix.rooms.\"!a:x\"]\n[matrix.rooms.\"!b:x\"]\n",
+        );
+        assert_eq!(cfg.matrix.as_ref().unwrap().primary_room_id(), Some("!a:x"));
+    }
+
+    #[test]
+    fn leftover_room_lists_are_migration_errors() {
+        let cfg = parse(
+            "[anthropic]\napi_key = \"t\"\n[matrix]\n\
+             homeserver = \"h\"\naccess_token = \"t\"\nuser_id = \"u\"\ndevice_id = \"d\"\n\
+             room_ids = [\"!a:x\"]\n",
+        );
+        let errors = cfg.migration_errors();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("matrix.room_ids") && e.contains("[matrix.rooms")),
+            "{errors:?}"
+        );
+        let cfg = parse(
+            "[anthropic]\napi_key = \"t\"\n[discord]\nbot_token = \"t\"\nchannel_ids = [\"7\"]\n",
+        );
+        let errors = cfg.migration_errors();
+        assert!(
+            errors.iter().any(|e| e.contains("discord.channel_ids")),
+            "{errors:?}"
+        );
+        let cfg = parse(
+            "[anthropic]\napi_key = \"t\"\n[room_profile.ops]\nprofile = \"x\"\nrooms = [\"!a:x\"]\n",
+        );
+        let errors = cfg.migration_errors();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("room_profile") && e.contains("rooms")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_block_naming_an_unknown_room_profile_is_a_validation_error() {
+        let cfg = parse(
+            "[anthropic]\napi_key = \"t\"\n[telegram]\nbot_token = \"t\"\n\
+             [telegram.rooms.\"-1001\"]\nprofile = \"ghost\"\n",
+        );
+        let errors = cfg.validate_profiles();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("-1001") && e.contains("ghost")),
+            "{errors:?}"
+        );
+    }
+
     /// The default is off: no room profile is named, so none of the four
     /// tools is ever registered.
     #[test]
@@ -2297,13 +2477,15 @@ mod tests {
     }
 
     /// A channel room resolves to the profile the rest of the config uses:
-    /// an explicit listing wins, `[room_profile.default]` catches the rest,
+    /// an explicit room block wins, `[room_profile.default]` catches the rest,
     /// and with neither defined the implicit `"default"` applies.
     #[test]
     fn a_room_resolves_to_the_same_profile_everywhere() {
         let cfg = parse(
             "[anthropic]\napi_key = \"test\"\n\n[profiles.dev]\nprovider = \"stub\"\n\n\
-             [room_profile.ops]\nprofile = \"dev\"\nrooms = [\"!ops:x\"]\n\n\
+             [matrix]\nhomeserver = \"h\"\naccess_token = \"t\"\nuser_id = \"u\"\ndevice_id = \"d\"\n\
+             [matrix.rooms.\"!ops:x\"]\nprofile = \"ops\"\n\n\
+             [room_profile.ops]\nprofile = \"dev\"\n\n\
              [room_profile.default]\nprofile = \"dev\"\n",
         );
         assert_eq!(cfg.room_profile_name_for_room("!ops:x"), "ops");
@@ -2533,7 +2715,7 @@ provider = "anthropic"
     }
 
     #[test]
-    fn room_profile_assigns_profile_to_listed_rooms() {
+    fn room_profile_assigns_profile_to_a_room_block() {
         let cfg = parse(
             r#"
 [anthropic]
@@ -2550,9 +2732,17 @@ provider = "anthropic"
 [profiles.nsfw]
 provider = "local"
 
+[matrix]
+homeserver = "h"
+access_token = "t"
+user_id = "u"
+device_id = "d"
+
+[matrix.rooms."!nsfw:srv"]
+profile = "private_nsfw"
+
 [room_profile.private_nsfw]
 profile = "nsfw"
-rooms   = ["!nsfw:srv"]
 "#,
         );
         assert_eq!(cfg.profile_for("!nsfw:srv"), Some("nsfw"));
@@ -2576,13 +2766,20 @@ provider = "anthropic"
 [profiles.opus]
 provider = "anthropic"
 
+[matrix]
+homeserver = "h"
+access_token = "t"
+user_id = "u"
+device_id = "d"
+
+[matrix.rooms."!dev:srv"]
+profile = "dev"
+
 [room_profile.default]
 profile = "casual"
-rooms   = []
 
 [room_profile.dev]
 profile = "opus"
-rooms   = ["!dev:srv"]
 "#,
         );
         assert_eq!(cfg.profile_for("!dev:srv"), Some("opus"));
@@ -2591,7 +2788,7 @@ rooms   = ["!dev:srv"]
     }
 
     #[test]
-    fn validate_rejects_room_listed_in_two_profiles() {
+    fn migration_rejects_room_lists_in_room_profiles() {
         let cfg = parse(
             r#"
 [anthropic]
@@ -2612,10 +2809,19 @@ profile = "b"
 rooms   = ["!shared:srv"]
 "#,
         );
-        let errors = cfg.validate_profiles();
+        let errors = cfg.migration_errors();
+        assert_eq!(errors.len(), 2, "got: {errors:?}");
         assert!(
-            errors.iter().any(|e| e.contains("multiple room_profiles")),
-            "expected duplicate-room error, got: {errors:?}"
+            errors
+                .iter()
+                .any(|e| e.contains("room_profile.first") && e.contains("rooms")),
+            "expected first room-list migration error, got: {errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("room_profile.second") && e.contains("rooms")),
+            "expected second room-list migration error, got: {errors:?}"
         );
     }
 
@@ -2978,10 +3184,18 @@ include = ["default"]
 [profiles.nsfw]
 provider = "anthropic"
 
+[matrix]
+homeserver = "h"
+access_token = "t"
+user_id = "u"
+device_id = "d"
+
+[matrix.rooms."!nsfw:srv"]
+profile = "private_nsfw"
+
 [room_profile.private_nsfw]
 profile          = "nsfw"
 memory_namespace = "user_nsfw"
-rooms            = ["!nsfw:srv"]
 "#,
         );
         assert!(cfg.validate_profiles().is_empty());
@@ -3431,14 +3645,10 @@ reasoning_effort = "low"
         assert!(loaded.config.timer.retired_presets.is_some());
     }
 
-    /// A key serde accepts under another spelling must not be reported.
-    /// `room_id` is an alias for `room_ids`, and the cheap way to find
-    /// unknown keys — serialize the parsed `Config` back out and diff the
-    /// two documents — would call it unknown, because it round-trips under
-    /// its canonical name. Reading serde's own ignored-key callback is what
-    /// makes aliases, `flatten` and defaulted fields come out right.
+    /// The legacy singular Matrix key still deserializes far enough to be
+    /// diagnosed, but is no longer an alias that populates `room_ids`.
     #[test]
-    fn an_accepted_alias_is_not_reported_as_unknown() {
+    fn the_legacy_matrix_room_id_is_retained_for_a_migration_error() {
         let dir = tempfile::tempdir().unwrap();
         let host_path = dir.path().join("config.toml");
         std::fs::write(
@@ -3450,15 +3660,13 @@ reasoning_effort = "low"
         .unwrap();
 
         let loaded = Config::load_layered(&host_path).unwrap();
-        assert!(
-            loaded.unknown.is_empty(),
-            "the `room_id` alias was reported as unknown: {:?}",
-            loaded.unknown
-        );
-        assert_eq!(
-            loaded.config.matrix.as_ref().unwrap().room_ids,
-            vec!["!a:srv".to_string()]
-        );
+        assert!(loaded.unknown.is_empty(), "{:?}", loaded.unknown);
+        let matrix = loaded.config.matrix.as_ref().unwrap();
+        assert_eq!(matrix.room_id.as_deref(), Some("!a:srv"));
+        assert!(matrix.room_ids.is_empty());
+        let errors = loaded.config.migration_errors();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("matrix.room_id"), "{errors:?}");
     }
 
     /// The framework keeps its app server's settings in the agent's own

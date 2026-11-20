@@ -8373,6 +8373,7 @@ dependencies = [
  "grain-id",
  "hound",
  "image",
+ "indexmap 2.14.2",
  "libc",
  "matrix-sdk",
  "reqwest 0.12.28",

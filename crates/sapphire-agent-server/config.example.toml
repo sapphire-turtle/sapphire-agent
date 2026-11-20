@@ -79,8 +79,8 @@
 # origin = "trusted"
 # Chat room where autonomous sessions post questions (the `ask_human`
 # tool); a reply to a question's message is the answer. The room must also
-# be in the channel's room list (`discord.channel_ids` / `matrix.room_ids`),
-# or be a Discord channel ID while `discord.channel_ids` is empty.
+# have a block in its channel's rooms map (`discord.rooms` / `matrix.rooms`
+# / `telegram.rooms`), or be a Discord channel ID while `discord.rooms` is empty.
 # consult_room = "123456789012345678"
 # How long a question waits for a reply, in hours: 1 to 8760 (a year);
 # a value outside that range is clamped, with a warning.
@@ -97,9 +97,6 @@ homeserver = "https://matrix.example.com"
 access_token = "syt_..."
 user_id = "@bot:example.com"
 device_id = "DEVICEID"
-# Rooms to listen in. Accepts either an array (preferred) or a single string
-# via the legacy `room_id` key.
-room_ids = ["!roomid:example.com"]
 # Messages from users not in this list are silently ignored.
 # Leave empty ([]) to allow all users.
 allowed_users = ["@you:example.com"]
@@ -108,11 +105,35 @@ recovery_key = "EsT... "
 # Where to store matrix-sdk state / crypto DB (default: ~/.local/share/sapphire-agent/matrix)
 # state_dir = "~/.local/share/sapphire-agent/matrix"
 
-# Per-room behaviour is configured via [room_profile.<n>] further down,
-# not via per-room blocks. A room profile bundles `(profile, namespace,
-# session_policy)` and applies to a list of rooms — perfect when several
-# rooms share the same setup, and trivial to add API access controls to
-# later (see issue #73).
+# Rooms to listen in. Empty = all rooms the bot can see. Each block can
+# carry display metadata and bind a [room_profile.<n>] via `profile`.
+# A room profile bundles `(profile, namespace, session_policy)`, so several
+# rooms can share one setup by naming the same [room_profile.<n>].
+[matrix.rooms."!roomid:example.com"]
+name = "Chat"
+description = "Everyday chat"
+profile = "everyday"
+
+# [discord]
+# bot_token = "..."
+# # Discord user IDs allowed to interact. Empty = all users.
+# allowed_users = ["123456789012345678"]
+#
+# [discord.rooms."123456789012345678"]
+# name = "development"
+# description = "Development and autonomous sessions"
+# profile = "development"
+
+# [telegram]
+# bot_token = "123456:ABC..."
+# # Telegram user IDs allowed to interact. Empty = all users.
+# allowed_users = ["11111111"]
+# # A forum topic's room id is "<chat_id>:<message_thread_id>"; a plain chat
+# # uses just "<chat_id>". Empty rooms = all chats the bot can see.
+# [telegram.rooms."-1002000333444555:42"]
+# name = "Development"
+# description = "Development and autonomous sessions"
+# profile = "development"
 
 # Periodic log digests. The agent summarises weekly/monthly/yearly activity
 # into short importance-ordered bullet lists, stored as YAML frontmatter in
@@ -207,9 +228,9 @@ system_prompt = "You are a helpful personal assistant."
 # for background tasks (daily-log generator, memory compaction, periodic
 # digests) when a memory namespace doesn't pin its own.
 #
-# [profiles.default]
-# provider = "anthropic"
-#
+[profiles.default]
+provider = "anthropic"
+
 # [profiles.opus]
 # provider = "anthropic"            # use claude-opus-4-7 in [anthropic.model]
 #
@@ -251,9 +272,9 @@ system_prompt = "You are a helpful personal assistant."
 
 # ── Room profiles ───────────────────────────────────────────────────────
 # A room profile bundles a chat profile + memory namespace + session
-# policy and applies to a list of rooms (Matrix room_ids, Discord
-# channel ids, etc). Each room_id may appear in at most one room
-# profile. Rooms not listed anywhere fall back to [room_profile.default]
+# policy. A room names its bundle with `profile` in its channel's room block
+# (Matrix room ids, Discord channel ids, Telegram composite room ids, etc).
+# Rooms whose block has no `profile` fall back to [room_profile.default]
 # if defined, otherwise the built-in defaults (Anthropic provider,
 # `default` namespace, global session_policy).
 #
@@ -264,22 +285,19 @@ system_prompt = "You are a helpful personal assistant."
 # is the room profile it runs under — same mechanism `/a2a`, `/acp`
 # and ambient ingest all use (sapphire-agent-desktop: `[server].token`).
 #
-# [room_profile.everyday]
-# profile          = "default"
-# memory_namespace = "default"     # optional; defaults to "default"
-# session_policy   = "reset"       # optional; defaults to global setting
-# rooms            = ["!chat:example.com"]
-#
+[room_profile.everyday]
+profile          = "default"
+memory_namespace = "default"     # optional; defaults to "default"
+session_policy   = "reset"       # optional; defaults to global setting
+
 # [room_profile.development]
 # profile = "opus"                 # higher-quality model for coding work
-# rooms   = ["!dev:example.com", "!code:example.com"]
 # # memory_namespace omitted → writes to "default" alongside everyday chat
 #
 # [room_profile.private_nsfw]
 # profile          = "local"
 # memory_namespace = "user_nsfw"
 # session_policy   = "compact"
-# rooms            = ["!nsfw:example.com"]
 #
 # /rpc (sapphire-agent-desktop), A2A (Agent2Agent Protocol), `/acp`
 # and ambient ingest all reach a room_profile through the API key's
@@ -298,8 +316,7 @@ system_prompt = "You are a helpful personal assistant."
 #
 # [room_profile.sapphire_world]
 # profile          = "default"
-# memory_namespace = "sapphire_world"
-# rooms            = []             # A2A-only; no chat rooms map here
+# memory_namespace = "sapphire_world" # A2A-only; no chat rooms name it
 # # its client's key: `api-key add a2a-client --profile sapphire_world`
 #
 # Caveat: workspace retrieve (FTS / vector search) currently spans every
@@ -550,8 +567,7 @@ system_prompt = "You are a helpful personal assistant."
 #
 # [room_profile.home_voice]
 # profile          = "casual"
-# voice_pipeline   = "default"
-# rooms            = []             # MCP-only; not bound to chat rooms
+# voice_pipeline   = "default"      # MCP-only; no chat rooms name it
 #
 # # ── Voice-mode global settings ───────────────────────────────────────
 # # AI-name wake words can't be served by pre-trained KWS bundles

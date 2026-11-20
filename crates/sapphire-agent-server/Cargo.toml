@@ -58,6 +58,9 @@ serde_json.workspace = true
 
 # Config (TOML)
 toml = "1.0"
+# Document-ordered per-room blocks. The first Matrix room is the heartbeat's
+# default target, so map order must survive deserialization.
+indexmap = { version = "2", default-features = false, features = ["serde"] }
 # Reports the keys a `Config` deserialization ignored, so a typo or a
 # setting written under the wrong table is a startup warning instead of
 # silence. `deny_unknown_fields` would be the other way to notice, but it

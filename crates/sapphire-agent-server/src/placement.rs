@@ -707,6 +707,7 @@ mod tests {
         let mut config = crate::config::Config::for_test();
         config.discord = Some(crate::config::DiscordConfig {
             bot_token: "SECRET-TOKEN".into(),
+            rooms: indexmap::IndexMap::new(),
             channel_ids: vec!["123".into()],
             allowed_users: vec![],
         });

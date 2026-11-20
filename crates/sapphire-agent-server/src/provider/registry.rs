@@ -582,9 +582,17 @@ model = "gemma-4-31b-it"
 [profiles.nsfw]
 provider = "local"
 
+[matrix]
+homeserver = "h"
+access_token = "t"
+user_id = "u"
+device_id = "d"
+
+[matrix.rooms."!nsfw:srv"]
+profile = "private_nsfw"
+
 [room_profile.private_nsfw]
 profile = "nsfw"
-rooms   = ["!nsfw:srv"]
 "#,
         );
         let reg = ProviderRegistry::from_config(&cfg).unwrap();
