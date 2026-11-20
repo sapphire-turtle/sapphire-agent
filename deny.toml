@@ -29,6 +29,18 @@ ignore = [
     # with bevy_vrm1 (the companion's VRM renderer), which uses it for macros.
     { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained (author-declared, no vulnerability); a compile-time macro crate reached only via bevy_vrm1 0.11. No safe upgrade; drop once bevy_vrm1 moves to pastey or similar." },
 
+    # --- unmaintained, reached only through telers ---
+    # backoff is used by telers' retry/dispatcher helpers, which our channel
+    # does not use (it calls Bot::send directly). backoff also pulls instant.
+    # Drop both when telers moves off these dependencies.
+    { id = "RUSTSEC-2025-0012", reason = "backoff is unmaintained (no vulnerability); reached only via telers' retry/dispatcher helpers, which TelegramChannel does not use (it calls Bot::send directly)." },
+    { id = "RUSTSEC-2024-0384", reason = "instant is unmaintained (no vulnerability); transitive via telers → backoff 0.4.0." },
+
+    # --- unmaintained, broadly used chrono ---
+    # Pre-existing, but surfaced by the cargo-deny job on this branch's
+    # Cargo.toml and Cargo.lock changes. Drop once the wide fan-in moves.
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained (no vulnerability); reached widely via a2a-lf, cron, reedline, rmcp, matrix-sdk's oauth2, and the sapphire/corundum framework stack. No safe upgrade; chrono recommends time as a replacement. Drop once the wide fan-in moves." },
+
     # --- unmaintained, reached only through the bevy/egui text stack ---
     # ttf-parser is unmaintained upstream (author-declared). It reaches us via
     # bevy_text > cosmic-text > fontdb and egui > epaint > ab_glyph >

@@ -1162,6 +1162,8 @@ pub struct MatrixConfig {
 impl MatrixConfig {
     /// Primary room — first configured room. Used as the default target for
     /// heartbeat tasks that don't name a specific room.
+    /// With preserve_order, this is the first room in the merged document; a
+    /// layered host block for an earlier room can reorder an overridden key.
     pub fn primary_room_id(&self) -> Option<&str> {
         self.rooms.keys().next().map(String::as_str)
     }
@@ -1195,6 +1197,8 @@ pub struct DiscordConfig {
 
 impl DiscordConfig {
     /// First configured room, used as the default heartbeat target.
+    /// With preserve_order, this is the first room in the merged document; a
+    /// layered host block for an earlier room can reorder an overridden key.
     pub fn primary_room_id(&self) -> Option<&str> {
         self.rooms.keys().next().map(String::as_str)
     }
@@ -1214,6 +1218,8 @@ pub struct TelegramConfig {
 
 impl TelegramConfig {
     /// First configured room, used as the default heartbeat target.
+    /// With preserve_order, this is the first room in the merged document; a
+    /// layered host block for an earlier room can reorder an overridden key.
     pub fn primary_room_id(&self) -> Option<&str> {
         self.rooms.keys().next().map(String::as_str)
     }

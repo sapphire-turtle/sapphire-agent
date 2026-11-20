@@ -174,10 +174,11 @@ serenity = { version = "0.12", default-features = false, features = [
     "rustls_backend",
 ] }
 
-# Telegram bot (long polling + Bot API methods). `serde` enables the Bot API
-# types' serde representation used by the offline channel fixtures. rustls
-# matches the other channel HTTP clients without pulling in native-tls.
-telers = { version = "1.0.0-beta.10", default-features = false, features = [
+# Telegram bot (long polling + Bot API methods). Upstream requires `serde` or
+# `deser`; `serde` also provides the Bot API types' serde representation used
+# by offline channel fixtures. rustls matches the other channel HTTP clients
+# without pulling in native-tls.
+telers = { version = "=1.0.0-beta.10", default-features = false, features = [
     "rustls-tls",
     "serde",
 ] }

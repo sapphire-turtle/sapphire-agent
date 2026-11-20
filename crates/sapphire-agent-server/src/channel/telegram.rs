@@ -35,7 +35,7 @@ const LONG_POLL_REQUEST_TIMEOUT_SECONDS: f32 = LONG_POLL_SECONDS as f32 + 10.0;
 
 struct TelegramHandler {
     tx: mpsc::Sender<IncomingMessage>,
-    allowed_users: HashSet<String>,
+    allowed_users: HashSet<i64>,
     rooms: IndexMap<String, RoomBlock>,
 }
 
@@ -63,7 +63,7 @@ impl TelegramHandler {
 pub struct TelegramChannel {
     token: String,
     rooms: IndexMap<String, RoomBlock>,
-    allowed_users: HashSet<String>,
+    allowed_users: HashSet<i64>,
     /// Filled by `listen()` once the client exists; used by `send()`.
     client: Arc<OnceCell<Arc<Bot>>>,
 }
@@ -85,10 +85,19 @@ impl TelegramChannel {
         for key in cfg.rooms.keys() {
             split_room_id(key)?;
         }
+        let allowed_users = cfg
+            .allowed_users
+            .iter()
+            .map(|s| {
+                s.parse::<i64>()
+                    .context("Invalid Telegram user ID in allowed_users")
+            })
+            .collect::<Result<HashSet<_>>>()?;
+
         Ok(Self {
             token: cfg.bot_token.clone(),
             rooms: cfg.rooms.clone(),
-            allowed_users: cfg.allowed_users.iter().cloned().collect(),
+            allowed_users,
             client: Arc::new(OnceCell::new()),
         })
     }
@@ -286,7 +295,7 @@ async fn receive_updates(
 /// `rooms` is the listen list: an empty map accepts every visible room.
 async fn route_update(
     msg: &Message,
-    allowed_users: &HashSet<String>,
+    allowed_users: &HashSet<i64>,
     rooms: &IndexMap<String, RoomBlock>,
     download: impl AsyncFnOnce(&str) -> Result<Vec<u8>, String>,
 ) -> Option<IncomingMessage> {
@@ -295,7 +304,7 @@ async fn route_update(
         return None;
     }
     let sender = from.id.to_string();
-    if !allowed_users.is_empty() && !allowed_users.contains(&sender) {
+    if !allowed_users.is_empty() && !allowed_users.contains(&from.id) {
         debug!("Ignoring message from user {sender} (not in allowed list)");
         return None;
     }
@@ -328,7 +337,10 @@ async fn route_update(
 /// Telegram photos are alternative sizes of one image; fetch only the largest.
 /// Documents and animations can also carry supported image types. Declared
 /// metadata screens the fetch, but the bytes determine what goes to the model.
-/// Other media types are not fetched and produce a drop note.
+/// Video, audio, voice and paid media are not fetched and produce a drop note.
+/// Other media, such as stickers, live photos and polls, are not fetched and
+/// produce no drop note. Routing retains captions on non-image media as text;
+/// a captionless poll has no content to forward.
 async fn download_image_attachments(
     msg: &Message,
     download: impl AsyncFnOnce(&str) -> Result<Vec<u8>, String>,
@@ -385,9 +397,7 @@ async fn download_image_attachments(
                 Vec::new(),
                 vec![dropped_attachment_note(
                     name,
-                    &format!(
-                        "it is a {kind}, and only images (JPEG, PNG, GIF, WebP) are passed on"
-                    ),
+                    &format!("it is {kind}, and only images (JPEG, PNG, GIF, WebP) are passed on"),
                 )],
             ),
             None => (Vec::new(), Vec::new()),
@@ -548,13 +558,13 @@ mod tests {
             });
         }
         let msg: Message = serde_json::from_value(value).unwrap();
-        debug_assert_eq!(msg.message_thread_id(), thread_id);
-        debug_assert_eq!(msg.chat().id(), chat_id);
+        assert_eq!(msg.message_thread_id(), thread_id);
+        assert_eq!(msg.chat().id(), chat_id);
         let round_trip: Message =
             serde_json::from_value(serde_json::to_value(&msg).unwrap()).unwrap();
-        debug_assert_eq!(round_trip.message_thread_id(), thread_id);
-        debug_assert_eq!(round_trip.chat().id(), chat_id);
-        debug_assert_eq!(round_trip.from().unwrap().id, from_id);
+        assert_eq!(round_trip.message_thread_id(), thread_id);
+        assert_eq!(round_trip.chat().id(), chat_id);
+        assert_eq!(round_trip.from().unwrap().id, from_id);
         msg
     }
 
@@ -725,12 +735,20 @@ mod tests {
         );
         let empty = route_update(
             &fixture_message(CHAT, Some(42), "9", "hi", None),
-            &HashSet::from(["1".to_string()]),
+            &HashSet::from([1]),
             &IndexMap::new(),
             unexpected_download,
         )
         .await;
         assert!(empty.is_none(), "allowed_users non-empty miss");
+        let accepted = route_update(
+            &fixture_message(CHAT, Some(42), "1", "hi", None),
+            &HashSet::from([1]),
+            &IndexMap::new(),
+            unexpected_download,
+        )
+        .await;
+        assert_eq!(accepted.unwrap().sender, "1");
     }
 
     #[tokio::test]
@@ -811,7 +829,7 @@ mod tests {
         assert!(incoming.attachments.is_empty());
         assert_eq!(
             incoming.content,
-            "Look at this video\n\n[Attachment 'fixture.mp4' was sent but not passed on to you: it is a video, and only images (JPEG, PNG, GIF, WebP) are passed on. Tell the user if it matters.]"
+            "Look at this video\n\n[Attachment 'fixture.mp4' was sent but not passed on to you: it is video, and only images (JPEG, PNG, GIF, WebP) are passed on. Tell the user if it matters.]"
         );
     }
 
@@ -941,6 +959,17 @@ mod tests {
         };
         let error = TelegramChannel::new(&cfg).unwrap_err().to_string();
         assert_eq!(error, "Invalid Telegram bot token");
+    }
+
+    #[test]
+    fn invalid_configured_user_ids_are_rejected_loudly() {
+        let cfg = TelegramConfig {
+            bot_token: "123456:test".to_string(),
+            rooms: IndexMap::new(),
+            allowed_users: vec!["not-a-user-id".to_string()],
+        };
+        let error = TelegramChannel::new(&cfg).unwrap_err().to_string();
+        assert_eq!(error, "Invalid Telegram user ID in allowed_users");
     }
 
     #[test]
