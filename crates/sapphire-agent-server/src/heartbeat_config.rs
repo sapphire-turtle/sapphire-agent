@@ -21,20 +21,25 @@
 //! satellite is offline. The body is used verbatim as the trigger
 //! prompt fed to the agent.
 
-use chrono::{DateTime, Local};
 use cron::Schedule;
+use jiff::ZonedDateTime;
+use jiff::tz::TimeZone;
 use serde::Deserialize;
 use std::path::Path;
 use std::str::FromStr;
 use tracing::warn;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HeartbeatTaskMeta {
     /// Cron expression. The `cron` crate uses 6- or 7-field syntax (with seconds).
     /// We accept the standard 5-field form and prefix `"0 "` for seconds.
     pub schedule: String,
     #[serde(default)]
     pub room_id: Option<String>,
+    /// Session profile governing this task; room_id is only a delivery target.
+    #[serde(default)]
+    pub profile: Option<String>,
     /// The device that runs this task, by name or id, when the workspace
     /// is synced with other hosts. Without it the task runs where it can be
     /// delivered (see `placement::heartbeat_runner`).
@@ -51,11 +56,10 @@ pub struct HeartbeatTaskMeta {
     pub voice: Option<HeartbeatVoiceTarget>,
 }
 
-/// Voice satellite target, identified by `device_id`. The
-/// `room_profile` to use is reverse-looked-up from the active
-/// `voice/subscribe` registration, so heartbeat tasks don't have to
-/// duplicate it. A device only ever has one active voice session at a
-/// time, which makes the lookup unambiguous.
+/// Voice satellite target, identified by `device_id`. Delivery uses the
+/// active `voice/subscribe` registration for that device; the task's
+/// declared session profile governs the turn. A device only ever has
+/// one active voice session at a time, making delivery unambiguous.
 #[derive(Debug, Clone, Deserialize)]
 pub struct HeartbeatVoiceTarget {
     pub device_id: String,
@@ -92,8 +96,19 @@ impl HeartbeatTask {
         }
     }
 
-    pub fn next_after(&self, after: DateTime<Local>) -> Option<DateTime<Local>> {
-        self.parsed_schedule()?.after(&after).next()
+    /// The first run after `after`, in this host's time zone.
+    ///
+    /// The `cron` crate schedules on chrono, so `after` crosses to chrono
+    /// and back here.
+    pub fn next_after(&self, after: &ZonedDateTime) -> Option<ZonedDateTime> {
+        let ts = after.timestamp();
+        let after =
+            chrono::DateTime::from_timestamp(ts.as_second(), ts.subsec_nanosecond() as u32)?
+                .with_timezone(&chrono::Local);
+        let next = self.parsed_schedule()?.after(&after).next()?;
+        let next =
+            jiff::Timestamp::new(next.timestamp(), next.timestamp_subsec_nanos() as i32).ok()?;
+        Some(next.to_zoned_datetime(TimeZone::system()))
     }
 }
 
@@ -192,13 +207,13 @@ pub fn parse_definition(name: &str, raw: &str) -> Result<HeartbeatTask, String> 
 /// Tasks scheduled within a 1-second window are batched together.
 pub fn next_due(
     tasks: &[HeartbeatTask],
-    now: DateTime<Local>,
-) -> Option<(DateTime<Local>, Vec<&HeartbeatTask>)> {
-    let mut earliest: Option<DateTime<Local>> = None;
-    let mut next_for: Vec<(DateTime<Local>, &HeartbeatTask)> = Vec::new();
+    now: ZonedDateTime,
+) -> Option<(ZonedDateTime, Vec<&HeartbeatTask>)> {
+    let mut earliest: Option<ZonedDateTime> = None;
+    let mut next_for: Vec<(ZonedDateTime, &HeartbeatTask)> = Vec::new();
     for t in tasks {
-        if let Some(next) = t.next_after(now) {
-            next_for.push((next, t));
+        if let Some(next) = t.next_after(&now) {
+            next_for.push((next.clone(), t));
             earliest = Some(match earliest {
                 Some(e) if e <= next => e,
                 _ => next,
@@ -208,7 +223,13 @@ pub fn next_due(
     let earliest = earliest?;
     let due: Vec<&HeartbeatTask> = next_for
         .into_iter()
-        .filter(|(t, _)| (*t - earliest).num_seconds().abs() <= 1)
+        .filter(|(t, _)| {
+            t.timestamp()
+                .duration_since(earliest.timestamp())
+                .as_secs()
+                .abs()
+                <= 1
+        })
         .map(|(_, t)| t)
         .collect();
     Some((earliest, due))
@@ -224,6 +245,22 @@ mod tests {
         let err = parse_definition("broken", "# no frontmatter\n").unwrap_err();
         assert!(err.contains("frontmatter"), "{err}");
         assert!(parse_definition("broken", "---\nschedule: [oops\n---\nHi\n").is_err());
+    }
+
+    #[test]
+    fn misspelled_profile_is_rejected() {
+        let raw = "---\nschedule: '@hourly'\nprofiel: ops\n---\nbody";
+        assert!(parse_definition("typo", raw).is_err());
+        assert!(parse_task("typo".into(), raw).is_none());
+        let valid = raw.replace("profiel", "profile");
+        assert_eq!(
+            parse_definition("valid", &valid)
+                .unwrap()
+                .meta
+                .profile
+                .as_deref(),
+            Some("ops")
+        );
     }
 
     #[test]

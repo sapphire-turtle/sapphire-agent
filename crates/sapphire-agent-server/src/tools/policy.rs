@@ -7,8 +7,9 @@
 //! themselves is a separate job, tracked in the design spec.
 //!
 //! Nothing here does I/O or knows about persistence: an `AllowAlways` is
-//! recorded by the caller, not by `decide`.
+//! recorded by the caller, not by `allow`.
 
+use crate::config::{Config, ToolGroup};
 use crate::tools::ToolKind;
 
 /// The ACP session modes this agent offers.
@@ -66,43 +67,102 @@ impl SessionMode {
     }
 }
 
-/// Which transport asked for this tool call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Origin and session-profile name, captured for the turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Origin {
-    /// An editor over `/acp`, in the session's current mode.
-    Acp(SessionMode),
-    /// Matrix or Discord. Never asked — a channel turn is asynchronous,
-    /// so blocking it on a human reply could hang for hours, and routing
-    /// the question through the LLM turn would let the model broker its
-    /// own permission request.
-    ///
-    /// The heartbeat's chat leg arrives here too, because it shares
-    /// `Agent::handle_message`. That is the right answer rather than an
-    /// accident: heartbeat tasks are workspace files, and `file_write`
-    /// is an `Edit`, which this origin allows unasked *when host access
-    /// is on* — so a trusted heartbeat would let a chat message write
-    /// itself a task that runs a command on the next tick. With host
-    /// access off (the default this crate ships), `host_tool_denied`
-    /// refuses `file_write` before `decide` is even consulted, so this
-    /// origin cannot reach it regardless of what `decide` says below —
-    /// but the conclusion (`Channel` must not be trusted with `Edit`)
-    /// still holds for anyone who turns host access on.
-    Channel,
-    /// `/rpc`, voice and `/a2a`: authenticated before the turn began,
-    /// with no UI to ask through. Behaviour must not change for these.
-    ///
-    /// `/a2a` is a peer agent rather than a local device, and a peer is
-    /// promptable in ways a device is not. It sits here because it
-    /// presents an operator-issued token from the same device registry
-    /// as `/rpc` — the trust is in the token, not in the locality.
-    Trusted,
+    Acp {
+        mode: SessionMode,
+        session_profile: String,
+    },
+    Channel {
+        session_profile: String,
+    },
+    Unattended {
+        session_profile: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Decision {
+#[allow(clippy::enum_variant_names)] // Public policy vocabulary: Allow::Allow.
+pub enum Allow {
     Allow,
     Ask,
     Deny,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedPermission {
+    pub name: String,
+    pub permission: String,
+    pub groups: Vec<ToolGroup>,
+    pub mode: Option<SessionMode>,
+}
+
+impl ResolvedPermission {
+    pub fn resolve(config: &Config, origin: Origin) -> Self {
+        let (name, mode) = match origin {
+            Origin::Acp {
+                mode,
+                session_profile,
+            } => (session_profile, Some(mode)),
+            Origin::Channel { session_profile } | Origin::Unattended { session_profile } => {
+                (session_profile, None)
+            }
+        };
+        let permission = config.permission_profile_name_for_session(&name);
+        Self {
+            groups: config.permission_profile(&permission).tools,
+            name,
+            permission,
+            mode,
+        }
+    }
+
+    pub fn lists(&self, group: ToolGroup) -> bool {
+        self.groups.contains(&group)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolEntry {
+    pub name: String,
+    pub group: Option<ToolGroup>,
+    pub enabled: bool,
+    pub kind: ToolKind,
+}
+
+impl ToolEntry {
+    pub(crate) fn from_spec(spec: &crate::provider::ToolSpec, config: &Config) -> Self {
+        Self {
+            name: spec.name.to_string(),
+            group: spec.group,
+            kind: spec.kind,
+            enabled: spec.group.is_some_and(|g| config.group_enabled(g)),
+        }
+    }
+}
+
+/// Group access is the intersection of the session grant and host capabilities;
+/// the ACP mode then decides whether the tool's kind requires approval.
+pub fn allow(profile: &ResolvedPermission, entry: &ToolEntry) -> Allow {
+    if entry
+        .group
+        .is_some_and(|g| !entry.enabled || !profile.lists(g))
+    {
+        return Allow::Deny;
+    }
+    let risky = matches!(entry.kind, ToolKind::Execute | ToolKind::Other);
+    let safe = matches!(
+        entry.kind,
+        ToolKind::Read | ToolKind::Search | ToolKind::Fetch | ToolKind::Think
+    );
+    match profile.mode {
+        None | Some(SessionMode::Bypass) => Allow::Allow,
+        Some(_) if safe => Allow::Allow,
+        Some(SessionMode::AcceptEdits) if risky => Allow::Ask,
+        Some(SessionMode::AcceptEdits) => Allow::Allow,
+        Some(SessionMode::Default) => Allow::Ask,
+    }
 }
 
 /// The outcome of asking. Maps 1:1 onto ACP's `PermissionOptionKind`.
@@ -128,12 +188,16 @@ impl Approval {
 
 /// Why a call was refused. The model reads the difference: one is
 /// worth rephrasing around, the other is not worth retrying at all.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refusal {
     /// A human was asked and said no.
     UserDeclined,
     /// The policy refuses it outright on this transport; nobody was asked.
-    Unavailable,
+    Unavailable {
+        session: String,
+        permission: String,
+        group: ToolGroup,
+    },
     /// The name does not appear in this round's own `tool_specs` — it
     /// was never offered to this conversation, whether or not it is
     /// registered on the shared `ToolSet`. Distinct from `Unavailable`:
@@ -149,19 +213,6 @@ pub enum Refusal {
     NeedsApproval,
 }
 
-/// Look a tool's kind up by name.
-///
-/// An unregistered name yields `Other`. It will come back from
-/// `ToolSet::execute` as "Unknown tool" anyway, but it must not travel
-/// there classified as safe on the way.
-pub fn kind_of(name: &str, kinds: &[(String, ToolKind)]) -> ToolKind {
-    kinds
-        .iter()
-        .find(|(known, _)| known == name)
-        .map(|(_, kind)| *kind)
-        .unwrap_or(ToolKind::Other)
-}
-
 /// What the model is told in place of a result.
 ///
 /// One function rather than a literal at each call site: both tool
@@ -172,9 +223,13 @@ pub fn refusal_message(tool: &str, why: Refusal) -> String {
             "Permission denied: the user declined the '{tool}' call. \
              Do not retry it without being asked to."
         ),
-        Refusal::Unavailable => format!(
-            "Permission denied: the '{tool}' tool is not available on this \
-             transport. Try another approach, or ask the user to run it."
+        Refusal::Unavailable {
+            session,
+            permission,
+            group,
+        } => format!(
+            "Permission denied: the '{tool}' tool is unavailable for session profile '{session}'; check permission_profile.{permission}.tools and [tools.{}].enabled.",
+            group.as_str()
         ),
         // Deliberately not "Permission denied": for a name this round
         // never offered — a typo, a hallucination, or `subagent`
@@ -193,515 +248,386 @@ pub fn refusal_message(tool: &str, why: Refusal) -> String {
     }
 }
 
-/// The tools that operate on the agent's own filesystem and shell.
-///
-/// Listed by name rather than derived from `ToolKind`, because the
-/// distinction is *which machine*, not how dangerous the operation is:
-/// `memory_add` is also an `Edit`, and it is never in question.
-pub const HOST_TOOLS: &[&str] = &[
-    "file_read",
-    "file_write",
-    "file_append",
-    "file_delete",
-    "dir_list",
-    "dir_walk",
-    "shell",
-];
-
-/// Whether this call is refused before the policy table is consulted.
-///
-/// A gate in front of `decide` rather than a row inside it: `decide` is
-/// a pure function of origin and kind, and this is a fact about the
-/// deployment. Keeping them apart means the permission table still
-/// reads as one thing.
-///
-/// `routed_to_client` is what #270 added, and it is what changed this
-/// gate's meaning. The seven names below are "the agent's own filesystem
-/// and shell" *only when that is where the call is going*: inside an ACP
-/// session the same names reach the editor's machine, which this
-/// deployment's `[tools.host_access]` switch has no business speaking
-/// for — that turn's list is set by the capabilities its editor declared
-/// (`serve::visible_tool_predicate`) and each call is answered by the
-/// editor itself through `session/request_permission`. A caller that
-/// knows this turn has an ACP client passes `true` and the gate declines
-/// to fire; a caller that does not (every non-ACP transport, whose turns
-/// never have one) passes `false` and gets exactly the old behaviour.
-pub fn host_tool_denied(name: &str, host_access_enabled: bool, routed_to_client: bool) -> bool {
-    !host_access_enabled && !routed_to_client && HOST_TOOLS.contains(&name)
+/// Explain the group policy refusal using the actual grant and host switch.
+pub fn unavailable_message(profile: &ResolvedPermission, entry: &ToolEntry) -> String {
+    let group = entry.group.expect("only grouped tools can be denied");
+    refusal_message(
+        &entry.name,
+        Refusal::Unavailable {
+            session: profile.name.clone(),
+            permission: profile.permission.clone(),
+            group,
+        },
+    )
 }
 
-/// The whole policy. The table in the design spec is this function.
-pub fn decide(origin: Origin, kind: ToolKind) -> Decision {
-    // Group first, so that a `ToolKind` variant added upstream lands in
-    // the strict bucket rather than silently becoming safe. `ToolKind`
-    // is `#[non_exhaustive]`, so that is not hypothetical.
-    //
-    // Note what is in neither group: `Edit`, `Delete`, `Move` — the
-    // middle row of the table — and `SwitchMode`, which upstream defines
-    // but no tool here declares. `SwitchMode` therefore lands in that
-    // middle row: asked in `default`, allowed once edits are accepted.
-    // That is the right side to err on for something that changes the
-    // session's own mode.
-    let risky = matches!(kind, ToolKind::Execute | ToolKind::Other);
-    let safe = matches!(
-        kind,
-        ToolKind::Read | ToolKind::Search | ToolKind::Fetch | ToolKind::Think
-    );
-
-    match origin {
-        Origin::Trusted => Decision::Allow,
-        Origin::Channel => {
-            if risky {
-                Decision::Deny
-            } else {
-                Decision::Allow
-            }
-        }
-        Origin::Acp(SessionMode::Bypass) => Decision::Allow,
-        Origin::Acp(_) if safe => Decision::Allow,
-        Origin::Acp(SessionMode::AcceptEdits) => {
-            if risky {
-                Decision::Ask
-            } else {
-                Decision::Allow
-            }
-        }
-        Origin::Acp(SessionMode::Default) => Decision::Ask,
-    }
-}
-
-/// Split calls into the ones that may run and the ones that may not,
-/// for an origin that has nobody to ask.
-///
-/// `Ask` is treated as a refusal, not as an allowance. Today only
-/// `Origin::Channel` reaches this, and `decide` never returns `Ask` for
-/// it — but a later policy change that did must not silently open the
-/// channel path, so the unreachable case fails closed.
-///
-/// `host_access_enabled` and `routed_to_client` are checked before
-/// `decide` for the same reason they are in `run_llm_turn`'s permission
-/// loop: they are facts about the deployment and the turn, not rows in
-/// the origin/kind table, so a host tool never even reaches `decide`
-/// while the gate refuses it — including for a channel message, which has
-/// nobody to ask and would otherwise reach `Edit`/`Delete` tools like
-/// `file_write`/`file_delete` unasked.
-///
-/// `routed_to_client` goes straight through to `host_tool_denied` and is
-/// `false` at every call site of this function today: the channel path
-/// (`src/agent.rs`) is the only one, and a Matrix/Discord turn never has
-/// an ACP client. It is a parameter rather than a constant so the two
-/// gates cannot drift apart if a routed origin ever reaches here — and so
-/// that this path states that it is unrouted rather than assuming it.
+/// Split non-interactive calls, failing closed for unknown names or Ask.
 pub fn partition_without_asking(
-    origin: Origin,
+    profile: &ResolvedPermission,
     calls: &[crate::provider::ToolCall],
-    kinds: &[(String, ToolKind)],
-    host_access_enabled: bool,
-    routed_to_client: bool,
+    entries: &[ToolEntry],
 ) -> (Vec<crate::provider::ToolCall>, Vec<(String, String)>) {
     let mut permitted = Vec::with_capacity(calls.len());
     let mut refused = Vec::new();
-
     for call in calls {
-        if host_tool_denied(&call.name, host_access_enabled, routed_to_client) {
-            refused.push((
+        match entries.iter().find(|entry| entry.name == call.name) {
+            Some(entry) if allow(profile, entry) == Allow::Allow => permitted.push(call.clone()),
+            Some(entry) if allow(profile, entry) == Allow::Deny => {
+                refused.push((call.id.clone(), unavailable_message(profile, entry)))
+            }
+            Some(_) => refused.push((
                 call.id.clone(),
-                refusal_message(&call.name, Refusal::Unavailable),
-            ));
-            continue;
-        }
-        match decide(origin, kind_of(&call.name, kinds)) {
-            Decision::Allow => permitted.push(call.clone()),
-            Decision::Deny | Decision::Ask => refused.push((
+                refusal_message(&call.name, Refusal::NeedsApproval),
+            )),
+            None => refused.push((
                 call.id.clone(),
-                refusal_message(&call.name, Refusal::Unavailable),
+                refusal_message(&call.name, Refusal::NotOffered),
             )),
         }
     }
-
     (permitted, refused)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const SAFE: [ToolKind; 4] = [
-        ToolKind::Read,
-        ToolKind::Search,
-        ToolKind::Fetch,
-        ToolKind::Think,
-    ];
-    const EDITING: [ToolKind; 3] = [ToolKind::Edit, ToolKind::Delete, ToolKind::Move];
-    const RISKY: [ToolKind; 2] = [ToolKind::Execute, ToolKind::Other];
-
-    const EVERY_ORIGIN: [Origin; 5] = [
-        Origin::Acp(SessionMode::Default),
-        Origin::Acp(SessionMode::AcceptEdits),
-        Origin::Acp(SessionMode::Bypass),
-        Origin::Channel,
-        Origin::Trusted,
-    ];
-
-    fn call(id: &str, name: &str) -> crate::provider::ToolCall {
-        crate::provider::ToolCall {
-            id: id.to_string(),
-            name: name.to_string(),
-            input: serde_json::json!({}),
-        }
-    }
+    use crate::config::{Config, ToolGroup};
 
     #[test]
-    fn safe_kinds_never_ask_on_any_origin() {
-        for kind in SAFE {
-            for origin in EVERY_ORIGIN {
-                assert_eq!(decide(origin, kind), Decision::Allow, "{origin:?} {kind:?}");
+    fn middle_row_kinds_follow_all_acp_modes() {
+        let mut profile = ResolvedPermission {
+            name: "default".into(),
+            permission: "default".into(),
+            groups: vec![],
+            mode: None,
+        };
+        for kind in [
+            ToolKind::Edit,
+            ToolKind::Delete,
+            ToolKind::Move,
+            ToolKind::SwitchMode,
+        ] {
+            let entry = ToolEntry {
+                name: "middle".into(),
+                group: None,
+                enabled: false,
+                kind,
+            };
+            for (mode, expected) in [
+                (SessionMode::Default, Allow::Ask),
+                (SessionMode::AcceptEdits, Allow::Allow),
+                (SessionMode::Bypass, Allow::Allow),
+            ] {
+                profile.mode = Some(mode);
+                assert_eq!(allow(&profile, &entry), expected, "{kind:?} {mode:?}");
             }
         }
     }
 
     #[test]
-    fn editing_asks_only_in_acp_default() {
-        for kind in EDITING {
-            assert_eq!(
-                decide(Origin::Acp(SessionMode::Default), kind),
-                Decision::Ask
-            );
-            assert_eq!(
-                decide(Origin::Acp(SessionMode::AcceptEdits), kind),
-                Decision::Allow
-            );
-            assert_eq!(
-                decide(Origin::Acp(SessionMode::Bypass), kind),
-                Decision::Allow
-            );
-            assert_eq!(decide(Origin::Channel, kind), Decision::Allow);
-            assert_eq!(decide(Origin::Trusted, kind), Decision::Allow);
-        }
+    fn partition_refuses_rather_than_allows_an_ask() {
+        let cfg = Config::for_test();
+        let profile = ResolvedPermission::resolve(
+            &cfg,
+            Origin::Acp {
+                mode: SessionMode::Default,
+                session_profile: "default".into(),
+            },
+        );
+        let entries = [ToolEntry {
+            name: "memory_add".into(),
+            group: None,
+            enabled: false,
+            kind: ToolKind::Edit,
+        }];
+        let calls = [crate::provider::ToolCall {
+            id: "c1".into(),
+            name: "memory_add".into(),
+            input: serde_json::json!({}),
+        }];
+        let (permitted, refused) = partition_without_asking(&profile, &calls, &entries);
+        assert!(permitted.is_empty());
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].0, "c1");
+        assert!(refused[0].1.contains("memory_add"), "{}", refused[0].1);
+        assert_eq!(
+            refused[0].1,
+            refusal_message("memory_add", Refusal::NeedsApproval)
+        );
     }
 
-    /// `shell` and every MCP tool live here. A channel must never reach
-    /// them — that is the one behavioural change this feature makes to
-    /// an existing transport.
     #[test]
-    fn risky_kinds_are_refused_on_channels_and_asked_in_acp() {
-        for kind in RISKY {
-            assert_eq!(
-                decide(Origin::Acp(SessionMode::Default), kind),
-                Decision::Ask
-            );
-            assert_eq!(
-                decide(Origin::Acp(SessionMode::AcceptEdits), kind),
-                Decision::Ask
-            );
-            assert_eq!(
-                decide(Origin::Acp(SessionMode::Bypass), kind),
-                Decision::Allow
-            );
-            assert_eq!(decide(Origin::Channel, kind), Decision::Deny);
-            assert_eq!(decide(Origin::Trusted, kind), Decision::Allow);
+    fn refusal_messages_name_the_tool_and_the_reason() {
+        let declined = refusal_message("shell", Refusal::UserDeclined);
+        let not_offered = refusal_message("shell", Refusal::NotOffered);
+        let needs_approval = refusal_message("shell", Refusal::NeedsApproval);
+        for message in [&declined, &not_offered, &needs_approval] {
+            assert!(message.contains("shell"), "{message}");
         }
-    }
-
-    /// `Trusted` is `/rpc`, voice, the heartbeat and `/a2a` — paths that
-    /// were already authenticated and have no UI to ask through. Nothing
-    /// they can call may change behaviour.
-    #[test]
-    fn trusted_allows_everything() {
-        for kind in SAFE.iter().chain(&EDITING).chain(&RISKY) {
-            assert_eq!(decide(Origin::Trusted, *kind), Decision::Allow);
-        }
-    }
-
-    /// `SwitchMode` is declared upstream and by no tool here, so it is
-    /// in neither the safe nor the risky set. `decide`'s doc comment
-    /// claims it therefore lands in the middle row; this is the only
-    /// thing stopping a later edit from quietly moving it. Without this,
-    /// pulling `SwitchMode` into `risky` would compile and pass.
-    #[test]
-    fn an_unclassified_kind_lands_in_the_middle_row() {
-        let kind = ToolKind::SwitchMode;
-        assert_eq!(
-            decide(Origin::Acp(SessionMode::Default), kind),
-            Decision::Ask
+        assert!(declined.contains("declined"), "{declined}");
+        assert!(
+            !not_offered.starts_with("Permission denied"),
+            "{not_offered}"
         );
-        assert_eq!(
-            decide(Origin::Acp(SessionMode::AcceptEdits), kind),
-            Decision::Allow
-        );
-        assert_eq!(
-            decide(Origin::Acp(SessionMode::Bypass), kind),
-            Decision::Allow
-        );
-        assert_eq!(decide(Origin::Channel, kind), Decision::Allow);
-        assert_eq!(decide(Origin::Trusted, kind), Decision::Allow);
+        assert_ne!(declined, needs_approval);
     }
 
     #[test]
     fn mode_ids_round_trip() {
+        assert_eq!(SessionMode::ALL.len(), 3);
         for mode in SessionMode::ALL {
             assert_eq!(SessionMode::from_id(mode.id()), Some(mode));
         }
-        // `plan` is deliberately not implemented; it must not silently
-        // resolve to some other mode.
         assert_eq!(SessionMode::from_id("plan"), None);
-        assert_eq!(SessionMode::ALL.len(), 3);
     }
 
     #[test]
-    fn only_always_variants_are_sticky() {
-        assert!(!Approval::AllowOnce.is_sticky());
-        assert!(Approval::AllowAlways.is_sticky());
-        assert!(!Approval::RejectOnce.is_sticky());
-        assert!(Approval::RejectAlways.is_sticky());
-
-        assert!(Approval::AllowOnce.allows());
-        assert!(Approval::AllowAlways.allows());
-        assert!(!Approval::RejectOnce.allows());
-        assert!(!Approval::RejectAlways.allows());
-    }
-
-    /// An unregistered name must not be treated as safe on its way to
-    /// `ToolSet::execute`'s "Unknown tool" reply.
-    #[test]
-    fn an_unknown_tool_name_is_other() {
-        let kinds = vec![("file_read".to_string(), ToolKind::Read)];
-        assert_eq!(kind_of("file_read", &kinds), ToolKind::Read);
-        assert_eq!(kind_of("no_such_tool", &kinds), ToolKind::Other);
-    }
-
-    /// All three refusal reasons name the tool, so the model can tell
-    /// which of several calls was refused, and each reads distinctly
-    /// from the other two — a decline, a deployment-wide unavailability,
-    /// and a name this round simply never offered are different things
-    /// to tell the model, and it needs to be able to act on the
-    /// difference (only the first is "you could ask the user again").
-    #[test]
-    fn refusal_messages_name_the_tool_and_the_reason() {
-        let declined = refusal_message("shell", Refusal::UserDeclined);
-        assert!(declined.contains("shell"), "got {declined}");
-        assert!(declined.contains("declined"), "got {declined}");
-
-        let unavailable = refusal_message("shell", Refusal::Unavailable);
-        assert!(unavailable.contains("shell"), "got {unavailable}");
-
-        let not_offered = refusal_message("shell", Refusal::NotOffered);
-        assert!(not_offered.contains("shell"), "got {not_offered}");
-        assert!(
-            !not_offered.contains("Permission denied"),
-            "an invented/out-of-round name has no permission to be denied: {not_offered}"
-        );
-
-        let needs_approval = refusal_message("shell", Refusal::NeedsApproval);
-        assert_eq!(
-            needs_approval,
-            "shell needs the user's approval, which a background task cannot ask for. \
-             Report it in your answer instead of retrying."
-        );
-        assert_ne!(
-            declined, needs_approval,
-            "nobody said no to a background task's call, so it must not read as a decline"
-        );
-
-        assert_ne!(
-            declined, unavailable,
-            "the model should be able to tell a refusal from an unavailability"
-        );
-        assert_ne!(
-            declined, not_offered,
-            "a decline and a name outside this round's own list must read differently"
-        );
-        assert_ne!(
-            unavailable, not_offered,
-            "a deployment-wide unavailability and a name simply not offered \
-             this round must read differently"
-        );
-    }
-
-    /// The channel path's whole gate, in one call: safe calls survive,
-    /// risky ones are dropped and come back as refusals that still name
-    /// their call id.
-    #[test]
-    fn partition_drops_risky_calls_and_reports_them() {
-        let kinds = vec![
-            ("file_read".to_string(), ToolKind::Read),
-            ("shell".to_string(), ToolKind::Execute),
-            ("mcp__x__y".to_string(), ToolKind::Other),
-        ];
-        let calls = vec![
-            call("c1", "file_read"),
-            call("c2", "shell"),
-            call("c3", "mcp__x__y"),
-        ];
-
-        let (permitted, refused) =
-            partition_without_asking(Origin::Channel, &calls, &kinds, true, false);
-
-        let kept: Vec<&str> = permitted.iter().map(|c| c.id.as_str()).collect();
-        assert_eq!(kept, vec!["c1"]);
-
-        let refused_ids: Vec<&str> = refused.iter().map(|(id, _)| id.as_str()).collect();
-        assert_eq!(refused_ids, vec!["c2", "c3"]);
-        assert!(refused[0].1.contains("shell"), "got {}", refused[0].1);
-    }
-
-    /// The host gate applies inside `partition_without_asking` too, not
-    /// just at `decide`/`host_tool_denied` in isolation — this is what
-    /// actually closes the channel path, since `Origin::Channel` has no
-    /// other gate in front of it.
-    #[test]
-    fn partition_without_asking_refuses_host_tools_when_host_access_is_off() {
-        let kinds = vec![("file_delete".to_string(), ToolKind::Delete)];
-        let calls = vec![call("c1", "file_delete")];
-
-        let (permitted, refused) =
-            partition_without_asking(Origin::Channel, &calls, &kinds, false, false);
-
-        assert!(permitted.is_empty(), "host access is off by default");
-        assert_eq!(refused.len(), 1);
-        assert!(refused[0].1.contains("file_delete"), "got {}", refused[0].1);
-    }
-
-    #[test]
-    fn partition_without_asking_allows_host_tools_when_host_access_is_on() {
-        let kinds = vec![("file_delete".to_string(), ToolKind::Delete)];
-        let calls = vec![call("c1", "file_delete")];
-
-        let (permitted, refused) =
-            partition_without_asking(Origin::Channel, &calls, &kinds, true, false);
-
-        assert_eq!(permitted.len(), 1);
-        assert!(refused.is_empty());
-    }
-
-    /// The seven tools that touch the agent's own machine. Off unless
-    /// the operator turned them on — including for `Origin::Trusted`,
-    /// which is the voice pipeline and the heartbeat.
-    #[test]
-    fn host_tools_are_denied_when_host_access_is_off() {
-        for name in HOST_TOOLS {
-            assert!(
-                host_tool_denied(name, false, false),
-                "{name} must be denied with host access off"
-            );
-        }
-    }
-
-    #[test]
-    fn host_tools_are_allowed_through_when_host_access_is_on() {
-        for name in HOST_TOOLS {
-            assert!(
-                !host_tool_denied(name, true, false),
-                "{name} must fall through to the policy table when enabled"
-            );
-        }
-    }
-
-    /// The gate is about *which machine*, not about the tool's risk, so
-    /// a workspace-scoped tool is never caught by it.
-    #[test]
-    fn workspace_tools_are_not_host_tools() {
-        for name in [
-            "memory_add",
-            "workspace_search",
-            "current_time",
-            "web_search",
+    fn tool_group_names_are_config_section_names() {
+        for (group, expected) in [
+            (ToolGroup::Fs, "fs"),
+            (ToolGroup::Shell, "shell"),
+            (ToolGroup::Mcp, "mcp"),
+            (ToolGroup::Admin, "admin"),
         ] {
+            assert_eq!(group.as_str(), expected);
+            let message = refusal_message(
+                "tool",
+                Refusal::Unavailable {
+                    session: "session".into(),
+                    permission: "grant".into(),
+                    group,
+                },
+            );
             assert!(
-                !host_tool_denied(name, false, false),
-                "{name} is not a host tool"
+                message.contains(&format!("[tools.{expected}].enabled")),
+                "{message}"
             );
         }
     }
 
-    /// The hole this closes: `file_delete` is `Delete`, which
-    /// `Origin::Channel` allows unasked, so a Discord message can
-    /// delete a file on the agent's host today.
-    #[test]
-    fn a_channel_turn_cannot_reach_file_delete_with_host_access_off() {
+    /// R2/R9: the table is group × permission profile, and the mode is what decides
+    /// whether an *offered* one asks, from `kind` — today's `decide` rows, unchanged,
+    /// including for a tool that carries no group.
+    #[tokio::test]
+    async fn allow_is_the_group_table_and_the_mode_row() {
+        let entry = |name: &str, group: Option<ToolGroup>, enabled: bool, kind| ToolEntry {
+            name: name.into(),
+            group,
+            enabled,
+            kind,
+        };
+        let default_fs = ResolvedPermission {
+            name: "default".into(),
+            permission: "default".into(),
+            groups: vec![ToolGroup::Fs],
+            mode: None,
+        };
+        // A channel turn under `default`: `fs` is listed and enabled here, so it runs unasked.
         assert_eq!(
-            decide(Origin::Channel, ToolKind::Delete),
-            Decision::Allow,
-            "the policy table alone still allows it — which is the point"
+            allow(
+                &default_fs,
+                &entry("file_write", Some(ToolGroup::Fs), true, ToolKind::Edit)
+            ),
+            Allow::Allow
         );
-        assert!(
-            host_tool_denied("file_delete", false, false),
-            "the host gate is what stops it"
+        // `shell` is refused because no profile named it (decision 3), whatever its kind.
+        assert_eq!(
+            allow(
+                &default_fs,
+                &entry("shell", Some(ToolGroup::Shell), true, ToolKind::Execute)
+            ),
+            Allow::Deny
+        );
+        // R2's ∧ half: a group this host does not hand the agent is refused whatever lists it.
+        assert_eq!(
+            allow(
+                &default_fs,
+                &entry("file_write", Some(ToolGroup::Fs), false, ToolKind::Edit)
+            ),
+            Allow::Deny
+        );
+
+        // R9: under `default` an offered edit asks; under `accept_edits` it does not, and
+        // only `Execute`/`Other` still do; `bypass` asks nothing.
+        let edits = ResolvedPermission {
+            name: "default".into(),
+            permission: "default".into(),
+            groups: vec![ToolGroup::Fs],
+            mode: Some(SessionMode::Default),
+        };
+        assert_eq!(
+            allow(
+                &edits,
+                &entry("file_write", Some(ToolGroup::Fs), true, ToolKind::Edit)
+            ),
+            Allow::Ask
+        );
+        let accepted = ResolvedPermission {
+            groups: vec![ToolGroup::Fs, ToolGroup::Shell],
+            mode: Some(SessionMode::AcceptEdits),
+            ..edits.clone()
+        };
+        assert_eq!(
+            allow(
+                &accepted,
+                &entry("file_write", Some(ToolGroup::Fs), true, ToolKind::Edit)
+            ),
+            Allow::Allow
+        );
+        assert_eq!(
+            allow(
+                &accepted,
+                &entry("shell", Some(ToolGroup::Shell), true, ToolKind::Execute)
+            ),
+            Allow::Ask
+        );
+        let bypass = ResolvedPermission {
+            groups: vec![ToolGroup::Fs, ToolGroup::Shell],
+            mode: Some(SessionMode::Bypass),
+            ..edits.clone()
+        };
+        assert_eq!(
+            allow(
+                &bypass,
+                &entry("shell", Some(ToolGroup::Shell), true, ToolKind::Execute)
+            ),
+            Allow::Allow
         );
     }
 
-    /// A trusted origin refuses nothing, so the helper is a no-op there.
-    #[test]
-    fn partition_keeps_everything_for_a_trusted_origin() {
-        let kinds = vec![("shell".to_string(), ToolKind::Execute)];
-        let calls = vec![call("c1", "shell")];
-
-        let (permitted, refused) =
-            partition_without_asking(Origin::Trusted, &calls, &kinds, true, false);
-
-        assert_eq!(permitted.len(), 1);
-        assert!(refused.is_empty());
-    }
-
-    /// `Ask` cannot be honoured without a human, so an origin that
-    /// somehow produces one is refused rather than waved through. This
-    /// is what keeps a future policy change from silently opening the
-    /// channel path.
-    #[test]
-    fn partition_refuses_rather_than_allows_an_ask() {
-        let kinds = vec![("shell".to_string(), ToolKind::Execute)];
-        let calls = vec![call("c1", "shell")];
-
-        let (permitted, refused) = partition_without_asking(
-            Origin::Acp(SessionMode::Default),
-            &calls,
-            &kinds,
-            true,
-            false,
-        );
-
-        assert!(permitted.is_empty(), "an Ask must not be treated as Allow");
-        assert_eq!(refused.len(), 1);
-    }
-
-    /// The meaning change #270 makes: with host access off, a call routed
-    /// to the editor is not this deployment's own disk and has nothing to
-    /// do with this gate. What that turn may see is decided by the
-    /// capabilities the editor declared (`serve::visible_tool_predicate`)
-    /// and by the editor's own answer to `session/request_permission`.
-    #[test]
-    fn a_call_routed_to_the_client_is_never_denied_by_the_host_gate() {
-        for name in HOST_TOOLS {
-            assert!(!host_tool_denied(name, false, true), "{name}");
+    /// R4: the always-allowed tools are outside the table's subject — `enabled` and the
+    /// profile's listing are both beside the point. Their `kind` still meets the mode
+    /// exactly as a grouped tool's does: the old early-return that would have skipped it dies.
+    #[tokio::test]
+    async fn always_allowed_tools_are_outside_the_table() {
+        let chat = ResolvedPermission {
+            name: "chat".into(),
+            permission: "chat".into(),
+            groups: vec![],
+            mode: None,
+        };
+        for kind in [
+            ToolKind::Read,
+            ToolKind::Fetch,
+            ToolKind::Search,
+            ToolKind::Think,
+        ] {
+            let entry = ToolEntry {
+                name: "current_time".into(),
+                group: None,
+                enabled: false,
+                kind,
+            };
+            assert_eq!(allow(&chat, &entry), Allow::Allow, "{kind:?}");
         }
+        // A delegation tool with no group is still asked under a mode that asks.
+        let acp_default = ResolvedPermission {
+            name: "chat".into(),
+            permission: "chat".into(),
+            groups: vec![],
+            mode: Some(SessionMode::Default),
+        };
+        assert_eq!(
+            allow(
+                &acp_default,
+                &ToolEntry {
+                    name: "subagent".into(),
+                    group: None,
+                    enabled: false,
+                    kind: ToolKind::Other
+                }
+            ),
+            Allow::Ask
+        );
+        assert_eq!(
+            allow(
+                &acp_default,
+                &ToolEntry {
+                    name: "memory_read".into(),
+                    group: None,
+                    enabled: false,
+                    kind: ToolKind::Read
+                }
+            ),
+            Allow::Allow
+        );
     }
 
-    /// Unchanged: with no client on the other end the gate behaves exactly
-    /// as it did, for every origin.
-    #[test]
-    fn a_call_routed_to_the_agent_is_still_denied_with_host_access_off() {
-        for name in HOST_TOOLS {
-            assert!(host_tool_denied(name, false, false), "{name}");
-            assert!(!host_tool_denied(name, true, false), "{name}");
+    /// A channel turn never asks: the partition sees Allow and Deny only, and every refusal
+    /// names the setting that would change it.
+    #[tokio::test]
+    async fn a_channel_turn_partitions_on_allow_alone() {
+        let cfg = Config::parse_for_test(
+            "[anthropic]\napi_key = \"test\"\n\n\
+             [session_profile.ops]\nprofile = \"dev\"\npermission = \"default\"\n\n\
+             [tools.fs]\nenabled = true\n[tools.shell]\nenabled = true\n",
+        );
+        // Declared wins verbatim; its `permission` names `default`, and `default` lists fs
+        // and mcp — never shell.
+        let profile = ResolvedPermission::resolve(
+            &cfg,
+            Origin::Channel {
+                session_profile: cfg.session_profile_name(Some("ops"), "!a:srv"),
+            },
+        );
+        assert_eq!(
+            profile.name, "ops",
+            "the turn carries the session-profile name it came with"
+        );
+        assert_eq!(
+            profile.permission, "default",
+            "and the permission profile is what the chain resolves to"
+        );
+
+        let entries = [
+            ToolEntry {
+                name: "file_write".into(),
+                group: Some(ToolGroup::Fs),
+                enabled: cfg.group_enabled(ToolGroup::Fs),
+                kind: ToolKind::Edit,
+            },
+            ToolEntry {
+                name: "shell".into(),
+                group: Some(ToolGroup::Shell),
+                enabled: cfg.group_enabled(ToolGroup::Shell),
+                kind: ToolKind::Execute,
+            },
+            ToolEntry {
+                name: "memory_add".into(),
+                group: None,
+                enabled: false,
+                kind: ToolKind::Edit,
+            },
+        ];
+        let calls: Vec<crate::provider::ToolCall> =
+            [("file_write", "c0"), ("shell", "c1"), ("memory_add", "c2")]
+                .into_iter()
+                .map(|(name, id)| crate::provider::ToolCall {
+                    id: id.into(),
+                    name: name.into(),
+                    input: serde_json::json!({}),
+                })
+                .collect();
+
+        let (permitted, refused) = partition_without_asking(&profile, &calls, &entries);
+        let kept: Vec<&str> = permitted.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(kept, vec!["file_write", "memory_add"]);
+        let name_of = |id: &str| {
+            calls
+                .iter()
+                .find(|c| c.id == id)
+                .map(|c| c.name.clone())
+                .unwrap()
+        };
+        let blocked: Vec<String> = refused.iter().map(|(id, _)| name_of(id)).collect();
+        assert_eq!(blocked, vec!["shell"]);
+        for (id, reason) in &refused {
+            assert!(reason.contains(&name_of(id)), "{reason} names its tool");
+            assert!(
+                reason.contains("permission_profile"),
+                "{reason} names the setting to change"
+            );
         }
-    }
-
-    /// `partition_without_asking` threads the flag into the gate rather
-    /// than assuming one answer somewhere along the way. Every call site of
-    /// this function passes `false` today (the channel path is the only
-    /// one), so this pins the other direction — a routed call survives a
-    /// deployment with host access off — which is what would otherwise
-    /// fail silently if the parameter stopped being forwarded.
-    #[test]
-    fn partition_without_asking_honours_routed_to_client() {
-        let kinds = vec![("file_read".to_string(), ToolKind::Read)];
-        let calls = vec![call("c1", "file_read")];
-
-        let (permitted, refused) =
-            partition_without_asking(Origin::Channel, &calls, &kinds, false, true);
-
-        let kept: Vec<&str> = permitted.iter().map(|c| c.id.as_str()).collect();
-        assert_eq!(kept, vec!["c1"], "a routed call is not this machine's call");
-        assert!(refused.is_empty());
+        assert_eq!(permitted.len() + refused.len(), calls.len());
     }
 }

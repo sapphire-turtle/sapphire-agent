@@ -22,7 +22,7 @@
 //! inventing a second one.
 
 use anyhow::{Result, bail};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -34,8 +34,8 @@ use uuid::Uuid;
 pub struct StoredChild {
     pub agent: String,
     pub history: Vec<crate::provider::ChatMessage>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 
 /// Reserved DOS device names. Matched case-insensitively against the
@@ -199,7 +199,7 @@ impl SubagentCache {
     /// unparseable `.tmp` orphan permanent — it can never age past
     /// "might still be mid-write" under a rule that only ever looks at
     /// its content, not its age.
-    pub fn prune_before(&self, cutoff: DateTime<Utc>) -> usize {
+    pub fn prune_before(&self, cutoff: Timestamp) -> usize {
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
             return 0;
         };
@@ -211,7 +211,7 @@ impl SubagentCache {
                 entry
                     .metadata()
                     .and_then(|m| m.modified())
-                    .map(|modified| DateTime::<Utc>::from(modified) < cutoff)
+                    .map(|modified| jiff::Timestamp::try_from(modified).is_ok_and(|m| m < cutoff))
                     // Can't stat it — treat like any other unreadable
                     // entry: not provably stale, leave it for a later
                     // sweep.
@@ -249,8 +249,8 @@ mod tests {
         StoredChild {
             agent: "impl".into(),
             history: vec![msg("hi")],
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: Timestamp::now(),
+            updated_at: Timestamp::now(),
         }
     }
 
@@ -261,8 +261,8 @@ mod tests {
         let child = StoredChild {
             agent: "impl".into(),
             history: vec![msg("hi")],
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: Timestamp::now(),
+            updated_at: Timestamp::now(),
         };
         assert!(c.put("h1", &child).unwrap());
         assert_eq!(c.get("h1").unwrap().agent, "impl");
@@ -280,8 +280,8 @@ mod tests {
         let big = StoredChild {
             agent: "impl".into(),
             history: vec![msg(&"x".repeat(10_000))],
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: Timestamp::now(),
+            updated_at: Timestamp::now(),
         };
         assert!(!c.put("h2", &big).unwrap());
         assert!(c.get("h2").is_none());
@@ -309,18 +309,18 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let c = SubagentCache::open(d.path().into(), 1_000_000).unwrap();
 
-        let cutoff = Utc::now();
+        let cutoff = Timestamp::now();
         let old = StoredChild {
             agent: "impl".into(),
             history: vec![msg("old")],
-            created_at: cutoff - chrono::Duration::days(2),
-            updated_at: cutoff - chrono::Duration::days(1),
+            created_at: cutoff - jiff::SignedDuration::from_hours(24 * 2),
+            updated_at: cutoff - jiff::SignedDuration::from_hours(24),
         };
         let fresh = StoredChild {
             agent: "impl".into(),
             history: vec![msg("fresh")],
-            created_at: cutoff + chrono::Duration::hours(1),
-            updated_at: cutoff + chrono::Duration::hours(1),
+            created_at: cutoff + jiff::SignedDuration::from_hours(1),
+            updated_at: cutoff + jiff::SignedDuration::from_hours(1),
         };
         assert!(c.put("old", &old).unwrap());
         assert!(c.put("fresh", &fresh).unwrap());
@@ -348,7 +348,7 @@ mod tests {
         let c = SubagentCache::open(d.path().into(), 1_000_000).unwrap();
         std::fs::write(d.path().join("h3.json"), "{ not json").unwrap();
 
-        let cutoff = Utc::now() + chrono::Duration::days(1);
+        let cutoff = Timestamp::now() + jiff::SignedDuration::from_hours(24);
         assert_eq!(c.prune_before(cutoff), 0);
         assert!(d.path().join("h3.json").exists());
     }
@@ -372,7 +372,7 @@ mod tests {
         let old_time = filetime::FileTime::from_system_time(old);
         filetime::set_file_mtime(&tmp_path, old_time).unwrap();
 
-        assert_eq!(c.prune_before(Utc::now()), 1);
+        assert_eq!(c.prune_before(Timestamp::now()), 1);
         assert!(!tmp_path.exists());
     }
 
@@ -386,7 +386,10 @@ mod tests {
         let tmp_path = d.path().join("h5.json.0198f-inflight.tmp");
         std::fs::write(&tmp_path, "{ not even valid json").unwrap();
 
-        assert_eq!(c.prune_before(Utc::now() - chrono::Duration::days(1)), 0);
+        assert_eq!(
+            c.prune_before(Timestamp::now() - jiff::SignedDuration::from_hours(24)),
+            0
+        );
         assert!(tmp_path.exists());
     }
 

@@ -320,21 +320,21 @@ pub fn local_channels(config: &crate::config::Config) -> Vec<ClaimedChannel> {
         out.push(ClaimedChannel {
             kind: "matrix".to_owned(),
             account: m.user_id.clone(),
-            rooms: m.rooms.keys().cloned().collect(),
+            rooms: m.rooms.iter().map(|r| r.room_id.clone()).collect(),
         });
     }
     if let Some(d) = &config.discord {
         out.push(ClaimedChannel {
             kind: "discord".to_owned(),
             account: token_fingerprint(&d.bot_token),
-            rooms: d.rooms.keys().cloned().collect(),
+            rooms: d.rooms.iter().map(|r| r.room_id.clone()).collect(),
         });
     }
     if let Some(t) = &config.telegram {
         out.push(ClaimedChannel {
             kind: "telegram".to_owned(),
             account: token_fingerprint(&t.bot_token),
-            rooms: t.rooms.keys().cloned().collect(),
+            rooms: t.rooms.iter().map(|r| r.room_id.clone()).collect(),
         });
     }
     out
@@ -712,10 +712,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let me = dev("desk");
         let config = crate::config::Config::parse_for_test(
-            "[discord]\nbot_token = \"SECRET-DISCORD-TOKEN\"\n[discord.rooms.\"123\"]\n\
-             [telegram]\nbot_token = \"SECRET-TELEGRAM-TOKEN\"\n[telegram.rooms.\"-1001:42\"]\n\
+            "[discord]\nbot_token = \"SECRET-DISCORD-TOKEN\"\n[[discord.rooms]]\nroom_id = \"123\"\n\
+             [telegram]\nbot_token = \"SECRET-TELEGRAM-TOKEN\"\n[[telegram.rooms]]\nroom_id = \"-1001:42\"\n\
              [matrix]\nhomeserver = \"h\"\naccess_token = \"SECRET-MATRIX-TOKEN\"\n\
-             user_id = \"@b:x\"\ndevice_id = \"d\"\n[matrix.rooms.\"!a:x\"]\n",
+             user_id = \"@b:x\"\ndevice_id = \"d\"\n[[matrix.rooms]]\nroom_id = \"!a:x\"\n",
         );
         let channels = local_channels(&config);
 

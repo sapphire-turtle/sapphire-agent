@@ -18,6 +18,7 @@ mod agent;
 mod agents;
 mod ambient;
 mod app_server;
+mod attachment_store;
 mod autonomous;
 mod autonomous_config;
 mod avatar_store;
@@ -132,7 +133,7 @@ use workspace::Workspace;
 /// falling back to the default namespace for old files that predate
 /// the field. Every other channel (Matrix/Discord `"channel"`
 /// sessions) has no such field and resolves via
-/// `Config::namespace_for_room` instead.
+/// `Config::namespace_for_session` instead.
 ///
 /// Extracted to a named function (rather than inlined as a closure)
 /// so it can be unit-tested directly.
@@ -147,7 +148,7 @@ fn daily_log_catchup_predicate(
             .unwrap_or(config::DEFAULT_NAMESPACE_NAME)
             == namespace
     } else {
-        config.namespace_for_room(&meta.room_id) == namespace
+        config.namespace_for_session(&meta.room_id) == namespace
     }
 }
 
@@ -200,7 +201,8 @@ fn consult_room_warnings(config: &config::Config) -> Vec<String> {
         return Vec::new();
     };
     let mut lines = Vec::new();
-    let listed = config.room_block_for(room).is_some() || discord_listens_to_room(config, room);
+    let listed = config.channels().any(|(_, r)| r.room_id == room)
+        || wildcard_channel_for_room(config, room).is_some();
     if !listed {
         lines.push(format!(
             "  Consult room      : {room} is not in matrix.rooms, discord.rooms, or \
@@ -216,10 +218,23 @@ fn consult_room_warnings(config: &config::Config) -> Vec<String> {
     lines
 }
 
-/// Whether Discord listens in `room` without listing it: an empty
-/// `rooms` map means every channel, and a Discord channel ID is numeric.
-fn discord_listens_to_room(config: &config::Config, room: &str) -> bool {
-    config.discord.as_ref().is_some_and(|d| d.rooms.is_empty()) && room.parse::<u64>().is_ok()
+/// Infer a route for an unlisted consult room when its channel listens everywhere.
+fn wildcard_channel_for_room(config: &config::Config, room: &str) -> Option<&'static str> {
+    if config.matrix.as_ref().is_some_and(|m| m.rooms.is_empty())
+        && matrix_sdk::ruma::RoomId::parse(room).is_ok()
+    {
+        Some("matrix")
+    } else if config.discord.as_ref().is_some_and(|d| d.rooms.is_empty())
+        && room.parse::<u64>().is_ok()
+    {
+        Some("discord")
+    } else if config.telegram.as_ref().is_some_and(|t| t.rooms.is_empty())
+        && channel::telegram::split_room_id(room).is_ok()
+    {
+        Some("telegram")
+    } else {
+        None
+    }
 }
 
 /// Prefer the first configured Matrix room, then Discord, then Telegram.
@@ -256,7 +271,7 @@ fn consult_timeout(hours: u64) -> std::time::Duration {
 
 /// `verify`'s API key section: the keys of the workspace the agent serves
 /// and the room profile each runs under, so a key that would be refused
-/// shows up before a request is. Also the `[room_profile.<n>].devices`
+/// shows up before a request is. Also the `[session_profile.<n>].devices`
 /// fallback for keys from before profiles, and any entry of it naming no
 /// key. Reads the key files without changing them.
 fn verify_api_keys(auth: &device_auth::DeviceAuth, root: Option<&std::path::Path>) {
@@ -266,7 +281,7 @@ fn verify_api_keys(auth: &device_auth::DeviceAuth, root: Option<&std::path::Path
     if !bindings.is_empty() {
         println!("  Device bindings   : (for API keys from before key profiles)");
         for (selector, rp) in &bindings {
-            println!("    {selector:<20} -> room_profile '{rp}'");
+            println!("    {selector:<20} -> session_profile '{rp}'");
         }
     }
     let Some(root) = root else {
@@ -295,15 +310,15 @@ fn verify_api_keys(auth: &device_auth::DeviceAuth, root: Option<&std::path::Path
     println!("  API keys          : {} in {}", live.len(), dir.display());
     for key in &live {
         let profile = key.profile.as_str();
-        if auth.is_room_profile(profile) {
+        if auth.is_session_profile(profile) {
             println!(
-                "    {:<20} {} -> room_profile '{profile}'",
+                "    {:<20} {} -> session_profile '{profile}'",
                 key.name, key.id
             );
         } else if profile == MIGRATED {
             match auth.legacy_binding(key.id.as_str(), &key.name) {
                 Some(rp) => println!(
-                    "    {:<20} {} -> room_profile '{rp}' (by `devices`; re-issue it with \
+                    "    {:<20} {} -> session_profile '{rp}' (by `devices`; re-issue it with \
                      `--profile {rp}`)",
                     key.name, key.id
                 ),
@@ -413,6 +428,25 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
         // config it would refuse is one it serves without below.
         .and_then(|loaded| {
             if serving {
+                let errors = loaded.config.validate_task_profiles(
+                    &heartbeat_config::load_heartbeat_dir(&loaded.workspace_dir.join("heartbeat")),
+                    &autonomous_config::load_autonomous_dir(
+                        &loaded.workspace_dir.join("autonomous"),
+                    ),
+                );
+                if !errors.is_empty() {
+                    anyhow::bail!(
+                        "invalid task session profile references:\n  - {}",
+                        errors.join("\n  - ")
+                    );
+                }
+                let errors = loaded.config.validate_session_profiles();
+                if !errors.is_empty() {
+                    anyhow::bail!(
+                        "invalid session profile references:\n  - {}",
+                        errors.join("\n  - ")
+                    );
+                }
                 ProviderRegistry::from_config(&loaded.config)
                     .context("Failed to build provider registry")?;
             }
@@ -526,7 +560,7 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
             // ── Split sessions/<ns>/{api,rpc}/ into cross-device + legacy-voice ─
             // Quarantines pre-redesign voice files (their `voice-<hash>`
             // names can't be re-hydrated into the new
-            // `(device_id, room_profile)` keying) and moves remaining
+            // `(device_id, session_profile)` keying) and moves remaining
             // sessions into the new `cross-device/` directory, rewriting
             // stored `meta.channel = "api"` → `"rpc"` along the way.
             if let Err(e) = migrate_to_device_default_layout(&sessions_base_for_migration) {
@@ -551,7 +585,7 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
             let acp_tunnel = serve::acp_tunnel::AcpTunnel::default();
             let chat_tunnel = serve::chat_ipc::ChatTunnel::default();
             let server = app_server::build(edition)
-                .key_profiles(device_auth::room_key_profiles(&config.room_profiles))
+                .key_profiles(device_auth::room_key_profiles(&config.session_profiles))
                 .extend({
                     let acp = acp_tunnel.clone();
                     let chat = chat_tunnel.clone();
@@ -619,6 +653,7 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
                 config.tools.tavily_api_key.clone(),
                 &config.tools.mcp_servers,
                 config.day_boundary_hour,
+                &config,
             )
             .await;
 
@@ -656,7 +691,7 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
             // `src/agent.rs`, stay untouched by this feature. Registered
             // when at least one definition loaded — a tool with nobody to
             // delegate to has no reason to be offered — and also when
-            // `[tools.admin].room_profiles` names a profile: `agent_config` can
+            // `admin` is registered: `agent_config` can
             // create a definition while the process is running.
             let agent_defs = agents::load_agents_dir(&workspace_dir.join("agents"));
             // Taken before `new` moves the list: an empty list is not an
@@ -670,7 +705,7 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
                 );
             }
             // Registered when there is something to delegate to, and also
-            // when `[tools.admin].room_profiles` names a profile: `agent_config`
+            // when `admin` is registered: `agent_config`
             // can create a definition while the process is running. `Arc` rather
             // than a bare `Box` because `agent_config` holds a `Weak` to it —
             // same shape `SkillTool` uses.
@@ -678,7 +713,7 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
                 agent_defs,
                 config.tools.background.max_per_session > 0,
             ));
-            if !no_agent_defs || config.config_tools_enabled() {
+            if !no_agent_defs || config.group_registered(config::ToolGroup::Admin) {
                 tool_set
                     .register_tool(Box::new(Arc::clone(&subagent)))
                     .await;
@@ -809,7 +844,7 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
             ));
 
             // ── Device-default session store (sessions/<ns>/device-default/) ─
-            // Lazy-created, daily-rotated per `(device_id, room_profile)` —
+            // Lazy-created, daily-rotated per `(device_id, session_profile)` —
             // the heartbeat target and the implicit session for a satellite
             // with nothing else selected. See #122.
             let device_default_session_store = Arc::new(SessionStore::with_workspace(
@@ -876,7 +911,9 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
             // there is exactly one answer to "who is this token" in the
             // process. Tokens are checked against the served workspace's
             // API keys; a key's profile is its room profile.
-            let device_auth = Arc::new(device_auth::DeviceAuth::workspace(&config.room_profiles)?);
+            let device_auth = Arc::new(device_auth::DeviceAuth::workspace(
+                &config.session_profiles,
+            )?);
 
             // ── Ambient audio ingest (optional) ─────────────────────────────
             // Built here — after `voice_providers` exists, before it is
@@ -931,6 +968,42 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
             } else {
                 None
             };
+
+            // Original attachments are independent of the image cache switch.
+            // Resolve, open and sweep on a blocking worker before any channel
+            // can insert entries or attachment_save can look them up.
+            let attachment_root = workspace_dir.clone();
+            let attachment_store =
+                match tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                    let dir = attachment_store::AttachmentStore::default_dir(&attachment_root)?;
+                    let store = attachment_store::AttachmentStore::open(dir)?;
+                    store.sweep(jiff::Timestamp::now().as_millisecond().max(0) as u64)?;
+                    Ok(store)
+                })
+                .await
+                {
+                    Ok(Ok(store)) => Some(store),
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            "Attachment store startup failed ({e:#}); original caching disabled"
+                        );
+                        None
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Attachment store startup task failed ({e}); original caching disabled"
+                        );
+                        None
+                    }
+                };
+            if let Some(store) = attachment_store.clone() {
+                tool_set
+                    .register_tool(Box::new(tools::attachment_tools::AttachmentSaveTool::new(
+                        store,
+                        Arc::clone(&ws_state),
+                    )))
+                    .await;
+            }
 
             // Register `recall_image` once the image cache is resolved.
             // Without a cache there's nothing to recall, so skip the
@@ -1092,10 +1165,9 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
 
             // ── Config tools ────────────────────────────────────────────────
             // The agent's own heartbeat / autonomous / subagent definitions,
-            // editable from a chat room an operator names in
-            // `[tools.admin].room_profiles`. Registered here rather than in
+            // editable through the `admin` group. Registered here rather than in
             // `default_tool_set` because `task_test` needs `serve_state`,
-            // which is built above, and because a `room_profiles` that names
+            // which is built above, and because a `session_profiles` that names
             // nobody must register none of the four at all — see
             // `register_admin_tools`.
             tools::config_tools::register_admin_tools(
@@ -1120,14 +1192,20 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
             if config.matrix.is_some() || config.discord.is_some() || config.telegram.is_some() {
                 let mut channel_list: Vec<(String, Arc<dyn channel::Channel>)> = Vec::new();
                 if let Some(m) = &config.matrix {
-                    channel_list.push(("matrix".to_string(), Arc::new(MatrixChannel::new(m))));
+                    channel_list.push((
+                        "matrix".to_string(),
+                        Arc::new(
+                            MatrixChannel::new(m).with_attachment_store(attachment_store.clone()),
+                        ),
+                    ));
                 }
                 if let Some(d) = &config.discord {
                     channel_list.push((
                         "discord".to_string(),
                         Arc::new(
                             DiscordChannel::new(d)
-                                .context("Failed to initialise Discord channel")?,
+                                .context("Failed to initialise Discord channel")?
+                                .with_attachment_store(attachment_store.clone()),
                         ),
                     ));
                 }
@@ -1136,7 +1214,8 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
                         "telegram".to_string(),
                         Arc::new(
                             TelegramChannel::new(t)
-                                .context("Failed to initialise Telegram channel")?,
+                                .context("Failed to initialise Telegram channel")?
+                                .with_attachment_store(attachment_store.clone()),
                         ),
                     ));
                 }
@@ -1161,8 +1240,10 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
                 // always keeps the room's messages out of chat; `ask` checks
                 // `serves` again at call time.
                 if let Some(room) = config.autonomous.consult_room.clone() {
-                    if !channels.serves(&room).await && discord_listens_to_room(&config, &room) {
-                        channels.seed_room(&room, "discord").await;
+                    if !channels.serves(&room).await
+                        && let Some(kind) = wildcard_channel_for_room(&config, &room)
+                    {
+                        channels.seed_room(&room, kind).await;
                     }
                     if !channels.serves(&room).await {
                         tracing::warn!(
@@ -1263,7 +1344,7 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
                 // NSFW namespace can route to its local model up front
                 // instead of bouncing through Anthropic refusal-fallback.
                 let today_local = session::local_date_for_timestamp(
-                    chrono::Local::now(),
+                    jiff::ZonedDateTime::now(),
                     config.day_boundary_hour,
                 );
                 for ns in config.all_memory_namespaces() {
@@ -1381,6 +1462,33 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
                 }
             }
 
+            // Start only once fallible startup has finished so every spawned
+            // sweep task reaches the explicit shutdown-and-join path below.
+            let attachment_sweep_handle = attachment_store.map(|store| {
+                let shutdown = shutdown.clone();
+                tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+                    // Startup already swept; consume interval's immediate tick.
+                    interval.tick().await;
+                    loop {
+                        tokio::select! {
+                            biased;
+                            () = shutdown.cancelled() => break,
+                            _ = interval.tick() => {
+                                let store = store.clone();
+                                match tokio::task::spawn_blocking(move || {
+                                    store.sweep(jiff::Timestamp::now().as_millisecond().max(0) as u64)
+                                }).await {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(e)) => tracing::warn!("Attachment sweep failed: {e:#}"),
+                                    Err(e) => tracing::warn!("Attachment sweep task failed: {e}"),
+                                }
+                            }
+                        }
+                    }
+                })
+            });
+
             let served = serve::run(
                 addr,
                 Arc::clone(&serve_state),
@@ -1391,6 +1499,13 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
             // However the HTTP server ended, everything else stops with it.
             shutdown.cancel();
             switch_watch.abort();
+            // This also waits for an in-flight blocking sweep to finish; do
+            // not leave cleanup to runtime destruction (or restart's exit).
+            if let Some(handle) = attachment_sweep_handle
+                && let Err(e) = handle.await
+            {
+                tracing::warn!("Attachment cleanup task did not finish cleanly: {e}");
+            }
 
             // Wait for the agent task's graceful shutdown to finish so its
             // flush_digests_on_shutdown LLM call isn't aborted by runtime drop.
@@ -1416,7 +1531,11 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
             server_task.await.context("the app server panicked")??;
         }
         Mode::Verify => {
-            let mut profile_errors = config.validate_profiles();
+            let mut profile_errors = config.validate_session_profiles();
+            profile_errors.extend(config.validate_task_profiles(
+                &heartbeat_config::load_heartbeat_dir(&workspace_dir.join("heartbeat")),
+                &autonomous_config::load_autonomous_dir(&workspace_dir.join("autonomous")),
+            ));
             // `serve` refuses to start on what only the registry can see —
             // a profile naming `anthropic` with no API key, or no key and no
             // `[profiles.default]` — so `verify` builds it too.
@@ -1447,7 +1566,7 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
             // Where each API key goes — its profile, or for a key from
             // before profiles the hand-written `devices` — needs somewhere
             // to be checked.
-            match device_auth::DeviceAuth::workspace(&config.room_profiles) {
+            match device_auth::DeviceAuth::workspace(&config.session_profiles) {
                 Ok(auth) => verify_api_keys(&auth, selection.as_ref().map(|s| s.root.as_path())),
                 Err(e) => println!("  Devices           : INVALID: {e:#}"),
             }
@@ -1467,14 +1586,14 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
                 println!("  Matrix user_id    : {}", m.user_id);
                 println!(
                     "  Matrix rooms      : {:?}",
-                    m.rooms.keys().collect::<Vec<_>>()
+                    m.rooms.iter().map(|r| &r.room_id).collect::<Vec<_>>()
                 );
             }
             if let Some(d) = &config.discord {
                 println!("  Channel           : discord");
                 println!(
                     "  Discord channels  : {:?}",
-                    d.rooms.keys().collect::<Vec<_>>()
+                    d.rooms.iter().map(|r| &r.room_id).collect::<Vec<_>>()
                 );
                 println!("  Allowed users     : {:?}", d.allowed_users);
             }
@@ -1482,7 +1601,7 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
                 println!("  Channel           : telegram");
                 println!(
                     "  Telegram rooms    : {:?}",
-                    t.rooms.keys().collect::<Vec<_>>()
+                    t.rooms.iter().map(|r| &r.room_id).collect::<Vec<_>>()
                 );
                 println!("  Allowed users     : {:?}", t.allowed_users);
             }
@@ -1667,7 +1786,7 @@ fn migrate_sessions_to_namespaced_layout(sessions_base: &std::path::Path) -> any
 /// `sessions/<ns>/{api,rpc}/` directory into the new layout.
 ///
 /// - Files whose name starts with `voice-` are pre-redesign voice
-///   sessions. Their `(device_id, room_profile)` was hashed into the
+///   sessions. Their `(device_id, session_profile)` was hashed into the
 ///   filename and is unrecoverable from disk, so we can't slot them
 ///   into the new device-default layout. They move to
 ///   `sessions/<ns>/legacy-voice/` instead — the daily-log archive
@@ -1955,6 +2074,64 @@ fn migrate_pre_namespace_layout(workspace_dir: &std::path::Path) -> anyhow::Resu
 mod tests {
     use super::*;
 
+    /// R1: a heartbeat/autonomous task names the profile that governs its run. An
+    /// unknown one is a startup error, same shape as a subagent definition's.
+    #[test]
+    fn a_task_frontmatter_names_its_session_profile() {
+        let raw = "---\nschedule: \"0 8 * * *\"\nroom_id: \"!a:srv\"\nprofile: \"ops\"\nenabled: true\n---\n\n# Morning Call\n";
+        let (_dir, root, _ws) = tools::config_tools::test_workspace();
+        std::fs::write(root.join("heartbeat/morning_call.md"), raw).unwrap();
+        let tasks = crate::heartbeat_config::load_heartbeat_dir(&root.join("heartbeat"));
+        assert_eq!(tasks[0].meta.profile.as_deref(), Some("ops"));
+        assert_eq!(
+            tasks[0].meta.room_id.as_deref(),
+            Some("!a:srv"),
+            "room_id keeps parsing: delivery-only"
+        );
+        let cfg = config::Config::parse_for_test("[anthropic]\napi_key = \"test\"\n");
+        let errors = cfg.validate_task_profiles(&tasks, &[]);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("'ops'") && e.contains("session_profile")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn task_profiles_validate_every_explicit_and_implicit_name() {
+        let (_dir, root, _ws) = tools::config_tools::test_workspace();
+        std::fs::write(
+            root.join("heartbeat/a.md"),
+            "---\nschedule: '0 8 * * *'\n---\nA\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("autonomous/b.md"), "---\nprofile: ops\n---\nB\n").unwrap();
+        std::fs::write(
+            root.join("autonomous/c.md"),
+            "---\nprofile: missing\n---\nC\n",
+        )
+        .unwrap();
+        let heartbeat = heartbeat_config::load_heartbeat_dir(&root.join("heartbeat"));
+        let autonomous = autonomous_config::load_autonomous_dir(&root.join("autonomous"));
+        assert_eq!(autonomous[0].profile.as_deref(), Some("ops"));
+        let cfg = config::Config::parse_for_test(
+            "[anthropic]\napi_key='test'\n[profiles.dev]\nprovider='anthropic'\n[session_profile.ops]\nprofile='dev'\n",
+        );
+        let errors = cfg.validate_task_profiles(&heartbeat, &autonomous);
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("heartbeat") && e.contains("'default'"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("autonomous") && e.contains("'missing'"))
+        );
+    }
+
     fn consult_config(extra: &str) -> config::Config {
         config::Config::parse_for_test(&format!("[anthropic]\napi_key = \"t\"\n{extra}"))
     }
@@ -1963,7 +2140,7 @@ mod tests {
     fn verify_warns_about_an_unlisted_consult_room() {
         let cfg = consult_config(
             "[autonomous]\nenabled = true\nconsult_room = \"c1\"\n\
-             [discord]\nbot_token = \"x\"\n[discord.rooms.\"other\"]\n",
+             [discord]\nbot_token = \"x\"\n[[discord.rooms]]\nroom_id = \"other\"\n",
         );
         let lines = consult_room_warnings(&cfg);
         assert_eq!(lines.len(), 1, "{lines:?}");
@@ -1974,7 +2151,7 @@ mod tests {
     fn verify_accepts_a_listed_consult_room_and_warns_when_autonomous_is_off() {
         let cfg = consult_config(
             "[autonomous]\nconsult_room = \"c1\"\n\
-             [discord]\nbot_token = \"x\"\n[discord.rooms.\"c1\"]\n",
+             [discord]\nbot_token = \"x\"\n[[discord.rooms]]\nroom_id = \"c1\"\n",
         );
         let lines = consult_room_warnings(&cfg);
         assert_eq!(lines.len(), 1, "{lines:?}");
@@ -1986,7 +2163,7 @@ mod tests {
     fn verify_accepts_a_listed_telegram_consult_room() {
         let cfg = consult_config(
             "[autonomous]\nenabled = true\nconsult_room = \"-1001:42\"\n\
-             [telegram]\nbot_token = \"123456:test\"\n[telegram.rooms.\"-1001:42\"]\n",
+             [telegram]\nbot_token = \"123456:test\"\n[[telegram.rooms]]\nroom_id = \"-1001:42\"\n",
         );
         assert!(consult_room_warnings(&cfg).is_empty());
     }
@@ -1998,23 +2175,23 @@ mod tests {
              [discord]\nbot_token = \"x\"\n",
         );
         assert!(consult_room_warnings(&cfg).is_empty());
-        assert!(discord_listens_to_room(&cfg, "123"));
+        assert_eq!(wildcard_channel_for_room(&cfg, "123"), Some("discord"));
         // A non-numeric room can't be a Discord channel.
         let cfg = consult_config(
             "[autonomous]\nenabled = true\nconsult_room = \"!r:x\"\n\
              [discord]\nbot_token = \"x\"\n",
         );
         assert_eq!(consult_room_warnings(&cfg).len(), 1);
-        assert!(!discord_listens_to_room(&cfg, "!r:x"));
+        assert_eq!(wildcard_channel_for_room(&cfg, "!r:x"), None);
     }
 
     #[test]
     fn heartbeat_defaults_to_the_first_room_in_channel_preference_order() {
         let mut cfg = consult_config(
             "[matrix]\nhomeserver = \"h\"\naccess_token = \"t\"\nuser_id = \"@b:x\"\n\
-             device_id = \"d\"\n[matrix.rooms.\"!z:x\"]\n[matrix.rooms.\"!a:x\"]\n\
-             [discord]\nbot_token = \"x\"\n[discord.rooms.\"9\"]\n[discord.rooms.\"7\"]\n\
-             [telegram]\nbot_token = \"123456:test\"\n[telegram.rooms.\"-1001:42\"]\n[telegram.rooms.\"-1001:11\"]\n",
+             device_id = \"d\"\n[[matrix.rooms]]\nroom_id = \"!z:x\"\n[[matrix.rooms]]\nroom_id = \"!a:x\"\n\
+             [discord]\nbot_token = \"x\"\n[[discord.rooms]]\nroom_id = \"9\"\n[[discord.rooms]]\nroom_id = \"7\"\n\
+             [telegram]\nbot_token = \"123456:test\"\n[[telegram.rooms]]\nroom_id = \"-1001:42\"\n[[telegram.rooms]]\nroom_id = \"-1001:11\"\n",
         );
         assert_eq!(default_heartbeat_room(&cfg), Some("!z:x"));
         cfg.matrix.as_mut().unwrap().rooms.clear();
@@ -2048,7 +2225,7 @@ mod tests {
             room_id: String::new(),
             thread_id: None,
             channel: "acp".to_string(),
-            created_at: chrono::Utc::now(),
+            created_at: jiff::Timestamp::now(),
             public_id: None,
             namespace: Some(namespace.to_string()),
             device_id: None,
@@ -2064,7 +2241,7 @@ mod tests {
     fn unknown_keys_are_grouped_under_the_file_that_supplied_them() {
         let provenance = std::collections::BTreeMap::from([
             (
-                "room_profile.default.skills".to_string(),
+                "session_profile.default.skills".to_string(),
                 config_layer::Layer::Host,
             ),
             (
@@ -2074,7 +2251,7 @@ mod tests {
         ]);
         let unknown = vec![
             "memory_namespace.dev.skils".to_string(),
-            "room_profile.default.skills".to_string(),
+            "session_profile.default.skills".to_string(),
         ];
 
         let grouped = group_unknown_keys(
@@ -2089,7 +2266,7 @@ mod tests {
             vec![
                 (
                     "/etc/host.toml".to_string(),
-                    vec!["room_profile.default.skills"]
+                    vec!["session_profile.default.skills"]
                 ),
                 (
                     "/ws/.sapphire-agent/config.toml".to_string(),

@@ -13,7 +13,9 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Local, NaiveDate, Utc};
+use jiff::Timestamp;
+use jiff::civil::Date;
+use jiff::tz::TimeZone;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -27,7 +29,7 @@ pub struct TranscriptRecord {
     /// `[device.<name>]` key the bearer token resolved to.
     pub device: String,
     /// When the audio was **recorded**, not when it arrived.
-    pub started_at: DateTime<Utc>,
+    pub started_at: Timestamp,
     /// Speech duration after the VAD re-gate — not the length of the
     /// submitted segment. The same measure feeds `min_embed_ms` and a
     /// candidate's promotion total, so all three agree.
@@ -59,11 +61,14 @@ impl TranscriptStore {
     }
 
     /// The logical day `at` belongs to, honouring `day_boundary_hour`.
-    pub fn day_of(&self, at: DateTime<Utc>) -> NaiveDate {
-        local_date_for_timestamp(at.with_timezone(&Local), self.day_boundary_hour)
+    pub fn day_of(&self, at: Timestamp) -> Date {
+        local_date_for_timestamp(
+            at.to_zoned_datetime(TimeZone::system()),
+            self.day_boundary_hour,
+        )
     }
 
-    fn path_for_day(&self, day: NaiveDate) -> PathBuf {
+    fn path_for_day(&self, day: Date) -> PathBuf {
         self.dir.join(format!("{day}.jsonl"))
     }
 
@@ -94,15 +99,15 @@ impl TranscriptStore {
     /// from a crash must not make the whole day unreadable.
     pub fn read(
         &self,
-        from: DateTime<Utc>,
-        to: DateTime<Utc>,
+        from: Timestamp,
+        to: Timestamp,
         speakers: Option<&[String]>,
     ) -> Result<Vec<TranscriptRecord>> {
         let mut out = Vec::new();
         // Widen by a day on each side: the boundary hour means a record's
         // logical day can differ from its calendar day.
-        let mut day = self.day_of(from) - chrono::Duration::days(1);
-        let last = self.day_of(to) + chrono::Duration::days(1);
+        let mut day = self.day_of(from) - jiff::Span::new().days(1);
+        let last = self.day_of(to) + jiff::Span::new().days(1);
         while day <= last {
             let path = self.path_for_day(day);
             match std::fs::File::open(&path) {
@@ -126,7 +131,7 @@ impl TranscriptStore {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => warn!("skipping unreadable transcript file {path:?}: {e}"),
             }
-            day += chrono::Duration::days(1);
+            day += jiff::SignedDuration::from_hours(24);
         }
         out.retain(|r| {
             r.started_at >= from
@@ -145,11 +150,10 @@ impl TranscriptStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
 
-    fn rec(started_at: DateTime<Utc>, speaker: Option<&str>, text: &str) -> TranscriptRecord {
+    fn rec(started_at: Timestamp, speaker: Option<&str>, text: &str) -> TranscriptRecord {
         TranscriptRecord {
-            segment: format!("seg-{}", started_at.timestamp()),
+            segment: format!("seg-{}", started_at.as_second()),
             device: "pendant".into(),
             started_at,
             speech_ms: 4200,
@@ -164,14 +168,18 @@ mod tests {
     fn append_then_read_round_trips_a_record() {
         let tmp = tempfile::tempdir().unwrap();
         let store = TranscriptStore::open(tmp.path().to_path_buf(), 4).unwrap();
-        let at = Utc.with_ymd_and_hms(2026, 8, 26, 5, 3, 11).unwrap();
+        let at = jiff::civil::date(2026, 8, 26)
+            .at(5, 3, 11, 0)
+            .to_zoned_datetime(jiff::tz::TimeZone::UTC)
+            .unwrap()
+            .timestamp();
         let r = rec(at, Some("me"), "hello");
         store.append(&r).unwrap();
 
         let got = store
             .read(
-                at - chrono::Duration::hours(1),
-                at + chrono::Duration::hours(1),
+                at - jiff::SignedDuration::from_hours(1),
+                at + jiff::SignedDuration::from_hours(1),
                 None,
             )
             .unwrap();
@@ -183,11 +191,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = TranscriptStore::open(tmp.path().to_path_buf(), 4).unwrap();
         // 02:00 local on the 27th is still the 26th when the day starts at 04:00.
-        let local = chrono::Local
-            .with_ymd_and_hms(2026, 8, 27, 2, 0, 0)
+        let local = jiff::civil::date(2026, 8, 27)
+            .at(2, 0, 0, 0)
+            .to_zoned_datetime(jiff::tz::TimeZone::system())
             .unwrap();
         store
-            .append(&rec(local.with_timezone(&Utc), None, "late night"))
+            .append(&rec(local.timestamp(), None, "late night"))
             .unwrap();
 
         let files: Vec<String> = std::fs::read_dir(tmp.path())
@@ -201,23 +210,31 @@ mod tests {
     fn read_filters_by_speaker_and_by_range() {
         let tmp = tempfile::tempdir().unwrap();
         let store = TranscriptStore::open(tmp.path().to_path_buf(), 4).unwrap();
-        let base = Utc.with_ymd_and_hms(2026, 8, 26, 12, 0, 0).unwrap();
+        let base = jiff::civil::date(2026, 8, 26)
+            .at(12, 0, 0, 0)
+            .to_zoned_datetime(jiff::tz::TimeZone::UTC)
+            .unwrap()
+            .timestamp();
         store.append(&rec(base, Some("me"), "mine")).unwrap();
         store
             .append(&rec(
-                base + chrono::Duration::minutes(1),
+                base + jiff::SignedDuration::from_mins(1),
                 Some("tanaka-san"),
                 "theirs",
             ))
             .unwrap();
         store
-            .append(&rec(base + chrono::Duration::hours(5), Some("me"), "later"))
+            .append(&rec(
+                base + jiff::SignedDuration::from_hours(5),
+                Some("me"),
+                "later",
+            ))
             .unwrap();
 
         let mine = store
             .read(
-                base - chrono::Duration::hours(1),
-                base + chrono::Duration::hours(1),
+                base - jiff::SignedDuration::from_hours(1),
+                base + jiff::SignedDuration::from_hours(1),
                 Some(&["me".to_string()][..]),
             )
             .unwrap();
@@ -231,18 +248,22 @@ mod tests {
     fn read_matches_any_of_several_speaker_ids() {
         let tmp = tempfile::tempdir().unwrap();
         let store = TranscriptStore::open(tmp.path().to_path_buf(), 4).unwrap();
-        let base = Utc.with_ymd_and_hms(2026, 8, 26, 12, 0, 0).unwrap();
+        let base = jiff::civil::date(2026, 8, 26)
+            .at(12, 0, 0, 0)
+            .to_zoned_datetime(jiff::tz::TimeZone::UTC)
+            .unwrap()
+            .timestamp();
         store.append(&rec(base, Some("me"), "before")).unwrap();
         store
             .append(&rec(
-                base + chrono::Duration::minutes(1),
+                base + jiff::SignedDuration::from_mins(1),
                 Some("blithe-otter-42"),
                 "after",
             ))
             .unwrap();
         store
             .append(&rec(
-                base + chrono::Duration::minutes(2),
+                base + jiff::SignedDuration::from_mins(2),
                 Some("someone-else"),
                 "not mine",
             ))
@@ -251,8 +272,8 @@ mod tests {
         let ids = ["me".to_string(), "blithe-otter-42".to_string()];
         let got = store
             .read(
-                base - chrono::Duration::hours(1),
-                base + chrono::Duration::hours(1),
+                base - jiff::SignedDuration::from_hours(1),
+                base + jiff::SignedDuration::from_hours(1),
                 Some(&ids[..]),
             )
             .unwrap();
@@ -264,15 +285,23 @@ mod tests {
     fn read_spans_multiple_day_files_in_time_order() {
         let tmp = tempfile::tempdir().unwrap();
         let store = TranscriptStore::open(tmp.path().to_path_buf(), 4).unwrap();
-        let day2 = Utc.with_ymd_and_hms(2026, 8, 27, 12, 0, 0).unwrap();
-        let day1 = Utc.with_ymd_and_hms(2026, 8, 26, 12, 0, 0).unwrap();
+        let day2 = jiff::civil::date(2026, 8, 27)
+            .at(12, 0, 0, 0)
+            .to_zoned_datetime(jiff::tz::TimeZone::UTC)
+            .unwrap()
+            .timestamp();
+        let day1 = jiff::civil::date(2026, 8, 26)
+            .at(12, 0, 0, 0)
+            .to_zoned_datetime(jiff::tz::TimeZone::UTC)
+            .unwrap()
+            .timestamp();
         store.append(&rec(day2, Some("me"), "second")).unwrap();
         store.append(&rec(day1, Some("me"), "first")).unwrap();
 
         let all = store
             .read(
-                day1 - chrono::Duration::days(1),
-                day2 + chrono::Duration::days(1),
+                day1 - jiff::SignedDuration::from_hours(24),
+                day2 + jiff::SignedDuration::from_hours(24),
                 None,
             )
             .unwrap();
@@ -284,17 +313,21 @@ mod tests {
     fn read_orders_records_within_a_single_day_file_by_started_at() {
         let tmp = tempfile::tempdir().unwrap();
         let store = TranscriptStore::open(tmp.path().to_path_buf(), 4).unwrap();
-        let base = Utc.with_ymd_and_hms(2026, 8, 26, 12, 0, 0).unwrap();
+        let base = jiff::civil::date(2026, 8, 26)
+            .at(12, 0, 0, 0)
+            .to_zoned_datetime(jiff::tz::TimeZone::UTC)
+            .unwrap()
+            .timestamp();
         let earlier = base;
-        let later = base + chrono::Duration::minutes(30);
+        let later = base + jiff::SignedDuration::from_mins(30);
         // Appended out of chronological order, into the same day file.
         store.append(&rec(later, Some("me"), "later")).unwrap();
         store.append(&rec(earlier, Some("me"), "earlier")).unwrap();
 
         let got = store
             .read(
-                base - chrono::Duration::hours(1),
-                base + chrono::Duration::hours(1),
+                base - jiff::SignedDuration::from_hours(1),
+                base + jiff::SignedDuration::from_hours(1),
                 None,
             )
             .unwrap();
@@ -310,7 +343,11 @@ mod tests {
     fn a_corrupt_line_is_skipped_rather_than_failing_the_read() {
         let tmp = tempfile::tempdir().unwrap();
         let store = TranscriptStore::open(tmp.path().to_path_buf(), 4).unwrap();
-        let at = Utc.with_ymd_and_hms(2026, 8, 26, 12, 0, 0).unwrap();
+        let at = jiff::civil::date(2026, 8, 26)
+            .at(12, 0, 0, 0)
+            .to_zoned_datetime(jiff::tz::TimeZone::UTC)
+            .unwrap()
+            .timestamp();
         store.append(&rec(at, Some("me"), "good")).unwrap();
         let day_file = tmp.path().join("2026-08-26.jsonl");
         let mut body = std::fs::read_to_string(&day_file).unwrap();
@@ -319,8 +356,8 @@ mod tests {
 
         let got = store
             .read(
-                at - chrono::Duration::hours(1),
-                at + chrono::Duration::hours(1),
+                at - jiff::SignedDuration::from_hours(1),
+                at + jiff::SignedDuration::from_hours(1),
                 None,
             )
             .unwrap();

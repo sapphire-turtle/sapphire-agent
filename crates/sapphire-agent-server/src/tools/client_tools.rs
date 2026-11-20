@@ -639,6 +639,8 @@ impl ClientShellStart {
     pub fn new() -> Self {
         Self {
             spec: ToolSpec {
+                kind: ToolKind::Execute,
+                group: None,
                 name: "shell_start".into(),
                 description: format!(
                     "Start a long-running command on the machine the connected \
@@ -685,10 +687,6 @@ impl Default for ClientShellStart {
 
 #[async_trait]
 impl Tool for ClientShellStart {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Execute
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -763,6 +761,8 @@ impl ClientShellOutput {
     pub fn new() -> Self {
         Self {
             spec: ToolSpec {
+                kind: ToolKind::Read,
+                group: None,
                 name: "shell_output".into(),
                 description: "Check on a command started with shell_start (or left \
                     running by a shell call that timed out): its output so far, \
@@ -793,10 +793,6 @@ impl Default for ClientShellOutput {
 
 #[async_trait]
 impl Tool for ClientShellOutput {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Read
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -855,6 +851,8 @@ impl ClientShellKill {
     pub fn new() -> Self {
         Self {
             spec: ToolSpec {
+                kind: ToolKind::Execute,
+                group: None,
                 name: "shell_kill".into(),
                 description: format!(
                     "Stop a command started with shell_start (or left \
@@ -886,10 +884,6 @@ impl Default for ClientShellKill {
 
 #[async_trait]
 impl Tool for ClientShellKill {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Execute
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }

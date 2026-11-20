@@ -32,6 +32,8 @@ impl AskHumanTool {
     pub fn new() -> Self {
         Self {
             spec: ToolSpec {
+                kind: ToolKind::Think,
+                group: None,
                 name: NAME.into(),
                 description: "Ask the person overseeing autonomous work a question in the \
                     consult room. Returns at once; the answer arrives later in this \
@@ -55,10 +57,6 @@ impl AskHumanTool {
 
 #[async_trait]
 impl Tool for AskHumanTool {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Think
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -143,7 +141,7 @@ mod tests {
             timer_origin: None,
             session_id: Some("s".into()),
             subagent_depth: 0,
-            admin_room_profile: None,
+            session_profile: "default".into(),
         });
         crate::serve::scope_turn_context(ctx, AskHumanTool::new().execute(&input)).await
     }

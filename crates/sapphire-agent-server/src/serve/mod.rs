@@ -50,13 +50,13 @@ use tracing::{debug, error, info, warn};
 // Shared server state
 // ---------------------------------------------------------------------------
 
-/// Map of `device_id` → (`room_profile`, push channel), populated by
+/// Map of `device_id` → (`session_profile`, push channel), populated by
 /// `voice/subscribe`. Heartbeat (and any future server-initiated voice
 /// notifier) looks up subscribers here to deliver TTS audio.
 ///
 /// Keyed by `device_id` alone because a single satellite only ever
 /// holds one active voice session at a time — the satellite tells us
-/// which room_profile it's bound to when it subscribes, and we keep
+/// which session_profile it's bound to when it subscribes, and we keep
 /// that around as the reverse index so heartbeat tasks don't have to
 /// duplicate the value.
 pub type VoiceSubscribers =
@@ -77,7 +77,7 @@ pub struct ServeState {
     /// `--resume <grain-id>`.
     pub(crate) cross_device_session_store: Arc<SessionStore>,
     /// Device-default session store (kind = `"device-default"`). Holds the
-    /// per-`(device_id, room_profile)` always-on session that heartbeat
+    /// per-`(device_id, session_profile)` always-on session that heartbeat
     /// pushes target and that a satellite falls into when no other session
     /// is selected. Lazy-created, daily-rotated. See #122.
     pub(crate) device_default_session_store: Arc<SessionStore>,
@@ -96,11 +96,14 @@ pub struct ServeState {
     /// that quitting without sending anything leaves no empty file behind.
     /// Maps internal UUID → reserved public_id (grain-id).
     pub(crate) pending_sessions: tokio::sync::Mutex<HashMap<String, String>>,
-    /// Per-session room_profile pin from `initialize`. Sessions absent
+    /// Per-session session_profile pin from `initialize`. Sessions absent
     /// from this map fall through to the background provider. Not
-    /// persisted across restarts — clients must re-pass `room_profile`
+    /// persisted across restarts — clients must re-pass `session_profile`
     /// on resume.
-    pub(crate) session_room_profiles: tokio::sync::Mutex<HashMap<String, String>>,
+    pub(crate) session_profiles: tokio::sync::Mutex<HashMap<String, String>>,
+    /// Channel room voice overrides, keyed by the same internal session id.
+    /// Device/API pins have no room override and keep the profile's pipeline.
+    session_voice_overrides: tokio::sync::Mutex<HashMap<String, String>>,
     /// Per-session room metadata supplied by the client at `initialize`
     /// (a voice client's `[device]` block, principally). Mirrors the
     /// channel-side `Channel::room_info()` lookup so the agent can tell
@@ -119,7 +122,7 @@ pub struct ServeState {
     /// (rare). Absent → no in-memory scrub; on-disk persistence still
     /// gets the hash-marker fallback from `SessionStore::append`.
     pub(crate) image_cache: Option<Arc<crate::image_cache::ImageCache>>,
-    /// Active satellites, keyed by `(device_id, room_profile)`. Inserted
+    /// Active satellites, keyed by `(device_id, session_profile)`. Inserted
     /// by `voice/subscribe`, removed by the per-subscription writer task
     /// when its SSE channel closes (i.e. satellite disconnects).
     pub(crate) voice_subscribers: Arc<VoiceSubscribers>,
@@ -221,7 +224,8 @@ impl ServeState {
             autonomous_session_store,
             sessions: tokio::sync::Mutex::new(HashMap::new()),
             pending_sessions: tokio::sync::Mutex::new(HashMap::new()),
-            session_room_profiles: tokio::sync::Mutex::new(HashMap::new()),
+            session_profiles: tokio::sync::Mutex::new(HashMap::new()),
+            session_voice_overrides: Default::default(),
             session_room_metadata: tokio::sync::Mutex::new(HashMap::new()),
             voice,
             voice_subscribers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -289,18 +293,33 @@ impl ServeState {
         }
     }
 
+    /// Pin at ingress, retaining only the profile name on the turn. A room's
+    /// optional voice override accompanies the pin, never a client parameter.
+    async fn pin_session_profile(&self, session_id: &str, declared: Option<&str>, room_id: &str) {
+        let profile = self.config.session_profile_name(declared, room_id);
+        let voice = self.config.channels().find_map(|(_, room)| {
+            (room.room_id == room_id)
+                .then_some(room.voice_pipeline.as_ref())
+                .flatten()
+        });
+        // Use the same lock order as voice resolution.
+        let mut profiles = self.session_profiles.lock().await;
+        let mut overrides = self.session_voice_overrides.lock().await;
+        profiles.insert(session_id.to_string(), profile);
+        if let Some(voice) = voice {
+            overrides.insert(session_id.to_string(), voice.clone());
+        } else {
+            overrides.remove(session_id);
+        }
+    }
+
     /// Provider that should serve the given session. Resolves the
-    /// session's pinned room_profile to its `profile`, then to a
+    /// session's pinned session_profile to its `profile`, then to a
     /// concrete provider (with optional refusal fallback). Falls back
-    /// to the background provider when no room_profile is pinned.
+    /// to the background provider when no session_profile is pinned.
     pub(crate) async fn provider_for_session(&self, session_id: &str) -> Arc<dyn Provider> {
-        let rp_name = self
-            .session_room_profiles
-            .lock()
-            .await
-            .get(session_id)
-            .cloned();
-        match rp_name.and_then(|n| self.config.room_profile(&n).map(|rp| rp.profile.clone())) {
+        let rp_name = self.session_profiles.lock().await.get(session_id).cloned();
+        match rp_name.and_then(|n| self.config.session_profile(&n).map(|rp| rp.profile.clone())) {
             Some(profile_name) => self.registry.for_profile(&self.config, &profile_name),
             None => self.registry.background_provider(&self.config),
         }
@@ -552,8 +571,8 @@ async fn rpc_post(
 
     let req_id = req.id.clone().unwrap_or(Value::Null);
 
-    // Bearer auth → room_profile reverse lookup. The token IS the
-    // profile selector; clients no longer pass `room_profile` in
+    // Bearer auth → session_profile reverse lookup. The token IS the
+    // profile selector; clients no longer pass `session_profile` in
     // params. Missing/empty bearer → 401 at the HTTP layer (matches
     // /a2a); unknown token → JSON-RPC AUTH_REQUIRED.
     let bearer = match extract_bearer(&headers) {
@@ -563,7 +582,7 @@ async fn rpc_post(
         }
     };
     let (profile_name, authenticated_device_id) = match state.device_auth.resolve(&bearer).await {
-        Ok(r) => (r.room_profile, r.device.id.to_string()),
+        Ok(r) => (r.session_profile, r.device.id.to_string()),
         Err(crate::device_auth::AuthError::Forbidden) => {
             return (
                 StatusCode::FORBIDDEN,
@@ -658,7 +677,7 @@ async fn handle_initialize(
     existing_header_session: Option<String>,
     profile_name: String,
 ) -> axum::response::Response {
-    // `room_profile` is no longer accepted as a JSON-RPC param — the
+    // `session_profile` is no longer accepted as a JSON-RPC param — the
     // bearer token resolved in `rpc_post` is the sole profile selector
     // (mirrors A2A / MCP). `DeviceAuth::resolve` only returns profile
     // names that exist in the config, so no extra validation is needed
@@ -709,16 +728,17 @@ pub(crate) struct OpenedSession {
     /// The 7-char grain-id shown to people. Reserved now for a new session.
     pub public_id: Option<String>,
     pub is_new: bool,
-    pub room_profile: String,
+    pub session_profile: String,
 }
 
 impl OpenedSession {
     /// The `initialize` result's shape, which the IPC `open` shares.
     pub(crate) fn to_json(&self) -> Value {
+        // Keep the legacy wire key for client compatibility.
         let mut result = json!({
             "session_id": self.session_id,
             "is_new": self.is_new,
-            "room_profile": self.room_profile,
+            "room_profile": self.session_profile,
         });
         if let Some(pub_id) = &self.public_id {
             result["public_id"] = json!(pub_id);
@@ -811,10 +831,8 @@ pub(crate) async fn open_session(
     };
 
     state
-        .session_room_profiles
-        .lock()
-        .await
-        .insert(session_id.clone(), profile_name.clone());
+        .pin_session_profile(&session_id, Some(&profile_name), "")
+        .await;
 
     // Optional `params.device = { name, description }` from voice
     // clients. We treat `name` as the device handle (e.g.
@@ -848,7 +866,7 @@ pub(crate) async fn open_session(
         session_id,
         public_id,
         is_new,
-        room_profile: profile_name,
+        session_profile: profile_name,
     })
 }
 
@@ -1027,7 +1045,7 @@ pub(crate) fn session_history(state: &ServeState, session_id: &str) -> Vec<Value
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// voice/config — return the room_profile's wake-word + (future)
+// voice/config — return the session_profile's wake-word + (future)
 // per-session voice settings so satellites can self-configure
 // ---------------------------------------------------------------------------
 
@@ -1040,7 +1058,7 @@ async fn handle_voice_config(
     use sha2::{Digest, Sha256};
 
     // Wake-word config is global — the same Saphina (or whatever)
-    // greets the user across every room_profile. `params` is reserved
+    // greets the user across every session_profile. `params` is reserved
     // for a future per-profile override but currently unused.
     let mut result = json!({});
     if let Some(path_str) = &state.config.voice.wake_word_model {
@@ -1092,7 +1110,7 @@ async fn handle_voice_pipeline_run(
     state: Arc<ServeState>,
     req_id: Value,
     params: Option<Value>,
-    room_profile: String,
+    session_profile: String,
     authenticated_device_id: String,
 ) -> axum::response::Response {
     if state.voice.is_none() {
@@ -1134,24 +1152,24 @@ async fn handle_voice_pipeline_run(
         );
         return body.into_response();
     }
-    // `room_profile` comes from the bearer token resolved in
+    // `session_profile` comes from the bearer token resolved in
     // `rpc_post`; clients no longer pass it as a param.
     let language = params["language"].as_str().map(|s| s.to_string());
 
     // Resolve / lazily-create the device-default session for this
-    // `(device_id, room_profile)` pair under that profile's memory
+    // `(device_id, session_profile)` pair under that profile's memory
     // namespace. Daily rotation falls out naturally: a satellite
     // reconnecting after the day boundary finds yesterday's file as
     // "not in today's window" and a fresh UUID file is opened. See #122.
     let namespace = state
         .config
-        .namespace_for_room_profile(&room_profile)
+        .namespace_for_session_profile(&session_profile)
         .to_string();
     let session_id = match state
         .device_default_session_store
         .find_or_create_for_device(
             &device_id,
-            &room_profile,
+            &session_profile,
             &namespace,
             state.config.day_boundary_hour,
         ) {
@@ -1166,10 +1184,8 @@ async fn handle_voice_pipeline_run(
         }
     };
     state
-        .session_room_profiles
-        .lock()
-        .await
-        .insert(session_id.clone(), room_profile.clone());
+        .pin_session_profile(&session_id, Some(&session_profile), "")
+        .await;
 
     // Same `device` block accepted by `initialize` — refreshed on every
     // pipeline_run so satellites can update their description without a
@@ -1227,7 +1243,7 @@ async fn handle_voice_subscribe(
     state: Arc<ServeState>,
     req_id: Value,
     params: Option<Value>,
-    room_profile: String,
+    session_profile: String,
     authenticated_device_id: String,
 ) -> axum::response::Response {
     let params = params.unwrap_or(Value::Null);
@@ -1249,21 +1265,21 @@ async fn handle_voice_subscribe(
         );
         return body.into_response();
     }
-    // `room_profile` comes from the bearer token resolved in
+    // `session_profile` comes from the bearer token resolved in
     // `rpc_post`; clients no longer pass it as a param.
 
     // Replace any prior subscription for this device (typical case:
     // the same satellite reconnects after a brief network blip). The
     // old sender is dropped; its writer task exits on the first
-    // failed send. The room_profile may also have changed across
+    // failed send. The session_profile may also have changed across
     // reconnect, so the freshest value wins — that's the satellite's
     // current binding.
     let (push_tx, push_rx) = mpsc::channel::<crate::voice::VoicePushItem>(32);
     {
         let mut subs = state.voice_subscribers.lock().await;
-        subs.insert(device_id.clone(), (room_profile.clone(), push_tx));
+        subs.insert(device_id.clone(), (session_profile.clone(), push_tx));
     }
-    info!("voice/subscribe: registered (device={device_id}, room_profile={room_profile})");
+    info!("voice/subscribe: registered (device={device_id}, session_profile={session_profile})");
 
     let (sse_tx, sse_rx) = mpsc::channel::<Result<Event, Infallible>>(32);
     let cleanup_state = Arc::clone(&state);
@@ -1281,7 +1297,7 @@ async fn handle_voice_subscribe(
             .unwrap_or(false)
             && let Some((rp, _)) = subs.remove(&cleanup_device)
         {
-            info!("voice/subscribe: unregistered (device={cleanup_device}, room_profile={rp})");
+            info!("voice/subscribe: unregistered (device={cleanup_device}, session_profile={rp})");
         }
     });
 
@@ -1368,7 +1384,7 @@ async fn run_voice_turn(
             send(error_event(
                 &req_id,
                 -32602,
-                "Session's room_profile has no voice_pipeline configured",
+                "Session's session_profile has no voice_pipeline configured",
             ))
             .await;
             return;
@@ -1466,17 +1482,15 @@ async fn resolve_voice_pipeline(
     if state.voice.is_none() {
         return Err(VoicePipelineLookup::NoVoice);
     }
-    let rp_name = state
-        .session_room_profiles
-        .lock()
-        .await
-        .get(session_id)
-        .cloned();
-    rp_name
-        .as_deref()
-        .and_then(|n| state.config.voice_pipeline_for_room_profile(n))
-        .cloned()
-        .ok_or(VoicePipelineLookup::NotConfigured)
+    let profiles = state.session_profiles.lock().await;
+    let overrides = state.session_voice_overrides.lock().await;
+    let pipeline = match overrides.get(session_id) {
+        Some(name) => state.config.voice_pipelines.get(name),
+        None => profiles
+            .get(session_id)
+            .and_then(|name| state.config.voice_pipeline_for_session_profile(name)),
+    };
+    pipeline.cloned().ok_or(VoicePipelineLookup::NotConfigured)
 }
 
 /// LLM turn + TTS streaming, with progress emitted as SSE notifications
@@ -1514,7 +1528,7 @@ async fn run_voice_turn_from_text_sse(
             send(error_event(
                 &req_id,
                 -32602,
-                "Session's room_profile has no voice_pipeline configured",
+                "Session's session_profile has no voice_pipeline configured",
             ))
             .await;
             return;
@@ -1681,10 +1695,10 @@ pub enum VoicePushError {
     /// The server has no `[stt_provider.*]` / `[tts_provider.*]` blocks
     /// configured at all — voice push is fundamentally unavailable.
     NoVoice,
-    /// The room_profile is unknown or has no `voice_pipeline` set.
+    /// The session_profile is unknown or has no `voice_pipeline` set.
     NotConfigured,
     /// No satellite is currently subscribed for this `(device_id,
-    /// room_profile)` pair. Caller should fall back to chat if the
+    /// session_profile)` pair. Caller should fall back to chat if the
     /// heartbeat task has a `room_id`, or log and skip otherwise.
     Offline,
     /// Any other failure (TTS, LLM, etc.) surfaced for logging.
@@ -1695,9 +1709,9 @@ pub enum VoicePushError {
 /// session bound to `device_id` and stream the TTS audio to the
 /// satellite subscribed via `voice/subscribe`.
 ///
-/// The satellite supplied its current `room_profile` when it
+/// The satellite supplied its current `session_profile` when it
 /// subscribed — that value is the authoritative reverse index, so the
-/// caller never has to duplicate it (a satellite's room_profile can
+/// caller never has to duplicate it (a satellite's session_profile can
 /// only change via a fresh subscription, which atomically replaces
 /// the binding).
 ///
@@ -1708,43 +1722,42 @@ pub(crate) async fn push_voice_text_to_subscriber(
     device_id: String,
     task_name: Option<String>,
     user_text: String,
+    task_profile: Option<String>,
 ) -> Result<(), VoicePushError> {
     // Look up the active subscription up front — if the satellite is
     // offline, surface that without burning an LLM call. The map also
-    // tells us which room_profile the satellite is bound to.
-    let (room_profile, push_tx) = {
+    // tells us which session_profile the satellite is bound to.
+    let (session_profile, push_tx) = {
         let subs = state.voice_subscribers.lock().await;
         match subs.get(&device_id) {
             Some((rp, tx)) => (rp.clone(), tx.clone()),
             None => return Err(VoicePushError::Offline),
         }
     };
-    if state.config.room_profile(&room_profile).is_none() {
+    if state.config.session_profile(&session_profile).is_none() {
         return Err(VoicePushError::NotConfigured);
     }
 
     // Resolve / lazily-create the device-default session for this
-    // `(device_id, room_profile)` pair under that profile's memory
-    // namespace, then pin the room_profile so `resolve_voice_pipeline`
+    // `(device_id, session_profile)` pair under that profile's memory
+    // namespace, then pin the session_profile so `resolve_voice_pipeline`
     // and `run_llm_turn` find the right config. See #122.
     let namespace = state
         .config
-        .namespace_for_room_profile(&room_profile)
+        .namespace_for_session_profile(&session_profile)
         .to_string();
     let session_id = state
         .device_default_session_store
         .find_or_create_for_device(
             &device_id,
-            &room_profile,
+            &session_profile,
             &namespace,
             state.config.day_boundary_hour,
         )
         .map_err(|e| VoicePushError::Other(format!("device-default lookup: {e}")))?;
     state
-        .session_room_profiles
-        .lock()
-        .await
-        .insert(session_id.clone(), room_profile.clone());
+        .pin_session_profile(&session_id, Some(&session_profile), "")
+        .await;
 
     let pipeline = match resolve_voice_pipeline(&state, &session_id).await {
         Ok(p) => p,
@@ -1781,7 +1794,13 @@ pub(crate) async fn push_voice_text_to_subscriber(
         Arc::clone(&state),
         session_id.clone(),
         injected_msg,
-        Arc::new(NullProgress),
+        match task_profile {
+            Some(session_profile) => Arc::new(AutonomousHost {
+                origin: crate::tools::policy::Origin::Unattended { session_profile },
+                consult: None,
+            }),
+            None => Arc::new(NullProgress),
+        },
         Some(crate::timer::TimerOrigin::Voice {
             device_id: device_id.clone(),
         }),
@@ -1956,17 +1975,28 @@ pub(crate) trait TurnHost: Send + Sync {
         RoundBudget::Unattended
     }
 
-    /// Which row of the permission table this turn is judged by.
+    /// The origin and session profile used to resolve this turn's permissions.
     ///
-    /// `Trusted` by default: `/rpc`, `/a2a` and the voice pipeline were
-    /// authenticated before the turn started and have no UI to ask
-    /// through, so they must keep running everything.
-    ///
-    /// The heartbeat only reaches this default on its *voice* leg. Its
-    /// chat leg goes through `Agent::handle_message`, which does not use
-    /// `TurnHost` at all and judges itself `Origin::Channel`.
+    /// Defaults to unattended with the default session profile: `/rpc`, `/a2a`
+    /// and voice have no UI to ask through. The profile's group grants and
+    /// host switches still apply. The heartbeat's chat leg uses the channel
+    /// loop instead and does not use `TurnHost`.
     fn origin(&self) -> crate::tools::policy::Origin {
-        crate::tools::policy::Origin::Trusted
+        crate::tools::policy::Origin::Unattended {
+            session_profile: "default".into(),
+        }
+    }
+
+    /// The ingress-resolved binding for this turn, when the host carries one.
+    /// ACP uses its connection pin; unattended tasks use their declaration.
+    fn session_profile_override(&self) -> Option<String> {
+        match self.origin() {
+            crate::tools::policy::Origin::Acp {
+                session_profile, ..
+            }
+            | crate::tools::policy::Origin::Channel { session_profile } => Some(session_profile),
+            crate::tools::policy::Origin::Unattended { .. } => None,
+        }
     }
 
     /// The editor on the other end, when there is one.
@@ -2051,7 +2081,7 @@ pub(crate) trait TurnHost: Send + Sync {
         let _ = id;
     }
 
-    /// Called only when `decide` returned `Ask`.
+    /// Called only when `policy::allow` returned `Allow::Ask`.
     ///
     /// The default answers `AllowOnce` — a host that never returns an
     /// asking `origin()` can never reach this, so the default exists
@@ -2140,11 +2170,21 @@ impl TurnHost for DetachedHost {
     async fn turn_error(&self, _message: &str) {}
 
     fn origin(&self) -> crate::tools::policy::Origin {
-        self.origin
+        self.origin.clone()
     }
 
     fn consult_identity(&self) -> Option<ConsultIdentity> {
         self.consult.clone()
+    }
+
+    fn session_profile_override(&self) -> Option<String> {
+        match &self.origin {
+            crate::tools::policy::Origin::Unattended { session_profile }
+            | crate::tools::policy::Origin::Channel { session_profile }
+            | crate::tools::policy::Origin::Acp {
+                session_profile, ..
+            } => Some(session_profile.clone()),
+        }
     }
 }
 
@@ -2242,7 +2282,19 @@ impl TurnHost for AutonomousHost {
     }
 
     fn origin(&self) -> crate::tools::policy::Origin {
-        self.origin
+        self.origin.clone()
+    }
+
+    fn session_profile_override(&self) -> Option<String> {
+        match &self.origin {
+            crate::tools::policy::Origin::Acp {
+                session_profile, ..
+            }
+            | crate::tools::policy::Origin::Channel { session_profile }
+            | crate::tools::policy::Origin::Unattended { session_profile } => {
+                Some(session_profile.clone())
+            }
+        }
     }
 
     fn consult_identity(&self) -> Option<ConsultIdentity> {
@@ -2372,30 +2424,43 @@ fn turn_tool_predicate(
 /// implement `fs/read_text_file` without `fs/write_text_file` (or vice
 /// versa), so those two are read independently.
 ///
-/// The one gate that is not about capabilities is
-/// `policy::host_tool_denied`, and #270 is what moved it inside: it now
-/// receives `has_client` as its `routed_to_client`, so on an ACP turn the
-/// seven unified names are decided by capability alone — the same seven
-/// names on a non-ACP turn are decided by `host_access` alone, which is
-/// the deployment switch's entire domain. `Agent::handle_message` calls
-/// this with every client flag false for exactly that reason.
+/// Host-only fs and shell names are filtered by the corresponding host
+/// registration flags when there is no client. Client-routed names are
+/// filtered by client capabilities instead. The turn's permission gate still
+/// checks group grants and host enabled flags using `policy::allow`.
 pub(crate) fn visible_tool_predicate(
-    host_access_enabled: bool,
+    fs_enabled: bool,
+    shell_enabled: bool,
     has_client: bool,
     client_fs_read: bool,
     client_fs_write: bool,
     client_terminal: bool,
 ) -> impl Fn(&str) -> bool {
     move |name: &str| {
-        // The host gate, and the one place #270 changed its meaning:
-        // `has_client` is the `routed_to_client` argument. On an ACP turn
-        // these calls are going to the *editor's* machine, which this
-        // deployment's `[tools.host_access]` switch has no business
-        // speaking for, so the gate declines to fire and the list below
-        // is the whole answer. On a turn with no client (Matrix, Discord,
-        // `/rpc`, voice, the heartbeat) the gate is exactly the old rule
-        // and every name it lets through is the agent's own.
-        if crate::tools::policy::host_tool_denied(name, host_access_enabled, has_client) {
+        // Only Agent's channel-owner check may let this tool back in.
+        // RPC, ACP, heartbeat and subagents never gain it from these flags.
+        if name == "attachment_save" {
+            return false;
+        }
+        // ACP has no image-read request: never fall back to the host.
+        if has_client && name == "image_read" {
+            return false;
+        }
+        // Host-only names are hidden without their host capability; ACP
+        // client-routed names continue to use the capability checks below.
+        if !has_client
+            && ((matches!(
+                name,
+                "file_read"
+                    | "file_write"
+                    | "file_append"
+                    | "file_delete"
+                    | "dir_list"
+                    | "dir_walk"
+                    | "image_read"
+            ) && !fs_enabled)
+                || (name == "shell" && !shell_enabled))
+        {
             return false;
         }
 
@@ -2576,17 +2641,9 @@ pub(crate) struct TurnContext {
     /// `tools.subagent.max_depth`, this is what `subagent_tool_specs`
     /// uses to decide whether this turn may delegate further.
     pub subagent_depth: u32,
-    /// The room profile this turn's admin-tool grant hangs on, or `None` on a
-    /// transport that names no profile an operator could have allowed
-    /// (`/rpc`, A2A, voice, the unattended loops). Set by `run_llm_turn` from
-    /// the profile an ACP session pinned, and read through
-    /// `config_tools::current_admin_room_profile_for` while a tool call runs.
-    ///
-    /// Copied straight into the nested `TurnLoop` a delegated subagent builds,
-    /// so a delegation keeps the grant its parent ran under — the grant is the
-    /// session's, not the caller's, the same way `timer_origin` is carried.
-    /// A definition that must not hold it narrows its own `tools:` instead.
-    pub admin_room_profile: Option<String>,
+    /// Ingress-resolved binding, inherited unchanged by delegated turns.
+    /// Every transport carries a name, including the implicit default.
+    pub session_profile: String,
 }
 
 tokio::task_local! {
@@ -2642,10 +2699,8 @@ pub(crate) struct TurnLoop<'a> {
     /// builds its `TurnLoop` with `0`; a nested subagent turn with its
     /// delegator's depth + 1.
     pub subagent_depth: u32,
-    /// The admin-tool grant this loop's tool calls are judged by. Copied into
-    /// every round's `TurnContext` and scoped around tool execution the same
-    /// way `timer_origin` is. See `TurnContext::admin_room_profile`.
-    pub admin_room_profile: Option<String>,
+    /// Resolved session profile, scoped around execution and copied to children.
+    pub session_profile: String,
 }
 
 impl TurnLoop<'_> {
@@ -2659,28 +2714,33 @@ impl TurnLoop<'_> {
         let tool_specs = self.tool_specs;
         let progress = self.progress;
         let namespace = self.namespace;
-        // Read once per turn: `None` on every non-ACP transport, which
-        // is what keeps the client-side tools refusing there rather
-        // than reaching for a connection that does not exist.
-        let host_access_enabled = state.config.tools.host_access.enabled;
-        // The tools the ACP client provided for this session. A subagent's
-        // loop never sees them: its tool list is cut from the parent's by
-        // `subagent_tool_specs`, which drops them, and its calls would not
-        // be judged by a session the delegate is not part of.
+        // The tools supplied by an ACP client are scoped to the main session.
         let session_tools = if self.subagent_depth == 0 {
             progress.session_tools()
         } else {
             None
         };
-        // Read once per turn, beside the switch and for the same reason it
-        // is: this is what decides whether that switch speaks for this
-        // turn at all. #270's core meaning change — an ACP turn's calls go
-        // to the editor's machine, so the host gate must not fire for
-        // them; a turn with no client gets exactly the old behaviour.
-        // `visible_tool_predicate` applies the same rule to the *offered*
-        // list, and the two must move together or a name is advertised and
-        // then refused on every call.
-        let routed_to_client = progress.acp_client().is_some();
+        let mut entries: Vec<_> = state
+            .tools
+            .entries()
+            .await
+            .into_iter()
+            .map(|(_, entry)| entry)
+            .collect();
+        if let Some(session) = &session_tools {
+            entries.extend(session.entries().await.into_iter().map(|(_, entry)| entry));
+        }
+        let mut origin = progress.origin();
+        match &mut origin {
+            crate::tools::policy::Origin::Acp {
+                session_profile, ..
+            }
+            | crate::tools::policy::Origin::Channel { session_profile }
+            | crate::tools::policy::Origin::Unattended { session_profile } => {
+                *session_profile = self.session_profile.clone()
+            }
+        }
+        let profile = crate::tools::policy::ResolvedPermission::resolve(&state.config, origin);
         let compression_config = &state.config.compression;
         let mut accumulated_text: Vec<String> = Vec::new();
         // Built once per turn, not once per round: `tool_specs` is fixed
@@ -2821,7 +2881,7 @@ impl TurnLoop<'_> {
 
                     // Permission gate.
                     //
-                    // Serial on purpose. `decide` is a cheap pure call, but
+                    // Serial on purpose. `policy::allow` is a cheap pure call, but
                     // `approve` puts a dialog in front of a human, and
                     // firing several at once would stack them on the poor
                     // soul in the editor. Execution below stays concurrent.
@@ -2840,64 +2900,25 @@ impl TurnLoop<'_> {
                     // simply naming a tool outside it. One check here
                     // closes both, and the same hallucinated-name gap on
                     // the ordinary (non-subagent) path.
-                    let offered: std::collections::HashSet<&str> =
-                        tool_specs.iter().map(|s| s.name.as_ref()).collect();
-                    let mut kinds = self.state.tools.kinds().await;
-                    if let Some(session) = &session_tools {
-                        kinds.extend(session.kinds().await);
-                    }
-                    let origin = progress.origin();
                     let mut permitted: Vec<crate::provider::ToolCall> = Vec::new();
                     let mut refused: Vec<(String, String)> = Vec::new();
                     for call in &tool_calls {
                         use crate::tools::policy::{
-                            Decision, Refusal, host_tool_denied, kind_of, refusal_message,
+                            Allow, Refusal, allow, refusal_message, unavailable_message,
                         };
-
-                        // Three gates, checked in order, only the last of
-                        // which is the origin/kind policy table itself.
-                        //
-                        // `NotOffered` goes first: whether a name is even
-                        // in this round's own `tool_specs` is a fact about
-                        // what *this call* is allowed to see (a subagent's
-                        // `tools:` restriction, `subagent` removed from its
-                        // own nested round, a hallucinated name on an
-                        // ordinary turn) — see `Refusal::NotOffered`'s doc
-                        // — and it has to come before the deployment-wide
-                        // host-machine gate below it, or a name outside
-                        // this round's list but happening to match a host
-                        // tool would be reported as merely unavailable on
-                        // this transport rather than as what it actually
-                        // is: not offered here at all.
-                        //
-                        // The host-machine gate itself sits in front of
-                        // `decide`: it is a fact about the deployment ("may
-                        // this agent touch its own disk at all"), not a
-                        // row in the origin/kind policy table — so it is
-                        // checked, and can refuse, before `decide` is even
-                        // consulted. `routed_to_client` is what scopes that
-                        // fact to the machine it is about: on this turn an
-                        // ACP client means the call lands elsewhere, and
-                        // the editor's own `session/request_permission`
-                        // answer is what governs it instead.
-                        let refusal = if !offered.contains(call.name.as_str()) {
-                            Some(refusal_message(&call.name, Refusal::NotOffered))
-                        } else if host_tool_denied(
-                            &call.name,
-                            host_access_enabled,
-                            routed_to_client,
-                        ) {
-                            Some(refusal_message(&call.name, Refusal::Unavailable))
-                        } else {
-                            let kind = kind_of(&call.name, &kinds);
-                            let verdict = crate::tools::policy::decide(origin, kind);
-                            match verdict {
-                                Decision::Allow => None,
-                                Decision::Deny => {
-                                    Some(refusal_message(&call.name, Refusal::Unavailable))
-                                }
-                                Decision::Ask => {
-                                    let approval = progress.approve(call, kind).await;
+                        let refusal = match entries.iter().find(|entry| entry.name == call.name) {
+                            None => Some(refusal_message(&call.name, Refusal::NotOffered)),
+                            Some(entry)
+                                if !tool_specs.iter().any(|spec| spec.name == call.name)
+                                    && allow(&profile, entry) != Allow::Deny =>
+                            {
+                                Some(refusal_message(&call.name, Refusal::NotOffered))
+                            }
+                            Some(entry) => match allow(&profile, entry) {
+                                Allow::Allow => None,
+                                Allow::Deny => Some(unavailable_message(&profile, entry)),
+                                Allow::Ask => {
+                                    let approval = progress.approve(call, entry.kind).await;
                                     if approval.allows() {
                                         None
                                     } else {
@@ -2907,7 +2928,7 @@ impl TurnLoop<'_> {
                                         ))
                                     }
                                 }
-                            }
+                            },
                         };
 
                         match refusal {
@@ -2933,7 +2954,7 @@ impl TurnLoop<'_> {
                     let session_tools = session_tools.clone();
                     let ns = namespace.clone();
                     let timer_origin = self.timer_origin.clone();
-                    let admin_room_profile = self.admin_room_profile.clone();
+                    let session_profile = self.session_profile.clone();
                     // Read once per turn, same as `timer_origin`: `None` on
                     // every non-ACP transport, which is what keeps the
                     // client-side tools refusing there rather than reaching
@@ -2960,7 +2981,7 @@ impl TurnLoop<'_> {
                         timer_origin: timer_origin.clone(),
                         session_id: self.persistence.map(|p| p.session_id.clone()),
                         subagent_depth: self.subagent_depth,
-                        admin_room_profile: self.admin_room_profile.clone(),
+                        session_profile: self.session_profile.clone(),
                     });
                     let mut results: Vec<(String, crate::tools::ToolOutput)> =
                         futures_util::future::join_all(permitted.into_iter().map(|c| {
@@ -2970,8 +2991,9 @@ impl TurnLoop<'_> {
                             let origin = timer_origin.clone();
                             let client = acp_client.clone();
                             let turn_ctx = Arc::clone(&turn_ctx);
-                            let admin_room_profile = admin_room_profile.clone();
+                            let session_profile = session_profile.clone();
                             let avatar = avatar.clone();
+                            let permission_profile = profile.permission.clone();
                             async move {
                                 let fut = crate::tools::workspace_tools::scope_memory_namespace(
                                     ns,
@@ -3000,15 +3022,16 @@ impl TurnLoop<'_> {
                                 // to any tool this round, not just the one
                                 // named `subagent`.
                                 // The admin tools read this through
-                                // `config_tools::current_admin_room_profile()`.
+                                // `config_tools::current_session_profile()`.
                                 // Scoped here rather than inside the match
                                 // below so the four (origin, client) arms do
-                                // not each need their own copy; `None` is a
-                                // meaningful value (no profile to allow), not
-                                // "unset".
-                                let fut = crate::tools::config_tools::scope_admin_room_profile(
-                                    admin_room_profile.clone(),
-                                    fut,
+                                // not each need their own copy.
+                                let fut = crate::tools::config_tools::scope_session_profile(
+                                    Some(session_profile.clone()),
+                                    crate::tools::config_tools::scope_permission_profile(
+                                        permission_profile,
+                                        fut,
+                                    ),
                                 );
                                 // Unconditional for the same reason: `None`
                                 // is the answer the avatar tools refuse on.
@@ -3219,24 +3242,22 @@ pub(crate) async fn run_llm_turn(
     // Pick the right store up front so every persistence call in this
     // turn lands in the same place (device-default vs cross-device).
     let store = Arc::clone(state.store_for_session(&session_id));
+    if let Some(crate::timer::TimerOrigin::Chat { room_id }) = &timer_origin {
+        state.pin_session_profile(&session_id, None, room_id).await;
+    }
     let is_acp = state.is_acp(&session_id).await;
-    // The room profile this turn's admin-tool grant hangs on. An ACP session
-    // carries the one its bearer token pinned at `session/new` (or
-    // `load`/`resume`); `/rpc`, A2A, voice and the unattended loops name no
-    // profile an operator declared, so they get `None` and the admin tools
-    // refuse there. Channel rooms never reach this function — `Agent::
-    // handle_message` runs its own loop, where the room travels as
-    // `TimerOrigin::Chat` instead.
-    let admin_room_profile = if is_acp {
-        state
-            .session_room_profiles
-            .lock()
-            .await
-            .get(&session_id)
-            .cloned()
-    } else {
-        None
-    };
+    // Task frontmatter overrides the session pin for this turn only. Voice
+    // sessions keep their subscriber pin for subsequent interactive turns.
+    let task_profile = progress.session_profile_override();
+    let pin = state
+        .session_profiles
+        .lock()
+        .await
+        .get(&session_id)
+        .cloned();
+    let session_profile = state
+        .config
+        .session_profile_name(task_profile.as_deref().or(pin.as_deref()), "");
 
     // 1. Hydrate history fresh from storage every turn, rather than only
     //    the first time this process touches the session.
@@ -3281,17 +3302,24 @@ pub(crate) async fn run_llm_turn(
 
     // 2. Resolve provider once per turn — sessions can pin a profile at
     //    initialize-time; absent that, the background provider is used.
-    let provider = state.provider_for_session(&session_id).await;
+    let provider = match task_profile.as_deref() {
+        Some(name) => state
+            .config
+            .profile_for_session(name)
+            .map(|profile| state.registry.for_profile(&state.config, profile))
+            .unwrap_or_else(|| state.registry.default_provider()),
+        None => state.provider_for_session(&session_id).await,
+    };
 
-    // 2a. Namespace chain follows the session's pinned room_profile when
+    // 2a. Namespace chain follows the session's pinned session_profile when
     //     set; otherwise the implicit default namespace. Resolved here
     //     so it can be recorded in the session metadata on first chat
     //     (used by the daily-log builder to route NSFW sessions away
     //     from default-namespace rooms).
-    let namespace = match state.session_room_profiles.lock().await.get(&session_id) {
-        Some(rp_name) => state.config.namespace_for_room_profile(rp_name).to_string(),
-        None => crate::config::DEFAULT_NAMESPACE_NAME.to_string(),
-    };
+    let namespace = state
+        .config
+        .namespace_for_session_profile(&session_profile)
+        .to_string();
     let namespace_chain = state.config.resolve_namespace_chain(&namespace);
 
     // 2b. Ensure JSONL file exists. If this session was deferred at initialize
@@ -3372,7 +3400,10 @@ pub(crate) async fn run_llm_turn(
     // opted this deployment into host access; the two client-side file
     // tools are hidden whenever there is no editor on the other end, or
     // it did not declare the matching `fs` capability.
-    let host_access_enabled = state.config.tools.host_access.enabled;
+    let fs_enabled = state.config.group_registered(crate::config::ToolGroup::Fs);
+    let shell_enabled = state
+        .config
+        .group_registered(crate::config::ToolGroup::Shell);
     let has_client = progress.acp_client().is_some();
     let (client_fs_read, client_fs_write) = progress.client_fs_caps();
     let client_terminal = progress.client_terminal_cap();
@@ -3389,7 +3420,8 @@ pub(crate) async fn run_llm_turn(
         .map(|ns| ns.skills)
         .unwrap_or(false);
     let base = visible_tool_predicate(
-        host_access_enabled,
+        fs_enabled,
+        shell_enabled,
         has_client,
         client_fs_read,
         client_fs_write,
@@ -3410,6 +3442,29 @@ pub(crate) async fn run_llm_turn(
             skills_enabled,
         ))
         .await;
+    let mut origin = progress.origin();
+    match &mut origin {
+        crate::tools::policy::Origin::Acp {
+            session_profile: name,
+            ..
+        }
+        | crate::tools::policy::Origin::Channel {
+            session_profile: name,
+        }
+        | crate::tools::policy::Origin::Unattended {
+            session_profile: name,
+        } => *name = session_profile.clone(),
+    }
+    let permission = crate::tools::policy::ResolvedPermission::resolve(&state.config, origin);
+    let entries = state.tools.entries().await;
+    tool_specs.retain(|spec| {
+        entries
+            .iter()
+            .find(|(name, _)| name == &spec.name)
+            .is_some_and(|(_, entry)| {
+                crate::tools::policy::allow(&permission, entry) != crate::tools::policy::Allow::Deny
+            })
+    });
     crate::tools::avatar_tools::specialize_specs(
         &mut tool_specs,
         avatar.as_ref().map(|a| a.caps()),
@@ -3441,7 +3496,7 @@ pub(crate) async fn run_llm_turn(
         namespace: namespace.clone(),
         persistence: Some(&persistence),
         subagent_depth: 0,
-        admin_room_profile: admin_room_profile.clone(),
+        session_profile: session_profile.clone(),
     }
     .run(&mut history)
     .await;
@@ -3596,8 +3651,10 @@ async fn stream_chat_tts(
             return;
         }
         Err(VoicePipelineLookup::NotConfigured) => {
-            emit_tts_error("session's room_profile has no voice_pipeline configured".to_string())
-                .await;
+            emit_tts_error(
+                "session's session_profile has no voice_pipeline configured".to_string(),
+            )
+            .await;
             return;
         }
     };
@@ -3708,6 +3765,8 @@ impl EchoTool {
     pub(crate) fn new() -> Self {
         Self {
             spec: crate::provider::ToolSpec {
+                kind: crate::tools::ToolKind::Read,
+                group: None,
                 name: "echo".into(),
                 description: "Echo the given text back.".into(),
                 input_schema: json!({
@@ -3725,15 +3784,6 @@ impl EchoTool {
 impl crate::tools::Tool for EchoTool {
     fn spec(&self) -> &crate::provider::ToolSpec {
         &self.spec
-    }
-
-    /// A test fixture standing in for an ordinary read-only tool.
-    /// Deliberately NOT `Other`: that is the ask-me bucket, and the
-    /// pre-existing ACP tests drive turns with a helper that answers no
-    /// permission requests, so leaving this unclassified would make them
-    /// hang rather than fail once the permission gate lands.
-    fn kind(&self) -> crate::tools::ToolKind {
-        crate::tools::ToolKind::Read
     }
 
     async fn execute(&self, input: &Value) -> anyhow::Result<String> {
@@ -3759,6 +3809,8 @@ impl RiskyTool {
     pub(crate) fn new() -> Self {
         Self {
             spec: crate::provider::ToolSpec {
+                kind: crate::tools::ToolKind::Execute,
+                group: None,
                 name: "risky".into(),
                 description: "Pretend to run a command.".into(),
                 input_schema: json!({ "type": "object", "properties": {} }),
@@ -3780,10 +3832,6 @@ impl crate::tools::Tool for RiskyTool {
         &self.spec
     }
 
-    fn kind(&self) -> crate::tools::ToolKind {
-        crate::tools::ToolKind::Execute
-    }
-
     async fn execute(&self, _input: &Value) -> anyhow::Result<String> {
         self.ran.store(true, std::sync::atomic::Ordering::SeqCst);
         Ok("ran".to_string())
@@ -3792,7 +3840,7 @@ impl crate::tools::Tool for RiskyTool {
 
 /// A minimal named stub, for tests that only care whether a tool's name
 /// survives `specs_filtered` — not what it does. Used to stand in for
-/// the host tools (`crate::tools::policy::HOST_TOOLS`), which the
+/// the host tools (`TEST_HOST_TOOLS`), which the
 /// filtering tests below need present in the set so "not offered"
 /// means the predicate hid them, not that they were never registered.
 #[cfg(test)]
@@ -3802,6 +3850,8 @@ struct NamedStubTool(crate::provider::ToolSpec);
 impl NamedStubTool {
     fn new(name: &str) -> Self {
         Self(crate::provider::ToolSpec {
+            kind: crate::tools::ToolKind::Other,
+            group: None,
             name: name.to_string().into(),
             description: String::new().into(),
             input_schema: json!({ "type": "object", "properties": {} }),
@@ -3843,6 +3893,8 @@ impl AdminProfileProbe {
         Arc::new(Self {
             seen: std::sync::Mutex::new(None),
             spec: crate::provider::ToolSpec {
+                kind: crate::tools::ToolKind::Read,
+                group: None,
                 name: "heartbeat_config".into(),
                 description: "Records the room profile this turn scoped.".into(),
                 input_schema: serde_json::json!({"type": "object", "properties": {}}),
@@ -3863,12 +3915,8 @@ impl crate::tools::Tool for AdminProfileProbe {
         &self.spec
     }
 
-    fn kind(&self) -> crate::tools::ToolKind {
-        crate::tools::ToolKind::Read
-    }
-
     async fn execute(&self, _input: &serde_json::Value) -> anyhow::Result<String> {
-        *self.seen.lock().unwrap() = Some(crate::tools::config_tools::current_admin_room_profile());
+        *self.seen.lock().unwrap() = Some(crate::tools::config_tools::current_session_profile());
         Ok("probed".to_string())
     }
 }
@@ -3885,14 +3933,49 @@ impl crate::tools::Tool for Arc<AdminProfileProbe> {
         (**self).spec()
     }
 
-    fn kind(&self) -> crate::tools::ToolKind {
-        (**self).kind()
-    }
-
     async fn execute(&self, input: &serde_json::Value) -> anyhow::Result<String> {
         (**self).execute(input).await
     }
 }
+/// Per-instance execution instrument shared by both loop integration tests.
+#[cfg(test)]
+pub(crate) struct GateProbe {
+    spec: ToolSpec,
+    seen: std::sync::Mutex<Option<(String, String)>>,
+}
+#[cfg(test)]
+impl GateProbe {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            spec: ToolSpec {
+                name: "gate_probe".into(),
+                description: "Observe the execution scope".into(),
+                input_schema: json!({}),
+                kind: crate::tools::ToolKind::Read,
+                group: None,
+            },
+            seen: std::sync::Mutex::new(None),
+        })
+    }
+    pub(crate) fn seen(&self) -> Option<(String, String)> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+#[cfg(test)]
+#[async_trait::async_trait]
+impl crate::tools::Tool for Arc<GateProbe> {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+    async fn execute(&self, _: &Value) -> anyhow::Result<String> {
+        *self.seen.lock().unwrap() = Some((
+            crate::tools::config_tools::current_session_profile().expect("session scope"),
+            crate::tools::config_tools::current_permission_profile().expect("permission scope"),
+        ));
+        Ok("probed".into())
+    }
+}
+
 /// Every `chat()` call a [`StubProvider`] has seen, in call order:
 /// `(system, tool names offered)`. `system` is owned (not the borrowed
 /// `Option<&str>` `chat()` receives) so the log outlives the call.
@@ -4217,8 +4300,19 @@ impl ServeState {
             crate::config::ToolRounds::default(),
             DEFAULT_TEST_ACP_KEEPALIVE_SECS,
             |config| {
-                config.tools.host_access.enabled = true;
+                config.tools.fs.enabled = true;
+                config.tools.shell.enabled = true;
                 config.autonomous.origin = crate::config::AutonomousOrigin::Trusted;
+                config.permission_profiles.insert(
+                    "default".into(),
+                    crate::config::PermissionProfileConfig {
+                        tools: vec![
+                            crate::config::ToolGroup::Fs,
+                            crate::config::ToolGroup::Shell,
+                            crate::config::ToolGroup::Mcp,
+                        ],
+                    },
+                );
             },
         )
     }
@@ -4247,7 +4341,7 @@ impl ServeState {
         std::fs::create_dir_all(&workspace_dir).unwrap();
 
         // Device auth fixture: one device ("developer-device") routed to
-        // room_profile "developer", with its bearer token fixed at
+        // session_profile "developer", with its bearer token fixed at
         // "sa-acp-token" so the many tests presenting that literal keep
         // working. A static verifier stands in for the bridge.
         let mut config = Config::parse_for_test(
@@ -4258,7 +4352,7 @@ api_key = "test"
 [profiles.dev]
 provider = "stub"
 
-[room_profile.developer]
+[session_profile.developer]
 profile  = "dev"
 rooms    = []
 "#,
@@ -4266,23 +4360,28 @@ rooms    = []
         config.acp = Some(crate::config::AcpConfig {
             enabled: acp_enabled,
             keepalive_secs: acp_keepalive_secs,
-            stdio_room_profile: Some("developer".to_string()),
+            stdio_session_profile: Some("developer".to_string()),
         });
         config.cli = Some(crate::config::CliConfig {
-            room_profile: Some("developer".to_string()),
+            profile: Some("developer".to_string()),
         });
         config.tools.tool_rounds = rounds;
+        // MCP integration fixtures exercise a host that explicitly enables MCP.
+        config.tools.mcp.enabled = true;
         tweak(&mut config);
-        config.room_profiles.get_mut("developer").unwrap().devices =
-            vec!["developer-device".to_string()];
+        config
+            .session_profiles
+            .get_mut("developer")
+            .unwrap()
+            .devices = vec!["developer-device".to_string()];
 
         let device_auth = crate::device_auth::testing::device_auth(
             &[("sa-acp-token", "developer-device")],
-            &config.room_profiles,
+            &config.session_profiles,
         );
 
         // Registered under both names: `provider_for_session` falls
-        // through to the background provider when no room_profile is
+        // through to the background provider when no session_profile is
         // pinned (as in the fixture_state_serves_the_scripted_provider
         // test above, which looks up an unpinned session), and the
         // background provider resolves the built-in "anthropic" key.
@@ -4303,13 +4402,17 @@ rooms    = []
         );
 
         Arc::new(Self {
-            config,
+            config: config.clone(),
             registry: Arc::new(registry),
             workspace: Arc::new(Workspace::new(
                 workspace_dir,
                 crate::config::DigestConfig::default(),
             )),
-            tools: Arc::new(ToolSet::new(vec![Box::new(EchoTool::new())], Vec::new())),
+            tools: Arc::new(ToolSet::new(
+                vec![Box::new(EchoTool::new())],
+                Vec::new(),
+                &config,
+            )),
             permissions: Arc::new(acp_permissions::PermissionStore::open(
                 base.join("acp-permissions.json"),
             )),
@@ -4333,7 +4436,8 @@ rooms    = []
             ),
             sessions: Default::default(),
             pending_sessions: Default::default(),
-            session_room_profiles: Default::default(),
+            session_profiles: Default::default(),
+            session_voice_overrides: Default::default(),
             session_room_metadata: Default::default(),
             voice: None,
             image_cache: None,
@@ -4352,10 +4456,403 @@ rooms    = []
 }
 
 #[cfg(test)]
+const TEST_HOST_TOOLS: &[&str] = &[
+    "file_read",
+    "image_read",
+    "attachment_save",
+    "file_write",
+    "file_append",
+    "file_delete",
+    "dir_list",
+    "dir_walk",
+    "shell",
+];
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::acp_session::{EventBody, StoredPart};
     use crate::provider::{Role, UserInputKind};
+
+    #[tokio::test]
+    async fn task6_acp_group_visibility_execution_and_persistence() {
+        for (permission, runs) in [("chat", false), ("default", true)] {
+            let cfg = Config::parse_for_test(&format!(
+                "[anthropic]\napi_key='test'\n[session_profile.ops]\nprofile='default'\npermission='{permission}'\n[tools.fs]\nenabled=true\n"
+            ));
+            let mut state = ServeState::for_test_scripted(
+                true,
+                vec![
+                    crate::provider::ChatResponse {
+                        text: None,
+                        prompt_usage: None,
+                        stop_reason: None,
+                        tool_calls: vec![
+                            crate::provider::ToolCall {
+                                id: "write".into(),
+                                name: "file_write".into(),
+                                input: json!({"path":"notes/x.md","content":"written"}),
+                            },
+                            crate::provider::ToolCall {
+                                id: "probe".into(),
+                                name: "gate_probe".into(),
+                                input: json!({}),
+                            },
+                        ]
+                        .into_iter()
+                        .filter(|call| runs || call.name != "gate_probe")
+                        .collect(),
+                    },
+                    final_round("done"),
+                ],
+            );
+            let (_dir, root, ws) = crate::tools::config_tools::test_workspace();
+            let tools = crate::tools::default_tool_set(ws, None, &[], 4, &cfg).await;
+            let probe = GateProbe::new();
+            tools.register_tool(Box::new(Arc::clone(&probe))).await;
+            let inner = Arc::get_mut(&mut state).unwrap();
+            inner.config = cfg;
+            inner.tools = tools;
+            let sid = format!("acp-{permission}");
+            state
+                .acp_session_store
+                .create(&sid, "default", "/tmp")
+                .unwrap();
+            state.acp_sessions.lock().await.insert(sid.clone());
+            state
+                .session_profiles
+                .lock()
+                .await
+                .insert(sid.clone(), "ops".into());
+            let host: Arc<dyn TurnHost> = Arc::new(AutonomousHost {
+                origin: crate::tools::policy::Origin::Acp {
+                    mode: crate::tools::policy::SessionMode::Bypass,
+                    session_profile: "ops".into(),
+                },
+                consult: None,
+            });
+            run_llm_turn(
+                Arc::clone(&state),
+                sid.clone(),
+                ChatMessage::user("go"),
+                host,
+                None,
+            )
+            .await;
+            assert_eq!(root.join("notes/x.md").exists(), runs);
+            if runs {
+                assert_eq!(probe.seen(), Some(("ops".into(), permission.into())));
+                assert_eq!(
+                    std::fs::read_to_string(root.join("notes/x.md")).unwrap(),
+                    "written"
+                );
+            } else {
+                // The probe was not requested in this leg; filesystem absence and
+                // the persisted refusal below demonstrate the denied write instead.
+                assert_eq!(probe.seen(), None);
+                assert!(state.acp_session_store.history_for_model(&sid).unwrap().iter().flat_map(|m| &m.parts).any(|p| matches!(p, ContentPart::ToolResult { content, .. } if content.contains("permission_profile.chat.tools"))));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unroutable_name_and_an_unregistered_name_are_both_not_offered() {
+        let state = ServeState::for_test_scripted(
+            false,
+            vec![
+                crate::provider::ChatResponse {
+                    prompt_usage: None,
+                    text: None,
+                    tool_calls: vec![
+                        crate::provider::ToolCall {
+                            id: "unroutable".into(),
+                            name: "shell_start".into(),
+                            input: json!({}),
+                        },
+                        crate::provider::ToolCall {
+                            id: "unregistered".into(),
+                            name: "not_registered_here".into(),
+                            input: json!({}),
+                        },
+                    ],
+                    stop_reason: None,
+                },
+                final_round("done"),
+            ],
+        );
+        let unroutable = RiskyTool::new();
+        let ran = unroutable.ran_flag();
+        let mut spec = unroutable.spec.clone();
+        spec.name = "shell_start".into();
+        let mut unroutable = unroutable;
+        unroutable.spec = spec;
+        state.tools.register_tool(Box::new(unroutable)).await;
+
+        run_llm_turn(
+            Arc::clone(&state),
+            "unroutable-and-unregistered".into(),
+            ChatMessage::user("go"),
+            Arc::new(NullProgress),
+            None,
+        )
+        .await;
+
+        let messages = state.sessions.lock().await;
+        let history = messages.get("unroutable-and-unregistered").unwrap();
+        for id in ["unroutable", "unregistered"] {
+            let name = if id == "unroutable" {
+                "shell_start"
+            } else {
+                "not_registered_here"
+            };
+            let expected = crate::tools::policy::refusal_message(
+                name,
+                crate::tools::policy::Refusal::NotOffered,
+            );
+            assert!(
+                history.iter().flat_map(|m| &m.parts).any(|part| {
+                    matches!(part, ContentPart::ToolResult { tool_use_id, content }
+                    if tool_use_id == id && content == &expected)
+                }),
+                "{id}: {history:?}"
+            );
+        }
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn rpc_device_binding_reaches_the_turns_permission_scope() {
+        use axum::http::header;
+
+        let provider = StubProvider::new(vec![
+            crate::provider::ChatResponse {
+                prompt_usage: None,
+                text: None,
+                tool_calls: vec![crate::provider::ToolCall {
+                    id: "probe".into(),
+                    name: "gate_probe".into(),
+                    input: json!({}),
+                }],
+                stop_reason: None,
+            },
+            final_round("done"),
+        ]);
+        let mut state = ServeState::build_for_test(false, provider);
+        {
+            let inner = Arc::get_mut(&mut state).unwrap();
+            inner
+                .config
+                .session_profiles
+                .get_mut("developer")
+                .unwrap()
+                .permission = Some("device_ops".into());
+            inner.config.permission_profiles.insert(
+                "device_ops".into(),
+                crate::config::PermissionProfileConfig { tools: vec![] },
+            );
+            inner.config.session_profiles.insert(
+                "other".into(),
+                crate::config::SessionProfileConfig {
+                    profile: "dev".into(),
+                    permission: Some("chat".into()),
+                    memory_namespace: None,
+                    session_policy: None,
+                    rooms: vec![],
+                    voice_pipeline: None,
+                    api_keys: vec![],
+                    devices: vec![],
+                },
+            );
+        }
+        let probe = GateProbe::new();
+        state
+            .tools
+            .register_tool(Box::new(Arc::clone(&probe)))
+            .await;
+
+        let init = rpc_post(
+            State(Arc::clone(&state)),
+            HeaderMap::from_iter([(
+                header::AUTHORIZATION,
+                HeaderValue::from_static("Bearer sa-acp-token"),
+            )]),
+            Json(JsonRpcRequest {
+                jsonrpc: Some("2.0".into()),
+                id: Some(json!(1)),
+                method: "initialize".into(),
+                params: Some(json!({})),
+            }),
+        )
+        .await
+        .into_response();
+        let sid = init
+            .headers()
+            .get("session-id")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        state
+            .session_profiles
+            .lock()
+            .await
+            .insert(sid.clone(), "other".into());
+        // Re-initialize the same session: the authenticated device binding must
+        // replace a stale pin, not coexist with it as another profile source.
+        let _ = rpc_post(
+            State(Arc::clone(&state)),
+            HeaderMap::from_iter([
+                (
+                    header::AUTHORIZATION,
+                    HeaderValue::from_static("Bearer sa-acp-token"),
+                ),
+                (
+                    header::HeaderName::from_static("session-id"),
+                    HeaderValue::from_str(&sid).unwrap(),
+                ),
+            ]),
+            Json(JsonRpcRequest {
+                jsonrpc: Some("2.0".into()),
+                id: Some(json!(2)),
+                method: "initialize".into(),
+                params: Some(json!({})),
+            }),
+        )
+        .await
+        .into_response();
+
+        let response = rpc_post(
+            State(Arc::clone(&state)),
+            HeaderMap::from_iter([
+                (
+                    header::AUTHORIZATION,
+                    HeaderValue::from_static("Bearer sa-acp-token"),
+                ),
+                (
+                    header::HeaderName::from_static("session-id"),
+                    HeaderValue::from_str(&sid).unwrap(),
+                ),
+            ]),
+            Json(JsonRpcRequest {
+                jsonrpc: Some("2.0".into()),
+                id: Some(json!(3)),
+                method: "chat".into(),
+                params: Some(json!({"content": "go"})),
+            }),
+        )
+        .await
+        .into_response();
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            probe.seen(),
+            Some(("developer".into(), "device_ops".into()))
+        );
+        assert_eq!(
+            state
+                .session_profiles
+                .lock()
+                .await
+                .get(&sid)
+                .map(String::as_str),
+            Some("developer")
+        );
+    }
+
+    #[tokio::test]
+    async fn task6_non_acp_turn_uses_its_pinned_profile() {
+        let mut state = ServeState::for_test_scripted(
+            false,
+            vec![
+                crate::provider::ChatResponse {
+                    prompt_usage: None,
+                    text: None,
+                    tool_calls: vec![crate::provider::ToolCall {
+                        id: "c".into(),
+                        name: "heartbeat_config".into(),
+                        input: json!({}),
+                    }],
+                    stop_reason: None,
+                },
+                final_round("done"),
+            ],
+        );
+        Arc::get_mut(&mut state).unwrap().config = Config::parse_for_test(
+            "[anthropic]\napi_key='test'\n[session_profile.ops]\nprofile='default'\npermission='chat'\n",
+        );
+        let probe = AdminProfileProbe::new();
+        state
+            .tools
+            .register_tool(Box::new(Arc::clone(&probe)))
+            .await;
+        state
+            .session_profiles
+            .lock()
+            .await
+            .insert("rpc-pinned".into(), "ops".into());
+        run_llm_turn(
+            Arc::clone(&state),
+            "rpc-pinned".into(),
+            ChatMessage::user("go"),
+            Arc::new(NullProgress),
+            None,
+        )
+        .await;
+        assert_eq!(probe.seen(), Some(Some("ops".into())));
+    }
+
+    #[tokio::test]
+    async fn task6_acp_connection_profile_beats_shared_session_pin() {
+        use crate::tools::policy::{Origin, SessionMode};
+        let mut state = ServeState::for_test_scripted(
+            true,
+            vec![
+                crate::provider::ChatResponse {
+                    prompt_usage: None,
+                    text: None,
+                    tool_calls: vec![crate::provider::ToolCall {
+                        id: "c".into(),
+                        name: "heartbeat_config".into(),
+                        input: json!({}),
+                    }],
+                    stop_reason: None,
+                },
+                final_round("done"),
+            ],
+        );
+        Arc::get_mut(&mut state).unwrap().config = Config::parse_for_test(
+            "[anthropic]\napi_key='test'\n[session_profile.ops]\nprofile='default'\n[session_profile.other]\nprofile='default'\n",
+        );
+        let probe = AdminProfileProbe::new();
+        state
+            .tools
+            .register_tool(Box::new(Arc::clone(&probe)))
+            .await;
+        state.acp_sessions.lock().await.insert("shared".into());
+        state
+            .session_profiles
+            .lock()
+            .await
+            .insert("shared".into(), "other".into());
+        let host = AutonomousHost {
+            origin: Origin::Acp {
+                mode: SessionMode::Bypass,
+                session_profile: "ops".into(),
+            },
+            consult: None,
+        };
+        run_llm_turn(
+            Arc::clone(&state),
+            "shared".into(),
+            ChatMessage::user("go"),
+            Arc::new(host),
+            None,
+        )
+        .await;
+        assert_eq!(probe.seen(), Some(Some("ops".into())));
+    }
 
     /// Without `[serve]` there is no address, and `run` must neither bind
     /// nor return early: it is what `serve` waits on, so returning before
@@ -4397,11 +4894,13 @@ mod tests {
             }
             async fn turn_error(&self, _message: &str) {}
             fn origin(&self) -> Origin {
-                Origin::Channel
+                Origin::Channel {
+                    session_profile: "default".into(),
+                }
             }
         }
 
-        // `risky` is Execute, so `Origin::Channel` refuses it. The
+        // The default profile does not grant shell, so the call is refused. The
         // second scripted response is the model carrying on afterwards.
         let state = ServeState::for_test_scripted(
             true,
@@ -4424,7 +4923,9 @@ mod tests {
                 },
             ],
         );
-        let risky = RiskyTool::new();
+        let mut risky = RiskyTool::new();
+        // Offered by name, but the shell group is not granted by default.
+        risky.spec.group = Some(crate::config::ToolGroup::Shell);
         let ran = risky.ran_flag();
         state.tools.register_tool(Box::new(risky)).await;
 
@@ -4525,7 +5026,7 @@ mod tests {
     /// is scoped and the admin tools refuse. Asserting `None` — not merely
     /// "not 'developer'" — keeps the two paths distinguishable.
     #[tokio::test]
-    async fn a_non_acp_turn_scopes_no_room_profile() {
+    async fn a_non_acp_turn_scopes_the_implicit_session_profile() {
         let state = ServeState::for_test_scripted(
             true,
             vec![
@@ -4562,7 +5063,88 @@ mod tests {
         )
         .await;
 
-        assert_eq!(probe.seen(), Some(None), "no profile may be scoped here");
+        assert_eq!(
+            probe.seen(),
+            Some(Some("default".into())),
+            "the implicit profile is scoped here"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_room_voice_override_wins_and_absence_keeps_the_profile_pipeline() {
+        let mut state = ServeState::for_test_scripted(false, vec![]);
+        let state_mut = Arc::get_mut(&mut state).unwrap();
+        state_mut.config = Config::parse_for_test(
+            r#"
+[profiles.dev]
+provider = "anthropic"
+[session_profile.ops]
+profile = "dev"
+voice_pipeline = "default"
+[discord]
+bot_token = "t"
+[[discord.rooms]]
+room_id = "inherited"
+profile = "ops"
+[[discord.rooms]]
+room_id = "overridden"
+profile = "ops"
+voice_pipeline = "room"
+[voice_pipeline.default]
+stt_provider = "stt"
+tts_provider = "tts"
+language = "ja"
+[voice_pipeline.room]
+stt_provider = "stt"
+tts_provider = "tts"
+language = "en"
+[stt_provider.stt]
+type = "mock"
+transcript = "hello"
+[tts_provider.tts]
+type = "mock"
+"#,
+        );
+        state_mut.voice = Some(Arc::new(
+            VoiceProviders::from_config(&state_mut.config).unwrap(),
+        ));
+        assert!(state_mut.config.validate_session_profiles().is_empty());
+        state.pin_session_profile("s1", None, "inherited").await;
+        state.pin_session_profile("s2", None, "overridden").await;
+        assert_eq!(
+            resolve_voice_pipeline(&state, "s1")
+                .await
+                .ok()
+                .unwrap()
+                .language
+                .as_deref(),
+            Some("ja")
+        );
+        assert_eq!(
+            resolve_voice_pipeline(&state, "s2")
+                .await
+                .ok()
+                .unwrap()
+                .language
+                .as_deref(),
+            Some("en")
+        );
+        // An authenticated explicit profile is never replaced by a room's binding.
+        state.pin_session_profile("s3", Some("ops"), "").await;
+        assert_eq!(
+            resolve_voice_pipeline(&state, "s3")
+                .await
+                .ok()
+                .unwrap()
+                .language
+                .as_deref(),
+            Some("ja")
+        );
+        state.pin_session_profile("s1", Some("missing"), "").await;
+        assert!(matches!(
+            resolve_voice_pipeline(&state, "s1").await,
+            Err(VoicePipelineLookup::NotConfigured)
+        ));
     }
 
     /// A config tool must be reachable through the room profile an ACP
@@ -4573,21 +5155,21 @@ mod tests {
     /// pinned one) must fail here, the way Task 4's probe would.
     ///
     /// The tool is a real `ConfigTool` over a real workspace with
-    /// `[tools.admin].room_profiles = ["ops"]`; the turn is an ACP turn
+    /// `admin` enabled and listed by its permission profile; the turn is an ACP turn
     /// only by `state.acp_sessions` plus the pin in
-    /// `session_room_profiles`, exactly what `session/new` writes. The
-    /// policy layer is left at the default `Origin::Trusted` so the
+    /// `session_profiles`, exactly what `session/new` writes. The
+    /// policy layer is left at the default `Origin::Unattended` so the
     /// profile gate is the only permission this call passes through —
     /// if the profile does not reach the tool, the call is refused.
     #[tokio::test]
-    async fn an_acp_turn_carries_its_pinned_room_profile_to_its_tools() {
+    async fn an_acp_turn_carries_its_pinned_session_profile_to_its_tools() {
         let (state, _dir) = scripted_state_with_agent_config(vec!["ops".to_string()]).await;
 
         // The pin `session/new` writes: ACP session + a room profile name.
         let sid = "acp-profile-carry".to_string();
         state.acp_sessions.lock().await.insert(sid.clone());
         state
-            .session_room_profiles
+            .session_profiles
             .lock()
             .await
             .insert(sid.clone(), "ops".to_string());
@@ -4622,7 +5204,7 @@ mod tests {
         // one some *other* session pinned.
         let sid = "rpc-no-profile".to_string();
         state
-            .session_room_profiles
+            .session_profiles
             .lock()
             .await
             .insert("some-other-session".to_string(), "ops".to_string());
@@ -4638,7 +5220,7 @@ mod tests {
 
         let result = tool_result_for(&state, &sid, "call-1").await;
         assert!(
-            result.contains("Permission denied") && result.contains("room_profiles"),
+            result.contains("Permission denied") && result.contains("permission_profile"),
             "a /rpc turn must be refused by the profile gate: got {result}"
         );
     }
@@ -4646,7 +5228,7 @@ mod tests {
     /// The state + real `agent_config` tool the two wiring tests above
     /// share: a scripted one-round-then-answer provider, and a
     /// `ConfigTool` over `state.workspace` itself with
-    /// `[tools.admin].room_profiles` set to `profiles`. The framework
+    /// `admin` enabled and listed for `profiles`. The framework
     /// workspace the tool writes through is opened over the same
     /// directory (`Workspace::from_root` needs the `.sapphire-agent`
     /// marker), with a shared cache dir under the system temp dir.
@@ -4666,7 +5248,7 @@ mod tests {
         // Windows).
         ctx.set_cache_dir(std::env::temp_dir().join("sapphire-agent-serve-test-cache"));
 
-        let state = ServeState::for_test_scripted(
+        let mut state = ServeState::for_test_scripted(
             true,
             vec![
                 crate::provider::ChatResponse {
@@ -4694,8 +5276,29 @@ mod tests {
         // point both at the same root.
         std::fs::create_dir_all(root.join(".sapphire-agent")).unwrap();
 
-        let mut config = state.config.clone();
-        config.tools.admin.room_profiles = profiles;
+        let config = &mut Arc::get_mut(&mut state).unwrap().config;
+        config.tools.admin.enabled = true;
+        for name in profiles {
+            config.session_profiles.insert(
+                name,
+                crate::config::SessionProfileConfig {
+                    profile: "default".into(),
+                    permission: Some("admin".into()),
+                    ..Default::default()
+                },
+            );
+        }
+        // Permit the call through the shared table so these tests exercise
+        // the profile scoped around the tool execution itself.
+        config.permission_profiles.insert(
+            "admin".into(),
+            crate::config::PermissionProfileConfig {
+                tools: vec![crate::config::ToolGroup::Admin],
+            },
+        );
+        let config = config.clone();
+        Arc::get_mut(&mut state).unwrap().tools =
+            Arc::new(crate::tools::ToolSet::new(vec![], vec![], &config));
         let sw = sapphire_framework::workspace::Workspace::from_root(ctx, &root).unwrap();
         let ws = Arc::new(sapphire_framework::workspace::WorkspaceState::open(sw).unwrap());
 
@@ -4788,9 +5391,6 @@ mod tests {
         fn spec(&self) -> &ToolSpec {
             &self.spec
         }
-        fn kind(&self) -> crate::tools::ToolKind {
-            crate::tools::ToolKind::Read
-        }
         async fn execute(&self, _input: &Value) -> anyhow::Result<String> {
             let state = self.state.upgrade().unwrap();
             for (id, text) in &self.tasks {
@@ -4809,6 +5409,8 @@ mod tests {
             .tools
             .register_tool(Box::new(CompletesTasks {
                 spec: ToolSpec {
+                    kind: crate::tools::ToolKind::Read,
+                    group: None,
                     name: "completes".to_string().into(),
                     description: String::new().into(),
                     input_schema: json!({"type": "object"}),
@@ -5018,7 +5620,7 @@ mod tests {
             namespace: crate::config::DEFAULT_NAMESPACE_NAME.to_string(),
             persistence: None,
             subagent_depth: 1,
-            admin_room_profile: None,
+            session_profile: "default".into(),
         }
         .run(&mut history)
         .await;
@@ -5040,18 +5642,9 @@ mod tests {
     /// what the parent was refused. Anything else would make "ask a
     /// subagent" a way around the permission gate.
     ///
-    /// `subagent` itself is `ToolKind::Other`, which the policy table
-    /// groups with `Execute` in the same "risky" bucket in every origin
-    /// (see `crate::tools::policy::decide`) — so an origin that
-    /// auto-denies `Execute` (`Origin::Channel`) would auto-deny the
-    /// top-level `subagent` call too, before delegation ever ran, which
-    /// would make the test pass without exercising `SubagentTool` at
-    /// all. `Origin::Acp(SessionMode::Default)` sends every risky call
-    /// through `approve` instead of denying it outright, so this test
-    /// can let the top-level `subagent` call through while having the
-    /// very same `approve` reject the nested `risky` call — proving the
-    /// nested call is judged by the *parent's* host, not a laxer one
-    /// standing in for it.
+    /// Both `subagent` and the nested risky call ask under ACP default mode.
+    /// Approving only the top-level call proves that the nested call is judged
+    /// by the parent's host rather than a laxer one.
     #[tokio::test]
     async fn a_subagent_is_judged_by_the_parents_origin() {
         use crate::tools::policy::{Approval, Origin, SessionMode};
@@ -5069,7 +5662,10 @@ mod tests {
             async fn tool_end(&self, _id: &str, _name: &str) {}
             async fn turn_error(&self, _message: &str) {}
             fn origin(&self) -> Origin {
-                Origin::Acp(SessionMode::Default)
+                Origin::Acp {
+                    mode: SessionMode::Default,
+                    session_profile: "default".into(),
+                }
             }
             async fn approve(
                 &self,
@@ -5184,7 +5780,10 @@ mod tests {
             async fn tool_end(&self, _id: &str, _name: &str) {}
             async fn turn_error(&self, _message: &str) {}
             fn origin(&self) -> Origin {
-                Origin::Acp(SessionMode::Default)
+                Origin::Acp {
+                    mode: SessionMode::Default,
+                    session_profile: "default".into(),
+                }
             }
             async fn approve(
                 &self,
@@ -5459,7 +6058,7 @@ mod tests {
     /// A definition's `tools:` restriction is also a promise about what
     /// is *offered*, and needs the same gate: without it, a subagent
     /// could call any tool registered on the shared `ToolSet`, whether
-    /// or not its own definition named it. `Origin::Trusted` is used
+    /// or not its own definition named it. `Origin::Unattended` is used
     /// here specifically because it allows every kind unconditionally —
     /// isolating this from `a_subagent_is_judged_by_the_parents_origin`,
     /// which is about the origin/host gate, not this one.
@@ -5480,7 +6079,7 @@ mod tests {
                     stop_reason: None,
                 },
                 // Subagent round 1: try a tool outside its own `tools:`
-                // list — registered on the `ToolSet`, and `Origin::Trusted`
+                // list — registered on the `ToolSet`, and `Origin::Unattended`
                 // would allow it unconditionally, but the definition
                 // never named it.
                 crate::provider::ChatResponse {
@@ -5540,7 +6139,7 @@ mod tests {
         assert_eq!(outcome.text.as_deref(), Some("done"));
         assert!(
             !ran.load(std::sync::atomic::Ordering::SeqCst),
-            "`risky` was registered and `Origin::Trusted` allows every \
+            "`risky` was registered and `Origin::Unattended` allows every \
              kind, so only the `tools:` restriction itself explains a \
              refusal here"
         );
@@ -5548,23 +6147,12 @@ mod tests {
 
     /// `Refusal::NotOffered` closes the same hole on the *ordinary*
     /// (non-subagent) path — every test above exercises it only through
-    /// `subagent`. A name the model invents (or gets right, but this
-    /// round happens not to offer) that still matches something
-    /// registered on the shared `ToolSet` must be refused before
-    /// `ToolSet::execute` ever dispatches on it — see `TurnLoop::run`'s
-    /// permission gate, which checks `offered` first, ahead of the
-    /// host-machine gate and `decide` both.
+    /// `subagent`. The offered-name check precedes `policy::allow` and
+    /// `ToolSet::execute` even for a name registered on the shared set.
     ///
-    /// `shell_start` is the tool named: it isn't in `HOST_TOOLS`, so
-    /// the host-machine gate — the *other* thing that could explain a
-    /// refusal here — never fires for it, and `NullProgress`'s default
-    /// `origin()` is `Origin::Trusted`, which `decide` allows
-    /// unconditionally for every kind. The only thing left standing
-    /// between the call and `ran` flipping `true` is the offered check
-    /// itself: `visible_tool_predicate` excludes `shell_start` from
-    /// this round's own `tool_specs` because `NullProgress` reports no
-    /// ACP client (`has_client` is `false`), even though the tool stays
-    /// registered and visible to `state.tools.kinds()`.
+    /// `shell_start` is ungrouped, so the default unattended profile would
+    /// allow it. The predicate hides it from this clientless turn, even
+    /// though it remains registered in `state.tools.specs_filtered`.
     #[tokio::test]
     async fn a_registered_but_unoffered_tool_is_refused_on_an_ordinary_turn() {
         struct FakeClientShellStart {
@@ -5575,9 +6163,6 @@ mod tests {
         impl crate::tools::Tool for FakeClientShellStart {
             fn spec(&self) -> &crate::provider::ToolSpec {
                 &self.spec
-            }
-            fn kind(&self) -> crate::tools::ToolKind {
-                crate::tools::ToolKind::Execute
             }
             async fn execute(&self, _input: &Value) -> anyhow::Result<String> {
                 self.ran.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -5616,6 +6201,8 @@ mod tests {
             .tools
             .register_tool(Box::new(FakeClientShellStart {
                 spec: crate::provider::ToolSpec {
+                    kind: crate::tools::ToolKind::Execute,
+                    group: None,
                     name: "shell_start".into(),
                     description: "Pretend to run a command on the client.".into(),
                     input_schema: json!({ "type": "object", "properties": {} }),
@@ -5637,7 +6224,7 @@ mod tests {
         assert!(
             !ran.load(std::sync::atomic::Ordering::SeqCst),
             "`shell_start` is registered, isn't a `HOST_TOOLS` name (so the \
-             host gate never fires), and `Origin::Trusted` \
+             host gate never fires), and `Origin::Unattended` \
              allows every kind unconditionally — only the offered check \
              itself explains a refusal here"
         );
@@ -5905,17 +6492,26 @@ mod tests {
         );
     }
 
-    /// The pre-existing transports keep today's behaviour. `Trusted` is
-    /// what makes that true: `decide` allows everything for it, so no
-    /// `/rpc`, voice or heartbeat turn can start asking for permission.
+    /// Existing unattended transports resolve the default session profile
+    /// without an ACP mode, so they do not prompt; group restrictions apply.
     #[test]
     fn existing_transports_are_trusted() {
         use crate::tools::policy::Origin;
 
         let (tx, _rx) = mpsc::channel(4);
         let sse = SseProgress::new(tx, json!(1));
-        assert_eq!(sse.origin(), Origin::Trusted);
-        assert_eq!(NullProgress.origin(), Origin::Trusted);
+        assert_eq!(
+            sse.origin(),
+            Origin::Unattended {
+                session_profile: "default".into()
+            }
+        );
+        assert_eq!(
+            NullProgress.origin(),
+            Origin::Unattended {
+                session_profile: "default".into()
+            }
+        );
     }
 
     /// A host that cannot ask must not block the call. The default lets
@@ -6046,7 +6642,7 @@ mod tests {
             .resolve("sa-acp-token")
             .await
             .expect("fixture token should resolve");
-        assert_eq!(resolved.room_profile, "developer");
+        assert_eq!(resolved.session_profile, "developer");
         assert!(state.device_auth.resolve("sa-wrong").await.is_err());
     }
 
@@ -6438,6 +7034,8 @@ mod tests {
         fn new(moved_away: std::path::PathBuf, real_path: std::path::PathBuf) -> Self {
             Self {
                 spec: crate::provider::ToolSpec {
+                    kind: crate::tools::ToolKind::Execute,
+                    group: None,
                     name: "risky".into(),
                     description: "Pretend to run a command.".into(),
                     input_schema: json!({ "type": "object", "properties": {} }),
@@ -6452,10 +7050,6 @@ mod tests {
     impl crate::tools::Tool for RestoringTool {
         fn spec(&self) -> &crate::provider::ToolSpec {
             &self.spec
-        }
-
-        fn kind(&self) -> crate::tools::ToolKind {
-            crate::tools::ToolKind::Execute
         }
 
         async fn execute(&self, _input: &Value) -> anyhow::Result<String> {
@@ -6684,6 +7278,106 @@ mod tests {
         );
     }
 
+    /// Exercise the actual ToolOutput -> message -> scrub/hydrate boundary
+    /// with the payload-backed SessionStore used by non-ACP transports.
+    #[tokio::test]
+    async fn image_read_rpc_history_retains_tool_text_without_base64() {
+        use crate::image_cache::{ImageCache, hydrate_history, scrub_history_inplace, sha256_hex};
+        use crate::tools::Tool;
+        use sapphire_framework::workspace::{AppContext, Workspace, WorkspaceState};
+
+        static CTX: AppContext = AppContext::new("sapphire-agent");
+        CTX.set_cache_dir(std::env::temp_dir().join("sapphire-agent-serve-image-test-cache"));
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join(".sapphire-agent")).unwrap();
+        let ws =
+            Arc::new(WorkspaceState::open(Workspace::from_root(&CTX, &root).unwrap()).unwrap());
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::RgbImage::new(2, 1)
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .unwrap();
+        let bytes = encoded.into_inner();
+        std::fs::write(root.join("image.png"), &bytes).unwrap();
+        let output = crate::tools::attachment_tools::ImageReadTool::new(ws)
+            .execute_full(&json!({"path": "image.png"}))
+            .await
+            .unwrap();
+        assert_eq!(output.images.len(), 1);
+        let raw_base64 = output.images[0].1.clone();
+        let result_text = output.text.clone();
+        let message = ChatMessage::tool_results_with_images(
+            vec![("read-1".into(), output.text)],
+            output.images,
+        );
+        let sha = sha256_hex(&bytes);
+        let marker = format!("[image: image/png sha256={sha}]");
+
+        for cache_enabled in [true, false] {
+            let base = root.join(if cache_enabled { "on" } else { "off" });
+            let payloads =
+                crate::tool_payload_cache::ToolPayloadCache::open(base.join("payloads")).unwrap();
+            let store = SessionStore::new(base.join("sessions"), "rpc", Some(payloads));
+            store
+                .ensure_session("s1", &("s1".into(), None), "rpc", None, "default")
+                .unwrap();
+            store
+                .append(
+                    "s1",
+                    &ChatMessage::assistant_with_tools(
+                        None,
+                        vec![crate::provider::ToolCall {
+                            id: "read-1".into(),
+                            name: "image_read".into(),
+                            input: json!({"path": "image.png"}),
+                        }],
+                    ),
+                )
+                .unwrap();
+            let mut history = vec![message.clone()];
+            let same_turn = hydrate_history(&history);
+            assert!(matches!(
+                &same_turn[0].parts[0],
+                ContentPart::ToolResult { .. }
+            ));
+            assert!(matches!(&same_turn[0].parts[1],
+                ContentPart::Image { media_type, data_base64 }
+                    if media_type == "image/png" && data_base64 == &raw_base64));
+            // Persist before the final scrub, as the turn loops do.
+            store.append("s1", &history[0]).unwrap();
+            let raw = store.raw_for_test("s1");
+            assert!(!raw.contains(&raw_base64));
+            assert!(!raw.contains("data_base64"));
+            assert!(raw.contains(&marker));
+            let loaded = store.load_session("s1").unwrap();
+            let parts: Vec<_> = loaded.iter().flat_map(|msg| &msg.parts).collect();
+            assert!(parts.iter().any(|p| matches!(p,
+                ContentPart::ToolResult { tool_use_id, content }
+                    if tool_use_id == "read-1" && content == &result_text)));
+            assert!(
+                parts
+                    .iter()
+                    .any(|p| matches!(p, ContentPart::Text(text) if text == &marker))
+            );
+            assert!(!parts.iter().any(|p| matches!(p, ContentPart::Image { .. })));
+
+            let cache = cache_enabled.then(|| ImageCache::open(base.join("images")).unwrap());
+            scrub_history_inplace(&mut history, cache.as_deref());
+            let next_input = hydrate_history(&history);
+            if let Some(cache) = cache {
+                assert!(matches!(&history[0].parts[1],
+                    ContentPart::ImageRef { media_type, sha256 }
+                        if media_type == "image/png" && sha256 == &sha));
+                assert_eq!(cache.get(&sha).unwrap(), bytes);
+                assert!(
+                    matches!(&next_input[0].parts[1], ContentPart::Text(text) if text == &marker)
+                );
+            } else {
+                assert!(matches!(&history[0].parts[1], ContentPart::Image { .. }));
+            }
+        }
+    }
+
     /// The measurement exists to distinguish "many sessions accumulate"
     /// from "one session grows", because only the first is fixed by
     /// dropping idle sessions. A total alone cannot tell them apart, so
@@ -6772,6 +7466,8 @@ mod tests {
             "dir_list",
             "dir_walk",
             "shell",
+            "image_read",
+            "attachment_save",
             // Skill tools, gated on the same terminal capability.
             "skill",
             "skill_install",
@@ -6787,7 +7483,7 @@ mod tests {
             crate::tools::client_tools::ClientShellOutput::new(),
         ));
         tools.push(Box::new(crate::tools::client_tools::ClientShellKill::new()));
-        ToolSet::new(tools, Vec::new())
+        ToolSet::new(tools, Vec::new(), &crate::config::Config::for_test())
     }
 
     /// The tool names an ACP turn with an editor declaring `caps` would
@@ -6802,6 +7498,7 @@ mod tests {
     async fn tool_names_for_turn(caps: TestCaps, host_access: bool) -> Vec<String> {
         client_filtering_test_set()
             .specs_filtered(visible_tool_predicate(
+                host_access,
                 host_access,
                 true,
                 caps.fs_read,
@@ -6822,6 +7519,7 @@ mod tests {
         client_filtering_test_set()
             .specs_filtered(visible_tool_predicate(
                 host_access,
+                host_access,
                 false,
                 false,
                 false,
@@ -6833,12 +7531,41 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn attachment_save_is_hidden_without_channel_override() {
+        for mask in 0..32 {
+            let flag = |bit| mask & (1 << bit) != 0;
+            let visible =
+                visible_tool_predicate(flag(0), flag(0), flag(1), flag(2), flag(3), flag(4));
+            assert!(!visible("attachment_save"), "flags={mask}");
+        }
+    }
+
+    #[test]
+    fn image_read_visibility_host_and_acp() {
+        for (host, client, expected) in [
+            (false, false, false),
+            (true, false, true),
+            (false, true, false),
+            (true, true, false),
+        ] {
+            for caps in [false, true] {
+                let visible = visible_tool_predicate(host, host, client, caps, caps, caps);
+                assert_eq!(
+                    visible("image_read"),
+                    expected,
+                    "host={host} client={client} caps={caps}"
+                );
+            }
+        }
+    }
+
     /// A client that says it can read but not write gets exactly one of
     /// the two file tools. Clients implement these independently, so
     /// the two flags are read separately rather than as one "fs" bit.
     ///
     /// `host_access` is off in the helper: the seven names are
-    /// `HOST_TOOLS`, and an ACP turn must offer them regardless — that
+    /// in `HOST_TOOLS`, and an ACP turn must offer them regardless — that
     /// the deployment-wide switch has no say here is the change #270
     /// makes.
     #[tokio::test]
@@ -6941,9 +7668,14 @@ mod tests {
             false,
         )
         .await;
-        for n in crate::tools::policy::HOST_TOOLS {
+        for n in TEST_HOST_TOOLS
+            .iter()
+            .filter(|n| !matches!(**n, "image_read" | "attachment_save"))
+        {
             assert!(names.contains(&n.to_string()), "missing {n}: {names:?}");
         }
+        assert!(!names.contains(&"image_read".to_string()));
+        assert!(!names.contains(&"attachment_save".to_string()));
 
         // `fs.read` only: the read half survives, the write half and the
         // terminal-dependent names do not. No fallback to the agent's
@@ -6971,7 +7703,7 @@ mod tests {
         }
     }
 
-    /// Outside an ACP session the same seven names answer to the
+    /// Outside an ACP session all eight host names answer to the
     /// deployment switch and nothing else.
     ///
     /// `dir_list` and `dir_walk` are pinned on their own here because
@@ -6984,13 +7716,13 @@ mod tests {
     #[tokio::test]
     async fn a_non_acp_turn_is_governed_by_host_access_alone() {
         let off = tool_names_for_turn_without_a_client(false).await;
-        for n in crate::tools::policy::HOST_TOOLS {
+        for n in TEST_HOST_TOOLS {
             assert!(!off.contains(&n.to_string()), "{n} should be hidden");
         }
 
         let on = tool_names_for_turn_without_a_client(true).await;
-        for n in crate::tools::policy::HOST_TOOLS {
-            assert!(on.contains(&n.to_string()), "{n} should be present");
+        for n in TEST_HOST_TOOLS {
+            assert_eq!(on.contains(&n.to_string()), *n != "attachment_save", "{n}");
         }
 
         for n in ["shell_start", "shell_output", "shell_kill"] {
@@ -7024,21 +7756,21 @@ mod tests {
     /// machine.
     #[test]
     fn skill_tools_need_a_client_with_a_terminal() {
-        let none = visible_tool_predicate(false, false, false, false, false);
+        let none = visible_tool_predicate(false, false, false, false, false, false);
         for t in ["skill", "skill_install", "skill_update", "skill_uninstall"] {
             assert!(!none(t), "{t} offered with no client");
         }
         // And the host switch does not change that: it speaks for the
         // agent's own disk, which is not where these run.
-        let none_host_on = visible_tool_predicate(true, false, false, false, false);
+        let none_host_on = visible_tool_predicate(true, true, false, false, false, false);
         for t in ["skill", "skill_install", "skill_update", "skill_uninstall"] {
             assert!(!none_host_on(t), "{t} offered with no client");
         }
-        let full = visible_tool_predicate(false, true, true, true, true);
+        let full = visible_tool_predicate(false, false, true, true, true, true);
         for t in ["skill", "skill_install", "skill_update", "skill_uninstall"] {
             assert!(full(t), "{t} hidden from a fully capable editor");
         }
-        let no_term = visible_tool_predicate(false, true, true, true, false);
+        let no_term = visible_tool_predicate(false, false, true, true, true, false);
         assert!(!no_term("skill"), "skill offered without a terminal");
     }
 
@@ -7057,8 +7789,8 @@ mod tests {
         set.register_tool(Box::new(crate::tools::avatar_tools::SetPoseTool))
             .await;
         for predicate in [
-            visible_tool_predicate(false, false, false, false, false),
-            visible_tool_predicate(true, true, true, true, true),
+            visible_tool_predicate(false, false, false, false, false, false),
+            visible_tool_predicate(true, true, true, true, true, true),
         ] {
             let names: Vec<String> = set
                 .specs_filtered(predicate)
@@ -7076,7 +7808,7 @@ mod tests {
     fn ask_human_is_hidden_without_consult_identity() {
         for bits in 0..32u8 {
             let f = |i: u8| bits & (1 << i) != 0;
-            let visible = visible_tool_predicate(f(0), f(1), f(2), f(3), f(4));
+            let visible = visible_tool_predicate(f(0), f(0), f(1), f(2), f(3), f(4));
             assert!(!visible("ask_human"), "visible for flags {bits:05b}");
         }
     }
@@ -7092,13 +7824,15 @@ mod tests {
                 .register_tool(Box::new(crate::tools::ask_human::AskHumanTool::new()))
                 .await;
             let progress: Arc<dyn TurnHost> = Arc::new(AutonomousHost {
-                origin: crate::tools::policy::Origin::Trusted,
+                origin: crate::tools::policy::Origin::Unattended {
+                    session_profile: "default".into(),
+                },
                 consult,
             });
             let specs = state
                 .tools
                 .specs_filtered(turn_tool_predicate(
-                    visible_tool_predicate(false, false, false, false, false),
+                    visible_tool_predicate(false, false, false, false, false, false),
                     false,
                     progress.consult_identity().is_some(),
                     false,
@@ -7123,7 +7857,9 @@ mod tests {
             asked_by: None,
         };
         let host = AutonomousHost {
-            origin: crate::tools::policy::Origin::Trusted,
+            origin: crate::tools::policy::Origin::Unattended {
+                session_profile: "default".into(),
+            },
             consult: Some(id.clone()),
         };
         assert_eq!(host.detached().consult_identity(), Some(id));
@@ -7134,18 +7870,18 @@ mod tests {
     /// `text` input.
     struct SessionEcho {
         spec: crate::provider::ToolSpec,
-        kind: crate::tools::ToolKind,
     }
 
     impl SessionEcho {
         fn new(kind: crate::tools::ToolKind) -> Self {
             Self {
                 spec: crate::provider::ToolSpec {
+                    kind,
+                    group: None,
                     name: "acp__game__echo".into(),
                     description: "Echo the given text back.".into(),
                     input_schema: json!({"type": "object", "properties": {}}),
                 },
-                kind,
             }
         }
     }
@@ -7154,9 +7890,6 @@ mod tests {
     impl crate::tools::Tool for SessionEcho {
         fn spec(&self) -> &crate::provider::ToolSpec {
             &self.spec
-        }
-        fn kind(&self) -> crate::tools::ToolKind {
-            self.kind
         }
         async fn execute(&self, input: &Value) -> anyhow::Result<String> {
             Ok(input["text"].as_str().unwrap_or_default().to_string())
@@ -7181,6 +7914,7 @@ mod tests {
                 Arc::new(crate::tools::ToolSet::new(
                     vec![Box::new(SessionEcho::new(k))],
                     Vec::new(),
+                    &crate::config::Config::for_test(),
                 ))
             });
             (
@@ -7203,7 +7937,7 @@ mod tests {
             self.tools.clone()
         }
         fn origin(&self) -> crate::tools::policy::Origin {
-            self.origin
+            self.origin.clone()
         }
         async fn approve(
             &self,
@@ -7247,7 +7981,9 @@ mod tests {
         );
         let (host, _) = SessionToolsHost::new(
             Some(crate::tools::ToolKind::Read),
-            crate::tools::policy::Origin::Trusted,
+            crate::tools::policy::Origin::Unattended {
+                session_profile: "default".into(),
+            },
         );
         let sid = "s-session-tools".to_string();
         let outcome = run_llm_turn(
@@ -7276,7 +8012,12 @@ mod tests {
             true,
             vec![session_tool_call(), final_round("done")],
         );
-        let (host, _) = SessionToolsHost::new(None, crate::tools::policy::Origin::Trusted);
+        let (host, _) = SessionToolsHost::new(
+            None,
+            crate::tools::policy::Origin::Unattended {
+                session_profile: "default".into(),
+            },
+        );
         let sid = "s-no-session-tools".to_string();
         let outcome = run_llm_turn(
             Arc::clone(&state),
@@ -7313,8 +8054,13 @@ mod tests {
         ] {
             let state =
                 ServeState::for_test_scripted(true, vec![session_tool_call(), final_round("done")]);
-            let (host, asked) =
-                SessionToolsHost::new(Some(kind), Origin::Acp(SessionMode::Default));
+            let (host, asked) = SessionToolsHost::new(
+                Some(kind),
+                Origin::Acp {
+                    mode: SessionMode::Default,
+                    session_profile: "default".into(),
+                },
+            );
             let outcome = run_llm_turn(
                 Arc::clone(&state),
                 "s-session-tool-kind".to_string(),
@@ -7347,7 +8093,10 @@ mod tests {
         async fn tool_end(&self, _id: &str, _name: &str) {}
         async fn turn_error(&self, _message: &str) {}
         fn origin(&self) -> crate::tools::policy::Origin {
-            crate::tools::policy::Origin::Acp(crate::tools::policy::SessionMode::Default)
+            crate::tools::policy::Origin::Acp {
+                mode: crate::tools::policy::SessionMode::Default,
+                session_profile: "default".into(),
+            }
         }
         fn acp_client(&self) -> Option<Arc<dyn crate::tools::acp_client::AcpClient>> {
             self.client.clone()
@@ -7369,6 +8118,8 @@ mod tests {
         fn new(ran: Arc<std::sync::atomic::AtomicBool>) -> Self {
             Self {
                 spec: crate::provider::ToolSpec {
+                    kind: crate::tools::ToolKind::Read,
+                    group: Some(crate::config::ToolGroup::Fs),
                     name: "file_read".into(),
                     description: "Pretend to read a file.".into(),
                     input_schema: json!({"type": "object", "properties": {}}),
@@ -7382,9 +8133,6 @@ mod tests {
     impl crate::tools::Tool for FakeFileRead {
         fn spec(&self) -> &crate::provider::ToolSpec {
             &self.spec
-        }
-        fn kind(&self) -> crate::tools::ToolKind {
-            crate::tools::ToolKind::Read
         }
         async fn execute(&self, _input: &Value) -> anyhow::Result<String> {
             self.ran.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -7400,7 +8148,7 @@ mod tests {
     /// `routed_to_client` to tell the two apart, so a deployment-wide
     /// switch would have been deciding for a machine it does not own.
     #[tokio::test]
-    async fn an_acp_turn_runs_a_host_named_tool_with_host_access_off() {
+    async fn an_acp_turn_refuses_a_group_when_host_disables_it() {
         let state = ServeState::for_test_scripted(
             true,
             vec![
@@ -7423,7 +8171,7 @@ mod tests {
             ],
         );
         assert!(
-            !state.config.tools.host_access.enabled,
+            !state.config.tools.fs.enabled,
             "the shipped default is the case under test"
         );
 
@@ -7448,9 +8196,8 @@ mod tests {
 
         assert_eq!(outcome.text.as_deref(), Some("done"));
         assert!(
-            ran.load(std::sync::atomic::Ordering::SeqCst),
-            "an ACP turn reaches the editor's machine, so the deployment's \
-             host_access switch has nothing to refuse here"
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "group access requires the host switch even for an ACP turn"
         );
     }
 
@@ -7906,16 +8653,30 @@ mod tests {
     #[test]
     fn the_autonomous_host_is_trusted_and_unattended() {
         let host = AutonomousHost {
-            origin: crate::tools::policy::Origin::Trusted,
+            origin: crate::tools::policy::Origin::Unattended {
+                session_profile: "default".into(),
+            },
             consult: None,
         };
-        assert_eq!(host.origin(), crate::tools::policy::Origin::Trusted);
+        assert_eq!(
+            host.origin(),
+            crate::tools::policy::Origin::Unattended {
+                session_profile: "default".into()
+            }
+        );
         assert_eq!(host.round_budget(), RoundBudget::Unattended);
 
         let host = AutonomousHost {
-            origin: crate::tools::policy::Origin::Channel,
+            origin: crate::tools::policy::Origin::Channel {
+                session_profile: "default".into(),
+            },
             consult: None,
         };
-        assert_eq!(host.origin(), crate::tools::policy::Origin::Channel);
+        assert_eq!(
+            host.origin(),
+            crate::tools::policy::Origin::Channel {
+                session_profile: "default".into()
+            }
+        );
     }
 }

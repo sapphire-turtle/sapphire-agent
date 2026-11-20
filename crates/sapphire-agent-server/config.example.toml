@@ -26,7 +26,7 @@
 # It may set everything this file can except credentials: any key named
 # like one — `api_key`, `api_keys`, `*_api_key`, `*_token`, `secret`,
 # `password`, `recovery_key`, at any depth, including an MCP server's `env`
-# entries — `workspace_dir`, `[tools.host_access]`, which each device
+# entries — `workspace_dir`, `[tools.fs] / [tools.shell]`, which each device
 # grants for itself, and `[serve]`, this machine's bind address. If the
 # workspace file sets one, it is ignored and named in a warning at startup.
 # So a deployment can keep providers (base_url included), profiles, room
@@ -37,7 +37,7 @@
 #   api_key = "..."
 #
 # The shared file is input to every host that syncs the workspace, and it
-# can define MCP servers and `[tools.admin]` and point a provider at any
+# can define MCP servers and tool listings and point a provider at any
 # endpoint. Whoever can write it can run commands
 # on every such host, so guard write access to it like this file's.
 #
@@ -68,7 +68,7 @@
 #     delegates (background delegation included) needs `trusted` too.
 #     A task may also reply `WAIT` to suspend until its background tasks
 #     finish.
-#   - `[tools] host_access.enabled = true` — without it the host tools
+#   - `[tools.fs] / [tools.shell] enabled = true` — without it the host tools
 #     are refused before the permission table is consulted at all, for
 #     every origin.
 #
@@ -79,8 +79,8 @@
 # origin = "trusted"
 # Chat room where autonomous sessions post questions (the `ask_human`
 # tool); a reply to a question's message is the answer. The room must also
-# have a block in its channel's rooms map (`discord.rooms` / `matrix.rooms`
-# / `telegram.rooms`), or be a Discord channel ID while `discord.rooms` is empty.
+# be in the channel's room list (`matrix.rooms`, `discord.rooms`, or `telegram.rooms`),
+# or be a valid room ID for a configured channel whose rooms list is empty.
 # consult_room = "123456789012345678"
 # How long a question waits for a reply, in hours: 1 to 8760 (a year);
 # a value outside that range is clamped, with a warning.
@@ -97,6 +97,8 @@ homeserver = "https://matrix.example.com"
 access_token = "syt_..."
 user_id = "@bot:example.com"
 device_id = "DEVICEID"
+# For any channel, an empty rooms list means listen everywhere the bot can see.
+# See [[matrix.rooms]] below.
 # Messages from users not in this list are silently ignored.
 # Leave empty ([]) to allow all users.
 allowed_users = ["@you:example.com"]
@@ -105,44 +107,47 @@ recovery_key = "EsT... "
 # Where to store matrix-sdk state / crypto DB (default: ~/.local/share/sapphire-agent/matrix)
 # state_dir = "~/.local/share/sapphire-agent/matrix"
 
-# Rooms to listen in. Empty = all rooms the bot can see. Each block can
-# carry display metadata and bind a [room_profile.<n>] via `profile`.
-# A room profile bundles `(profile, namespace, session_policy)`, so several
-# rooms can share one setup by naming the same [room_profile.<n>].
-[matrix.rooms."!roomid:example.com"]
-name = "Chat"
-description = "Everyday chat"
-profile = "everyday"
+# Each room binds its own session profile. Profiles name LLM profiles.
+[[matrix.rooms]]
+room_id = "!roomid:example.com"
+profile = "default"
+# name = "Matrix room"         # optional; Matrix uses live display metadata
+# description = "Room topic"
+
+[profiles.default]
+provider = "anthropic"
+
+[session_profile.default]
+profile = "default"
 
 # [discord]
 # bot_token = "..."
-# # Discord user IDs allowed to interact. Empty = all users.
-# allowed_users = ["123456789012345678"]
-#
-# [discord.rooms."123456789012345678"]
-# name = "development"
-# description = "Development and autonomous sessions"
-# profile = "development"
+# [[discord.rooms]]
+# room_id = "1474368482296807444"
+# profile = "default"
+# voice_pipeline = "default"  # optional
+# name = "Discord room"       # optional; Discord uses live display metadata
+# description = "Room topic"
 
 # [telegram]
 # bot_token = "123456:ABC..."
-# # `bot_token`, like every `*_token` key, is host-local: never put it in
-# # the workspace-shared `.sapphire-agent/config.toml`.
-# # Telegram user IDs allowed to interact. Empty = all users.
 # allowed_users = ["11111111"]
-# # A forum topic's room id is "<chat_id>:<message_thread_id>"; a plain chat
-# # uses just "<chat_id>". Empty rooms = all chats the bot can see.
-# [telegram.rooms."-1001000000001"]
-# name = "daily"
-# profile = "everyday"
-#
-# [telegram.rooms."-1002000333444555:42"]
-# name = "dev"
-# profile = "development"
-#
-# [telegram.rooms."-1003000000003"]
-# name = "nsfw"
-# profile = "private_nsfw"
+# [[telegram.rooms]]
+# room_id = "-1002000333444555:42"  # chat ID, optionally followed by :topic ID
+# profile = "default"
+# name = "Development"
+# description = "Development and autonomous sessions"
+
+# [permission_profile.chat]
+# tools = []
+# [tools.fs]
+# enabled = false
+# [tools.shell]
+# enabled = false
+# [tools.mcp]
+# enabled = false
+# [tools.admin]
+# enabled = false
 
 # Periodic log digests. The agent summarises weekly/monthly/yearly activity
 # into short importance-ordered bullet lists, stored as YAML frontmatter in
@@ -223,7 +228,7 @@ system_prompt = "You are a helpful personal assistant."
 # ── Profiles (LLM presets) ──────────────────────────────────────────────
 # A profile is a *pure* LLM preset: a provider plus an optional
 # refusal-fallback provider. Profiles know nothing about rooms or memory
-# namespaces; pairings happen via [room_profile.<n>] (for chat) and
+# namespaces; pairings happen via [session_profile.<n>] (for chat) and
 # memory_namespace.<n>.background_profile (for daily-log / digests /
 # compaction). Profiles that name an unknown provider cause startup to
 # fail.
@@ -237,9 +242,9 @@ system_prompt = "You are a helpful personal assistant."
 # for background tasks (daily-log generator, memory compaction, periodic
 # digests) when a memory namespace doesn't pin its own.
 #
-[profiles.default]
-provider = "anthropic"
-
+# [profiles.default]
+# provider = "anthropic"
+#
 # [profiles.opus]
 # provider = "anthropic"            # use claude-opus-4-7 in [anthropic.model]
 #
@@ -252,7 +257,7 @@ provider = "anthropic"
 
 # ── Memory namespaces ────────────────────────────────────────────────────
 # A memory namespace owns one subtree of `memory/`: its own MEMORY.md
-# plus the daily/weekly/monthly/yearly logs and digests. Room profiles
+# plus the daily/weekly/monthly/yearly logs and digests. Session profiles
 # pin their writes to one namespace; rooms reading the system prompt
 # also pull in parent namespaces declared via `include`. Reads chain
 # through the include DAG; writes go only to the leaf namespace.
@@ -279,53 +284,49 @@ provider = "anthropic"
 # # Anthropic.
 # background_profile = "local"
 
-# ── Room profiles ───────────────────────────────────────────────────────
-# A room profile bundles a chat profile + memory namespace + session
-# policy. A room names its bundle with `profile` in its channel's room block
-# (Matrix room ids, Discord channel ids, Telegram composite room ids, etc).
-# Rooms whose block has no `profile` fall back to [room_profile.default]
-# if defined, otherwise the built-in defaults (Anthropic provider,
-# `default` namespace, global session_policy).
+# ── Session profiles ───────────────────────────────────────────────────────
+# A session profile bundles an LLM profile, memory namespace and policy.
+# Each [[matrix.rooms]] or [[discord.rooms]] entry declares its profile.
+# Unlisted rooms resolve to default, which must be explicitly defined.
 #
-# API sessions pin a room profile via the bearer token sent in
+# API sessions pin a session profile via the bearer token sent in
 # `Authorization: Bearer <token>` on every `/rpc` request. The token
 # is an API key of the workspace (`sapphire-agent api-key add <name>
-# --profile <room profile>`, see "API keys" below), and the key's profile
-# is the room profile it runs under — same mechanism `/a2a`, `/acp`
+# --profile <session profile>`, see "API keys" below), and the key's profile
+# is the session profile it runs under — same mechanism `/a2a`, `/acp`
 # and ambient ingest all use (sapphire-agent-desktop: `[server].token`).
 #
-[room_profile.everyday]
-profile          = "default"
-memory_namespace = "default"     # optional; defaults to "default"
-session_policy   = "reset"       # optional; defaults to global setting
-
-# [room_profile.development]
+# [session_profile.everyday]
+# profile          = "default"
+# memory_namespace = "default"     # optional; defaults to "default"
+# session_policy   = "reset"       # optional; defaults to global setting
+#
+# [session_profile.development]
 # profile = "opus"                 # higher-quality model for coding work
 # # memory_namespace omitted → writes to "default" alongside everyday chat
 #
-# [room_profile.private_nsfw]
+# [session_profile.private_nsfw]
 # profile          = "local"
 # memory_namespace = "user_nsfw"
 # session_policy   = "compact"
 #
 # /rpc (sapphire-agent-desktop), A2A (Agent2Agent Protocol), `/acp`
-# and ambient ingest all reach a room_profile through the API key's
+# and ambient ingest all reach a session_profile through the API key's
 # profile: an incoming `Authorization: Bearer <token>` resolves
-# implicitly (token -> API key -> its profile, a room profile), so
-# external clients never name room_profile themselves. A key whose
-# profile is no room profile here (one since removed, say) is refused
+# implicitly (token -> API key -> its profile, a session profile), so
+# external clients never name session_profile themselves. A key whose
+# profile is no session profile here (one since removed, say) is refused
 # with 403; `verify` lists every key and where it goes.
 #
 # `devices` is only for API keys from before key profiles (the
 # workgroup's external devices of `external-device add`, which the
 # framework imported into the workspace with the profile `read-only`). Each entry is
-# such a key's name or id, unique across all room profiles — startup
+# such a key's name or id, unique across all session profiles — startup
 # fails if two profiles share one. Re-issue those keys with
-# `api-key add <name> --profile <room profile>` and the entry can go.
+# `api-key add <name> --profile <session profile>` and the entry can go.
 #
-# [room_profile.sapphire_world]
+# [session_profile.sapphire_world]
 # profile          = "default"
-# A2A-only; no chat rooms name it
 # memory_namespace = "sapphire_world"
 # # its client's key: `api-key add a2a-client --profile sapphire_world`
 #
@@ -341,7 +342,7 @@ session_policy   = "reset"       # optional; defaults to global setting
 # Mounts `/a2a` (JSON-RPC) and `/.well-known/agent-card.json` on the
 # same HTTP server as `/rpc`. Disabled by default — flip `enabled` to
 # turn the routes on. Auth resolves like every other endpoint:
-# token -> API key -> its profile, a `[room_profile.<n>]`;
+# token -> API key -> its profile, a `[session_profile.<n>]`;
 # this section configures only the public face of the agent.
 #
 # [a2a]
@@ -356,14 +357,24 @@ session_policy   = "reset"       # optional; defaults to global setting
 # The `[tools]` table configures the agent's own tool belt. Three
 # concerns live here:
 #
-#   - `[tools.host_access]` — the switch that lets the agent touch its
+#   - `[tools.fs] / [tools.shell]` — the switch that lets the agent touch its
 #     own filesystem and shell: `file_read`, `file_write`, `file_append`,
-#     `file_delete`, `dir_list`, `dir_walk`, `shell`. `enabled = false`
-#     by default, for every origin — `/rpc`, voice, `/a2a`,
-#     Matrix/Discord/Telegram and ACP alike.
+#     `file_delete`, `dir_list`, `dir_walk`, `shell`, `image_read`,
+#     `attachment_save`. `enabled = false`
+#     by default, for every origin — `/rpc`, voice, `/a2a`, Matrix/Discord
+#     and ACP alike.
 #
-#     Inside an ACP session these same seven names reach the *editor's*
-#     machine instead, and this switch does not speak for it: what that
+#     `image_read(path)` reads one local JPEG/PNG/GIF/WebP (32 MiB input;
+#     over 5 MiB shrunk for display); `file_read` stays text-only.
+#     `attachment_save(attachment_id, path)` saves the same Discord/Matrix
+#     conversation's original, not the display resize. Both require this
+#     switch and are unavailable in ACP. Non-image attachments are also
+#     auto-fetched: 32 MiB/file, 8/post, 64 MiB/post, 1 GiB temporary store.
+#     Originals expire after 7 days: save before then; saved files are not
+#     auto-deleted. Capacity/download/cache failures become message notes.
+#
+#     Inside an ACP session the seven file/directory/shell names reach the
+#     *editor's* machine instead, and this switch does not speak for it: what that
 #     session may call is decided by the capabilities the connected editor
 #     declared at `initialize` (`fs.read_text_file`, `fs.write_text_file`,
 #     `terminal/*`), and a missing capability hides the tool rather than
@@ -377,8 +388,8 @@ session_policy   = "reset"       # optional; defaults to global setting
 #     covers ACP, which has `session/cancel` (the editor's Escape), and
 #     defaults to `0` — unbounded — so a long piece of delegated work runs
 #     to its end instead of stopping every ten rounds. `unattended` covers
-#     Matrix, Discord, Telegram, `/rpc`, `/a2a` and the heartbeat, none of
-#     which can be interrupted, and defaults to 25. `0` means unbounded on either
+#     Matrix, Discord, `/rpc`, `/a2a` and the heartbeat, none of which can
+#     be interrupted, and defaults to 25. `0` means unbounded on either
 #     side; subagents are always judged `unattended`, whatever their
 #     parent is. These bound spend, not context — `[compression]` is what
 #     keeps the history in the window.
@@ -416,23 +427,15 @@ session_policy   = "reset"       # optional; defaults to global setting
 #     server block above: that lets external AIs call sapphire-agent;
 #     this lets sapphire-agent call external MCP servers.
 #     MCP servers an ACP client provides over ACP need no entry here; see docs/sapphire-agent-tools.md.
-#   - `[tools.admin].room_profiles` — the room profiles whose sessions may
-#     use the config-file management tools (`heartbeat`, `autonomous`,
-#     `agents`), which add and edit the definitions under the workspace
-#     that the unattended loops later run. Values are `[room_profile.<name>]`
-#     keys, not room ids: a channel turn is judged by the profile its room
-#     resolves to, an ACP session by the profile its bearer token pinned, and
-#     voice / `/rpc` / A2A / the unattended loops by nothing (refused). Empty
-#     (the default) leaves all of them unregistered, the same shape as
-#     `[tools.host_access]`. The workspace layer may set it too, so whoever
-#     can write the synced workspace config can grant itself this.
+#   - `[tools.admin].enabled` is the host-local switch for the admin group.
+#     A turn also needs its session profile's `permission` to name a
+#     `[permission_profile.<name>]` whose `tools` lists `admin`. Registration
+#     requires the enabled host switch and at least one effective profile
+#     listing the group. The built-in default permission does not list admin.
+#     Admin access can rewrite unattended work; restrict API keys and channel
+#     `allowed_users` for sessions granted it. The old `room_profiles` key is
+#     rejected at startup.
 #
-#     `room_profiles = ["default"]` is the broad one: it names the implicit
-#     profile that every room no other profile claims falls through to, so
-#     list the profiles you actually mean. Anyone who can reach a session of
-#     a listed profile can rewrite, through the agent, what runs unattended
-#     — pair this with the profile's `devices` or the room's `allowed_users`.
-
 # Each `[[tools.mcp_servers]]` entry has a `name` (used as the tool
 # prefix) and a `type` selecting one of two transports:
 #
@@ -448,8 +451,8 @@ session_policy   = "reset"       # optional; defaults to global setting
 #
 #   - `"none"` (default) — the tools are unclassified, which the
 #     permission policy treats as its strictest bucket. Chat channels
-#     (Matrix, Discord, Telegram) refuse them, and so does the heartbeat's
-#     chat leg; `/acp` asks before each call. Leave it here unless you mean
+#     (Matrix, Discord) refuse them, and so does the heartbeat's chat
+#     leg; `/acp` asks before each call. Leave it here unless you mean
 #     to change that.
 #   - `"read"` — the tools are reads: allowed on every origin, never
 #     asked. For a server that only looks things up.
@@ -474,7 +477,7 @@ session_policy   = "reset"       # optional; defaults to global setting
 # [tools]
 # tavily_api_key = "tvly-..."
 #
-# [tools.host_access]
+# [tools.shell]
 # enabled = false
 #
 # [tools.tool_rounds]
@@ -489,11 +492,14 @@ session_policy   = "reset"       # optional; defaults to global setting
 # [tools.background]
 # max_per_session = 4                       # 0 = no background execution
 #
-# # Example: let the `ops` and `developer` room profiles manage the
-# # heartbeat/autonomous/agents definitions. Empty by default (all four
-# # tools unregistered).
+# # Example: let the ops session profile manage task definitions.
+# [session_profile.ops]
+# profile = "default"
+# permission = "ops"
+# [permission_profile.ops]
+# tools = ["fs", "admin"]
 # [tools.admin]
-# room_profiles = ["ops", "developer"]
+# enabled = true
 #
 # # Example: HTTP transport to a remote MCP server.
 # [[tools.mcp_servers]]
@@ -523,7 +529,7 @@ session_policy   = "reset"       # optional; defaults to global setting
 # Voice pipeline (optional)
 # ─────────────────────────────────────────────────────────────────────
 # Enables the `voice/pipeline_run` method used by voice clients on `/rpc`
-# (sapphire-agent-desktop). Each room_profile can opt in via `voice_pipeline = "<name>"`.
+# (sapphire-agent-desktop). Each session_profile can opt in via `voice_pipeline = "<name>"`.
 # Without these blocks the method returns -32601 "Method not found".
 #
 # Local STT and TTS require the `voice-sherpa` cargo feature:
@@ -575,9 +581,8 @@ session_policy   = "reset"       # optional; defaults to global setting
 # duration_ms  = 200
 # frequency_hz = 440
 #
-# [room_profile.home_voice]
+# [session_profile.home_voice]
 # profile          = "casual"
-# MCP-only; no chat rooms name it
 # voice_pipeline   = "default"
 #
 # # ── Voice-mode global settings ───────────────────────────────────────
@@ -710,7 +715,7 @@ session_policy   = "reset"       # optional; defaults to global setting
 #   sapphire-agent api-key restore <name-or-id>
 #
 # `add` and `rotate` print the token once. `--profile` is required and
-# takes the name of a `[room_profile.<n>]`: the room profile the key runs
+# takes the name of a `[session_profile.<n>]`: the session profile the key runs
 # under decides which LLM profile and which memory namespace its
 # conversations use — ambient-only devices included. The desktop app's
 # Settings › API keys does the same.
@@ -758,8 +763,8 @@ session_policy   = "reset"       # optional; defaults to global setting
 # Agent Client Protocol endpoint (GET /acp, WebSocket).
 # Lets an ACP client such as Zed drive this agent. Authentication resolves
 # like every other endpoint (token -> API key -> its profile, a
-# [room_profile.<name>]), and the token that
-# connects selects the room profile the ACP session runs under.
+# [session_profile.<name>]), and the token that
+# connects selects the session profile the ACP session runs under.
 # The workspace config layer may set this too.
 #
 # Tool permission is NOT configured here. Which tools need approval is
@@ -767,8 +772,8 @@ session_policy   = "reset"       # optional; defaults to global setting
 # (default / accept_edits / bypass). Standing "always allow" and "never
 # allow" answers are recorded in the host-local
 # ~/.config/sapphire-agent/acp-permissions.json — delete it to be asked
-# everything again. Chat channels (Matrix, Discord, Telegram) are never
-# asked: they cannot call shell at all, and can reach an MCP server's tools only when
+# everything again. Chat channels (Matrix, Discord) are never asked: they
+# cannot call shell at all, and can reach an MCP server's tools only when
 # that server carries a `trust` of "read" or "edit" (see
 # `[[tools.mcp_servers]]` above).
 [acp]
@@ -790,13 +795,13 @@ enabled = false
 # traffic on the tunnel in both directions.
 #keepalive_secs = 30
 
-# The room profile ACP on stdio runs under: `sapphire-agent acp`, which an
+# The session profile ACP on stdio runs under: `sapphire-agent acp`, which an
 # editor starts as its agent command on the machine the agent runs on. It
 # relays to the running agent over its local IPC endpoint (the agent loop
 # runs there), so no token is involved and no profile is picked by one —
 # name it here. Unset, `sapphire-agent acp` exits with an error. Independent
 # of `enabled`, which gates the WebSocket endpoint alone.
-#stdio_room_profile = "editor"
+#stdio_session_profile = "editor"
 
 # ---------------------------------------------------------------------------
 # [cli] — `sapphire-agent chat`
@@ -804,7 +809,7 @@ enabled = false
 # `sapphire-agent chat` (the REPL and `-m` one-shot client) and
 # `sapphire-agent-desktop` (the GUI) run on the machine the agent runs on and
 # reach it over the local IPC endpoint, the same way `sapphire-agent acp`
-# does, so no token picks their room profile — name it here. Unset, they
+# does, so no token picks their session profile — name it here. Unset, they
 # cannot open a session. The workspace layer may set it too.
 #[cli]
-#room_profile = "default"
+#profile = "default"

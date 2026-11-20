@@ -145,6 +145,8 @@ fn declared_name<'a>(input: &'a Value, field: &str, declared: &[String]) -> Resu
 // -- set_expression ----------------------------------------------------------
 
 static SET_EXPRESSION_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| ToolSpec {
+    kind: ToolKind::Think,
+    group: None,
     name: SET_EXPRESSION.into(),
     description: "Set your avatar's expression to match the feeling of your reply. \
                   Call it as often as you like within one turn."
@@ -168,12 +170,6 @@ impl Tool for SetExpressionTool {
         &SET_EXPRESSION_SPEC
     }
 
-    /// `Think`: it changes nothing anywhere but the avatar's face, so it
-    /// must run without a permission prompt on every origin.
-    fn kind(&self) -> ToolKind {
-        ToolKind::Think
-    }
-
     async fn execute(&self, input: &Value) -> Result<String> {
         let turn = avatar_turn()?;
         let name = declared_name(input, "expression", &turn.caps.expressions)?;
@@ -192,6 +188,8 @@ impl Tool for SetExpressionTool {
 // -- play_action -------------------------------------------------------------
 
 static PLAY_ACTION_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| ToolSpec {
+    kind: ToolKind::Think,
+    group: None,
     name: PLAY_ACTION.into(),
     description: "Play a gesture once. Use it only at the moments that call for it, \
                   such as a greeting or a burst of joy."
@@ -214,11 +212,6 @@ impl Tool for PlayActionTool {
         &PLAY_ACTION_SPEC
     }
 
-    /// `Think`, as for `set_expression`.
-    fn kind(&self) -> ToolKind {
-        ToolKind::Think
-    }
-
     async fn execute(&self, input: &Value) -> Result<String> {
         let turn = avatar_turn()?;
         // Validated before the gesture is spent, so a misspelt name does
@@ -235,6 +228,8 @@ impl Tool for PlayActionTool {
 // -- set_pose ----------------------------------------------------------------
 
 static SET_POSE_SPEC: LazyLock<ToolSpec> = LazyLock::new(|| ToolSpec {
+    kind: ToolKind::Think,
+    group: None,
     name: SET_POSE.into(),
     description: "Switch your avatar's stance (pose). It holds until you change it again, \
                   independent of the expression. Call it as often as you like within one turn."
@@ -255,11 +250,6 @@ pub(crate) struct SetPoseTool;
 impl Tool for SetPoseTool {
     fn spec(&self) -> &ToolSpec {
         &SET_POSE_SPEC
-    }
-
-    /// `Think`, as for `set_expression`.
-    fn kind(&self) -> ToolKind {
-        ToolKind::Think
     }
 
     async fn execute(&self, input: &Value) -> Result<String> {
@@ -548,6 +538,8 @@ mod tests {
     #[test]
     fn specialising_leaves_other_tools_alone() {
         let other = ToolSpec {
+            kind: ToolKind::Read,
+            group: Some(crate::config::ToolGroup::Fs),
             name: "file_read".into(),
             description: "".into(),
             input_schema: json!({"type":"object"}),

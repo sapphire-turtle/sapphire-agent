@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use tracing::warn;
 
 use crate::background::{
@@ -86,19 +86,19 @@ impl Consult {
             );
         }
 
-        let now = Utc::now();
-        let deadline = chrono::Duration::from_std(self.timeout)
+        let now = Timestamp::now();
+        let deadline = jiff::SignedDuration::try_from(self.timeout)
             .ok()
-            .and_then(|timeout| now.checked_add_signed(timeout))
-            .unwrap_or_else(|| now + chrono::Duration::hours(MAX_TIMEOUT_HOURS as i64));
+            .and_then(|timeout| now.checked_add(timeout).ok())
+            .unwrap_or_else(|| now + jiff::SignedDuration::from_hours(MAX_TIMEOUT_HOURS as i64));
         let who = asked_by
             .map(|h| format!(" question from subagent {h}"))
             .unwrap_or_default();
         let text = format!(
             "[Autonomous: {task}]{who}\n{question}\n(Reply to this message to answer. Waiting until {}.)",
             deadline
-                .with_timezone(&chrono::Local)
-                .format("%Y-%m-%d %H:%M")
+                .to_zoned_datetime(jiff::tz::TimeZone::system())
+                .strftime("%Y-%m-%d %H:%M")
         );
         let message_ids = self
             .channels
@@ -183,11 +183,12 @@ impl Consult {
         session: String,
         id: TaskId,
         first_message: String,
-        deadline: DateTime<Utc>,
+        deadline: Timestamp,
     ) {
         let this = Arc::clone(self);
         tokio::spawn(async move {
-            let wait = (deadline - Utc::now()).to_std().unwrap_or_default();
+            let wait = std::time::Duration::try_from(deadline.duration_since(Timestamp::now()))
+                .unwrap_or_default();
             tokio::time::sleep(wait).await;
             if this.background.expire(&session, &id) {
                 this.note(NOTE_DEADLINE, &first_message).await;
@@ -224,7 +225,8 @@ pub(crate) fn arm_deadlines_without_room(background: Arc<BackgroundTasks>) {
         let deadline = *deadline;
         let background = Arc::clone(&background);
         tokio::spawn(async move {
-            let wait = (deadline - Utc::now()).to_std().unwrap_or_default();
+            let wait = std::time::Duration::try_from(deadline.duration_since(Timestamp::now()))
+                .unwrap_or_default();
             tokio::time::sleep(wait).await;
             background.expire(&session, &task.id);
         });
@@ -361,6 +363,7 @@ pub(crate) mod test_support {
             timestamp: 0,
             thread_id: None,
             attachments: Vec::new(),
+            attachment_owner: None,
             reply_to: reply_to.map(str::to_string),
         }
     }
@@ -570,7 +573,7 @@ mod tests {
                     message_ids: vec!["m1".into()],
                     question: "why?".into(),
                     asked_by: None,
-                    deadline: chrono::Utc::now() - chrono::Duration::hours(1),
+                    deadline: jiff::Timestamp::now() - jiff::SignedDuration::from_hours(1),
                 },
                 "why?".into(),
             )
@@ -596,7 +599,7 @@ mod tests {
                     message_ids: vec!["m1".into()],
                     question: "why?".into(),
                     asked_by: None,
-                    deadline: chrono::Utc::now() - chrono::Duration::hours(1),
+                    deadline: jiff::Timestamp::now() - jiff::SignedDuration::from_hours(1),
                 },
                 "why?".into(),
             )

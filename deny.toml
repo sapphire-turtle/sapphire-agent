@@ -20,6 +20,7 @@ yanked = "warn"
 # dep moves off the flagged package, or when a more severe advisory is
 # filed.
 ignore = [
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained. The app's own code uses jiff; chrono remains only through dependencies that require it: rmcp 3 (and schemars `chrono04`), a2a-lf, oauth2, reedline and serde_with; sapphire-agent-server itself only to hand the `cron` crate its schedules and a2a-lf its message timestamps. Drop when they move off chrono." },
     # --- unmaintained (no vulnerability) ---
     # The bincode (RUSTSEC-2025-0141) and encoding (RUSTSEC-2021-0153) entries
     # are gone: both reached us through lance, which left the graph when
@@ -35,11 +36,6 @@ ignore = [
     # Drop both when telers moves off these dependencies.
     { id = "RUSTSEC-2025-0012", reason = "backoff is unmaintained (no vulnerability); reached only via telers' retry/dispatcher helpers, which TelegramChannel does not use (it calls Bot::send directly)." },
     { id = "RUSTSEC-2024-0384", reason = "instant is unmaintained (no vulnerability); transitive via telers → backoff 0.4.0." },
-
-    # --- unmaintained, broadly used chrono ---
-    # Pre-existing, but surfaced by the cargo-deny job on this branch's
-    # Cargo.toml and Cargo.lock changes. Drop once the wide fan-in moves.
-    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained (no vulnerability); reached widely via a2a-lf, cron, reedline, rmcp, matrix-sdk's oauth2, and the sapphire/corundum framework stack. No safe upgrade; chrono recommends time as a replacement. Drop once the wide fan-in moves." },
 
     # --- unmaintained, reached only through the bevy/egui text stack ---
     # ttf-parser is unmaintained upstream (author-declared). It reaches us via
@@ -93,14 +89,6 @@ ignore = [
     # under the agent's state_dir (channel/matrix.rs). Drop this once
     # matrix-sdk-sqlite moves to rusqlite >= 0.41.
     { id = "RUSTSEC-2026-0459", reason = "bundled SQLite in libsqlite3-sys 0.38 (CVE-2026-119375); transitive via matrix-sdk-sqlite 0.19.1 → rusqlite 0.40. Only matrix-sdk's own store under state_dir is opened. Drop once matrix-sdk-sqlite moves to rusqlite >= 0.41 (#392)." },
-
-    # --- ruzstd 0.8 pinned by bevy (desktop only) ---
-    # Fixed in ruzstd 0.9.1, but bevy_image requires ^0.8 — still so in bevy
-    # 0.20 — and bevy_egui turns on its `zstd_rust` feature whenever
-    # rendering is on, so it cannot be dropped. It decodes zstd-compressed
-    # KTX2 textures, and the desktop client loads no such assets, let alone
-    # untrusted ones. Drop this when bevy_image takes ruzstd 0.9.
-    { id = "RUSTSEC-2026-0344", reason = "ruzstd decompression bomb; reached only via the desktop's bevy_image, which pins ^0.8 through bevy 0.20 (KTX2 textures, none loaded)." },
 ]
 
 [licenses]

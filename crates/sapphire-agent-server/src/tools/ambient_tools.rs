@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 
 use crate::ambient::speaker::candidates::CandidateStore;
@@ -41,13 +41,12 @@ pub struct AmbientToolState {
     pub voices_dir: PathBuf,
 }
 
-fn parse_time(v: &Value, field: &str) -> Result<DateTime<Utc>> {
+fn parse_time(v: &Value, field: &str) -> Result<Timestamp> {
     let raw = v[field]
         .as_str()
         .with_context(|| format!("missing '{field}' (RFC 3339)"))?;
-    Ok(DateTime::parse_from_rfc3339(raw)
-        .with_context(|| format!("'{field}' must be RFC 3339, got {raw:?}"))?
-        .with_timezone(&Utc))
+    raw.parse::<Timestamp>()
+        .with_context(|| format!("'{field}' must be RFC 3339, got {raw:?}"))
 }
 
 // -- transcript_read ---------------------------------------------------------
@@ -62,6 +61,8 @@ impl TranscriptReadTool {
         Self {
             state,
             spec: ToolSpec {
+                kind: ToolKind::Read,
+                group: None,
                 name: "transcript_read".into(),
                 description: "Read ambient (always-on microphone) transcripts for a time \
                               window, optionally filtered to one speaker. Speakers are \
@@ -84,10 +85,6 @@ impl TranscriptReadTool {
 
 #[async_trait]
 impl Tool for TranscriptReadTool {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Read
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -117,12 +114,7 @@ impl Tool for TranscriptReadTool {
                 Some(id) => names.display_name(id),
                 None => "unattributed".to_string(),
             };
-            out.push_str(&format!(
-                "[{}] {}: {}\n",
-                r.started_at.to_rfc3339(),
-                who,
-                r.text
-            ));
+            out.push_str(&format!("[{}] {}: {}\n", r.started_at, who, r.text));
         }
         Ok(out)
     }
@@ -140,6 +132,8 @@ impl SpeakerCandidatesTool {
         Self {
             state,
             spec: ToolSpec {
+                kind: ToolKind::Search,
+                group: None,
                 name: "speaker_candidates".into(),
                 description: "List auto-enrolled voices that have not been named yet, with \
                               how much they have spoken and what they said. Use with \
@@ -153,10 +147,6 @@ impl SpeakerCandidatesTool {
 
 #[async_trait]
 impl Tool for SpeakerCandidatesTool {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Search
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -176,7 +166,7 @@ impl Tool for SpeakerCandidatesTool {
                     c.id,
                     c.stats.speech_ms / 1000,
                     c.stats.days_seen.len(),
-                    c.stats.first_seen.to_rfc3339()
+                    c.stats.first_seen
                 ));
                 for s in &c.stats.samples {
                     out.push_str(&format!("    \"{s}\"\n"));
@@ -200,6 +190,8 @@ impl SpeakerPromoteTool {
         Self {
             state,
             spec: ToolSpec {
+                kind: ToolKind::Edit,
+                group: None,
                 name: "speaker_promote".into(),
                 description: "Register an auto-enrolled voice in the workspace, optionally \
                               naming it at the same time -- e.g. after the user says 'that \
@@ -227,10 +219,6 @@ impl SpeakerPromoteTool {
 
 #[async_trait]
 impl Tool for SpeakerPromoteTool {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Edit
-    }
-
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -266,7 +254,6 @@ pub fn ambient_tools(state: Arc<Mutex<AmbientToolState>>) -> Vec<Box<dyn Tool>> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{TimeZone, Utc};
     use serde_json::json;
 
     fn state() -> (tempfile::TempDir, Arc<Mutex<AmbientToolState>>) {
@@ -296,7 +283,11 @@ mod tests {
                     .append(&crate::ambient::transcript::TranscriptRecord {
                         segment: format!("seg-{h}"),
                         device: "pendant".into(),
-                        started_at: Utc.with_ymd_and_hms(2026, 8, 26, h, 0, 0).unwrap(),
+                        started_at: jiff::civil::date(2026, 8, 26)
+                            .at(h, 0, 0, 0)
+                            .to_zoned_datetime(jiff::tz::TimeZone::UTC)
+                            .unwrap()
+                            .timestamp(),
                         speech_ms: 3000,
                         speaker: Some(speaker.into()),
                         speaker_score: Some(0.9),
@@ -328,7 +319,11 @@ mod tests {
                     .append(&crate::ambient::transcript::TranscriptRecord {
                         segment: format!("seg-{h}"),
                         device: "pendant".into(),
-                        started_at: Utc.with_ymd_and_hms(2026, 8, 26, h, 0, 0).unwrap(),
+                        started_at: jiff::civil::date(2026, 8, 26)
+                            .at(h, 0, 0, 0)
+                            .to_zoned_datetime(jiff::tz::TimeZone::UTC)
+                            .unwrap()
+                            .timestamp(),
                         speech_ms: 3000,
                         speaker: Some(speaker.into()),
                         speaker_score: Some(0.9),
@@ -361,7 +356,7 @@ mod tests {
                 .enrol(
                     vec![1.0, 0.0],
                     &vec![0i16; 16_000],
-                    chrono::NaiveDate::from_ymd_opt(2026, 8, 26).unwrap(),
+                    jiff::civil::date(2026, 8, 26),
                     30_000,
                     "something they said",
                 )
@@ -387,7 +382,7 @@ mod tests {
                 .enrol(
                     vec![1.0, 0.0],
                     &vec![0i16; 16_000],
-                    chrono::NaiveDate::from_ymd_opt(2026, 8, 26).unwrap(),
+                    jiff::civil::date(2026, 8, 26),
                     30_000,
                     "hi",
                 )
@@ -429,7 +424,7 @@ mod tests {
                 .enrol(
                     vec![1.0, 0.0],
                     &vec![0i16; 16_000],
-                    chrono::NaiveDate::from_ymd_opt(2026, 8, 26).unwrap(),
+                    jiff::civil::date(2026, 8, 26),
                     30_000,
                     "hi",
                 )
@@ -448,7 +443,11 @@ mod tests {
                 .append(&crate::ambient::transcript::TranscriptRecord {
                     segment: "seg-pre-rename".into(),
                     device: "pendant".into(),
-                    started_at: Utc.with_ymd_and_hms(2026, 8, 26, 9, 0, 0).unwrap(),
+                    started_at: jiff::civil::date(2026, 8, 26)
+                        .at(9, 0, 0, 0)
+                        .to_zoned_datetime(jiff::tz::TimeZone::UTC)
+                        .unwrap()
+                        .timestamp(),
                     speech_ms: 3000,
                     speaker: Some(id.clone()),
                     speaker_score: Some(0.9),
@@ -514,7 +513,7 @@ mod tests {
                 .enrol(
                     vec![1.0, 0.0],
                     &vec![0i16; 16_000],
-                    chrono::NaiveDate::from_ymd_opt(2026, 8, 26).unwrap(),
+                    jiff::civil::date(2026, 8, 26),
                     30_000,
                     "hi",
                 )

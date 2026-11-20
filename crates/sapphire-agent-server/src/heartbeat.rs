@@ -23,7 +23,8 @@ use crate::periodic_log::{
 use crate::provider::Provider;
 use crate::provider::registry::ProviderRegistry;
 use crate::session::SessionStore;
-use chrono::{Datelike, Duration, Local, NaiveTime, Timelike, Weekday};
+use jiff::ZonedDateTime;
+use jiff::civil::Weekday;
 use sapphire_framework::workspace::WorkspaceState;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -39,6 +40,7 @@ struct DueTask {
     body: String,
     /// Per-task chat room override; falls through to `default_room_id`.
     room_id: Option<String>,
+    profile: Option<String>,
     /// Voice satellite target, when this task should be delivered as
     /// TTS audio instead of (or in addition to, on failure) chat.
     voice: Option<HeartbeatVoiceTarget>,
@@ -81,7 +83,7 @@ pub struct Heartbeat {
 
 impl Heartbeat {
     /// Resolve which namespace a session belongs to. Matrix/Discord rooms
-    /// follow `Config::namespace_for_room`. Device-default sessions
+    /// follow `Config::namespace_for_session`. Device-default sessions
     /// (channel=`"device-default"`) and cross-device sessions
     /// (channel=`"rpc"`) persist their resolved namespace in the JSONL
     /// meta — trust that first, falling back to the default namespace
@@ -92,7 +94,7 @@ impl Heartbeat {
                 .clone()
                 .unwrap_or_else(|| crate::config::DEFAULT_NAMESPACE_NAME.to_string())
         } else {
-            self.config.namespace_for_room(&meta.room_id).to_string()
+            self.config.namespace_for_session(&meta.room_id).to_string()
         }
     }
 
@@ -131,8 +133,10 @@ impl Heartbeat {
             if !self.placement.runs_background().await {
                 continue;
             }
-            let today_local =
-                crate::session::local_date_for_timestamp(Local::now(), self.day_boundary_hour);
+            let today_local = crate::session::local_date_for_timestamp(
+                ZonedDateTime::now(),
+                self.day_boundary_hour,
+            );
             let mut total: usize = 0;
             for ns in self.config.all_memory_namespaces() {
                 let provider = self.provider_for_namespace(&ns);
@@ -209,7 +213,7 @@ impl Heartbeat {
             tokio::time::sleep(sleep_dur).await;
 
             let yesterday = crate::session::local_date_for_timestamp(
-                Local::now() - Duration::seconds(1),
+                ZonedDateTime::now() - jiff::SignedDuration::from_secs(1),
                 self.day_boundary_hour,
             );
 
@@ -219,7 +223,7 @@ impl Heartbeat {
             let background = self.placement.runs_background().await;
 
             if self.daily_log_enabled && background {
-                let today = yesterday + Duration::days(1);
+                let today = yesterday + jiff::Span::new().days(1);
                 let mut any_generated = false;
                 for ns in self.config.all_memory_namespaces() {
                     let provider = self.provider_for_namespace(&ns);
@@ -250,8 +254,8 @@ impl Heartbeat {
                     }
 
                     // Weekly: today is Monday → last ISO week closed yesterday.
-                    if self.digest_cfg.weekly_enabled && today.weekday() == Weekday::Mon {
-                        let iso = yesterday.iso_week();
+                    if self.digest_cfg.weekly_enabled && today.weekday() == Weekday::Monday {
+                        let iso = yesterday.iso_week_date();
                         info!(
                             "Heartbeat: generating weekly log for {}-W{:02} in '{ns}'",
                             iso.year(),
@@ -335,8 +339,10 @@ impl Heartbeat {
                 .as_ref()
                 .and_then(|s| s.subagent_cache.as_ref())
             {
-                let cutoff = chrono::Utc::now()
-                    - Duration::days(self.config.subagent_cache.retain_days.into());
+                let cutoff = jiff::Timestamp::now()
+                    - jiff::SignedDuration::from_hours(
+                        24 * i64::from(self.config.subagent_cache.retain_days),
+                    );
                 let removed = cache.prune_before(cutoff);
                 if removed > 0 {
                     info!("Pruned {removed} stale subagent child conversation(s)");
@@ -360,9 +366,9 @@ impl Heartbeat {
             let tasks = load_heartbeat_dir(&dir);
             let enabled: Vec<_> = tasks.into_iter().filter(|t| t.meta.enabled).collect();
 
-            let now = Local::now();
-            let (next_at, due_tasks): (chrono::DateTime<Local>, Vec<DueTask>) =
-                match next_due(&enabled, now) {
+            let now = ZonedDateTime::now();
+            let (next_at, due_tasks): (jiff::ZonedDateTime, Vec<DueTask>) =
+                match next_due(&enabled, now.clone()) {
                     None => {
                         // No tasks (or none with valid schedules); poll the
                         // directory periodically in case files are added.
@@ -376,6 +382,7 @@ impl Heartbeat {
                                 name: t.name.clone(),
                                 body: t.body.clone(),
                                 room_id: t.meta.room_id.clone(),
+                                profile: t.meta.profile.clone(),
                                 voice: t.meta.voice.clone(),
                                 device: t.meta.device.clone(),
                             })
@@ -384,8 +391,7 @@ impl Heartbeat {
                     }
                 };
 
-            let wait = (next_at - now)
-                .to_std()
+            let wait = StdDuration::try_from(next_at.timestamp().duration_since(now.timestamp()))
                 .unwrap_or(StdDuration::from_secs(0));
             info!(
                 "Heartbeat cron: next fire in {:.0}s ({} task(s))",
@@ -454,6 +460,7 @@ impl Heartbeat {
             name,
             body,
             room_id,
+            profile,
             voice,
             ..
         } = task;
@@ -471,6 +478,12 @@ impl Heartbeat {
                 voice.device_id.clone(),
                 Some(name.clone()),
                 prompt,
+                Some(
+                    profile
+                        .as_deref()
+                        .unwrap_or(crate::config::DEFAULT_PROFILE_NAME)
+                        .to_string(),
+                ),
             )
             .await
             {
@@ -496,7 +509,7 @@ impl Heartbeat {
                 }
                 Err(crate::serve::VoicePushError::NotConfigured) => {
                     warn!(
-                        "Heartbeat cron: subscribed satellite's room_profile has no voice_pipeline; falling back to chat for {name}"
+                        "Heartbeat cron: subscribed satellite's session_profile has no voice_pipeline; falling back to chat for {name}"
                     );
                 }
                 Err(crate::serve::VoicePushError::Other(msg)) => {
@@ -519,7 +532,19 @@ impl Heartbeat {
                     );
                     return;
                 };
-                if let Err(e) = agent.trigger(&name, &body, &room).await {
+                if let Err(e) = agent
+                    .trigger(
+                        &name,
+                        &body,
+                        &room,
+                        Some(
+                            profile
+                                .as_deref()
+                                .unwrap_or(crate::config::DEFAULT_PROFILE_NAME),
+                        ),
+                    )
+                    .await
+                {
                     warn!("Heartbeat cron: task {name} failed: {e:#}");
                 }
             }
@@ -531,17 +556,18 @@ impl Heartbeat {
 
     /// Compute how long to sleep until the next day-boundary time.
     fn time_until_next_boundary(&self) -> StdDuration {
-        let now = Local::now();
+        let now = ZonedDateTime::now();
         let boundary =
-            NaiveTime::from_hms_opt(self.day_boundary_hour as u32, 0, 0).expect("valid hour 0–23");
+            jiff::civil::Time::new(self.day_boundary_hour as i8, 0, 0, 0).expect("valid hour 0–23");
 
         let now_time = now.time();
+        let secs_of = |t: jiff::civil::Time| {
+            i64::from(t.hour()) * 3600 + i64::from(t.minute()) * 60 + i64::from(t.second())
+        };
         let secs_until = if now_time < boundary {
-            (boundary - now_time).num_seconds()
+            secs_of(boundary) - secs_of(now_time)
         } else {
-            let secs_today = now_time.num_seconds_from_midnight() as i64;
-            let boundary_secs = boundary.num_seconds_from_midnight() as i64;
-            86_400 - secs_today + boundary_secs
+            86_400 - secs_of(now_time) + secs_of(boundary)
         };
 
         StdDuration::from_secs(secs_until.max(1) as u64)

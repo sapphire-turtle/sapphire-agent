@@ -19,7 +19,10 @@
 use crate::acp_session::AcpSessionStore;
 use crate::provider::{ChatMessage, ContentPart, Provider, Role};
 use crate::session::{SessionMeta, SessionStore, StoredMessage};
-use chrono::{Datelike, Duration, Local, NaiveDate, Weekday};
+use jiff::ZonedDateTime;
+use jiff::civil::Date;
+use jiff::civil::Weekday;
+use jiff::tz::TimeZone;
 use sapphire_framework::workspace::WorkspaceState;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -82,23 +85,23 @@ pub(crate) fn log_abs_path(
 // ---------------------------------------------------------------------------
 
 /// `"YYYY-MM-DD"`.
-pub fn daily_stem(date: NaiveDate) -> String {
-    date.format("%Y-%m-%d").to_string()
+pub fn daily_stem(date: Date) -> String {
+    date.strftime("%Y-%m-%d").to_string()
 }
 
 /// `"YYYY-Www"` using the **ISO week-year** (which may differ from the
 /// calendar year at year boundaries — e.g. 2023-01-01 → `"2022-W52"`).
-pub fn weekly_stem(iso_year: i32, iso_week: u32) -> String {
+pub fn weekly_stem(iso_year: i16, iso_week: i8) -> String {
     format!("{iso_year:04}-W{iso_week:02}")
 }
 
 /// `"YYYY-MM"`.
-pub fn monthly_stem(year: i32, month: u32) -> String {
+pub fn monthly_stem(year: i16, month: i8) -> String {
     format!("{year:04}-{month:02}")
 }
 
 /// `"YYYY"`.
-pub fn yearly_stem(year: i32) -> String {
+pub fn yearly_stem(year: i16) -> String {
     format!("{year:04}")
 }
 
@@ -109,18 +112,21 @@ pub fn yearly_stem(year: i32) -> String {
 /// The 7 consecutive local dates of ISO week `(iso_year, iso_week)`,
 /// ordered Monday → Sunday. Returns an empty vec if the (year, week) pair
 /// is not a valid ISO date (e.g. week 53 in a short year).
-pub fn days_of_iso_week(iso_year: i32, iso_week: u32) -> Vec<NaiveDate> {
-    let Some(monday) = NaiveDate::from_isoywd_opt(iso_year, iso_week, Weekday::Mon) else {
+pub fn days_of_iso_week(iso_year: i16, iso_week: i8) -> Vec<Date> {
+    let Some(monday) = jiff::civil::ISOWeekDate::new(iso_year, iso_week, Weekday::Monday)
+        .ok()
+        .map(|w| w.date())
+    else {
         return Vec::new();
     };
     (0..7)
-        .map(|offset| monday + Duration::days(offset))
+        .map(|offset| monday + jiff::Span::new().days(offset))
         .collect()
 }
 
 /// Monthly stems for every completed month of `today`'s calendar year
 /// (`{year}-01` .. `{year}-(today.month-1)`). Empty in January.
-pub fn month_stems_in_year_before(today: NaiveDate) -> Vec<String> {
+pub fn month_stems_in_year_before(today: Date) -> Vec<String> {
     let year = today.year();
     (1..today.month()).map(|m| monthly_stem(year, m)).collect()
 }
@@ -148,15 +154,15 @@ pub fn existing_yearly_stems(workspace_dir: &Path, namespace: &str) -> Vec<Strin
 }
 
 /// Every local date in the given calendar month.
-pub fn days_of_month(year: i32, month: u32) -> Vec<NaiveDate> {
-    let Some(start) = NaiveDate::from_ymd_opt(year, month, 1) else {
+pub fn days_of_month(year: i16, month: i8) -> Vec<Date> {
+    let Some(start) = Date::new(year, month, 1).ok() else {
         return Vec::new();
     };
     let mut out = Vec::new();
     let mut d = start;
     while d.month() == month {
         out.push(d);
-        d += Duration::days(1);
+        d = d.tomorrow().expect("a day after");
     }
     out
 }
@@ -168,22 +174,22 @@ pub fn days_of_month(year: i32, month: u32) -> Vec<NaiveDate> {
 /// A week is included only when its Monday lies inside this month — this
 /// way ISO weeks that straddle month boundaries aren't double-counted
 /// across "# This Month's Digests" and the previous month's block.
-pub fn week_stems_in_month_before(today: NaiveDate) -> Vec<String> {
-    let current_iso = today.iso_week();
+pub fn week_stems_in_month_before(today: Date) -> Vec<String> {
+    let current_iso = today.iso_week_date();
     let month = today.month();
-    let Some(start) = NaiveDate::from_ymd_opt(today.year(), month, 1) else {
+    let Some(start) = Date::new(today.year(), month, 1).ok() else {
         return Vec::new();
     };
     let mut out = Vec::new();
     let mut d = start;
     while d.month() == month {
-        if d.weekday() == Weekday::Mon {
-            let iso = d.iso_week();
+        if d.weekday() == Weekday::Monday {
+            let iso = d.iso_week_date();
             if iso.year() != current_iso.year() || iso.week() != current_iso.week() {
                 out.push(weekly_stem(iso.year(), iso.week()));
             }
         }
-        d += Duration::days(1);
+        d = d.tomorrow().expect("a day after");
     }
     out
 }
@@ -196,20 +202,29 @@ pub fn week_stems_in_month_before(today: NaiveDate) -> Vec<String> {
 /// Note: the range excludes `today`, so the caller passes `today` (the
 /// current local date), not `yesterday`. On Monday the range collapses to
 /// empty (only Monday itself is in the current ISO week, and it's excluded).
-pub fn daily_stems_in_current_iso_week_before(today: NaiveDate) -> Vec<String> {
-    let iso = today.iso_week();
-    let Some(monday) = NaiveDate::from_isoywd_opt(iso.year(), iso.week(), Weekday::Mon) else {
+/// Whether two ISO week dates are in the same week (jiff's `ISOWeekDate` also
+/// holds the weekday).
+fn same_iso_week(a: jiff::civil::ISOWeekDate, b: jiff::civil::ISOWeekDate) -> bool {
+    a.year() == b.year() && a.week() == b.week()
+}
+
+pub fn daily_stems_in_current_iso_week_before(today: Date) -> Vec<String> {
+    let iso = today.iso_week_date();
+    let Some(monday) = jiff::civil::ISOWeekDate::new(iso.year(), iso.week(), Weekday::Monday)
+        .ok()
+        .map(|w| w.date())
+    else {
         return Vec::new();
     };
     // yesterday is today - 1; we want [monday, yesterday) which equals
     // [monday, today - 1). On Monday, today-1 = Sunday of last week, which
     // isn't in the current ISO week — so we clamp to <= today-1.
-    let yesterday = today - Duration::days(1);
+    let yesterday = today.yesterday().expect("a day before");
     let mut out = Vec::new();
     let mut d = monday;
-    while d < yesterday && d.iso_week() == iso {
+    while d < yesterday && same_iso_week(d.iso_week_date(), iso) {
         out.push(daily_stem(d));
-        d += Duration::days(1);
+        d = d.tomorrow().expect("a day after");
     }
     out
 }
@@ -223,7 +238,7 @@ pub fn daily_stems_in_current_iso_week_before(today: NaiveDate) -> Vec<String> {
 /// `memory/<namespace>/daily/`, up to and including yesterday (local time).
 ///
 /// `room_predicate` decides which sessions count toward this namespace.
-/// Callers compute it from `Config::namespace_for_room`.
+/// Callers compute it from `Config::namespace_for_session`.
 pub fn pending_daily_dates<F>(
     session_store: &SessionStore,
     acp_store: Option<&AcpSessionStore>,
@@ -231,11 +246,11 @@ pub fn pending_daily_dates<F>(
     namespace: &str,
     boundary_hour: u8,
     room_predicate: F,
-) -> Vec<NaiveDate>
+) -> Vec<Date>
 where
     F: Fn(&crate::session::SessionMeta) -> bool,
 {
-    let today = crate::session::local_date_for_timestamp(Local::now(), boundary_hour);
+    let today = crate::session::local_date_for_timestamp(ZonedDateTime::now(), boundary_hour);
     let mut dates = Vec::new();
     // Borrow `room_predicate` for the ACP side first — `&F` also
     // satisfies `Fn(&SessionMeta) -> bool` — then move it into the
@@ -265,7 +280,7 @@ where
 fn sessions_for_day_merged<F>(
     session_store: &SessionStore,
     acp_store: Option<&AcpSessionStore>,
-    date: NaiveDate,
+    date: Date,
     boundary_hour: u8,
     room_predicate: &F,
 ) -> Vec<(SessionMeta, Vec<StoredMessage>)>
@@ -298,7 +313,7 @@ pub async fn generate_daily_log<F>(
     ws_state: &Arc<WorkspaceState>,
     workspace_dir: &Path,
     namespace: &str,
-    date: NaiveDate,
+    date: Date,
     boundary_hour: u8,
     room_predicate: F,
 ) -> anyhow::Result<bool>
@@ -352,8 +367,8 @@ pub async fn generate_weekly_log(
     ws_state: &Arc<WorkspaceState>,
     workspace_dir: &Path,
     namespace: &str,
-    iso_year: i32,
-    iso_week: u32,
+    iso_year: i16,
+    iso_week: i8,
 ) -> anyhow::Result<bool> {
     let stem = weekly_stem(iso_year, iso_week);
     let days = days_of_iso_week(iso_year, iso_week);
@@ -399,8 +414,8 @@ pub async fn generate_monthly_log(
     ws_state: &Arc<WorkspaceState>,
     workspace_dir: &Path,
     namespace: &str,
-    year: i32,
-    month: u32,
+    year: i16,
+    month: i8,
 ) -> anyhow::Result<bool> {
     let stem = monthly_stem(year, month);
     let days = days_of_month(year, month);
@@ -445,7 +460,7 @@ pub async fn generate_yearly_log(
     ws_state: &Arc<WorkspaceState>,
     workspace_dir: &Path,
     namespace: &str,
-    year: i32,
+    year: i16,
 ) -> anyhow::Result<bool> {
     let stem = yearly_stem(year);
     let mut sections = Vec::new();
@@ -684,7 +699,7 @@ fn serialize_log_file(digest: &[String], body: &str) -> anyhow::Result<String> {
 
 /// Format sessions into a transcript suitable for LLM summarisation. Tool
 /// use / tool result parts are skipped to keep context concise.
-fn format_sessions(sessions: &[(SessionMeta, Vec<StoredMessage>)], date: NaiveDate) -> String {
+fn format_sessions(sessions: &[(SessionMeta, Vec<StoredMessage>)], date: Date) -> String {
     let mut parts = vec![format!("Conversations for {date}:\n")];
 
     for (meta, messages) in sessions {
@@ -715,10 +730,10 @@ fn format_sessions(sessions: &[(SessionMeta, Vec<StoredMessage>)], date: NaiveDa
                 Role::User => "User",
                 Role::Assistant => "Assistant",
             };
-            let local_ts = msg.timestamp.with_timezone(&Local);
+            let local_ts = msg.timestamp.to_zoned_datetime(TimeZone::system());
             parts.push(format!(
                 "[{}] {}: {}",
-                local_ts.format("%H:%M"),
+                local_ts.strftime("%H:%M"),
                 role_label,
                 text.join(" ")
             ));
@@ -958,7 +973,7 @@ where
 /// Distinct daily log dates on disk for `namespace` (i.e. stems in
 /// `memory/<namespace>/daily/*.md` that parse as `YYYY-MM-DD`). Used as
 /// the seed for weekly/monthly catch-up.
-fn existing_daily_dates(workspace_dir: &Path, namespace: &str) -> Vec<NaiveDate> {
+fn existing_daily_dates(workspace_dir: &Path, namespace: &str) -> Vec<Date> {
     let dir = workspace_dir.join("memory").join(namespace).join("daily");
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return Vec::new();
@@ -972,7 +987,7 @@ fn existing_daily_dates(workspace_dir: &Path, namespace: &str) -> Vec<NaiveDate>
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
-        if let Ok(date) = NaiveDate::parse_from_str(stem, "%Y-%m-%d") {
+        if let Ok(date) = stem.parse::<Date>() {
             out.push(date);
         }
     }
@@ -982,7 +997,7 @@ fn existing_daily_dates(workspace_dir: &Path, namespace: &str) -> Vec<NaiveDate>
 /// Distinct monthly log stems on disk for `namespace` (i.e. files in
 /// `memory/<namespace>/monthly/*.md` that parse as `YYYY-MM`). Used as
 /// the seed for yearly catch-up.
-fn existing_monthly_year_months(workspace_dir: &Path, namespace: &str) -> Vec<(i32, u32)> {
+fn existing_monthly_year_months(workspace_dir: &Path, namespace: &str) -> Vec<(i16, i8)> {
     let dir = workspace_dir.join("memory").join(namespace).join("monthly");
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return Vec::new();
@@ -1000,7 +1015,7 @@ fn existing_monthly_year_months(workspace_dir: &Path, namespace: &str) -> Vec<(i
         if parts.len() != 2 {
             continue;
         }
-        if let (Ok(y), Ok(m)) = (parts[0].parse::<i32>(), parts[1].parse::<u32>())
+        if let (Ok(y), Ok(m)) = (parts[0].parse::<i16>(), parts[1].parse::<i8>())
             && (1..=12).contains(&m)
         {
             out.push((y, m));
@@ -1012,17 +1027,13 @@ fn existing_monthly_year_months(workspace_dir: &Path, namespace: &str) -> Vec<(i
 /// Returns ISO (year, week) pairs that have at least one daily log on disk
 /// but no weekly log file yet, excluding `today`'s own ISO week. Sorted
 /// ascending by (year, week).
-pub fn pending_iso_weeks(
-    workspace_dir: &Path,
-    namespace: &str,
-    today: NaiveDate,
-) -> Vec<(i32, u32)> {
+pub fn pending_iso_weeks(workspace_dir: &Path, namespace: &str, today: Date) -> Vec<(i16, i8)> {
     use std::collections::BTreeSet;
-    let current_iso = today.iso_week();
+    let current_iso = today.iso_week_date();
     let current_key = (current_iso.year(), current_iso.week());
-    let mut weeks: BTreeSet<(i32, u32)> = BTreeSet::new();
+    let mut weeks: BTreeSet<(i16, i8)> = BTreeSet::new();
     for date in existing_daily_dates(workspace_dir, namespace) {
-        let iso = date.iso_week();
+        let iso = date.iso_week_date();
         let key = (iso.year(), iso.week());
         if key >= current_key {
             continue;
@@ -1046,10 +1057,10 @@ pub fn pending_iso_weeks(
 /// Returns calendar (year, month) pairs that have at least one daily log on
 /// disk but no monthly log file yet, excluding `today`'s own month. Sorted
 /// ascending.
-pub fn pending_months(workspace_dir: &Path, namespace: &str, today: NaiveDate) -> Vec<(i32, u32)> {
+pub fn pending_months(workspace_dir: &Path, namespace: &str, today: Date) -> Vec<(i16, i8)> {
     use std::collections::BTreeSet;
     let current_key = (today.year(), today.month());
-    let mut months: BTreeSet<(i32, u32)> = BTreeSet::new();
+    let mut months: BTreeSet<(i16, i8)> = BTreeSet::new();
     for date in existing_daily_dates(workspace_dir, namespace) {
         let key = (date.year(), date.month());
         if key >= current_key {
@@ -1073,10 +1084,10 @@ pub fn pending_months(workspace_dir: &Path, namespace: &str, today: NaiveDate) -
 
 /// Returns calendar years that have at least one monthly log on disk but no
 /// yearly log file yet, excluding `today`'s own year. Sorted ascending.
-pub fn pending_years(workspace_dir: &Path, namespace: &str, today: NaiveDate) -> Vec<i32> {
+pub fn pending_years(workspace_dir: &Path, namespace: &str, today: Date) -> Vec<i16> {
     use std::collections::BTreeSet;
     let current_year = today.year();
-    let mut years: BTreeSet<i32> = BTreeSet::new();
+    let mut years: BTreeSet<i16> = BTreeSet::new();
     for (y, _m) in existing_monthly_year_months(workspace_dir, namespace) {
         if y >= current_year {
             continue;
@@ -1099,7 +1110,7 @@ pub async fn catchup_pending_weekly_logs(
     ws_state: &Arc<WorkspaceState>,
     workspace_dir: &Path,
     namespace: &str,
-    today: NaiveDate,
+    today: Date,
 ) -> usize {
     let pending = pending_iso_weeks(workspace_dir, namespace, today);
     if pending.is_empty() {
@@ -1140,7 +1151,7 @@ pub async fn catchup_pending_monthly_logs(
     ws_state: &Arc<WorkspaceState>,
     workspace_dir: &Path,
     namespace: &str,
-    today: NaiveDate,
+    today: Date,
 ) -> usize {
     let pending = pending_months(workspace_dir, namespace, today);
     if pending.is_empty() {
@@ -1173,7 +1184,7 @@ pub async fn catchup_pending_yearly_logs(
     ws_state: &Arc<WorkspaceState>,
     workspace_dir: &Path,
     namespace: &str,
-    today: NaiveDate,
+    today: Date,
 ) -> usize {
     let pending = pending_years(workspace_dir, namespace, today);
     if pending.is_empty() {
@@ -1208,18 +1219,18 @@ mod tests {
 
     /// The local date "now" belongs to under `boundary_hour`.
     ///
-    /// Deliberately not `Local::now().date_naive()`. A timestamp before
+    /// Deliberately not `ZonedDateTime::now().date()`. A timestamp before
     /// the boundary hour belongs to the *previous* local day, so the
     /// naive date and a day window disagree for those hours — which made
     /// these tests pass all day and fail only when CI happened to run
     /// between midnight and 04:00.
-    fn today(boundary_hour: u8) -> NaiveDate {
-        crate::session::local_date_for_timestamp(chrono::Local::now(), boundary_hour)
+    fn today(boundary_hour: u8) -> Date {
+        crate::session::local_date_for_timestamp(jiff::ZonedDateTime::now(), boundary_hour)
     }
 
     #[test]
     fn stems_basic() {
-        let d = NaiveDate::from_ymd_opt(2026, 4, 15).unwrap();
+        let d = jiff::civil::date(2026, 4, 15);
         assert_eq!(daily_stem(d), "2026-04-15");
         assert_eq!(monthly_stem(2026, 4), "2026-04");
         assert_eq!(yearly_stem(2026), "2026");
@@ -1228,12 +1239,12 @@ mod tests {
     #[test]
     fn weekly_stem_iso_year_may_differ_from_calendar_year() {
         // 2023-01-01 is Sunday → ISO week 52 of 2022.
-        let d = NaiveDate::from_ymd_opt(2023, 1, 1).unwrap();
-        let iso = d.iso_week();
+        let d = jiff::civil::date(2023, 1, 1);
+        let iso = d.iso_week_date();
         assert_eq!(weekly_stem(iso.year(), iso.week()), "2022-W52");
         // 2024-12-30 is Monday → ISO week 1 of 2025.
-        let d = NaiveDate::from_ymd_opt(2024, 12, 30).unwrap();
-        let iso = d.iso_week();
+        let d = jiff::civil::date(2024, 12, 30);
+        let iso = d.iso_week_date();
         assert_eq!(weekly_stem(iso.year(), iso.week()), "2025-W01");
     }
 
@@ -1353,10 +1364,10 @@ mod tests {
         // 2026-W16: Monday 2026-04-13 .. Sunday 2026-04-19.
         let days = days_of_iso_week(2026, 16);
         assert_eq!(days.len(), 7);
-        assert_eq!(days[0], NaiveDate::from_ymd_opt(2026, 4, 13).unwrap());
-        assert_eq!(days[6], NaiveDate::from_ymd_opt(2026, 4, 19).unwrap());
-        assert_eq!(days[0].weekday(), Weekday::Mon);
-        assert_eq!(days[6].weekday(), Weekday::Sun);
+        assert_eq!(days[0], jiff::civil::date(2026, 4, 13));
+        assert_eq!(days[6], jiff::civil::date(2026, 4, 19));
+        assert_eq!(days[0].weekday(), Weekday::Monday);
+        assert_eq!(days[6].weekday(), Weekday::Sunday);
     }
 
     #[test]
@@ -1364,7 +1375,7 @@ mod tests {
         // Today = Thursday 2026-04-16; yesterday = Wed 2026-04-15.
         // Current ISO week starts Mon 2026-04-13.
         // Expected range [Mon, Wed) = [Mon, Tue].
-        let thu = NaiveDate::from_ymd_opt(2026, 4, 16).unwrap();
+        let thu = jiff::civil::date(2026, 4, 16);
         let stems = daily_stems_in_current_iso_week_before(thu);
         assert_eq!(stems, vec!["2026-04-13", "2026-04-14"]);
     }
@@ -1373,7 +1384,7 @@ mod tests {
     fn daily_stems_this_week_on_monday_is_empty() {
         // Today = Mon 2026-04-13; yesterday = Sun of *last* ISO week.
         // The current ISO week has nothing before "yesterday".
-        let mon = NaiveDate::from_ymd_opt(2026, 4, 13).unwrap();
+        let mon = jiff::civil::date(2026, 4, 13);
         assert!(daily_stems_in_current_iso_week_before(mon).is_empty());
     }
 
@@ -1381,7 +1392,7 @@ mod tests {
     fn daily_stems_this_week_on_tuesday_is_empty() {
         // Today = Tue 2026-04-14; yesterday = Mon 2026-04-13 (same week).
         // Range [Mon, Mon) is empty.
-        let tue = NaiveDate::from_ymd_opt(2026, 4, 14).unwrap();
+        let tue = jiff::civil::date(2026, 4, 14);
         assert!(daily_stems_in_current_iso_week_before(tue).is_empty());
     }
 
@@ -1389,7 +1400,7 @@ mod tests {
     fn daily_stems_this_week_on_sunday_gives_four_days() {
         // Today = Sun 2026-04-19; yesterday = Sat 2026-04-18.
         // Range [Mon 2026-04-13, Sat 2026-04-18) = Mon..Fri = 5 days.
-        let sun = NaiveDate::from_ymd_opt(2026, 4, 19).unwrap();
+        let sun = jiff::civil::date(2026, 4, 19);
         let stems = daily_stems_in_current_iso_week_before(sun);
         assert_eq!(
             stems,
@@ -1407,8 +1418,8 @@ mod tests {
     fn days_of_month_april_2026_is_30_days() {
         let days = days_of_month(2026, 4);
         assert_eq!(days.len(), 30);
-        assert_eq!(days[0], NaiveDate::from_ymd_opt(2026, 4, 1).unwrap());
-        assert_eq!(days[29], NaiveDate::from_ymd_opt(2026, 4, 30).unwrap());
+        assert_eq!(days[0], jiff::civil::date(2026, 4, 1));
+        assert_eq!(days[29], jiff::civil::date(2026, 4, 30));
     }
 
     #[test]
@@ -1429,7 +1440,7 @@ mod tests {
         // 04-27 — but only Mondays that are _before_ today shouldn't matter
         // for this helper: it returns every in-month Monday except the
         // current ISO week. So expected: 15, 17, 18.
-        let thu = NaiveDate::from_ymd_opt(2026, 4, 16).unwrap();
+        let thu = jiff::civil::date(2026, 4, 16);
         let stems = week_stems_in_month_before(thu);
         assert_eq!(stems, vec!["2026-W15", "2026-W17", "2026-W18"]);
     }
@@ -1439,14 +1450,14 @@ mod tests {
         // May 1 2026 is a Friday in ISO week 18 (whose Monday Apr 27 is in
         // April, not May — so no May Monday is in the current ISO week).
         // May's Mondays: 4, 11, 18, 25 → weeks 19, 20, 21, 22.
-        let fri = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
+        let fri = jiff::civil::date(2026, 5, 1);
         let stems = week_stems_in_month_before(fri);
         assert_eq!(stems, vec!["2026-W19", "2026-W20", "2026-W21", "2026-W22"]);
     }
 
     #[test]
     fn month_stems_in_year_before_april() {
-        let apr = NaiveDate::from_ymd_opt(2026, 4, 16).unwrap();
+        let apr = jiff::civil::date(2026, 4, 16);
         assert_eq!(
             month_stems_in_year_before(apr),
             vec!["2026-01", "2026-02", "2026-03"]
@@ -1455,13 +1466,13 @@ mod tests {
 
     #[test]
     fn month_stems_in_year_before_january_is_empty() {
-        let jan = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        let jan = jiff::civil::date(2026, 1, 1);
         assert!(month_stems_in_year_before(jan).is_empty());
     }
 
     #[test]
     fn month_stems_in_year_before_december() {
-        let dec = NaiveDate::from_ymd_opt(2026, 12, 31).unwrap();
+        let dec = jiff::civil::date(2026, 12, 31);
         let stems = month_stems_in_year_before(dec);
         assert_eq!(stems.len(), 11);
         assert_eq!(stems.first().map(String::as_str), Some("2026-01"));
@@ -1501,7 +1512,7 @@ mod tests {
             "---\ndigest: []\n---\nbody\n",
         );
 
-        let today = NaiveDate::from_ymd_opt(2026, 4, 16).unwrap();
+        let today = jiff::civil::date(2026, 4, 16);
         let pending = pending_iso_weeks(root, "default", today);
         assert_eq!(pending, vec![(2026, 15)]);
     }
@@ -1527,7 +1538,7 @@ mod tests {
             "---\ndigest: []\n---\nbody\n",
         );
 
-        let today = NaiveDate::from_ymd_opt(2026, 4, 16).unwrap();
+        let today = jiff::civil::date(2026, 4, 16);
         let pending = pending_months(root, "default", today);
         assert_eq!(pending, vec![(2026, 3)]);
     }
@@ -1550,7 +1561,7 @@ mod tests {
             "---\ndigest: []\n---\nbody\n",
         );
 
-        let today = NaiveDate::from_ymd_opt(2026, 4, 16).unwrap();
+        let today = jiff::civil::date(2026, 4, 16);
         let pending = pending_years(root, "default", today);
         // 2024 exists → skipped. 2025 missing → pending. 2026 = current → skipped.
         assert_eq!(pending, vec![2025]);
@@ -1559,7 +1570,7 @@ mod tests {
     #[test]
     fn pending_enumerations_handle_missing_directories() {
         let td = make_tempdir();
-        let today = NaiveDate::from_ymd_opt(2026, 4, 16).unwrap();
+        let today = jiff::civil::date(2026, 4, 16);
         assert!(pending_iso_weeks(td.path(), "default", today).is_empty());
         assert!(pending_months(td.path(), "default", today).is_empty());
         assert!(pending_years(td.path(), "default", today).is_empty());
@@ -1603,13 +1614,13 @@ mod tests {
 
     /// Append a message to an existing channel-store session with an
     /// explicit (possibly backdated) timestamp, bypassing `append()`
-    /// (which always stamps `Utc::now()`). Mirrors the file format
+    /// (which always stamps `Timestamp::now()`). Mirrors the file format
     /// documented at the top of `session.rs` and the hand-crafted-line
     /// pattern `session.rs`'s own tests already use for backdating.
     fn backdate_channel_message(
         store: &SessionStore,
         session_id: &str,
-        at: chrono::DateTime<chrono::Utc>,
+        at: jiff::Timestamp,
         text: &str,
     ) {
         store
@@ -1623,7 +1634,7 @@ mod tests {
     fn backdate_acp_message(
         store: &AcpSessionStore,
         session_id: &str,
-        at: chrono::DateTime<chrono::Utc>,
+        at: jiff::Timestamp,
         text: &str,
     ) {
         let line = serde_json::json!({
@@ -1752,10 +1763,10 @@ mod tests {
         let (channel_store, acp_store) = merge_test_stores(&td);
         let boundary_hour = 4u8;
 
-        let today = crate::session::local_date_for_timestamp(Local::now(), boundary_hour);
-        let channel_only_day = today - Duration::days(4);
-        let acp_only_day = today - Duration::days(3);
-        let shared_day = today - Duration::days(2);
+        let today = crate::session::local_date_for_timestamp(ZonedDateTime::now(), boundary_hour);
+        let channel_only_day = today - jiff::Span::new().days(4);
+        let acp_only_day = today - jiff::Span::new().days(3);
+        let shared_day = today - jiff::Span::new().days(2);
 
         let (channel_only_start, _) = crate::session::day_window(channel_only_day, boundary_hour);
         let (acp_only_start, _) = crate::session::day_window(acp_only_day, boundary_hour);
@@ -1768,7 +1779,7 @@ mod tests {
         backdate_channel_message(
             &channel_store,
             &chan1,
-            channel_only_start + Duration::hours(1),
+            channel_only_start + jiff::SignedDuration::from_hours(1),
             "channel only",
         );
         let chan2 = channel_store
@@ -1777,7 +1788,7 @@ mod tests {
         backdate_channel_message(
             &channel_store,
             &chan2,
-            shared_start + Duration::hours(1),
+            shared_start + jiff::SignedDuration::from_hours(1),
             "channel side of the shared day",
         );
 
@@ -1786,14 +1797,14 @@ mod tests {
         backdate_acp_message(
             &acp_store,
             "acp-only",
-            acp_only_start + Duration::hours(1),
+            acp_only_start + jiff::SignedDuration::from_hours(1),
             "acp only",
         );
         acp_store.create("acp-shared", "default", "/p").unwrap();
         backdate_acp_message(
             &acp_store,
             "acp-shared",
-            shared_start + Duration::hours(2),
+            shared_start + jiff::SignedDuration::from_hours(2),
             "acp side of the shared day",
         );
 
@@ -1837,14 +1848,14 @@ mod tests {
         // `pending_daily_dates` only reports dates strictly before
         // today (today's own log isn't due yet), so the message must
         // be backdated for this to exercise the "pending" path at all.
-        let today = crate::session::local_date_for_timestamp(Local::now(), boundary_hour);
+        let today = crate::session::local_date_for_timestamp(ZonedDateTime::now(), boundary_hour);
         let (yesterday_start, _) =
-            crate::session::day_window(today - Duration::days(1), boundary_hour);
+            crate::session::day_window(today - jiff::Span::new().days(1), boundary_hour);
         acp_store.create("work-only", "work", "/p").unwrap();
         backdate_acp_message(
             &acp_store,
             "work-only",
-            yesterday_start + Duration::hours(1),
+            yesterday_start + jiff::SignedDuration::from_hours(1),
             "work stuff",
         );
 
