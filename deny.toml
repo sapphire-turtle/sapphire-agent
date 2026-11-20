@@ -82,14 +82,6 @@ ignore = [
     # under the agent's state_dir (channel/matrix.rs). Drop this once
     # matrix-sdk-sqlite moves to rusqlite >= 0.41.
     { id = "RUSTSEC-2026-0459", reason = "bundled SQLite in libsqlite3-sys 0.38 (CVE-2026-119375); transitive via matrix-sdk-sqlite 0.19.1 → rusqlite 0.40. Only matrix-sdk's own store under state_dir is opened. Drop once matrix-sdk-sqlite moves to rusqlite >= 0.41 (#392)." },
-
-    # --- ruzstd 0.8 pinned by bevy (desktop only) ---
-    # Fixed in ruzstd 0.9.1, but bevy_image requires ^0.8 — still so in bevy
-    # 0.20 — and bevy_egui turns on its `zstd_rust` feature whenever
-    # rendering is on, so it cannot be dropped. It decodes zstd-compressed
-    # KTX2 textures, and the desktop client loads no such assets, let alone
-    # untrusted ones. Drop this when bevy_image takes ruzstd 0.9.
-    { id = "RUSTSEC-2026-0344", reason = "ruzstd decompression bomb; reached only via the desktop's bevy_image, which pins ^0.8 through bevy 0.20 (KTX2 textures, none loaded)." },
 ]
 
 [licenses]
