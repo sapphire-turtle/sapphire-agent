@@ -316,7 +316,8 @@ session_policy   = "reset"       # optional; defaults to global setting
 #
 # [room_profile.sapphire_world]
 # profile          = "default"
-# memory_namespace = "sapphire_world" # A2A-only; no chat rooms name it
+# A2A-only; no chat rooms name it
+# memory_namespace = "sapphire_world"
 # # its client's key: `api-key add a2a-client --profile sapphire_world`
 #
 # Caveat: workspace retrieve (FTS / vector search) currently spans every
@@ -567,7 +568,8 @@ session_policy   = "reset"       # optional; defaults to global setting
 #
 # [room_profile.home_voice]
 # profile          = "casual"
-# voice_pipeline   = "default"      # MCP-only; no chat rooms name it
+# MCP-only; no chat rooms name it
+# voice_pipeline   = "default"
 #
 # # ── Voice-mode global settings ───────────────────────────────────────
 # # AI-name wake words can't be served by pre-trained KWS bundles

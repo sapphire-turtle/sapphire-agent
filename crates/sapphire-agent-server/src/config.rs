@@ -1672,8 +1672,10 @@ api_key = "test"
             ("discord", self.discord.as_ref().map(|c| &c.rooms)),
             ("telegram", self.telegram.as_ref().map(|c| &c.rooms)),
         ];
+        let mut room_counts = BTreeMap::new();
         for (channel, rooms) in channels {
             for (room_id, block) in rooms.into_iter().flatten() {
+                *room_counts.entry(room_id).or_insert(0) += 1;
                 if let Some(profile) = block.profile.as_deref()
                     && !self.room_profiles.contains_key(profile)
                 {
@@ -1681,6 +1683,13 @@ api_key = "test"
                         "[{channel}.rooms.\"{room_id}\"].profile references unknown room_profile '{profile}'"
                     ));
                 }
+            }
+        }
+        for (room_id, count) in room_counts {
+            if count > 1 {
+                errors.push(format!(
+                    "room id '{room_id}' appears in multiple channel rooms maps"
+                ));
             }
         }
         if let Some(name) = self
@@ -1861,17 +1870,17 @@ api_key = "test"
             ));
         }
 
-        if let Some(matrix) = &self.matrix {
-            if !matrix.room_ids.is_empty() || matrix.room_id.is_some() {
-                errors.push(
-                    "matrix.room_ids (and the legacy matrix.room_id) is replaced by \
-                 [matrix.rooms.\"<room_id>\"] blocks. Delete the old key and create one \
-                 block per room; move each room's binding from \
-                 [room_profile.<name>].rooms to that block's `profile` key. \
-                 Startup refuses while the old list remains."
-                        .to_string(),
-                );
-            }
+        if let Some(matrix) = &self.matrix
+            && (!matrix.room_ids.is_empty() || matrix.room_id.is_some())
+        {
+            errors.push(
+                "matrix.room_ids (and the legacy matrix.room_id) is replaced by \
+             [matrix.rooms.\"<room_id>\"] blocks. Delete the old key and create one \
+             block per room; move each room's binding from \
+             [room_profile.<name>].rooms to that block's `profile` key. \
+             Startup refuses while the old list remains."
+                    .to_string(),
+            );
         }
         if let Some(discord) = &self.discord
             && !discord.channel_ids.is_empty()
@@ -2394,9 +2403,26 @@ mod tests {
         let cfg = parse(
             "[anthropic]\napi_key = \"test\"\n\n[matrix]\n\
              homeserver = \"h\"\naccess_token = \"t\"\nuser_id = \"u\"\ndevice_id = \"d\"\n\
-             [matrix.rooms.\"!a:x\"]\n[matrix.rooms.\"!b:x\"]\n",
+             [matrix.rooms.\"!zzz:x\"]\n[matrix.rooms.\"!aaa:x\"]\n",
         );
-        assert_eq!(cfg.matrix.as_ref().unwrap().primary_room_id(), Some("!a:x"));
+        assert_eq!(
+            cfg.matrix.as_ref().unwrap().primary_room_id(),
+            Some("!zzz:x")
+        );
+    }
+
+    #[test]
+    fn a_room_id_shared_by_three_channels_is_one_validation_error() {
+        let cfg = parse(
+            "[anthropic]\napi_key = \"t\"\n[matrix]\n\
+             homeserver = \"h\"\naccess_token = \"t\"\nuser_id = \"u\"\ndevice_id = \"d\"\n\
+             [matrix.rooms.\"7\"]\n[discord]\nbot_token = \"t\"\n[discord.rooms.\"7\"]\n\
+             [telegram]\nbot_token = \"t\"\n[telegram.rooms.\"7\"]\n",
+        );
+        assert_eq!(
+            cfg.validate_profiles(),
+            ["room id '7' appears in multiple channel rooms maps"]
+        );
     }
 
     #[test]
