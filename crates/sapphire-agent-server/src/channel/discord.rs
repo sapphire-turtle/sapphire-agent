@@ -98,8 +98,8 @@ impl std::fmt::Debug for DiscordChannel {
 impl DiscordChannel {
     pub fn new(cfg: &DiscordConfig) -> Result<Self> {
         let channel_ids = cfg
-            .channel_ids
-            .iter()
+            .rooms
+            .keys()
             .map(|s| s.parse::<u64>().context("Invalid Discord channel_id"))
             .collect::<Result<HashSet<_>>>()?;
 
@@ -376,6 +376,15 @@ pub fn reply_target(msg: &Message) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discord_listens_in_rooms_from_the_map() {
+        let cfg = crate::config::Config::parse_for_test(
+            "[discord]\nbot_token = \"t\"\n[discord.rooms.\"7\"]\n",
+        );
+        let ch = DiscordChannel::new(cfg.discord.as_ref().unwrap()).unwrap();
+        assert_eq!(ch.channel_ids, HashSet::from([7]));
+    }
 
     #[test]
     fn an_image_over_the_provider_limit_is_still_downloaded() {

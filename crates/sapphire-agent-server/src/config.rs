@@ -1193,6 +1193,13 @@ pub struct DiscordConfig {
     pub allowed_users: Vec<String>,
 }
 
+impl DiscordConfig {
+    /// First configured room, used as the default heartbeat target.
+    pub fn primary_room_id(&self) -> Option<&str> {
+        self.rooms.keys().next().map(String::as_str)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TelegramConfig {
     pub bot_token: String,
@@ -1203,6 +1210,13 @@ pub struct TelegramConfig {
     /// Messages from users not in this list are silently ignored. Empty = all.
     #[serde(default)]
     pub allowed_users: Vec<String>,
+}
+
+impl TelegramConfig {
+    /// First configured room, used as the default heartbeat target.
+    pub fn primary_room_id(&self) -> Option<&str> {
+        self.rooms.keys().next().map(String::as_str)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

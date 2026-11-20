@@ -277,8 +277,8 @@ pub trait Channel: Send + Sync {
 /// outgoing replies and typing indicators land on the channel the
 /// originating message came from.
 ///
-/// The routing map is seeded from `Config` (Matrix.room_ids and
-/// Discord.channel_ids) so proactive sends to known rooms work without
+/// The routing map is seeded from the channel room blocks in `Config`
+/// so proactive sends to known rooms work without
 /// having received a message first; it's also updated on every
 /// incoming message so DMs / unlisted rooms become routable as soon as
 /// the user pings the agent there.
@@ -332,7 +332,7 @@ impl Channels {
 
     /// Route `room_id` to the channel named `channel`, as if a message had
     /// arrived there. For a room the seed from `Config` can't know, such as
-    /// a Discord consult room when `channel_ids` is empty (listen to all).
+    /// a Discord consult room when its `rooms` map is empty (listen to all).
     pub async fn seed_room(&self, room_id: &str, channel: &str) {
         self.routing
             .write()
@@ -432,7 +432,7 @@ impl Channels {
     }
 }
 
-/// Build the routing seed map from a `Config` so proactive sends
+/// Seed routing from the per-room blocks in `Config` so proactive sends
 /// (heartbeat cron tasks, etc.) succeed without needing a prior
 /// inbound message.
 ///
@@ -441,21 +441,47 @@ impl Channels {
 pub fn seed_routing_from_config(config: &crate::config::Config) -> HashMap<String, String> {
     let mut seed = HashMap::new();
     if let Some(m) = &config.matrix {
-        for r in &m.room_ids {
+        for r in m.rooms.keys() {
             seed.insert(r.clone(), "matrix".to_string());
         }
     }
     if let Some(d) = &config.discord {
-        for c in &d.channel_ids {
+        for c in d.rooms.keys() {
             seed.insert(c.clone(), "discord".to_string());
+        }
+    }
+    if let Some(t) = &config.telegram {
+        for r in t.rooms.keys() {
+            seed.insert(r.clone(), "telegram".to_string());
         }
     }
     seed
 }
 
+/// Whether any configured channel listens in all visible rooms.
+pub fn has_room_wildcard(config: &crate::config::Config) -> bool {
+    config.matrix.as_ref().is_some_and(|m| m.rooms.is_empty())
+        || config.discord.as_ref().is_some_and(|d| d.rooms.is_empty())
+        || config.telegram.as_ref().is_some_and(|t| t.rooms.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn seed_routing_covers_all_three_channels() {
+        let cfg = crate::config::Config::parse_for_test(
+            "[matrix]\nhomeserver = \"h\"\naccess_token = \"t\"\nuser_id = \"@b:x\"\n\
+             device_id = \"d\"\n[matrix.rooms.\"!a:x\"]\n\
+             [discord]\nbot_token = \"t\"\n[discord.rooms.\"7\"]\n[telegram]\nbot_token = \"t\"\n\
+             [telegram.rooms.\"-1001:42\"]\n",
+        );
+        let seed = seed_routing_from_config(&cfg);
+        assert_eq!(seed.get("!a:x").map(String::as_str), Some("matrix"));
+        assert_eq!(seed.get("7").map(String::as_str), Some("discord"));
+        assert_eq!(seed.get("-1001:42").map(String::as_str), Some("telegram"));
+    }
 
     struct FakeChannel;
 
@@ -503,7 +529,7 @@ mod tests {
 
     /// A PNG of pseudo-random noise: it does not compress, so its size is
     /// close to `w * h * 3` bytes.
-    fn noise_png(w: u32, h: u32) -> Vec<u8> {
+    pub(super) fn noise_png(w: u32, h: u32) -> Vec<u8> {
         let mut state: u32 = 0x1234_5678;
         let img = image::RgbImage::from_fn(w, h, |_, _| {
             let mut px = [0u8; 3];

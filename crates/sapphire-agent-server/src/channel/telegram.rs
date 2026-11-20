@@ -1,14 +1,16 @@
 //! Telegram Bot API channel.
 //!
-//! Bot API `getUpdates` never echoes the bot's own messages, so there is no
-//! bot/self filter here, unlike Discord and Matrix. A forum topic's
-//! `message_thread_id` is part of its composite room id; it never becomes an
-//! [`IncomingMessage::thread_id`].
+//! A forum topic's `message_thread_id` is part of its composite room id; it
+//! never becomes an [`IncomingMessage::thread_id`].
 
-use crate::channel::{Channel, IncomingMessage, OutgoingMessage, RoomInfo, with_attachment_notes};
+use crate::channel::{
+    Attachment, Channel, IncomingMessage, MAX_DOWNLOAD_BYTES, OutgoingMessage, RoomInfo,
+    SUPPORTED_IMAGE_MIME, dropped_attachment_note, format_mb, prepare_image, with_attachment_notes,
+};
 use crate::config::{RoomBlock, TelegramConfig};
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
+use futures_util::TryStreamExt;
 use indexmap::IndexMap;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -40,8 +42,12 @@ struct TelegramHandler {
 impl TelegramHandler {
     /// Forward a routed message. A closed queue is logged without retrying
     /// the update, since this sender cannot recover.
-    async fn message(&self, msg: &Message) {
-        let Some(incoming) = route_update(msg, &self.allowed_users, &self.rooms).await else {
+    async fn message(&self, client: &Bot, msg: &Message) {
+        let Some(incoming) = route_update(msg, &self.allowed_users, &self.rooms, async |id| {
+            download_file(client, id).await
+        })
+        .await
+        else {
             return;
         };
         if let Err(e) = self.tx.send(incoming).await {
@@ -72,8 +78,6 @@ impl std::fmt::Debug for TelegramChannel {
 }
 
 impl TelegramChannel {
-    // Registered in the channel list by the later integration task.
-    #[allow(dead_code)]
     pub fn new(cfg: &TelegramConfig) -> Result<Self> {
         if !telers::utils::token::validate(&cfg.bot_token) {
             bail!("Invalid Telegram bot token");
@@ -265,7 +269,7 @@ async fn receive_updates(
             };
             let update_id = update.update_id();
             if let Update::Message(message) = update {
-                handler.message(&message.message).await;
+                handler.message(client, &message.message).await;
             }
             // Advance even for filtered messages or a closed agent queue.
             *offset = Some(
@@ -279,15 +283,17 @@ async fn receive_updates(
 
 /// Route one Telegram message into the common inbound representation.
 ///
-/// `rooms` is the listen list: an empty map accepts every visible room. The
-/// attachment path is filled in by the attachment task; for now text-only
-/// messages are routed and messages without text are ignored.
-pub async fn route_update(
+/// `rooms` is the listen list: an empty map accepts every visible room.
+async fn route_update(
     msg: &Message,
     allowed_users: &HashSet<String>,
     rooms: &IndexMap<String, RoomBlock>,
+    download: impl AsyncFnOnce(&str) -> Result<Vec<u8>, String>,
 ) -> Option<IncomingMessage> {
     let from = msg.from()?;
+    if from.is_bot {
+        return None;
+    }
     let sender = from.id.to_string();
     if !allowed_users.is_empty() && !allowed_users.contains(&sender) {
         debug!("Ignoring message from user {sender} (not in allowed list)");
@@ -300,8 +306,13 @@ pub async fn route_update(
         return None;
     }
 
-    let content = with_attachment_notes(msg.text().unwrap_or_default().trim().to_owned(), &[]);
-    if content.is_empty() {
+    let (attachments, notes) = download_image_attachments(msg, download).await;
+    let text = match msg {
+        Message::Photo(_) | Message::Document(_) | Message::Animation(_) => msg.caption(),
+        _ => msg.text(),
+    };
+    let content = with_attachment_notes(text.unwrap_or_default().trim().to_owned(), &notes);
+    if content.is_empty() && attachments.is_empty() {
         return None;
     }
 
@@ -312,9 +323,111 @@ pub async fn route_update(
         room_id,
         timestamp: msg.date() as u64 * 1000,
         thread_id: None,
-        attachments: vec![],
+        attachments,
         reply_to: reply_target(msg),
     })
+}
+
+/// Telegram photos are alternative sizes of one image; fetch only the largest.
+/// Documents and animations can also carry supported image types. Declared
+/// metadata screens the fetch, but the bytes determine what goes to the model.
+async fn download_image_attachments(
+    msg: &Message,
+    download: impl AsyncFnOnce(&str) -> Result<Vec<u8>, String>,
+) -> (Vec<Attachment>, Vec<String>) {
+    let (id, name, mime, size) = if let Some(photo) = msg.photo().and_then(|sizes| {
+        sizes
+            .iter()
+            .max_by_key(|p| p.width.saturating_mul(p.height))
+    }) {
+        // Telegram doesn't declare a MIME type for photos.
+        (
+            photo.file_id.as_ref(),
+            "Telegram photo",
+            Some("image/jpeg"),
+            photo.file_size,
+        )
+    } else if let Some(doc) = msg.document() {
+        (
+            doc.file_id.as_ref(),
+            doc.file_name.as_deref().unwrap_or("Telegram document"),
+            doc.mime_type.as_deref(),
+            doc.file_size,
+        )
+    } else if let Some(animation) = msg.animation() {
+        (
+            animation.file_id.as_ref(),
+            animation
+                .file_name
+                .as_deref()
+                .unwrap_or("Telegram animation"),
+            animation.mime_type.as_deref(),
+            animation.file_size,
+        )
+    } else {
+        return (Vec::new(), Vec::new());
+    };
+
+    let result = async {
+        screen_attachment(mime, size)?;
+        let bytes = download(id).await?;
+        tokio::task::spawn_blocking(move || prepare_image(bytes))
+            .await
+            .map_err(|e| format!("processing it failed ({e})"))?
+    }
+    .await;
+    match result {
+        Ok(attachment) => (vec![attachment], Vec::new()),
+        Err(reason) => {
+            warn!("Telegram attachment '{name}' not passed on: {reason}");
+            (Vec::new(), vec![dropped_attachment_note(name, &reason)])
+        }
+    }
+}
+
+fn screen_attachment(mime: Option<&str>, size: Option<i64>) -> Result<(), String> {
+    let only_images = "only images (JPEG, PNG, GIF, WebP) are passed on";
+    match mime {
+        None => return Err(format!("its type is unknown, and {only_images}")),
+        Some(mime) if !SUPPORTED_IMAGE_MIME.contains(&mime) => {
+            return Err(format!("it is {mime}, and {only_images}"));
+        }
+        Some(_) => {}
+    }
+    if let Some(size) = size.and_then(|size| usize::try_from(size).ok())
+        && size > MAX_DOWNLOAD_BYTES
+    {
+        return Err(format!(
+            "it is {}, over the {} download limit",
+            format_mb(size),
+            format_mb(MAX_DOWNLOAD_BYTES)
+        ));
+    }
+    Ok(())
+}
+
+async fn download_file(client: &Bot, id: &str) -> Result<Vec<u8>, String> {
+    // The library error can include the request URL, which carries the bot token.
+    let mut stream = client
+        .download(id)
+        .await
+        .map_err(|_| "downloading it from Telegram failed".to_owned())?;
+    let mut bytes = Vec::new();
+    // File sizes may be absent or inaccurate. Cap the actual bytes too.
+    while let Some(chunk) = stream
+        .try_next()
+        .await
+        .map_err(|_| "reading the Telegram download failed".to_owned())?
+    {
+        if chunk.len() > MAX_DOWNLOAD_BYTES - bytes.len() {
+            return Err(format!(
+                "the Telegram download exceeded the {} limit",
+                format_mb(MAX_DOWNLOAD_BYTES)
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 /// The configured room id for a chat, including its forum topic when present.
@@ -352,6 +465,10 @@ mod tests {
     use indexmap::IndexMap;
     use std::collections::HashSet;
     use telers::types::Message;
+
+    async fn unexpected_download(id: &str) -> Result<Vec<u8>, String> {
+        panic!("unexpected file download: {id}");
+    }
 
     const CHAT: i64 = -1_002_000_333_444_555;
 
@@ -541,7 +658,9 @@ mod tests {
     async fn an_inbound_topic_message_is_the_composite_room() {
         let rooms = rooms(&[("-1002000333444555:42", block(None, None, None))]);
         let msg = fixture_message(CHAT, Some(42), "1", "hello", Some("9"));
-        let incoming = route_update(&msg, &HashSet::new(), &rooms).await.unwrap();
+        let incoming = route_update(&msg, &HashSet::new(), &rooms, unexpected_download)
+            .await
+            .unwrap();
         assert_eq!(incoming.room_id, "-1002000333444555:42");
         assert!(
             incoming.thread_id.is_none(),
@@ -557,6 +676,7 @@ mod tests {
             &fixture_message(CHAT, None, "1", "hi", None),
             &HashSet::new(),
             &IndexMap::new(),
+            unexpected_download,
         )
         .await
         .unwrap();
@@ -570,6 +690,7 @@ mod tests {
             &fixture_message(-100999, Some(42), "1", "hi", None),
             &HashSet::new(),
             &rooms,
+            unexpected_download,
         )
         .await;
         assert!(
@@ -580,6 +701,7 @@ mod tests {
             &fixture_message(CHAT, Some(42), "9", "hi", None),
             &HashSet::from(["1".to_string()]),
             &IndexMap::new(),
+            unexpected_download,
         )
         .await;
         assert!(empty.is_none(), "allowed_users non-empty miss");
@@ -592,9 +714,115 @@ mod tests {
                 &fixture_message(CHAT, Some(42), "1", "", None),
                 &HashSet::new(),
                 &IndexMap::new(),
+                unexpected_download,
             )
             .await
             .is_none()
+        );
+    }
+
+    fn document_message(mime: &str, size: usize, caption: Option<&str>) -> Message {
+        serde_json::from_value(serde_json::json!({
+            "message_id": 500,
+            "from": {"id": 1, "is_bot": false, "first_name": "Fixture"},
+            "date": 1_767_225_600,
+            "chat": {"id": CHAT, "type": "supergroup", "title": "Fixture"},
+            "caption": caption,
+            "document": {
+                "file_id": "file", "file_unique_id": "unique",
+                "file_name": "fixture.png", "mime_type": mime, "file_size": size
+            }
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_telegram_image_over_the_download_limit_is_turned_away_before_it_is_fetched() {
+        let msg = document_message("image/png", MAX_DOWNLOAD_BYTES + 1, Some("Look"));
+        let incoming = route_update(&msg, &HashSet::new(), &IndexMap::new(), unexpected_download)
+            .await
+            .unwrap();
+        assert!(incoming.attachments.is_empty());
+        assert!(
+            incoming
+                .content
+                .starts_with("Look\n\n[Attachment 'fixture.png'")
+        );
+        assert!(incoming.content.contains("over the 32.0 MB download limit"));
+    }
+
+    #[tokio::test]
+    async fn a_telegram_document_with_an_unsupported_mime_is_not_fetched() {
+        let msg = document_message("application/pdf", 1000, None);
+        let incoming = route_update(&msg, &HashSet::new(), &IndexMap::new(), unexpected_download)
+            .await
+            .unwrap();
+        assert!(incoming.attachments.is_empty());
+        assert!(incoming.content.contains(
+            "it is application/pdf, and only images (JPEG, PNG, GIF, WebP) are passed on"
+        ));
+    }
+
+    fn photo_message(size: usize) -> Message {
+        serde_json::from_value(serde_json::json!({
+            "message_id": 500,
+            "from": {"id": 1, "is_bot": false, "first_name": "Fixture"},
+            "date": 1_767_225_600,
+            "chat": {"id": CHAT, "type": "supergroup", "title": "Fixture"},
+            "photo": [
+                {"file_id": "large", "file_unique_id": "l", "width": 1500, "height": 1230, "file_size": size},
+                {"file_id": "small", "file_unique_id": "s", "width": 48, "height": 39}
+            ]
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_5_point_3_mb_telegram_photo_is_fetched_and_shrunk_without_a_caption() {
+        let png = super::super::tests::noise_png(1500, 1230);
+        assert_eq!(format_mb(png.len()), "5.3 MB");
+        let msg = photo_message(png.len());
+        let incoming = route_update(&msg, &HashSet::new(), &IndexMap::new(), async move |id| {
+            assert_eq!(id, "large");
+            Ok(png)
+        })
+        .await
+        .unwrap();
+        assert!(incoming.content.is_empty());
+        let [attachment] = incoming.attachments.as_slice() else {
+            panic!("expected one attachment")
+        };
+        assert_eq!(attachment.media_type, "image/jpeg");
+        assert!(attachment.data.len() <= super::super::MAX_ATTACHMENT_BYTES);
+        assert!(image::load_from_memory(&attachment.data).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_telegram_document_uses_the_mime_of_its_bytes_not_its_label() {
+        let png = super::super::tests::noise_png(32, 32);
+        let msg = document_message("image/webp", png.len(), Some("Look"));
+        let incoming = route_update(&msg, &HashSet::new(), &IndexMap::new(), async |_| {
+            Ok(png.clone())
+        })
+        .await
+        .unwrap();
+        assert_eq!(incoming.content, "Look");
+        let [attachment] = incoming.attachments.as_slice() else {
+            panic!("expected one attachment")
+        };
+        assert_eq!(attachment.media_type, "image/png");
+        assert_eq!(attachment.data, png);
+
+        let incoming = route_update(&msg, &HashSet::new(), &IndexMap::new(), async |_| {
+            Ok(b"not an image".to_vec())
+        })
+        .await
+        .unwrap();
+        assert!(incoming.attachments.is_empty());
+        assert!(
+            incoming
+                .content
+                .contains("its format is not one of JPEG, PNG, GIF or WebP")
         );
     }
 

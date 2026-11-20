@@ -93,32 +93,16 @@ impl Agent {
         // not a safety one.
         //
         // If any configured channel uses the "listen everywhere" wildcard
-        // (empty room_ids / channel_ids), the whole agent is unrestricted
+        // (an empty rooms map), the whole agent is unrestricted
         // — narrowing to only the other channel's explicit set would
         // silently drop everything the wildcard channel was supposed to
         // handle.
-        let mut wildcard = false;
-        let allowed_rooms: std::collections::HashSet<String> = {
-            let mut set = std::collections::HashSet::new();
-            if let Some(m) = &config.matrix {
-                if m.room_ids.is_empty() {
-                    wildcard = true;
-                } else {
-                    set.extend(m.room_ids.iter().cloned());
-                }
-            }
-            if let Some(d) = &config.discord {
-                if d.channel_ids.is_empty() {
-                    wildcard = true;
-                } else {
-                    set.extend(d.channel_ids.iter().cloned());
-                }
-            }
-            set
-        };
-        if !wildcard && !allowed_rooms.is_empty() {
+        if !crate::channel::has_room_wildcard(&config) {
+            let allowed_rooms = crate::channel::seed_routing_from_config(&config);
             let before = histories.len();
-            histories.retain(|key, _| allowed_rooms.contains(&key.0));
+            if !allowed_rooms.is_empty() {
+                histories.retain(|key, _| allowed_rooms.contains_key(&key.0));
+            }
             let skipped = before - histories.len();
             if skipped > 0 {
                 info!(
@@ -1087,6 +1071,47 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
+    #[tokio::test]
+    async fn restored_histories_follow_room_maps_and_keep_wildcard_rooms() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(SessionStore::new(
+            dir.path().join("sessions"),
+            "channel",
+            None,
+        ));
+        let listed = ("-1001:42".to_owned(), None);
+        let unlisted = ("-1001:43".to_owned(), None);
+        for key in [&listed, &unlisted] {
+            let session = store.create_session(key, "telegram", "default").unwrap();
+            store.append(&session, &ChatMessage::user("hello")).unwrap();
+        }
+        for (rooms, keep_unlisted) in [("[telegram.rooms.\"-1001:42\"]\n", false), ("", true)] {
+            let config = Config::parse_for_test(&format!(
+                "[discord]\nbot_token = \"t\"\n[discord.rooms.\"7\"]\n\
+                 [telegram]\nbot_token = \"123456:test\"\n{rooms}"
+            ));
+            let agent = Agent::new(
+                config,
+                Arc::new(Channels::new(Vec::new(), HashMap::new())),
+                Arc::new(ProviderRegistry::for_test(
+                    &["anthropic"],
+                    Arc::new(crate::serve::StubProvider::new(Vec::new())),
+                )),
+                Arc::new(Workspace::new(
+                    dir.path().join("workspace"),
+                    Default::default(),
+                )),
+                None,
+                Arc::clone(&store),
+                None,
+            );
+            let history = agent.history.lock().await;
+            assert!(history.contains_key(&listed));
+            assert_eq!(history.contains_key(&unlisted), keep_unlisted);
+        }
+    }
+
     // Turn-driving harness
     //
     // Everything below builds a real `Agent` — scripted provider, tool
