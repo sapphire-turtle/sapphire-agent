@@ -38,17 +38,15 @@ struct TelegramHandler {
 }
 
 impl TelegramHandler {
-    /// Forward a message, or do nothing when routing filters it out. An update
-    /// is acknowledged only after this returns `Ok`, so a closed receiver
-    /// cannot silently discard it.
-    async fn message(&self, msg: &Message) -> Result<()> {
+    /// Forward a routed message. A closed queue is logged without retrying
+    /// the update, since this sender cannot recover.
+    async fn message(&self, msg: &Message) {
         let Some(incoming) = route_update(msg, &self.allowed_users, &self.rooms).await else {
-            return Ok(());
+            return;
         };
-        self.tx
-            .send(incoming)
-            .await
-            .map_err(|e| anyhow!("Failed to forward Telegram message: {e}"))
+        if let Err(e) = self.tx.send(incoming).await {
+            warn!("Failed to forward Telegram message: {e}");
+        }
     }
 }
 
@@ -77,6 +75,9 @@ impl TelegramChannel {
     // Registered in the channel list by the later integration task.
     #[allow(dead_code)]
     pub fn new(cfg: &TelegramConfig) -> Result<Self> {
+        if !telers::utils::token::validate(&cfg.bot_token) {
+            bail!("Invalid Telegram bot token");
+        }
         for key in cfg.rooms.keys() {
             split_room_id(key)?;
         }
@@ -185,10 +186,9 @@ async fn receive_updates(
             };
             let update_id = update.update_id();
             if let Update::Message(message) = update {
-                handler.message(&message.message).await?;
+                handler.message(&message.message).await;
             }
-            // Filtered messages are handled too. An unfiltered message reaches
-            // here only after its send into the agent's queue succeeded.
+            // Advance even for filtered messages or a closed agent queue.
             *offset = Some(
                 update_id
                     .checked_add(1)
@@ -411,6 +411,17 @@ mod tests {
         assert_eq!(split_room_id("-1001").unwrap(), (-1001, None));
         assert_eq!(split_room_id("-1001:42").unwrap(), (-1001, Some(42)));
         assert!(split_room_id("-1001:x").is_err());
+    }
+
+    #[test]
+    fn invalid_configured_bot_tokens_are_rejected_loudly() {
+        let cfg = TelegramConfig {
+            bot_token: "missing-separator".to_string(),
+            rooms: IndexMap::new(),
+            allowed_users: vec![],
+        };
+        let error = TelegramChannel::new(&cfg).unwrap_err().to_string();
+        assert_eq!(error, "Invalid Telegram bot token");
     }
 
     #[test]
