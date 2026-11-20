@@ -79,8 +79,8 @@
 # origin = "trusted"
 # Chat room where autonomous sessions post questions (the `ask_human`
 # tool); a reply to a question's message is the answer. The room must also
-# be in the channel's room list (`discord.rooms` / `matrix.rooms`),
-# or be a Discord channel ID while `discord.rooms` is empty.
+# be in the channel's room list (`matrix.rooms`, `discord.rooms`, or `telegram.rooms`),
+# or be a valid room ID for a configured channel whose rooms list is empty.
 # consult_room = "123456789012345678"
 # How long a question waits for a reply, in hours: 1 to 8760 (a year);
 # a value outside that range is clamped, with a warning.
@@ -97,8 +97,7 @@ homeserver = "https://matrix.example.com"
 access_token = "syt_..."
 user_id = "@bot:example.com"
 device_id = "DEVICEID"
-# Rooms to listen in. Accepts either an array (preferred) or a single string
-# via the legacy `room_id` key.
+# For any channel, an empty rooms list means listen everywhere the bot can see.
 # See [[matrix.rooms]] below.
 # Messages from users not in this list are silently ignored.
 # Leave empty ([]) to allow all users.
@@ -112,6 +111,8 @@ recovery_key = "EsT... "
 [[matrix.rooms]]
 room_id = "!roomid:example.com"
 profile = "default"
+# name = "Matrix room"         # optional; Matrix uses live display metadata
+# description = "Room topic"
 
 [profiles.default]
 provider = "anthropic"
@@ -125,6 +126,17 @@ profile = "default"
 # room_id = "1474368482296807444"
 # profile = "default"
 # voice_pipeline = "default"  # optional
+# name = "Discord room"       # optional; Discord uses live display metadata
+# description = "Room topic"
+
+# [telegram]
+# bot_token = "123456:ABC..."
+# allowed_users = ["11111111"]
+# [[telegram.rooms]]
+# room_id = "-1002000333444555:42"  # chat ID, optionally followed by :topic ID
+# profile = "default"
+# name = "Development"
+# description = "Development and autonomous sessions"
 
 # [permission_profile.chat]
 # tools = []

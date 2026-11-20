@@ -246,7 +246,7 @@ impl Channel for MatrixChannel {
 
                 async move {
                     let room_id_str = room.room_id().as_str().to_string();
-                    if !allowed_rooms.contains(&room_id_str) {
+                    if !allowed_rooms.is_empty() && !allowed_rooms.contains(&room_id_str) {
                         return;
                     }
                     if event.sender.as_str() == bot_user_id {
@@ -422,6 +422,16 @@ pub fn strip_reply_fallback(body: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn matrix_listens_in_rooms_from_the_list() {
+        let cfg = crate::config::Config::parse_for_test(
+            "[matrix]\nhomeserver = \"h\"\naccess_token = \"t\"\nuser_id = \"@b:x\"\n\
+             device_id = \"d\"\n[[matrix.rooms]]\nroom_id = \"!a:x\"\n",
+        );
+        let ch = MatrixChannel::new(cfg.matrix.as_ref().unwrap());
+        assert_eq!(ch.room_ids, HashSet::from(["!a:x".to_owned()]));
+    }
+
     use super::*;
     use matrix_sdk::ruma::EventId;
 

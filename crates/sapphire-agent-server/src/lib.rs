@@ -56,6 +56,7 @@ use agent::Agent;
 use anyhow::{Context, Result};
 use channel::discord::DiscordChannel;
 use channel::matrix::MatrixChannel;
+use channel::telegram::TelegramChannel;
 use config::{Config, LoadedConfig};
 use heartbeat::Heartbeat;
 use periodic_log::{
@@ -200,19 +201,12 @@ fn consult_room_warnings(config: &config::Config) -> Vec<String> {
         return Vec::new();
     };
     let mut lines = Vec::new();
-    let listed = config
-        .discord
-        .as_ref()
-        .is_some_and(|d| d.rooms.iter().any(|c| c.room_id == room))
-        || config
-            .matrix
-            .as_ref()
-            .is_some_and(|m| m.rooms.iter().any(|r| r.room_id == room))
-        || discord_listens_to_room(config, room);
+    let listed = config.channels().any(|(_, r)| r.room_id == room)
+        || wildcard_channel_for_room(config, room).is_some();
     if !listed {
         lines.push(format!(
-            "  Consult room      : {room} is in neither discord.channel_ids nor \
-             matrix.room_ids: ask_human will refuse"
+            "  Consult room      : {room} is not in matrix.rooms, discord.rooms, or \
+             telegram.rooms: ask_human will refuse"
         ));
     }
     if !config.autonomous.enabled {
@@ -224,10 +218,43 @@ fn consult_room_warnings(config: &config::Config) -> Vec<String> {
     lines
 }
 
-/// Whether Discord listens in `room` without listing it: an empty
-/// `channel_ids` means every channel, and a Discord channel ID is numeric.
-fn discord_listens_to_room(config: &config::Config, room: &str) -> bool {
-    config.discord.as_ref().is_some_and(|d| d.rooms.is_empty()) && room.parse::<u64>().is_ok()
+/// Infer a route for an unlisted consult room when its channel listens everywhere.
+fn wildcard_channel_for_room(config: &config::Config, room: &str) -> Option<&'static str> {
+    if config.matrix.as_ref().is_some_and(|m| m.rooms.is_empty())
+        && matrix_sdk::ruma::RoomId::parse(room).is_ok()
+    {
+        Some("matrix")
+    } else if config.discord.as_ref().is_some_and(|d| d.rooms.is_empty())
+        && room.parse::<u64>().is_ok()
+    {
+        Some("discord")
+    } else if config.telegram.as_ref().is_some_and(|t| t.rooms.is_empty())
+        && channel::telegram::split_room_id(room).is_ok()
+    {
+        Some("telegram")
+    } else {
+        None
+    }
+}
+
+/// Prefer the first configured Matrix room, then Discord, then Telegram.
+fn default_heartbeat_room(config: &config::Config) -> Option<&str> {
+    config
+        .matrix
+        .as_ref()
+        .and_then(config::MatrixConfig::primary_room_id)
+        .or_else(|| {
+            config
+                .discord
+                .as_ref()
+                .and_then(config::DiscordConfig::primary_room_id)
+        })
+        .or_else(|| {
+            config
+                .telegram
+                .as_ref()
+                .and_then(config::TelegramConfig::primary_room_id)
+        })
 }
 
 /// `consult_timeout_hours` as a duration, clamped to
@@ -1159,10 +1186,10 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
             // cancelling any in-flight LLM call (#48).
             let mut agent_handle: Option<tokio::task::JoinHandle<()>> = None;
 
-            // ── Channel + Agent (Matrix and/or Discord, if configured) ──────
+            // ── Channel + Agent (if any channel is configured) ────────────
             let mut channel_agent: Option<Arc<Agent>> = None;
             let mut consult_built = false;
-            if config.matrix.is_some() || config.discord.is_some() {
+            if config.matrix.is_some() || config.discord.is_some() || config.telegram.is_some() {
                 let mut channel_list: Vec<(String, Arc<dyn channel::Channel>)> = Vec::new();
                 if let Some(m) = &config.matrix {
                     channel_list.push((
@@ -1178,6 +1205,16 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
                         Arc::new(
                             DiscordChannel::new(d)
                                 .context("Failed to initialise Discord channel")?
+                                .with_attachment_store(attachment_store.clone()),
+                        ),
+                    ));
+                }
+                if let Some(t) = &config.telegram {
+                    channel_list.push((
+                        "telegram".to_string(),
+                        Arc::new(
+                            TelegramChannel::new(t)
+                                .context("Failed to initialise Telegram channel")?
                                 .with_attachment_store(attachment_store.clone()),
                         ),
                     ));
@@ -1203,8 +1240,10 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
                 // always keeps the room's messages out of chat; `ask` checks
                 // `serves` again at call time.
                 if let Some(room) = config.autonomous.consult_room.clone() {
-                    if !channels.serves(&room).await && discord_listens_to_room(&config, &room) {
-                        channels.seed_room(&room, "discord").await;
+                    if !channels.serves(&room).await
+                        && let Some(kind) = wildcard_channel_for_room(&config, &room)
+                    {
+                        channels.seed_room(&room, kind).await;
                     }
                     if !channels.serves(&room).await {
                         tracing::warn!(
@@ -1367,16 +1406,7 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
             }
 
             if config.heartbeat_enabled {
-                let default_room_id = config
-                    .matrix
-                    .as_ref()
-                    .and_then(|m| m.primary_room_id().map(str::to_string))
-                    .or_else(|| {
-                        config
-                            .discord
-                            .as_ref()
-                            .and_then(|d| d.rooms.first().map(|r| r.room_id.clone()))
-                    });
+                let default_room_id = default_heartbeat_room(&config).map(str::to_owned);
                 Heartbeat {
                     workspace_dir: workspace_dir.clone(),
                     ws_state: Arc::clone(&ws_state),
@@ -1390,8 +1420,7 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
                     default_room_id,
                     placement: Arc::clone(&placement),
                     local_rooms: channel::seed_routing_from_config(&config),
-                    local_catch_all: config.matrix.as_ref().is_some_and(|m| m.rooms.is_empty())
-                        || config.discord.as_ref().is_some_and(|d| d.rooms.is_empty()),
+                    local_catch_all: channel::has_room_wildcard(&config),
                     config: config.clone(),
                     serve_state: Some(Arc::clone(&serve_state)),
                 }
@@ -1559,15 +1588,27 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
                     "  Matrix rooms      : {:?}",
                     m.rooms.iter().map(|r| &r.room_id).collect::<Vec<_>>()
                 );
-            } else if let Some(d) = &config.discord {
+            }
+            if let Some(d) = &config.discord {
                 println!("  Channel           : discord");
                 println!(
                     "  Discord channels  : {:?}",
                     d.rooms.iter().map(|r| &r.room_id).collect::<Vec<_>>()
                 );
                 println!("  Allowed users     : {:?}", d.allowed_users);
-            } else {
-                println!("  Channel           : NONE (add [discord] or [matrix] to config)");
+            }
+            if let Some(t) = &config.telegram {
+                println!("  Channel           : telegram");
+                println!(
+                    "  Telegram rooms    : {:?}",
+                    t.rooms.iter().map(|r| &r.room_id).collect::<Vec<_>>()
+                );
+                println!("  Allowed users     : {:?}", t.allowed_users);
+            }
+            if config.matrix.is_none() && config.discord.is_none() && config.telegram.is_none() {
+                println!(
+                    "  Channel           : NONE (add [matrix], [discord], or [telegram] to config)"
+                );
             }
             match &config.serve {
                 Some(s) => println!("  HTTP API          : http://{}:{}", s.host, s.port),
@@ -2099,18 +2140,18 @@ mod tests {
     fn verify_warns_about_an_unlisted_consult_room() {
         let cfg = consult_config(
             "[autonomous]\nenabled = true\nconsult_room = \"c1\"\n\
-             [discord]\nbot_token = \"x\"\nchannel_ids = [\"other\"]\nallowed_users = []\n",
+             [discord]\nbot_token = \"x\"\n[[discord.rooms]]\nroom_id = \"other\"\n",
         );
         let lines = consult_room_warnings(&cfg);
         assert_eq!(lines.len(), 1, "{lines:?}");
-        assert!(lines[0].contains("neither discord.channel_ids nor matrix.room_ids"));
+        assert!(lines[0].contains("not in matrix.rooms, discord.rooms, or telegram.rooms"));
     }
 
     #[test]
     fn verify_accepts_a_listed_consult_room_and_warns_when_autonomous_is_off() {
         let cfg = consult_config(
             "[autonomous]\nconsult_room = \"c1\"\n\
-             [discord]\nbot_token = \"x\"\nallowed_users = []\n[[discord.rooms]]\nroom_id = \"c1\"\n",
+             [discord]\nbot_token = \"x\"\n[[discord.rooms]]\nroom_id = \"c1\"\n",
         );
         let lines = consult_room_warnings(&cfg);
         assert_eq!(lines.len(), 1, "{lines:?}");
@@ -2119,20 +2160,46 @@ mod tests {
     }
 
     #[test]
+    fn verify_accepts_a_listed_telegram_consult_room() {
+        let cfg = consult_config(
+            "[autonomous]\nenabled = true\nconsult_room = \"-1001:42\"\n\
+             [telegram]\nbot_token = \"123456:test\"\n[[telegram.rooms]]\nroom_id = \"-1001:42\"\n",
+        );
+        assert!(consult_room_warnings(&cfg).is_empty());
+    }
+
+    #[test]
     fn verify_accepts_a_numeric_room_when_discord_listens_everywhere() {
         let cfg = consult_config(
             "[autonomous]\nenabled = true\nconsult_room = \"123\"\n\
-             [discord]\nbot_token = \"x\"\nchannel_ids = []\nallowed_users = []\n",
+             [discord]\nbot_token = \"x\"\n",
         );
         assert!(consult_room_warnings(&cfg).is_empty());
-        assert!(discord_listens_to_room(&cfg, "123"));
+        assert_eq!(wildcard_channel_for_room(&cfg, "123"), Some("discord"));
         // A non-numeric room can't be a Discord channel.
         let cfg = consult_config(
             "[autonomous]\nenabled = true\nconsult_room = \"!r:x\"\n\
-             [discord]\nbot_token = \"x\"\nchannel_ids = []\nallowed_users = []\n",
+             [discord]\nbot_token = \"x\"\n",
         );
         assert_eq!(consult_room_warnings(&cfg).len(), 1);
-        assert!(!discord_listens_to_room(&cfg, "!r:x"));
+        assert_eq!(wildcard_channel_for_room(&cfg, "!r:x"), None);
+    }
+
+    #[test]
+    fn heartbeat_defaults_to_the_first_room_in_channel_preference_order() {
+        let mut cfg = consult_config(
+            "[matrix]\nhomeserver = \"h\"\naccess_token = \"t\"\nuser_id = \"@b:x\"\n\
+             device_id = \"d\"\n[[matrix.rooms]]\nroom_id = \"!z:x\"\n[[matrix.rooms]]\nroom_id = \"!a:x\"\n\
+             [discord]\nbot_token = \"x\"\n[[discord.rooms]]\nroom_id = \"9\"\n[[discord.rooms]]\nroom_id = \"7\"\n\
+             [telegram]\nbot_token = \"123456:test\"\n[[telegram.rooms]]\nroom_id = \"-1001:42\"\n[[telegram.rooms]]\nroom_id = \"-1001:11\"\n",
+        );
+        assert_eq!(default_heartbeat_room(&cfg), Some("!z:x"));
+        cfg.matrix.as_mut().unwrap().rooms.clear();
+        assert_eq!(default_heartbeat_room(&cfg), Some("9"));
+        cfg.discord.as_mut().unwrap().rooms.clear();
+        assert_eq!(default_heartbeat_room(&cfg), Some("-1001:42"));
+        cfg.telegram.as_mut().unwrap().rooms.clear();
+        assert_eq!(default_heartbeat_room(&cfg), None);
     }
 
     #[test]

@@ -188,8 +188,8 @@ pub struct HostView<'a> {
     pub role: &'a Role,
     /// The rooms this host's channels serve (`seed_routing_from_config`).
     pub local_rooms: &'a HashMap<String, String>,
-    /// Whether one of this host's channels lists no rooms — a Discord bot
-    /// with no `channel_ids` listens everywhere it can see.
+    /// Whether one of this host's channels has an empty `rooms` map and
+    /// listens everywhere it can see.
     pub local_catch_all: bool,
     /// The room a heartbeat with no target goes to on this host.
     pub default_room: Option<&'a str>,
@@ -305,10 +305,10 @@ impl Claim {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaimedChannel {
-    /// `matrix` or `discord`.
+    /// `matrix`, `discord`, or `telegram`.
     pub kind: String,
     /// Which account: the Matrix user id, or a fingerprint of the Discord
-    /// bot token (the token itself never leaves this host's config).
+    /// or Telegram bot token (the token itself never leaves this host's config).
     pub account: String,
     pub rooms: Vec<String>,
 }
@@ -328,6 +328,13 @@ pub fn local_channels(config: &crate::config::Config) -> Vec<ClaimedChannel> {
             kind: "discord".to_owned(),
             account: token_fingerprint(&d.bot_token),
             rooms: d.rooms.iter().map(|r| r.room_id.clone()).collect(),
+        });
+    }
+    if let Some(t) = &config.telegram {
+        out.push(ClaimedChannel {
+            kind: "telegram".to_owned(),
+            account: token_fingerprint(&t.bot_token),
+            rooms: t.rooms.iter().map(|r| r.room_id.clone()).collect(),
         });
     }
     out
@@ -704,16 +711,12 @@ mod tests {
     fn a_claim_round_trips_and_holds_no_token() {
         let tmp = tempfile::tempdir().unwrap();
         let me = dev("desk");
-        let mut config = crate::config::Config::for_test();
-        config.discord = Some(crate::config::DiscordConfig {
-            bot_token: "SECRET-TOKEN".into(),
-            rooms: vec![crate::config::RoomConfig {
-                room_id: "123".into(),
-                profile: "default".into(),
-                voice_pipeline: None,
-            }],
-            allowed_users: vec![],
-        });
+        let config = crate::config::Config::parse_for_test(
+            "[discord]\nbot_token = \"SECRET-DISCORD-TOKEN\"\n[[discord.rooms]]\nroom_id = \"123\"\n\
+             [telegram]\nbot_token = \"SECRET-TELEGRAM-TOKEN\"\n[[telegram.rooms]]\nroom_id = \"-1001:42\"\n\
+             [matrix]\nhomeserver = \"h\"\naccess_token = \"SECRET-MATRIX-TOKEN\"\n\
+             user_id = \"@b:x\"\ndevice_id = \"d\"\n[[matrix.rooms]]\nroom_id = \"!a:x\"\n",
+        );
         let channels = local_channels(&config);
 
         assert!(publish_claim(tmp.path(), &me, &channels).unwrap());
@@ -723,10 +726,13 @@ mod tests {
         );
 
         let raw = std::fs::read_to_string(claim_path(tmp.path(), me.id)).unwrap();
-        assert!(!raw.contains("SECRET-TOKEN"), "{raw}");
+        assert!(!raw.contains("SECRET-"), "{raw}");
         let claims = read_claims(tmp.path());
         assert_eq!(claims.len(), 1);
         assert!(claims[0].serves("123"));
+        assert!(claims[0].serves("-1001:42"));
+        assert!(claims[0].serves("!a:x"));
+        assert!(!claims[0].serves("-1001:43"));
 
         assert!(publish_claim(tmp.path(), &me, &[]).unwrap(), "removed");
         assert!(read_claims(tmp.path()).is_empty());

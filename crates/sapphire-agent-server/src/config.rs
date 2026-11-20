@@ -6,15 +6,18 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
-    /// Matrix channel configuration. Both `matrix` and `discord` may be
-    /// configured at once — when set, both run concurrently in the
-    /// same `serve` process. Both may also be omitted, in which case the
-    /// agent serves only the HTTP API.
+    /// Matrix channel configuration. Any of `matrix`, `discord` and
+    /// `telegram` may be configured at once — when set, all run concurrently
+    /// in the same `serve` process. All may also be omitted, in which case
+    /// the agent serves only the HTTP API.
     #[serde(default)]
     pub matrix: Option<MatrixConfig>,
-    /// Discord channel configuration. May coexist with `matrix`.
+    /// Discord channel configuration. May coexist with `matrix` and `telegram`.
     #[serde(default)]
     pub discord: Option<DiscordConfig>,
+    /// Telegram channel configuration. May coexist with `matrix` and `discord`.
+    #[serde(default)]
+    pub telegram: Option<TelegramConfig>,
     /// The built-in Anthropic provider. Optional: it is registered only
     /// when an API key resolves (here or in `ANTHROPIC_API_KEY`), and a
     /// deployment that runs entirely on `[providers.<n>]` can leave the
@@ -1186,6 +1189,12 @@ pub enum McpTransportConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RoomConfig {
     pub room_id: String,
+    /// Display name shown by Telegram in place of the description or room id.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Room description shown by Telegram; Matrix and Discord use live metadata.
+    #[serde(default)]
+    pub description: Option<String>,
     #[serde(default = "default_session_profile_name")]
     pub profile: String,
     #[serde(default)]
@@ -1198,11 +1207,16 @@ fn default_session_profile_name() -> String {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MatrixConfig {
+    /// Removed room keys, captured only to report migration errors.
+    #[serde(default)]
+    pub room_ids: Option<Vec<String>>,
+    pub room_id: Option<String>,
     pub homeserver: String,
     pub access_token: String,
     pub user_id: String,
     pub device_id: String,
-    /// Subscribed rooms, in order; the first is the primary heartbeat target.
+    /// Subscribed rooms in order; the first is the primary heartbeat target.
+    /// Empty = all rooms the bot can see.
     #[serde(default)]
     pub rooms: Vec<RoomConfig>,
     #[serde(default)]
@@ -1234,6 +1248,9 @@ impl MatrixConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DiscordConfig {
+    /// Removed room key, captured only to report migration errors.
+    #[serde(default)]
+    pub channel_ids: Option<Vec<String>>,
     pub bot_token: String,
     /// Subscribed rooms. Empty = all channels the bot can see.
     #[serde(default)]
@@ -1241,6 +1258,32 @@ pub struct DiscordConfig {
     /// Discord user IDs allowed to interact. Empty = all users.
     #[serde(default)]
     pub allowed_users: Vec<String>,
+}
+
+impl DiscordConfig {
+    /// First configured room, used as the default heartbeat target.
+    pub fn primary_room_id(&self) -> Option<&str> {
+        self.rooms.first().map(|r| r.room_id.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TelegramConfig {
+    pub bot_token: String,
+    /// Rooms the bot listens to, identified by composite room id (`<chat_id>` or
+    /// `<chat_id>:<message_thread_id>`). Empty = all chats the bot can see.
+    #[serde(default)]
+    pub rooms: Vec<RoomConfig>,
+    /// Messages from users not in this list are silently ignored. Empty = all.
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+}
+
+impl TelegramConfig {
+    /// First configured room, used as the default heartbeat target.
+    pub fn primary_room_id(&self) -> Option<&str> {
+        self.rooms.first().map(|r| r.room_id.as_str())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1514,7 +1557,9 @@ pub struct AutonomousConfig {
     #[serde(default)]
     pub origin: AutonomousOrigin,
     /// Chat room where autonomous sessions post questions for a human to
-    /// answer by replying (`ask_human`). `None`: the tool is not offered.
+    /// answer by replying (`ask_human`). The room must have a block under
+    /// its channel's `rooms` list (or be visible while that list is empty).
+    /// `None`: the tool is not offered.
     #[serde(default)]
     pub consult_room: Option<String>,
     /// How long a question waits for an answer before the session decides
@@ -1598,7 +1643,7 @@ api_key = "test"
             .unwrap_or_else(|| DEFAULT_PROFILE_NAME.to_string())
     }
 
-    /// Room declarations in both configured channels.
+    /// Room declarations in all configured channels.
     pub fn channels(&self) -> impl Iterator<Item = (&str, &RoomConfig)> {
         self.matrix
             .iter()
@@ -1607,6 +1652,11 @@ api_key = "test"
                 self.discord
                     .iter()
                     .flat_map(|c| c.rooms.iter().map(|r| ("discord", r))),
+            )
+            .chain(
+                self.telegram
+                    .iter()
+                    .flat_map(|c| c.rooms.iter().map(|r| ("telegram", r))),
             )
     }
 
@@ -1631,7 +1681,7 @@ api_key = "test"
 
     /// Resolve the LLM profile name for a given `room_id`.
     ///
-    /// Order: room profile that contains this room > `[profiles.default]`
+    /// Order: room profile named by this room's block > `[profiles.default]`
     /// if defined > `None` (caller falls back to the built-in Anthropic
     /// provider).
     pub fn profile_for_session(&self, name: &str) -> Option<&str> {
@@ -1904,12 +1954,9 @@ api_key = "test"
 
         if !self.tools.admin.legacy_rooms.is_empty() {
             errors.push(
-                "[tools.admin].rooms was replaced by `[tools.admin].room_profiles`, which names \
-                 session profiles instead of room ids. Delete the `rooms` line and write the session \
-                 profile names you mean, e.g. `room_profiles = [\"ops\"]`. For each room, use \
-                 the name of the profile whose `[session_profile.<name>].rooms` array lists that \
-                 room. Leaving `rooms` in place would drop the grant without saying so, so \
-                 startup refuses until it is gone."
+                "[tools.admin].rooms is gone. Bind each room to its session profile in its \
+                 channel's `[[<channel>.rooms]]` block and grant `admin` through that profile's \
+                 permission profile. Startup refuses while the old key remains."
                     .to_string(),
             );
         }
@@ -1953,6 +2000,30 @@ api_key = "test"
                  no longer live in this file; run `sapphire-agent api-key add <device> --profile \
                  {name}` for each client."
             ));
+        }
+
+        if let Some(matrix) = &self.matrix
+            && (matrix.room_ids.is_some() || matrix.room_id.is_some())
+        {
+            errors.push(
+                "matrix.room_ids (and the legacy matrix.room_id) is replaced by \
+             [[matrix.rooms]] blocks with a `room_id`. Delete the old key and create one \
+             block per room; move each room's binding from \
+             [session_profile.<name>].rooms to that block's `profile` key. \
+             Startup refuses while the old list remains."
+                    .to_string(),
+            );
+        }
+        if let Some(discord) = &self.discord
+            && discord.channel_ids.is_some()
+        {
+            errors.push(
+                "discord.channel_ids is replaced by [[discord.rooms]] blocks with a `room_id`. \
+                 Delete the old key and create one block per channel; move each \
+                 channel's binding from [session_profile.<name>].rooms to that block's \
+                 `profile` key. Startup refuses while the old list remains."
+                    .to_string(),
+            );
         }
 
         errors
@@ -2593,7 +2664,7 @@ profile = "chat"
     }
 
     #[test]
-    fn legacy_channel_keys_are_reported_as_unknown() {
+    fn legacy_channel_keys_are_reported_as_migration_errors() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(
@@ -2602,13 +2673,11 @@ profile = "chat"
         )
         .unwrap();
         let loaded = Config::load_layered(&path).unwrap();
+        assert!(loaded.unknown.is_empty(), "{:?}", loaded.unknown);
+        let errors = loaded.config.migration_errors();
         assert!(
-            loaded
-                .unknown
-                .iter()
-                .any(|key| key.ends_with(".channel_ids")),
-            "{:?}",
-            loaded.unknown
+            errors.iter().any(|e| e.contains("discord.channel_ids")),
+            "{errors:?}"
         );
     }
 
@@ -2628,6 +2697,83 @@ profile = "chat"
 
     fn parse(s: &str) -> Config {
         Config::parse_for_test(s)
+    }
+
+    #[test]
+    fn telegram_room_blocks_use_session_profiles_and_preserve_display_metadata() {
+        let cfg = parse(
+            r#"
+[profiles.dev]
+provider = "anthropic"
+[session_profile.dev]
+profile = "dev"
+memory_namespace = "ns"
+[session_profile.default]
+profile = "dev"
+[memory_namespace.ns]
+[telegram]
+bot_token = "t"
+[[telegram.rooms]]
+room_id = "-1001:42"
+name = "Development"
+description = "Development topic"
+profile = "dev"
+[[telegram.rooms]]
+room_id = "-1001"
+name = "Daily"
+"#,
+        );
+        assert_eq!(cfg.session_profile_name(None, "-1001:42"), "dev");
+        assert_eq!(cfg.namespace_for_session("-1001:42"), "ns");
+        assert_eq!(cfg.session_profile_name(None, "-1001"), "default");
+        let rooms = &cfg.telegram.as_ref().unwrap().rooms;
+        assert_eq!(rooms[0].name.as_deref(), Some("Development"));
+        assert_eq!(rooms[0].description.as_deref(), Some("Development topic"));
+        assert_eq!(rooms[1].description, None);
+        assert!(cfg.validate_session_profiles().is_empty());
+    }
+
+    #[test]
+    fn telegram_room_blocks_validate_their_session_profile() {
+        let cfg = parse(
+            r#"
+[telegram]
+bot_token = "t"
+[[telegram.rooms]]
+room_id = "-1001"
+profile = "ghost"
+"#,
+        );
+        let errors = cfg.validate_session_profiles();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e
+                    .contains("telegram room '-1001' references unknown session_profile 'ghost'")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn migration_rejects_legacy_channel_room_keys_even_when_lists_are_empty() {
+        let cfg = parse(
+            r#"
+[matrix]
+homeserver = "h"
+access_token = "t"
+user_id = "@a:x"
+device_id = "d"
+room_id = "!a:x"
+room_ids = []
+[discord]
+bot_token = "t"
+channel_ids = []
+"#,
+        );
+        let errors = cfg.migration_errors();
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(errors[0].contains("[[matrix.rooms]]"), "{errors:?}");
+        assert!(errors[1].contains("[[discord.rooms]]"), "{errors:?}");
     }
 
     /// Admin registration needs both a host key and an effective profile listing.
@@ -2682,7 +2828,7 @@ profile = "chat"
         let errors = cfg.migration_errors();
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert!(errors[0].contains("[tools.admin].rooms"), "{errors:?}");
-        assert!(errors[0].contains("room_profiles"), "{errors:?}");
+        assert!(errors[0].contains("permission profile"), "{errors:?}");
     }
 
     /// A typo in the allow list must fail `verify` and startup, not silently

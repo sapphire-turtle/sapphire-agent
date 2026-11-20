@@ -1346,18 +1346,22 @@ mod tests {
         let (d, root, ws) = test_workspace();
         let mut config = Config::for_test();
         config.tools.admin.enabled = true;
-        config.discord = Some(crate::config::DiscordConfig {
+        config.telegram = Some(crate::config::TelegramConfig {
             bot_token: "test".into(),
             rooms: vec![
                 crate::config::RoomConfig {
                     room_id: "!ops:x".into(),
                     profile: "ops".into(),
                     voice_pipeline: None,
+                    name: None,
+                    description: None,
                 },
                 crate::config::RoomConfig {
                     room_id: "!lounge:y".into(),
                     profile: "guest".into(),
                     voice_pipeline: None,
+                    name: None,
+                    description: None,
                 },
             ],
             allowed_users: vec![],
@@ -1634,18 +1638,22 @@ mod tests {
         let (d, root, ws) = test_workspace();
         let mut config = Config::for_test();
         config.tools.admin.enabled = true;
-        config.discord = Some(crate::config::DiscordConfig {
+        config.telegram = Some(crate::config::TelegramConfig {
             bot_token: "test".into(),
             rooms: vec![
                 crate::config::RoomConfig {
-                    room_id: "!ops:x".into(),
+                    room_id: "-1001:42".into(),
                     profile: "ops".into(),
                     voice_pipeline: None,
+                    name: None,
+                    description: None,
                 },
                 crate::config::RoomConfig {
-                    room_id: "!lounge:y".into(),
+                    room_id: "-1001:43".into(),
                     profile: "guest".into(),
                     voice_pipeline: None,
+                    name: None,
+                    description: None,
                 },
             ],
             allowed_users: vec![],
@@ -1662,10 +1670,10 @@ mod tests {
         }
         let tool = ConfigTool::new(ConfigDir::Agents, root, config, ws, None, Weak::new());
 
-        in_room("!ops:x", tool.execute(&json!({"action": "list"})))
+        in_room("-1001:42", tool.execute(&json!({"action": "list"})))
             .await
             .unwrap();
-        let err = in_room("!lounge:y", tool.execute(&json!({"action": "list"})))
+        let err = in_room("-1001:43", tool.execute(&json!({"action": "list"})))
             .await
             .unwrap_err()
             .to_string();
@@ -1702,17 +1710,22 @@ mod tests {
                 .config;
             config.tools.admin.enabled = true;
             config.discord = Some(crate::config::DiscordConfig {
+                channel_ids: None,
                 bot_token: "test".into(),
                 rooms: vec![
                     crate::config::RoomConfig {
                         room_id: "!ops:x".into(),
                         profile: "ops".into(),
                         voice_pipeline: None,
+                        name: None,
+                        description: None,
                     },
                     crate::config::RoomConfig {
                         room_id: "!lounge:y".into(),
                         profile: "guest".into(),
                         voice_pipeline: None,
+                        name: None,
+                        description: None,
                     },
                 ],
                 allowed_users: vec![],
@@ -1785,17 +1798,22 @@ mod tests {
                 .config;
             config.tools.admin.enabled = true;
             config.discord = Some(crate::config::DiscordConfig {
+                channel_ids: None,
                 bot_token: "test".into(),
                 rooms: vec![
                     crate::config::RoomConfig {
                         room_id: "!ops:x".into(),
                         profile: "ops".into(),
                         voice_pipeline: None,
+                        name: None,
+                        description: None,
                     },
                     crate::config::RoomConfig {
                         room_id: "!lounge:y".into(),
                         profile: "guest".into(),
                         voice_pipeline: None,
+                        name: None,
+                        description: None,
                     },
                 ],
                 allowed_users: vec![],
@@ -2012,17 +2030,22 @@ mod tests {
         let mut config = Config::for_test();
         config.tools.admin.enabled = true;
         config.discord = Some(crate::config::DiscordConfig {
+            channel_ids: None,
             bot_token: "test".into(),
             rooms: vec![
                 crate::config::RoomConfig {
                     room_id: "!ops:x".into(),
                     profile: "ops".into(),
                     voice_pipeline: None,
+                    name: None,
+                    description: None,
                 },
                 crate::config::RoomConfig {
                     room_id: "!lounge:y".into(),
                     profile: "guest".into(),
                     voice_pipeline: None,
+                    name: None,
+                    description: None,
                 },
             ],
             allowed_users: vec![],
@@ -2081,17 +2104,22 @@ mod tests {
         let mut config = Config::for_test();
         config.tools.admin.enabled = true;
         config.discord = Some(crate::config::DiscordConfig {
+            channel_ids: None,
             bot_token: "test".into(),
             rooms: vec![
                 crate::config::RoomConfig {
                     room_id: "!ops:x".into(),
                     profile: "ops".into(),
                     voice_pipeline: None,
+                    name: None,
+                    description: None,
                 },
                 crate::config::RoomConfig {
                     room_id: "!lounge:y".into(),
                     profile: "guest".into(),
                     voice_pipeline: None,
+                    name: None,
+                    description: None,
                 },
             ],
             allowed_users: vec![],

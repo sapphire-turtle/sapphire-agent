@@ -616,6 +616,7 @@ mod tests {
     #[test]
     fn builder_accepts_optional_store() {
         let cfg = crate::config::DiscordConfig {
+            channel_ids: None,
             bot_token: "unused".into(),
             rooms: vec![],
             allowed_users: vec![],
@@ -624,6 +625,15 @@ mod tests {
             .unwrap()
             .with_attachment_store(None);
         assert!(channel.attachment_store.is_none());
+    }
+
+    #[test]
+    fn discord_listens_in_rooms_from_the_list() {
+        let cfg = crate::config::Config::parse_for_test(
+            "[discord]\nbot_token = \"t\"\n[[discord.rooms]]\nroom_id = \"7\"\n",
+        );
+        let ch = DiscordChannel::new(cfg.discord.as_ref().unwrap()).unwrap();
+        assert_eq!(ch.channel_ids, HashSet::from([7]));
     }
 
     #[test]
