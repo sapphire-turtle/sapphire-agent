@@ -10,6 +10,22 @@ version with `sapphire-agent-server`) are recorded in the root `CHANGELOG.md`.
 
 ## [Unreleased]
 
+## [0.12.1](https://github.com/sapphire-turtle/sapphire-agent/compare/sapphire-agent-core-v0.12.0...sapphire-agent-core-v0.12.1) - 2026-11-20
+
+### Added
+
+- *(config)* Add ToolGroup and the session/permission profile types
+
+### Changed
+
+- Times are jiff's, not chrono's (RUSTSEC-2026-0543)
+
+### Fixed
+
+- *(config)* Preserve admin profile key and clarify migration
+
+
+
 ## [0.12.0](https://github.com/sapphire-turtle/sapphire-agent/compare/sapphire-agent-core-v0.11.1...sapphire-agent-core-v0.12.0) - 2026-11-06
 
 ### Added

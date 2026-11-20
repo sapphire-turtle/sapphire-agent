@@ -14,6 +14,14 @@ and predate any user-facing release of this binary.
 
 ## [Unreleased]
 
+## [0.14.0](https://github.com/sapphire-turtle/sapphire-agent/compare/v0.13.1...v0.14.0) - 2026-11-20
+
+### Changed
+
+- Times are jiff's, not chrono's (RUSTSEC-2026-0543)
+
+
+
 ### Changed
 
 - sapphire-framework 0.29, corundum-framework 0.13.
