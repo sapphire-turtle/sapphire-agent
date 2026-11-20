@@ -5,7 +5,7 @@
 //! `message_thread_id` is part of its composite room id; it never becomes an
 //! [`IncomingMessage::thread_id`].
 
-use crate::channel::{Channel, IncomingMessage, OutgoingMessage, with_attachment_notes};
+use crate::channel::{Channel, IncomingMessage, OutgoingMessage, RoomInfo, with_attachment_notes};
 use crate::config::{RoomBlock, TelegramConfig};
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -13,8 +13,8 @@ use indexmap::IndexMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use telers::methods::GetUpdates;
-use telers::types::{Message, Update};
+use telers::methods::{GetUpdates, SendChatAction, SendMessage};
+use telers::types::{Message, ReplyParameters, Update};
 use telers::{Bot, Either};
 use tokio::sync::{OnceCell, mpsc};
 use tracing::{debug, info, warn};
@@ -111,10 +111,18 @@ impl Channel for TelegramChannel {
         true
     }
 
-    async fn send(&self, _message: &OutgoingMessage) -> Result<Vec<String>> {
-        // Outbound chunking, replies and typing are the next implementation task.
-        let _ = self.get_client_or_new();
-        bail!("Telegram send is not implemented yet")
+    async fn send(&self, message: &OutgoingMessage) -> Result<Vec<String>> {
+        let requests = outbound_requests(message)?;
+        let client = self.get_client_or_new();
+        let mut ids = Vec::with_capacity(requests.len());
+        for request in requests {
+            let sent = client
+                .send(request)
+                .await
+                .context("Failed to send Telegram message")?;
+            ids.push(sent.message_id().to_string());
+        }
+        Ok(ids)
     }
 
     /// Long-running: long-poll Bot API updates and forward incoming messages
@@ -149,11 +157,82 @@ impl Channel for TelegramChannel {
             info!("Reconnecting Telegram long polling...");
         }
     }
+    async fn start_typing(&self, room_id: &str) -> Result<()> {
+        let request = typing_request(room_id)?;
+        self.get_client_or_new()
+            .send(request)
+            .await
+            .context("Failed to send Telegram typing indicator")?;
+        Ok(())
+    }
+
+    // stop_typing is a no-op: Telegram typing expires automatically.
+
+    async fn room_info(&self, room_id: &str) -> Option<RoomInfo> {
+        let block = self.rooms.get(room_id);
+        let description = block.and_then(|block| block.description.clone());
+        let name = block
+            .and_then(|block| block.name.clone())
+            .or_else(|| description.clone())
+            .unwrap_or_else(|| room_id.to_owned());
+        Some(RoomInfo {
+            name,
+            description,
+            kind: "telegram".to_owned(),
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Split into at most 4096 Unicode characters, preferring newline boundaries.
+fn split_for_telegram(content: &str) -> Vec<String> {
+    const LIMIT: usize = 4096;
+    let mut chunks = Vec::new();
+    let mut remaining = content;
+    while let Some((end, _)) = remaining.char_indices().nth(LIMIT) {
+        let split = remaining[..end].rfind('\n').map_or(end, |nl| nl + 1);
+        chunks.push(remaining[..split].to_owned());
+        remaining = remaining[split..].trim_start_matches('\n');
+    }
+    if !remaining.is_empty() || chunks.is_empty() {
+        chunks.push(remaining.to_owned());
+    }
+    chunks
+}
+
+/// Prepare each request before sending, validating IDs before any network call.
+fn outbound_requests(message: &OutgoingMessage) -> Result<Vec<SendMessage>> {
+    let (chat, thread) = split_room_id(&message.room_id)?;
+    let reply = message
+        .reply_to
+        .as_deref()
+        .map(|id| {
+            id.parse::<i64>()
+                .context("Telegram reply_to is not a message ID")
+        })
+        .transpose()?;
+    Ok(split_for_telegram(&message.content)
+        .into_iter()
+        .enumerate()
+        .map(|(index, chunk)| {
+            let mut request = SendMessage::new(chat, chunk).message_thread_id_option(thread);
+            if index == 0
+                && let Some(reply) = reply
+            {
+                request = request.reply_parameters(ReplyParameters::new().message_id(reply));
+            }
+            request
+        })
+        .collect())
+}
+
+fn typing_request(room_id: &str) -> Result<SendChatAction> {
+    let (chat, thread) = split_room_id(room_id)?;
+    Ok(SendChatAction::new(chat, "typing").message_thread_id_option(thread))
+}
 
 async fn receive_updates(
     client: &Bot,
@@ -247,8 +326,6 @@ pub fn room_id(chat_id: i64, thread: Option<i64>) -> String {
 }
 
 /// Split `<chat_id>` or `<chat_id>:<message_thread_id>` into signed 64-bit ids.
-// Used by the constructor and the later outbound implementation.
-#[allow(dead_code)]
 pub fn split_room_id(room_id: &str) -> Result<(i64, Option<i64>)> {
     let invalid = || anyhow!("Invalid Telegram room id {room_id}");
     let (chat, thread) = match room_id.split_once(':') {
@@ -336,6 +413,121 @@ mod tests {
         debug_assert_eq!(round_trip.chat().id(), chat_id);
         debug_assert_eq!(round_trip.from().unwrap().id, from_id);
         msg
+    }
+
+    fn channel_with(rooms: IndexMap<String, RoomBlock>) -> TelegramChannel {
+        TelegramChannel::new(&TelegramConfig {
+            bot_token: "123456:test".to_string(),
+            rooms,
+            allowed_users: vec![],
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_split_counts_characters_not_bytes() {
+        let one = "あ".repeat(3000);
+        assert_eq!(split_for_telegram(&one), vec![one.clone()]);
+        assert!(one.len() > 4096, "fixture must exceed 4096 bytes");
+        for len in 4091..=4096 {
+            assert_eq!(split_for_telegram(&"あ".repeat(len)).len(), 1);
+        }
+        let over = "あ".repeat(4097);
+        let chunks = split_for_telegram(&over);
+        assert_eq!(
+            chunks.iter().map(|s| s.chars().count()).collect::<Vec<_>>(),
+            vec![4096, 1]
+        );
+        assert_eq!(chunks.concat(), over);
+        assert_eq!(split_for_telegram(""), vec![""]);
+    }
+
+    #[test]
+    fn splits_prefer_a_newline_boundary() {
+        let text = format!("{}\n{}", "あ".repeat(3999), "界".repeat(1000));
+        let chunks = split_for_telegram(&text);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].chars().count(), 4000);
+        assert!(chunks[0].ends_with('\n'));
+        assert_eq!(chunks.concat(), text);
+        let text = format!("{}\n\n{}", "a".repeat(4095), "b".repeat(10));
+        let chunks = split_for_telegram(&text);
+        assert_eq!(chunks[0].chars().count(), 4096);
+        assert_eq!(chunks[1], "b".repeat(10));
+    }
+
+    #[tokio::test]
+    async fn the_block_display_fields_render_into_room_info() {
+        let ch = channel_with(rooms(&[
+            (
+                "-1001:42",
+                block(Some("開発"), Some("自律セーョョン"), None),
+            ),
+            ("-1001:43", block(None, Some("description"), None)),
+            ("-1001:44", block(None, None, None)),
+        ]));
+        let info = ch.room_info("-1001:42").await.unwrap();
+        assert_eq!(info.name, "開発");
+        assert_eq!(info.description.as_deref(), Some("自律セーョョン"));
+        assert_eq!(info.kind, "telegram");
+        let info = ch.room_info("-1001:43").await.unwrap();
+        assert_eq!(info.name, "description");
+        assert_eq!(info.description.as_deref(), Some("description"));
+        let info = ch.room_info("-1001:44").await.unwrap();
+        assert_eq!(info.name, "-1001:44");
+        assert_eq!(info.description, None);
+    }
+
+    #[tokio::test]
+    async fn a_room_seen_without_a_block_shows_its_raw_id() {
+        let ch = channel_with(IndexMap::new());
+        let info = ch.room_info("-1001:77").await.unwrap();
+        assert_eq!(info.name, "-1001:77");
+        assert_eq!(info.description, None);
+        assert_eq!(info.kind, "telegram");
+    }
+
+    #[test]
+    fn outbound_requests_carry_topic_and_only_the_first_reply() {
+        let msg = OutgoingMessage::new("あ".repeat(4097), "-1001:42").replying_to("123");
+        let requests = outbound_requests(&msg).unwrap();
+        assert_eq!(requests.len(), 2);
+        let first = serde_json::to_value(&requests[0]).unwrap();
+        let second = serde_json::to_value(&requests[1]).unwrap();
+        assert_eq!(first["chat_id"], -1001);
+        assert_eq!(first["message_thread_id"], 42);
+        assert_eq!(first["reply_parameters"]["message_id"], 123);
+        assert_eq!(first["text"].as_str().unwrap().chars().count(), 4096);
+        assert_eq!(second["message_thread_id"], 42);
+        assert!(second.get("reply_parameters").is_none());
+        assert_eq!(second["text"], "あ");
+        let plain = outbound_requests(&OutgoingMessage::new("hi", "-1001")).unwrap();
+        let plain = serde_json::to_value(&plain[0]).unwrap();
+        assert!(plain.get("message_thread_id").is_none());
+        assert!(plain.get("reply_parameters").is_none());
+        assert!(outbound_requests(&OutgoingMessage::new("hi", "bad")).is_err());
+        assert!(
+            outbound_requests(&OutgoingMessage::new("hi", "-1001").replying_to("bad")).is_err()
+        );
+    }
+
+    #[test]
+    fn typing_request_carries_topic_when_present() {
+        let topic = serde_json::to_value(typing_request("-1001:42").unwrap()).unwrap();
+        assert_eq!(topic["chat_id"], -1001);
+        assert_eq!(topic["message_thread_id"], 42);
+        assert_eq!(topic["action"], "typing");
+        let plain = serde_json::to_value(typing_request("-1001").unwrap()).unwrap();
+        assert!(plain.get("message_thread_id").is_none());
+        assert!(typing_request("bad").is_err());
+    }
+
+    #[tokio::test]
+    async fn stopping_typing_needs_no_network() {
+        channel_with(IndexMap::new())
+            .stop_typing("-1001:42")
+            .await
+            .unwrap();
     }
 
     #[test]
