@@ -4,7 +4,7 @@
 
 > Language: **English** | [日本語](README.ja.md)
 
-A personal AI assistant agent that works on file-based, local-first [`sapphire-framework`](https://github.com/sapphire-turtle/sapphire-framework) workspaces together with you — talking through Matrix and Discord.
+A personal AI assistant agent that works on file-based, local-first [`sapphire-framework`](https://github.com/sapphire-turtle/sapphire-framework) workspaces together with you — talking through Matrix, Discord and Telegram.
 
 > **Status: personal project.** This is something I built for my own use. It only has to work in my environment, and that is the only environment I test it in. You are welcome to use it, fork it, or send pull requests, but I am not going to maintain providers, channels, or features I do not personally use. If your use case overlaps with mine, great; if not, fork freely.
 >
@@ -14,17 +14,17 @@ A personal AI assistant agent that works on file-based, local-first [`sapphire-f
 
 ## What it does
 
-- **Channels**: Matrix (E2EE via `matrix-sdk`) and Discord (`serenity`), running concurrently.
+- **Channels**: Matrix (E2EE via `matrix-sdk`), Discord (`serenity`) and Telegram (Bot API), running concurrently.
 - **Providers**: Anthropic Messages API with SSE streaming and a multi-round tool-use loop, plus OpenAI-compatible backends (local LLMs, OpenRouter, …) selectable per room/session via the `[providers]` / `[profiles]` / `[room_profile]` schema.
 - **Workspace**: backed by [`sapphire-framework`](https://github.com/sapphire-turtle/sapphire-framework) — file index, full-text + vector search (redb + tantivy, plus LanceDB vectors by default).
-- **Built-in tools**: `file_read`, `file_write`, `file_append`, `file_delete`, `dir_list`, `dir_walk`, `shell`, plus workspace memory / search / sync tools. The seven that touch a filesystem or a shell (`file_read`, `file_write`, `file_append`, `file_delete`, `dir_list`, `dir_walk`, `shell`) plus `shell_start` / `shell_output` / `shell_kill` for long-running commands are **session-routed: which machine they reach is decided by the session, not by the name**. Inside an ACP session they act on the machine the connected editor is running on, over `/acp`'s `fs/*` and `terminal/*` requests, and only for the capabilities that editor declared at `initialize` — with no fallback to the agent's own disk when one is missing. Everywhere else (Matrix, Discord, `/rpc`, voice, `/a2a`, heartbeat, autonomous, subagents) they act on this agent's own machine, and are opt-in: `[tools.host_access] enabled = false` by default, for every origin. Turning that on is a deliberate act; running the agent in a container is the recommended way to do it once it is. See [Shell and file tools: whose machine](#shell-and-file-tools-whose-machine) below.
+- **Built-in tools**: `file_read`, `file_write`, `file_append`, `file_delete`, `dir_list`, `dir_walk`, `shell`, plus workspace memory / search / sync tools. The seven that touch a filesystem or a shell (`file_read`, `file_write`, `file_append`, `file_delete`, `dir_list`, `dir_walk`, `shell`) plus `shell_start` / `shell_output` / `shell_kill` for long-running commands are **session-routed: which machine they reach is decided by the session, not by the name**. Inside an ACP session they act on the machine the connected editor is running on, over `/acp`'s `fs/*` and `terminal/*` requests, and only for the capabilities that editor declared at `initialize` — with no fallback to the agent's own disk when one is missing. Everywhere else (Matrix, Discord, Telegram, `/rpc`, voice, `/a2a`, heartbeat, autonomous, subagents) they act on this agent's own machine, and are opt-in: `[tools.host_access] enabled = false` by default, for every origin. Turning that on is a deliberate act; running the agent in a container is the recommended way to do it once it is. See [Shell and file tools: whose machine](#shell-and-file-tools-whose-machine) below.
 - **Sessions**: human-readable [`grain-id`](https://crates.io/crates/grain-id) aliases, auto-generated titles, history dump on resume.
 - **Background**: heartbeat cron tasks, periodic memory compaction, periodic workspace re-index, daily / weekly / monthly / yearly logs with catch-up.
 - **Voice**: a server-side STT → turn → TTS pipeline (`voice/*` on `/rpc`) with local STT/TTS via `sherpa-onnx`, for networked voice clients. The `sapphire-agent-cli voice` satellite and the desktop's voice input / spoken replies were dropped when the local clients moved to IPC ([#278](https://github.com/sapphire-turtle/sapphire-agent/issues/278)); the satellite role moves to wearable device firmware.
 - **Ambient audio ingest**: optional always-on capture from a wearable/pendant device — `POST /audio/ingest` takes raw audio (metadata in query params, no JSON/base64 framing) from a bearer-authenticated device, re-gates it, transcribes it, attributes it to a speaker against reference audio curated in the workspace, and stores the transcript outside the workspace. Records without answering: nothing in this path starts an LLM turn. `transcript_read`, `speaker_candidates` and `speaker_promote` expose the result as agent tools. Disabled by default — enable via `[ambient].enabled = true`; see `config.example.toml`.
 - **Agent-to-agent**: `/a2a` endpoint speaks the v1 A2A protocol (JSON-RPC `SendMessage`, AgentCard) with per-device bearer-token auth — enable via `[a2a].enabled = true`.
 - **Subagents**: `<workspace>/agents/<name>.md` definitions the main agent can delegate a task to via the `subagent` tool — its own system prompt, its own tool loop, only the final answer comes back, it can be resumed by handle for a later round, and a delegated agent can itself delegate up to `[tools.subagent] max_depth` deep. See [Subagents](#subagents) below.
-- **Skills**: written procedures (planning, TDD, debugging, code review, …) loaded on request from a checkout on the *editor's* machine, over ACP. Requires an ACP client that declared terminal support — off entirely for Matrix, Discord and voice. See [Skills](#skills) below.
+- **Skills**: written procedures (planning, TDD, debugging, code review, …) loaded on request from a checkout on the *editor's* machine, over ACP. Requires an ACP client that declared terminal support — off entirely for Matrix, Discord, Telegram and voice. See [Skills](#skills) below.
 - **Editor integration**: Zed (or any ACP client) drives the running agent over the Agent Client Protocol — on the agent's own machine by starting `sapphire-agent acp` (stdio, relayed to the running agent over its local IPC endpoint), from elsewhere over the `/acp` WebSocket endpoint (`[acp].enabled = true`); see [Zed / ACP](#zed--acp) below.
 - **Commands**:
   - `sapphire-agent serve` — start the agent: channel listeners and the local IPC endpoint, plus the JSON-RPC HTTP API (`/rpc`, `/a2a`, `/acp`) when `[serve]` is configured (HTTP is off by default). With no usable config (a new host, say) it runs the IPC endpoint alone, so `workspace init --sync --remote-workspace <name>` can fetch the workspace and its `.sapphire-agent/config.toml`; it restarts into the agent once either config changes
@@ -118,6 +118,17 @@ providers, profiles, channels, MCP servers — can go in either file; the
 workspace's `.sapphire-agent/config.toml` refuses only credentials,
 `workspace_dir`, `[tools.host_access]` and `[serve]`. See `config.example.toml`.
 
+Channel rooms are per-room blocks: `[matrix.rooms."<room_id>"]`,
+`[discord.rooms."<channel_id>"]` and `[telegram.rooms."<chat_id>"]` (append
+`:<message_thread_id>` for a Telegram forum topic). Optional `name` and
+`description` provide display metadata; `profile` names the
+the room-profile bundle the room runs under. An empty or omitted `rooms` map
+means **listen in every room or chat the bot can see** for all three channels.
+For Matrix, this differs from the legacy empty room list, which meant listen
+in nothing. Credential keys such as `access_token` and `bot_token` (any
+`*_token` key) are host-local and must never go in the workspace-shared
+`.sapphire-agent/config.toml`.
+
 Then:
 
 ```sh
@@ -156,9 +167,10 @@ a bridge, or with sync off, the agent runs alone exactly as before.
 
 Work that must happen once is placed on one host:
 
-- **Chat channels** run where their credentials are. `[matrix]` and
-  `[discord]` are host-local settings and never sync; configure each bot on
-  exactly one host. Each host writes the channels it serves — accounts and
+- **Chat channels** run where their credentials are. `[matrix]`,
+  `[discord]` and `[telegram]` are host-local settings and never sync;
+  configure each bot on exactly one host. Each host writes the channels it serves —
+  accounts and
   rooms, no credentials — to `.sapphire-agent/hosts/<device-id>.toml` in the
   workspace, and warns at startup when another host claims the same account
   (both would answer every message).
@@ -317,16 +329,16 @@ Delegating is not a way to get done by proxy what the model would be
 refused directly.
 
 **`subagent` runs unconditionally on every trusted transport, and is
-excluded only on Matrix and Discord.** Its `ToolKind` is `Other` — what a
-subagent actually does depends entirely on which agent it delegates to, so
+excluded only on Matrix, Discord and Telegram.** Its `ToolKind` is `Other`:
+what a subagent actually does depends entirely on which agent it delegates to, so
 it can't honestly be classified as `Read`, `Edit`, `Execute`, etc., and
 `Other` is the policy table's most conservative bucket. `Origin::Trusted`
 (`/rpc`, `/a2a`, voice) allows every kind unconditionally, so those three
 run `subagent` the same as any other tool; on ACP it is asked for in
 `default` mode and allowed once edits are accepted or bypassed, same as
 any other `Other` call. `Origin::Channel` is the one origin that denies
-every `Other` call unconditionally, so Matrix and Discord — and only
-Matrix and Discord — cannot call `subagent` at all. See the
+every `Other` call unconditionally, so Matrix, Discord and Telegram — and
+only those three — cannot call `subagent` at all. See the
 [permission table](#permission-and-modes) below.
 
 **Project conventions are not shared yet.** A client-side project's
@@ -412,8 +424,8 @@ destroying a conversation over what might be a one-off glitch.
 (Agent Client Protocol) agent, running against the same production workspace
 and memory as every other transport — a Zed conversation is not a separate
 agent. Its sessions do get their own store, though: a separate directory
-tree and line format from `/rpc`, Matrix and Discord, not a `cwd`-tagged row
-folded into one of theirs. See
+tree and line format from `/rpc`, Matrix, Discord and Telegram, not a
+`cwd`-tagged row folded into one of theirs. See
 [Loading past sessions](#loading-past-sessions) below for the layout.
 
 There are two ways in. On a machine where the agent runs — every synced host
@@ -439,7 +451,6 @@ stdio_room_profile = "zed"   # any [room_profile.<name>]; required for `acp`
 
 [room_profile.zed]
 profile = "default"
-rooms   = []
 ```
 
 Then, in Zed's `settings.json`:
@@ -474,8 +485,7 @@ the editor on its own model or namespace:
 
 ```toml
 [room_profile.zed]
-profile = "default"
-rooms   = []              # ACP-only; no chat rooms map here
+profile = "default"   # ACP-only; no chat rooms name it
 ```
 
 ```sh
@@ -547,9 +557,9 @@ allow this tool" is not a kill switch: `bypass` runs everything regardless, and
 Declining a tool does not end the turn. The model is told the call was
 refused and can try another route.
 
-**Chat channels are not asked — they are restricted.** Matrix and Discord
-cannot call `shell` at all, and reach an outbound MCP server's tools only if
-the operator declared that server trusted (see "Trusting an outbound MCP
+**Chat channels are not asked — they are restricted.** Matrix, Discord and
+Telegram cannot call `shell` at all, and reach an outbound MCP server's tools
+only if the operator declared that server trusted (see "Trusting an outbound MCP
 server" below). A chat turn is asynchronous, so holding one open waiting for
 a human could hang it for hours; and routing the question through the model
 would let it broker its own permission request.
@@ -645,9 +655,9 @@ Ten tools — `file_read`, `file_write`, `file_append`, `file_delete`, `dir_list
 `shell_kill` — read or write a filesystem or run a shell. **Which machine they
 reach is decided by the session, not by the name.** Inside an ACP session they
 act on the machine the connected editor is running on, over `/acp`'s `fs/*` and
-`terminal/*` requests; everywhere else (Matrix, Discord, `/rpc`, voice, `/a2a`,
-heartbeat, autonomous, subagents) they act on this agent's own machine. Inside
-an ACP session each tool maps to a request on the editor's machine:
+`terminal/*` requests; everywhere else (Matrix, Discord, Telegram, `/rpc`, voice,
+`/a2a`, heartbeat, autonomous, subagents) they act on this agent's own machine.
+Inside an ACP session each tool maps to a request on the editor's machine:
 
 | Tool | ACP call(s) | `ToolKind` |
 |---|---|---|
@@ -891,7 +901,8 @@ whole turn.
   head, 30,000 from the tail, with a marker spliced in between) — this
   applies to every tool, on every transport, not only the shell tool over
   ACP; `ToolSet::execute` is the one path both `/acp` and the
-  Matrix/Discord turn executor call through. The head, tail and marker
+  Matrix/Discord/Telegram turn executor call through. The head, tail and
+  marker
   budgets are sized to sum to the cap exactly, so applying the truncation
   to an already-truncated result is a no-op rather than cutting again and
   nesting markers.
@@ -1035,12 +1046,12 @@ the model is never told they exist. A tool that is offered and then always refus
 is the worse answer: it invites a retry loop against a wall.
 
 A **channel** turn is judged by the profile its room resolves to — the same
-resolution that picks its provider and memory namespace, so an explicit listing in a
-`[room_profile.<name>].rooms` array wins and `[room_profile.default]` catches every
-room no profile claims. An **ACP** session (Zed and other editors) is judged by the
-profile its bearer token pinned at `session/new`, which is what makes these tools
-usable from an editor at all: ACP has no room id. Note what `room_profiles =
-["default"]` therefore means — every room no other profile claims — and list the
+resolution that picks its provider and memory namespace. Set `profile` in that room's
+block under `matrix.rooms`, `discord.rooms` or `telegram.rooms`; rooms without one
+fall through to `[room_profile.default]`. An **ACP** session (Zed and other
+editors) is judged by the profile its bearer token pinned at `session/new`,
+which is what makes these tools usable from an editor at all: ACP has no
+room id. Note what `room_profiles = ["default"]` therefore means — every room no other profile claims — and list the
 specific profiles you mean unless that is what you want.
 
 Voice, `/rpc`, A2A and the unattended loops (heartbeat, autonomous) name no profile
@@ -1092,8 +1103,8 @@ There is no ACP call to list a directory — no list, glob or stat exists in
 the agent→client surface — so resolving and indexing the skills directory
 always runs a shell script on the client over its terminal capability. That
 makes every skill tool, including the read-only `skill`, depend on it. In
-practice this means Matrix, Discord and voice never see any skill tool at
-all: `Agent::handle_message` (`src/agent.rs`) passes every client
+practice this means Matrix, Discord, Telegram and voice never see any skill
+tool at all: `Agent::handle_message` (`src/agent.rs`) passes every client
 capability flag as `false`, and `src/agent.rs` is not touched by this
 feature. Enforcement is in two places, deliberately:
 

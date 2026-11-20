@@ -126,14 +126,23 @@ profile = "everyday"
 
 # [telegram]
 # bot_token = "123456:ABC..."
+# # `bot_token`, like every `*_token` key, is host-local: never put it in
+# # the workspace-shared `.sapphire-agent/config.toml`.
 # # Telegram user IDs allowed to interact. Empty = all users.
 # allowed_users = ["11111111"]
 # # A forum topic's room id is "<chat_id>:<message_thread_id>"; a plain chat
 # # uses just "<chat_id>". Empty rooms = all chats the bot can see.
+# [telegram.rooms."-1001000000001"]
+# name = "daily"
+# profile = "everyday"
+#
 # [telegram.rooms."-1002000333444555:42"]
-# name = "Development"
-# description = "Development and autonomous sessions"
+# name = "dev"
 # profile = "development"
+#
+# [telegram.rooms."-1003000000003"]
+# name = "nsfw"
+# profile = "private_nsfw"
 
 # Periodic log digests. The agent summarises weekly/monthly/yearly activity
 # into short importance-ordered bullet lists, stored as YAML frontmatter in
@@ -350,8 +359,8 @@ session_policy   = "reset"       # optional; defaults to global setting
 #   - `[tools.host_access]` — the switch that lets the agent touch its
 #     own filesystem and shell: `file_read`, `file_write`, `file_append`,
 #     `file_delete`, `dir_list`, `dir_walk`, `shell`. `enabled = false`
-#     by default, for every origin — `/rpc`, voice, `/a2a`, Matrix/Discord
-#     and ACP alike.
+#     by default, for every origin — `/rpc`, voice, `/a2a`,
+#     Matrix/Discord/Telegram and ACP alike.
 #
 #     Inside an ACP session these same seven names reach the *editor's*
 #     machine instead, and this switch does not speak for it: what that
@@ -368,8 +377,8 @@ session_policy   = "reset"       # optional; defaults to global setting
 #     covers ACP, which has `session/cancel` (the editor's Escape), and
 #     defaults to `0` — unbounded — so a long piece of delegated work runs
 #     to its end instead of stopping every ten rounds. `unattended` covers
-#     Matrix, Discord, `/rpc`, `/a2a` and the heartbeat, none of which can
-#     be interrupted, and defaults to 25. `0` means unbounded on either
+#     Matrix, Discord, Telegram, `/rpc`, `/a2a` and the heartbeat, none of
+#     which can be interrupted, and defaults to 25. `0` means unbounded on either
 #     side; subagents are always judged `unattended`, whatever their
 #     parent is. These bound spend, not context — `[compression]` is what
 #     keeps the history in the window.
@@ -439,8 +448,8 @@ session_policy   = "reset"       # optional; defaults to global setting
 #
 #   - `"none"` (default) — the tools are unclassified, which the
 #     permission policy treats as its strictest bucket. Chat channels
-#     (Matrix, Discord) refuse them, and so does the heartbeat's chat
-#     leg; `/acp` asks before each call. Leave it here unless you mean
+#     (Matrix, Discord, Telegram) refuse them, and so does the heartbeat's
+#     chat leg; `/acp` asks before each call. Leave it here unless you mean
 #     to change that.
 #   - `"read"` — the tools are reads: allowed on every origin, never
 #     asked. For a server that only looks things up.
@@ -758,8 +767,8 @@ session_policy   = "reset"       # optional; defaults to global setting
 # (default / accept_edits / bypass). Standing "always allow" and "never
 # allow" answers are recorded in the host-local
 # ~/.config/sapphire-agent/acp-permissions.json — delete it to be asked
-# everything again. Chat channels (Matrix, Discord) are never asked: they
-# cannot call shell at all, and can reach an MCP server's tools only when
+# everything again. Chat channels (Matrix, Discord, Telegram) are never
+# asked: they cannot call shell at all, and can reach an MCP server's tools only when
 # that server carries a `trust` of "read" or "edit" (see
 # `[[tools.mcp_servers]]` above).
 [acp]

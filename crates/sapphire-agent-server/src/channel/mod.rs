@@ -272,7 +272,7 @@ pub trait Channel: Send + Sync {
     }
 }
 
-/// Dispatcher that fronts every configured `Channel` (Matrix + Discord)
+/// Dispatcher that fronts every configured `Channel` (Matrix + Discord + Telegram)
 /// for the agent. Maintains a `room_id → channel name` routing map so
 /// outgoing replies and typing indicators land on the channel the
 /// originating message came from.
