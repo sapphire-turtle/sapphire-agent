@@ -307,10 +307,7 @@ async fn route_update(
     }
 
     let (attachments, notes) = download_image_attachments(msg, download).await;
-    let text = match msg {
-        Message::Photo(_) | Message::Document(_) | Message::Animation(_) => msg.caption(),
-        _ => msg.text(),
-    };
+    let text = msg.caption().or_else(|| msg.text());
     let content = with_attachment_notes(text.unwrap_or_default().trim().to_owned(), &notes);
     if content.is_empty() && attachments.is_empty() {
         return None;
@@ -331,6 +328,7 @@ async fn route_update(
 /// Telegram photos are alternative sizes of one image; fetch only the largest.
 /// Documents and animations can also carry supported image types. Declared
 /// metadata screens the fetch, but the bytes determine what goes to the model.
+/// Other media types are not fetched and produce a drop note.
 async fn download_image_attachments(
     msg: &Message,
     download: impl AsyncFnOnce(&str) -> Result<Vec<u8>, String>,
@@ -365,7 +363,35 @@ async fn download_image_attachments(
             animation.file_size,
         )
     } else {
-        return (Vec::new(), Vec::new());
+        let unsupported = if let Some(video) = msg.video() {
+            Some((
+                video.file_name.as_deref().unwrap_or("Telegram video"),
+                "video",
+            ))
+        } else if let Some(audio) = msg.audio() {
+            Some((
+                audio.file_name.as_deref().unwrap_or("Telegram audio"),
+                "audio",
+            ))
+        } else if msg.voice().is_some() {
+            Some(("Telegram voice", "voice"))
+        } else if msg.paid_media().is_some() {
+            Some(("Telegram paid media", "paid media"))
+        } else {
+            None
+        };
+        return match unsupported {
+            Some((name, kind)) => (
+                Vec::new(),
+                vec![dropped_attachment_note(
+                    name,
+                    &format!(
+                        "it is a {kind}, and only images (JPEG, PNG, GIF, WebP) are passed on"
+                    ),
+                )],
+            ),
+            None => (Vec::new(), Vec::new()),
+        };
     };
 
     let result = async {
@@ -761,6 +787,79 @@ mod tests {
         assert!(incoming.content.contains(
             "it is application/pdf, and only images (JPEG, PNG, GIF, WebP) are passed on"
         ));
+    }
+
+    #[tokio::test]
+    async fn a_captioned_video_is_routed_with_a_drop_note_without_downloading() {
+        let msg: Message = serde_json::from_value(serde_json::json!({
+            "message_id": 500,
+            "from": {"id": 1, "is_bot": false, "first_name": "Fixture"},
+            "date": 1_767_225_600,
+            "chat": {"id": CHAT, "type": "supergroup", "title": "Fixture"},
+            "caption": "Look at this video",
+            "video": {
+                "file_id": "file", "file_unique_id": "unique",
+                "width": 640, "height": 480, "duration": 5,
+                "file_name": "fixture.mp4", "mime_type": "video/mp4"
+            }
+        }))
+        .unwrap();
+        assert!(matches!(msg, Message::Video(_)));
+        let incoming = route_update(&msg, &HashSet::new(), &IndexMap::new(), unexpected_download)
+            .await
+            .expect("captioned video should be routed");
+        assert!(incoming.attachments.is_empty());
+        assert_eq!(
+            incoming.content,
+            "Look at this video\n\n[Attachment 'fixture.mp4' was sent but not passed on to you: it is a video, and only images (JPEG, PNG, GIF, WebP) are passed on. Tell the user if it matters.]"
+        );
+    }
+
+    #[tokio::test]
+    async fn captions_on_other_media_and_polls_are_not_lost() {
+        for (key, media, note_name) in [
+            (
+                "voice",
+                serde_json::json!({"file_id":"f", "file_unique_id":"u", "duration":1}),
+                Some("Telegram voice"),
+            ),
+            (
+                "audio",
+                serde_json::json!({"file_id":"f", "file_unique_id":"u", "duration":1}),
+                Some("Telegram audio"),
+            ),
+            (
+                "paid_media",
+                serde_json::json!({"star_count":1, "paid_media":[]}),
+                Some("Telegram paid media"),
+            ),
+            (
+                "poll",
+                serde_json::json!({"type":"regular", "id":"p", "question":"Q", "options":[], "total_voter_count":0, "is_closed":false, "is_anonymous":true, "allows_multiple_answers":false, "allows_revoting":false}),
+                None,
+            ),
+        ] {
+            let mut fixture = serde_json::json!({
+                "message_id":500, "from":{"id":1, "is_bot":false, "first_name":"Fixture"},
+                "date":1_767_225_600, "chat":{"id":CHAT, "type":"supergroup", "title":"Fixture"},
+                "caption":"Caption"
+            });
+            fixture[key] = media;
+            let msg: Message = serde_json::from_value(fixture).unwrap();
+            let incoming =
+                route_update(&msg, &HashSet::new(), &IndexMap::new(), unexpected_download)
+                    .await
+                    .expect("caption should be routed");
+            assert!(incoming.attachments.is_empty());
+            match note_name {
+                Some(name) => assert!(
+                    incoming
+                        .content
+                        .starts_with(&format!("Caption\n\n[Attachment '{name}'"))
+                ),
+                None => assert_eq!(incoming.content, "Caption"),
+            }
+        }
     }
 
     fn photo_message(size: usize) -> Message {
