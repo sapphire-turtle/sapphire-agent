@@ -328,13 +328,16 @@ async fn a_room_seen_without_a_block_shows_its_raw_id() {
 
 **Files:**
 - Modify: `crates/sapphire-agent-server/src/channel/telegram.rs`
-- Modify: `crates/sapphire-agent-server/src/channel/mod.rs` (`seed_routing_from_config`)
-- Modify: `crates/sapphire-agent-server/src/lib.rs` (~line 1108: channel_list + the `is_some()` gate)
-- Test: `telegram.rs` and `channel/mod.rs` inline tests
+- Modify: `crates/sapphire-agent-server/src/channel/mod.rs` (`seed_routing_from_config` + its doc comment)
+- Modify: `crates/sapphire-agent-server/src/lib.rs` (channel_list + the `is_some()` gate; `consult_room_warnings`; the `verify` output lines; the heartbeat default-room wiring)
+- Modify: `crates/sapphire-agent-server/src/channel/matrix.rs` + `discord.rs` (listen sets built from the rooms maps, not the legacy lists; heartbeat default = `primary_room_id()`)
+- Modify: `crates/sapphire-agent-server/src/agent.rs` (session-history retention reads rooms maps)
+- Modify: `crates/sapphire-agent-server/src/placement.rs` (host claim `Claim::serves` from rooms maps)
+- Test: inline tests in each touched module
 
 **Interfaces:**
-- Consumes: `TelegramChannel` (Tasks 2-3).
-- Produces: `download_image_attachments(&Message) -> (Vec<Attachment>, Vec<String>)`; seed covers all three channels; the agent actually speaks Telegram end to end.
+- Consumes: `TelegramChannel` (Tasks 2-3); `room_block_for` / rooms maps / `primary_room_id()` (Task 1).
+- Produces: `download_image_attachments(&Message) -> (Vec<Attachment>, Vec<String>)`; seed covers all three channels; every runtime reader that used to read `room_ids`/`channel_ids` now reads the per-room maps; the agent actually speaks Telegram end to end.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -357,7 +360,7 @@ async fn seed_routing_covers_all_three_channels() {
 ```
 
 - [ ] **Step 2: Run to verify they fail.**
-- [ ] **Step 3: Implement.** `download_image_attachments` mirroring discord's: screen by the declared mime/size (`only images (JPEG, PNG, GIF, WebP) are passed on` wording), download the photo, `spawn_blocking(prepare_image)` — the declared mime is never trusted, the bytes are sniffed; per-drop `dropped_attachment_note`. Replace Task 2's placeholder in `route_update` with the real path (attachments passed on + notes into `with_attachment_notes`; skip if text and attachments are both empty — the existing empty-text test still holds once the fixture carries none). `mod.rs`: `seed_routing_from_config` walks `config.matrix/discord/telegram` `rooms.keys()` (update the fn's doc: seeds from per-room blocks). `lib.rs`: gate becomes `matrix.is_some() || discord.is_some() || telegram.is_some()`; push `("telegram".to_string(), Arc::new(TelegramChannel::new(t).context("Failed to initialise Telegram channel")?))` after discord; `use crate::channel::telegram::TelegramChannel` next to the discord/matrix imports.
+- [ ] **Step 3: Implement.** `download_image_attachments` mirroring discord's: screen by the declared mime/size (`only images (JPEG, PNG, GIF, WebP) are passed on` wording), download the photo, `spawn_blocking(prepare_image)` — the declared mime is never trusted, the bytes are sniffed; per-drop `dropped_attachment_note`. Replace Task 2's placeholder in `route_update` with the real path (attachments passed on + notes into `with_attachment_notes`; skip if text and attachments are both empty — the existing empty-text test still holds once the fixture carries none). `mod.rs`: `seed_routing_from_config` walks `config.matrix/discord/telegram` `rooms.keys()` (update the fn's doc: seeds from per-room blocks). `lib.rs`: gate becomes `matrix.is_some() || discord.is_some() || telegram.is_some()`; push `("telegram".to_string(), Arc::new(TelegramChannel::new(t).context("Failed to initialise Telegram channel")?))` after discord; `use crate::channel::telegram::TelegramChannel` next to the discord/matrix imports. **Remaining legacy readers (all switched to the per-room maps now that the old keys only exist to raise migration errors):** `matrix.rs`'s `MatrixChannel::new` listen set and `discord.rs`'s equivalent build from `rooms.keys()` (empty map = all visible); Matrix heartbeat default becomes `primary_room_id()`; `lib.rs`'s `consult_room_warnings` checks rooms-map membership across all three channels (including telegram); `lib.rs`'s heartbeat default wiring per channel uses `primary_room_id()`; `lib.rs`'s `verify` output lines print from the maps and reach telegram; `agent.rs`'s retention decision reads rooms keys; `placement.rs`'s host claim (`Claim::serves`) builds from rooms keys.
 - [ ] **Step 4: Run the full suite** — `cargo test -p sapphire-agent-server -q`; also `cargo clippy -p sapphire-agent-server -D warnings` and `cargo build -p sapphire-agent-server` green (this is where the app-server startup log should show `Channels active: ..., telegram` in a manual smoke if the operator runs one — not required).
 - [ ] **Step 5: Commit** — "feat(channel): telegram attachments and channel wiring; seed routing from per-room blocks" + trailer.
 
