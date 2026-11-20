@@ -148,7 +148,7 @@ impl Workspace {
         // the previous one and each request re-processed the whole
         // system prompt. Temporal awareness now comes from the
         // `current_time` tool, which the model calls when it needs it.
-        let now_local = chrono::Local::now();
+        let now_local = jiff::ZonedDateTime::now();
 
         // Channel-side room metadata (Matrix room.name+topic, Discord
         // channel.name+topic, or device-supplied "voice channel with X").
@@ -216,7 +216,7 @@ impl Workspace {
     async fn inject_periodic_logs(
         &self,
         parts: &mut Vec<String>,
-        today: chrono::NaiveDate,
+        today: jiff::civil::Date,
         namespace_chain: &[String],
     ) {
         // Yesterday's full body — read only from the room's direct
@@ -224,7 +224,7 @@ impl Workspace {
         // balloon the body verbatim; parents' yesterday context is
         // conveyed through digest items below.
         if let Some(direct_ns) = namespace_chain.first()
-            && let Some(yesterday) = today.pred_opt()
+            && let Some(yesterday) = today.yesterday().ok()
         {
             let stem = periodic_log::daily_stem(yesterday);
             let body = self

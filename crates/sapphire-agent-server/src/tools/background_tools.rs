@@ -11,7 +11,7 @@ use crate::provider::ToolSpec;
 use crate::tools::{Tool, ToolKind};
 use anyhow::{Result, bail};
 use async_trait::async_trait;
-use chrono::Utc;
+use jiff::Timestamp;
 use serde_json::json;
 
 /// List, peek at or cancel this session's running background tasks.
@@ -92,7 +92,7 @@ impl Tool for BackgroundTaskTool {
                 if pending.is_empty() {
                     return Ok("No background tasks are running.".to_string());
                 }
-                let now = Utc::now();
+                let now = Timestamp::now();
                 let rows: Vec<String> = pending
                     .iter()
                     .map(|t| {
@@ -112,7 +112,7 @@ impl Tool for BackgroundTaskTool {
                                 )
                             }
                         };
-                        let secs = (now - t.started_at).num_seconds().max(0);
+                        let secs = (now - t.started_at).as_secs().max(0);
                         format!("- {} ({what}): {} — started {secs}s ago", t.id, t.label)
                     })
                     .collect();

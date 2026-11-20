@@ -37,7 +37,8 @@ use crate::config::{AutonomousOrigin, DEFAULT_PROFILE_NAME};
 use crate::provider::{ChatMessage, ContentPart, Role};
 use crate::serve::{AutonomousHost, ConsultIdentity, ServeState};
 use crate::session::{SessionRow, SessionStore};
-use chrono::{DateTime, Duration, Utc};
+use jiff::SignedDuration;
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -75,7 +76,7 @@ pub fn marker(task: &str) -> String {
 pub struct AutonomousState {
     pub status: String,
     pub reason: String,
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
 }
 
 /// Write the status file. Best-effort: a cycle that cannot write its own
@@ -90,7 +91,7 @@ fn write_state(workspace_dir: &Path, status: &str, reason: String) {
     let state = AutonomousState {
         status: status.to_string(),
         reason,
-        updated_at: Utc::now(),
+        updated_at: Timestamp::now(),
     };
     let path = dir.join("autonomous.json");
     let tmp = dir.join(".autonomous.json.tmp");
@@ -112,7 +113,7 @@ fn write_state(workspace_dir: &Path, status: &str, reason: String) {
 /// Idle iff the newest activity in the *other* stores is at least `idle`
 /// old. Rows with no messages do not count as activity — an empty session
 /// is not somebody talking (design decision 9).
-pub fn is_idle(rows: &[SessionRow], now: DateTime<Utc>, idle: Duration) -> bool {
+pub fn is_idle(rows: &[SessionRow], now: Timestamp, idle: SignedDuration) -> bool {
     match rows.iter().filter_map(|r| r.last_at).max() {
         Some(last) => now - last >= idle,
         None => true,
@@ -142,8 +143,8 @@ where
 fn is_due(
     task: &AutonomousTask,
     rows: &[SessionRow],
-    not_before: &HashMap<String, DateTime<Utc>>,
-    now: DateTime<Utc>,
+    not_before: &HashMap<String, Timestamp>,
+    now: Timestamp,
 ) -> bool {
     if let Some(at) = not_before.get(&task.name)
         && *at > now
@@ -156,7 +157,7 @@ fn is_due(
         .map(|r| r.last_at.unwrap_or(r.meta.created_at))
         .max();
     match anchor {
-        Some(a) => now - a >= Duration::days(task.cooldown_days as i64),
+        Some(a) => now - a >= jiff::SignedDuration::from_hours(24 * (task.cooldown_days as i64)),
         None => true,
     }
 }
@@ -215,14 +216,14 @@ pub struct AutonomousLoop {
     /// `ServeState` is built before the channel store exists.
     channel_session_store: Option<Arc<SessionStore>>,
     workspace_dir: PathBuf,
-    idle: Duration,
-    poll: Duration,
+    idle: SignedDuration,
+    poll: SignedDuration,
     /// In-process back-off: task name → the instant it may run again.
     ///
     /// The store's anchor is what survives a restart; this is what keeps
     /// `cooldown_days = 0` from meaning "a new session every cycle" within
     /// one run (design decision 12).
-    not_before: HashMap<String, DateTime<Utc>>,
+    not_before: HashMap<String, Timestamp>,
     /// Session id → turns this process has run in it.
     ///
     /// A floor under `turns_spent`, which counts only turns whose message
@@ -247,8 +248,9 @@ impl AutonomousLoop {
         let workspace_dir = state.workspace.dir().to_path_buf();
         // Read the two knobs before the `state` move below: `cfg` is a
         // borrow of the same `Arc` that is about to be stored.
-        let idle = Duration::minutes(state.config.autonomous.idle_minutes as i64);
-        let poll = Duration::seconds(state.config.autonomous.poll_seconds.max(1) as i64);
+        let idle = jiff::SignedDuration::from_mins(state.config.autonomous.idle_minutes as i64);
+        let poll =
+            jiff::SignedDuration::from_secs(state.config.autonomous.poll_seconds.max(1) as i64);
         Self {
             state,
             channel_session_store,
@@ -303,13 +305,13 @@ impl AutonomousLoop {
         // `interval` panics on a zero period; `new` already floors it at a
         // second, and the first tick is discarded so startup does not
         // immediately start working (same as both heartbeat loops).
-        // `poll` is a `chrono::Duration` (the back-off arithmetic wants
+        // `poll` is a `jiff::SignedDuration` (the back-off arithmetic wants
         // one); tokio wants a `std::time::Duration`. `new` floors it at a
         // second, so `to_std` cannot fail in practice — the fallback keeps
         // the loop alive rather than panicking in a task if it somehow did.
         let period = self
             .poll
-            .to_std()
+            .try_into()
             .unwrap_or(std::time::Duration::from_secs(1));
         let mut tick = tokio::time::interval(period);
         tick.tick().await;
@@ -330,7 +332,7 @@ impl AutonomousLoop {
     /// One pass: idle? task? run it. Separated from `run` so a test can
     /// drive a cycle with no clock in the way.
     pub async fn run_cycle(&mut self) -> anyhow::Result<()> {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let tasks = load_autonomous_dir(&self.workspace_dir.join("autonomous"));
         if tasks.iter().all(|t| !t.enabled) {
             write_state(&self.workspace_dir, "idle", "no tasks".to_string());
@@ -482,9 +484,10 @@ impl AutonomousLoop {
                 // anchor clears instantly when the cooldown is zero, and
                 // "as soon as the previous session ended" must not mean
                 // "again in this same cycle".
-                let backoff = Duration::days(task.cooldown_days as i64).max(self.poll);
+                let backoff = jiff::SignedDuration::from_hours(24 * (task.cooldown_days as i64))
+                    .max(self.poll);
                 self.not_before
-                    .insert(task.name.clone(), Utc::now() + backoff);
+                    .insert(task.name.clone(), Timestamp::now() + backoff);
                 info!(
                     "autonomous: {} finished after {turns} turn(s) (done={said_done}, capped={capped})",
                     task.name
@@ -529,14 +532,14 @@ mod tests {
         }
     }
 
-    fn row(room_id: &str, last_at: Option<DateTime<Utc>>, is_closed: bool) -> SessionRow {
+    fn row(room_id: &str, last_at: Option<Timestamp>, is_closed: bool) -> SessionRow {
         SessionRow {
             meta: crate::session::SessionMeta {
                 session_id: "01920f00-0000-7000-8000-000000000000".to_string(),
                 room_id: room_id.to_string(),
                 thread_id: None,
                 channel: "server".to_string(),
-                created_at: Utc::now() - Duration::hours(5),
+                created_at: Timestamp::now() - jiff::SignedDuration::from_hours(5),
                 public_id: None,
                 namespace: Some("default".to_string()),
                 device_id: None,
@@ -614,13 +617,17 @@ mod tests {
     /// The whole idle rule: the newest activity in any *other* store.
     #[test]
     fn idle_is_true_only_when_nothing_else_moved_recently() {
-        let now = Utc::now();
-        let idle = Duration::minutes(30);
+        let now = Timestamp::now();
+        let idle = jiff::SignedDuration::from_mins(30);
 
         assert!(is_idle(&[], now, idle), "no sessions at all is idle");
         assert!(
             is_idle(
-                &[row("chat", Some(now - Duration::minutes(31)), false)],
+                &[row(
+                    "chat",
+                    Some(now - jiff::SignedDuration::from_mins(31)),
+                    false
+                )],
                 now,
                 idle
             ),
@@ -628,7 +635,11 @@ mod tests {
         );
         assert!(
             !is_idle(
-                &[row("chat", Some(now - Duration::minutes(29)), false)],
+                &[row(
+                    "chat",
+                    Some(now - jiff::SignedDuration::from_mins(29)),
+                    false
+                )],
                 now,
                 idle
             ),
@@ -637,8 +648,8 @@ mod tests {
         assert!(
             !is_idle(
                 &[
-                    row("old", Some(now - Duration::hours(4)), true),
-                    row("new", Some(now - Duration::seconds(5)), false),
+                    row("old", Some(now - jiff::SignedDuration::from_hours(4)), true),
+                    row("new", Some(now - jiff::SignedDuration::from_secs(5)), false),
                 ],
                 now,
                 idle
@@ -680,7 +691,7 @@ mod tests {
         store.append(&sid, &ChatMessage::user("hello")).unwrap();
 
         let rows = store.session_rows();
-        let now = Utc::now();
+        let now = Timestamp::now();
 
         let mut fresh = task("refactor");
         fresh.cooldown_days = 0;
@@ -693,7 +704,10 @@ mod tests {
         // And the in-process back-off wins over the store even at
         // `cooldown_days = 0`.
         let mut backoff = HashMap::new();
-        backoff.insert("refactor".to_string(), now + Duration::minutes(10));
+        backoff.insert(
+            "refactor".to_string(),
+            now + jiff::SignedDuration::from_mins(10),
+        );
         assert!(!is_due(&fresh, &rows, &backoff, now));
     }
 

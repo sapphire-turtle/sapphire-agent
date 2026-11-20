@@ -23,7 +23,8 @@ use crate::session_log::{self, BodyOr, EntryFile, Linked};
 use crate::session_storage::{MISSING_RESULT, missing_input};
 use crate::tool_payload_cache::ToolPayloadCache;
 use anyhow::Result;
-use chrono::{DateTime, NaiveDate, Utc};
+use jiff::Timestamp;
+use jiff::civil::Date;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -42,7 +43,7 @@ pub struct SessionHeader {
     /// reports one, which is why this is not an `Option` the way the
     /// old store's `cwd` had to be.
     pub cwd: String,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -52,7 +53,7 @@ pub struct Event {
     /// not a root event — making it one would need a special case in
     /// every traversal.
     pub parent: Option<Uuid>,
-    pub at: DateTime<Utc>,
+    pub at: Timestamp,
     pub body: EventBody,
 }
 
@@ -143,25 +144,25 @@ enum Line {
     Message {
         id: Uuid,
         parent: Option<Uuid>,
-        at: DateTime<Utc>,
+        at: Timestamp,
         role: Role,
         parts: Vec<StoredPart>,
     },
     Title {
         id: Uuid,
         parent: Option<Uuid>,
-        at: DateTime<Utc>,
+        at: Timestamp,
         title: String,
     },
     Closed {
         id: Uuid,
         parent: Option<Uuid>,
-        at: DateTime<Utc>,
+        at: Timestamp,
     },
     Summary {
         id: Uuid,
         parent: Option<Uuid>,
-        at: DateTime<Utc>,
+        at: Timestamp,
         summary: String,
         covers_through: Uuid,
     },
@@ -174,7 +175,7 @@ enum Line {
 enum AcpFront {
     Message {
         parent: Option<Uuid>,
-        at: DateTime<Utc>,
+        at: Timestamp,
         role: Role,
         /// Absent when the body is the whole message.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -182,16 +183,16 @@ enum AcpFront {
     },
     Title {
         parent: Option<Uuid>,
-        at: DateTime<Utc>,
+        at: Timestamp,
         title: String,
     },
     Closed {
         parent: Option<Uuid>,
-        at: DateTime<Utc>,
+        at: Timestamp,
     },
     Summary {
         parent: Option<Uuid>,
-        at: DateTime<Utc>,
+        at: Timestamp,
         covers_through: Uuid,
     },
 }
@@ -205,7 +206,7 @@ impl Linked for AcpFront {
             | AcpFront::Summary { parent, .. } => *parent,
         }
     }
-    fn at(&self) -> DateTime<Utc> {
+    fn at(&self) -> Timestamp {
         match self {
             AcpFront::Message { at, .. }
             | AcpFront::Title { at, .. }
@@ -380,7 +381,7 @@ impl AcpSessionStore {
             session_id: session_id.to_string(),
             namespace: namespace.to_string(),
             cwd: cwd.to_string(),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
         };
         session_log::write_meta(&self.path(session_id, namespace), &header)?;
         Ok(())
@@ -445,7 +446,7 @@ impl AcpSessionStore {
         self.append_line(session_id, id, move |parent| Line::Message {
             id,
             parent,
-            at: Utc::now(),
+            at: Timestamp::now(),
             role,
             parts,
         })
@@ -457,7 +458,7 @@ impl AcpSessionStore {
         self.append_line(session_id, id, move |parent| Line::Title {
             id,
             parent,
-            at: Utc::now(),
+            at: Timestamp::now(),
             title,
         })
     }
@@ -500,7 +501,7 @@ impl AcpSessionStore {
         self.append_line(session_id, id, move |parent| Line::Summary {
             id,
             parent,
-            at: Utc::now(),
+            at: Timestamp::now(),
             summary,
             covers_through,
         })
@@ -521,7 +522,7 @@ impl AcpSessionStore {
         self.append_line(session_id, id, move |parent| Line::Closed {
             id,
             parent,
-            at: Utc::now(),
+            at: Timestamp::now(),
         })
     }
 
@@ -924,7 +925,7 @@ impl AcpSessionStore {
     /// narrative of what was said, not a transcript of what was read.
     pub fn sessions_for_day(
         &self,
-        date: NaiveDate,
+        date: Date,
         boundary_hour: u8,
     ) -> Vec<(SessionMeta, Vec<StoredMessage>)> {
         let (day_start, day_end) = crate::session::day_window(date, boundary_hour);
@@ -982,7 +983,7 @@ impl AcpSessionStore {
     /// no in-namespace sessions for that date, write nothing, and the
     /// date would stay pending forever — re-walked on every startup
     /// and catch-up tick.
-    pub fn session_dates<F>(&self, boundary_hour: u8, predicate: F) -> Vec<NaiveDate>
+    pub fn session_dates<F>(&self, boundary_hour: u8, predicate: F) -> Vec<Date>
     where
         F: Fn(&SessionMeta) -> bool,
     {
@@ -1001,14 +1002,14 @@ impl AcpSessionStore {
                 if !matches!(event.body, EventBody::Message { .. }) {
                     continue;
                 }
-                let local = event.at.with_timezone(&chrono::Local);
+                let local = event.at.to_zoned_datetime(jiff::tz::TimeZone::system());
                 dates.insert(crate::session::local_date_for_timestamp(
                     local,
                     boundary_hour,
                 ));
             }
         }
-        let mut sorted: Vec<NaiveDate> = dates.into_iter().collect();
+        let mut sorted: Vec<Date> = dates.into_iter().collect();
         sorted.sort();
         sorted
     }
@@ -1103,37 +1104,36 @@ mod tests {
 
     /// The local date "now" belongs to under `boundary_hour`.
     ///
-    /// Deliberately not `Local::now().date_naive()`. A timestamp before
+    /// Deliberately not `ZonedDateTime::now().date()`. A timestamp before
     /// the boundary hour belongs to the *previous* local day, so the
     /// naive date and the store's day window disagree for those hours —
     /// which made these tests pass all day and fail only when CI
     /// happened to run between midnight and 04:00.
-    fn today(boundary_hour: u8) -> chrono::NaiveDate {
-        crate::session::local_date_for_timestamp(chrono::Local::now(), boundary_hour)
+    fn today(boundary_hour: u8) -> jiff::civil::Date {
+        crate::session::local_date_for_timestamp(jiff::ZonedDateTime::now(), boundary_hour)
     }
 
     /// The rule the helper above encodes, pinned on its own so a future
     /// reader does not have to infer it from a failing CI run.
     #[test]
     fn a_timestamp_before_the_boundary_belongs_to_the_previous_day() {
-        use chrono::TimeZone as _;
-        let at_two_am = chrono::Local
-            .with_ymd_and_hms(2026, 9, 1, 2, 0, 0)
-            .single()
-            .expect("an unambiguous local time");
+        let at_two_am = jiff::civil::date(2026, 9, 1)
+            .at(2, 0, 0, 0)
+            .to_zoned_datetime(jiff::tz::TimeZone::system())
+            .expect("a local time");
         assert_eq!(
             crate::session::local_date_for_timestamp(at_two_am, 4),
-            chrono::NaiveDate::from_ymd_opt(2026, 8, 31).unwrap(),
+            jiff::civil::date(2026, 8, 31),
             "02:00 under a 04:00 boundary is still the previous day"
         );
 
-        let at_ten_am = chrono::Local
-            .with_ymd_and_hms(2026, 9, 1, 10, 0, 0)
-            .single()
-            .expect("an unambiguous local time");
+        let at_ten_am = jiff::civil::date(2026, 9, 1)
+            .at(10, 0, 0, 0)
+            .to_zoned_datetime(jiff::tz::TimeZone::system())
+            .expect("a local time");
         assert_eq!(
             crate::session::local_date_for_timestamp(at_ten_am, 4),
-            chrono::NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(),
+            jiff::civil::date(2026, 9, 1),
         );
     }
 
@@ -1462,7 +1462,7 @@ mod tests {
             "kind": "message",
             "id": Uuid::now_v7(),
             "parent": parent,
-            "at": Utc::now(),
+            "at": Timestamp::now(),
             "role": "assistant",
             "parts": [{"tool_use": {
                 "id": "c1",
@@ -1811,7 +1811,7 @@ mod tests {
             "kind": "message",
             "id": Uuid::now_v7(),
             "parent": root,
-            "at": Utc::now(),
+            "at": Timestamp::now(),
             "role": "user",
             "parts": [{"text": "the other branch"}],
         });
@@ -1852,7 +1852,7 @@ mod tests {
             "kind": "message",
             "id": Uuid::now_v7(),
             "parent": Uuid::now_v7(),
-            "at": Utc::now(),
+            "at": Timestamp::now(),
             "role": "user",
             "parts": [{"text": "unreachable"}],
         });
@@ -1888,7 +1888,7 @@ mod tests {
             "kind": "message",
             "id": Uuid::now_v7(),
             "parent": parent,
-            "at": Utc::now(),
+            "at": Timestamp::now(),
             "role": "assistant",
             "parts": [{"tool_use": {"id": "call-1", "name": "risky", "input": {}}}],
         });
@@ -1932,7 +1932,7 @@ mod tests {
             "kind": "message",
             "id": orphan_id,
             "parent": null,
-            "at": Utc::now(),
+            "at": Timestamp::now(),
             "role": "assistant",
             "parts": [{"tool_use": {"id": "call-1", "name": "risky", "input": {}}}],
         });
@@ -1989,7 +1989,7 @@ mod tests {
                 "kind": "message",
                 "id": id,
                 "parent": parent,
-                "at": Utc::now(),
+                "at": Timestamp::now(),
                 "role": role,
                 "parts": parts,
             });
@@ -2168,7 +2168,7 @@ mod tests {
                 "kind": "message",
                 "id": id,
                 "parent": parent,
-                "at": Utc::now(),
+                "at": Timestamp::now(),
                 "role": role,
                 "parts": parts,
             });

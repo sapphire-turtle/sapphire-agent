@@ -88,7 +88,7 @@ impl Tool for AttachmentSaveTool {
         let store = Arc::clone(&self.store);
         let state = Arc::clone(&self.state);
         tokio::task::spawn_blocking(move || -> Result<String> {
-            let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+            let now_ms = jiff::Timestamp::now().as_millisecond().max(0) as u64;
             // Keep get's indistinguishable unavailable error intact.
             let (_, bytes) = store.get(&owner, &id, now_ms)?;
             state
@@ -279,7 +279,7 @@ mod tests {
                 "original.pdf".into(),
                 "application/pdf".into(),
                 b"original\0\xff",
-                chrono::Utc::now().timestamp_millis().max(0) as u64,
+                jiff::Timestamp::now().as_millisecond().max(0) as u64,
             )
             .unwrap();
         (dir, store, test_workspace(false), meta)
@@ -638,7 +638,7 @@ mod tests {
                 "original.png".into(),
                 "image/png".into(),
                 &bytes,
-                chrono::Utc::now().timestamp_millis().max(0) as u64,
+                jiff::Timestamp::now().as_millisecond().max(0) as u64,
             )
             .unwrap();
         let state = test_workspace(true);
@@ -704,7 +704,7 @@ mod tests {
                 "original.png".into(),
                 "image/png".into(),
                 &bytes,
-                chrono::Utc::now().timestamp_millis().max(0) as u64,
+                jiff::Timestamp::now().as_millisecond().max(0) as u64,
             )
             .unwrap();
         let destination = dir.path().join("nested").join("saved.png");

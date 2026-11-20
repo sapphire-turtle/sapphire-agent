@@ -49,13 +49,13 @@ pub fn route(seg: &Segment, state: DeviceState) -> Disposition {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
+    use jiff::Timestamp;
 
     fn seg(live: bool) -> crate::ambient::ingest::Segment {
         crate::ambient::ingest::Segment {
             segment: "seg".into(),
             device: "pendant".into(),
-            started_at: Utc::now(),
+            started_at: Timestamp::now(),
             live,
             pcm: vec![0; 16_000],
         }

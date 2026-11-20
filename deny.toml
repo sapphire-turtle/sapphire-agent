@@ -20,6 +20,7 @@ yanked = "warn"
 # dep moves off the flagged package, or when a more severe advisory is
 # filed.
 ignore = [
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained. The app's own code uses jiff; chrono remains only through dependencies that require it: rmcp 3 (and schemars `chrono04`), a2a-lf, oauth2, reedline and serde_with; sapphire-agent-server itself only to hand the `cron` crate its schedules and a2a-lf its message timestamps. Drop when they move off chrono." },
     # --- unmaintained (no vulnerability) ---
     # The bincode (RUSTSEC-2025-0141) and encoding (RUSTSEC-2021-0153) entries
     # are gone: both reached us through lance, which left the graph when

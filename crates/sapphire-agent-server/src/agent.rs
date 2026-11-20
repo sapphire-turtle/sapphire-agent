@@ -9,7 +9,9 @@ use crate::provider::{ChatMessage, ContentPart, Provider, ToolCall};
 use crate::session::{ConversationKey, SessionStore, local_date_for_timestamp};
 use crate::tools::ToolSet;
 use crate::workspace::Workspace;
-use chrono::{Local, NaiveDate};
+use jiff::ZonedDateTime;
+use jiff::civil::Date;
+use jiff::tz::TimeZone;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
@@ -30,7 +32,7 @@ impl Agent {
 
 struct SystemSnapshot {
     system_prompt: String,
-    date: NaiveDate,
+    date: Date,
 }
 
 // ---------------------------------------------------------------------------
@@ -60,7 +62,7 @@ pub struct Agent {
     /// Local date on which the last day-boundary action fired for each key.
     /// Prevents re-firing within the same day for policies that don't rotate
     /// the session file (Compact, None).
-    boundary_handled: Mutex<HashMap<ConversationKey, NaiveDate>>,
+    boundary_handled: Mutex<HashMap<ConversationKey, Date>>,
     /// The consult room, set once at startup when one is configured. A
     /// message in that room is an answer, never chat.
     consult: std::sync::OnceLock<Arc<crate::consult::Consult>>,
@@ -201,7 +203,7 @@ impl Agent {
         profile: Option<&str>,
     ) -> anyhow::Result<()> {
         let content = format!("[Heartbeat: {task_name}]\n\n{prompt}");
-        let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let now_ms = jiff::Timestamp::now().as_millisecond().max(0) as u64;
         let incoming = crate::channel::IncomingMessage {
             id: format!("heartbeat-{task_name}-{now_ms}"),
             sender: "heartbeat".to_string(),
@@ -341,7 +343,7 @@ impl Agent {
     /// idempotent within a day via `boundary_handled`.
     async fn maybe_handle_day_boundary(&self, key: &ConversationKey, profile_name: &str) {
         let boundary = self.config.day_boundary_hour;
-        let today = local_date_for_timestamp(Local::now(), boundary);
+        let today = local_date_for_timestamp(ZonedDateTime::now(), boundary);
         let policy = self.config.session_policy_for_profile(profile_name);
 
         if policy == SessionPolicy::None {
@@ -359,7 +361,9 @@ impl Agent {
         let Some(created_at) = self.session_store.created_at(&session_id) else {
             return;
         };
-        if local_date_for_timestamp(created_at.with_timezone(&Local), boundary) >= today {
+        if local_date_for_timestamp(created_at.to_zoned_datetime(TimeZone::system()), boundary)
+            >= today
+        {
             return;
         }
 
@@ -459,7 +463,7 @@ impl Agent {
     /// Return the system prompt for `key`, rebuilding if the local date has changed.
     async fn get_system_prompt(&self, key: &ConversationKey, profile_name: &str) -> Option<String> {
         let boundary = self.config.day_boundary_hour;
-        let today = local_date_for_timestamp(Local::now(), boundary);
+        let today = local_date_for_timestamp(ZonedDateTime::now(), boundary);
 
         {
             let snapshots = self.snapshots.lock().await;
@@ -1821,12 +1825,12 @@ profile = "chat"
             // Make the persisted session old enough to exercise the real boundary path.
             let path = store.absolute_path_for(&id).unwrap().join("session.md");
             let raw = std::fs::read_to_string(&path).unwrap();
-            let old = chrono::Utc::now() - chrono::Duration::days(3);
+            let old = jiff::Timestamp::now() - jiff::SignedDuration::from_hours(24 * 3);
             let raw = raw
                 .lines()
                 .map(|line| {
                     if line.starts_with("created_at:") {
-                        format!("created_at: {}", old.to_rfc3339())
+                        format!("created_at: {}", old)
                     } else {
                         line.to_string()
                     }
@@ -2306,7 +2310,7 @@ profile = "chat"
                 "a".into(),
                 "text/plain".into(),
                 b"original",
-                chrono::Utc::now().timestamp_millis() as u64,
+                jiff::Timestamp::now().as_millisecond() as u64,
             )
             .unwrap();
         let mut response = attachment_call(
@@ -2360,7 +2364,7 @@ profile = "chat"
                 "a".into(),
                 "text/plain".into(),
                 b"original",
-                chrono::Utc::now().timestamp_millis() as u64,
+                jiff::Timestamp::now().as_millisecond() as u64,
             )
             .unwrap();
         let mut owners = vec![attachment_owner(); 3];
@@ -2401,7 +2405,7 @@ profile = "chat"
                 "a".into(),
                 "text/plain".into(),
                 b"original",
-                chrono::Utc::now().timestamp_millis() as u64,
+                jiff::Timestamp::now().as_millisecond() as u64,
             )
             .unwrap();
         let state = test_workspace();
@@ -2448,7 +2452,7 @@ profile = "chat"
                 "a".into(),
                 "text/plain".into(),
                 b"original",
-                chrono::Utc::now().timestamp_millis() as u64,
+                jiff::Timestamp::now().as_millisecond() as u64,
             )
             .unwrap();
         drop(store);

@@ -10,7 +10,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, NaiveDate, Utc};
+use jiff::Timestamp;
+use jiff::civil::Date;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -36,8 +37,8 @@ pub struct CandidateStats {
     #[serde(default)]
     pub speech_ms: u64,
     /// Distinct logical days this voice was heard on.
-    pub days_seen: Vec<NaiveDate>,
-    pub first_seen: DateTime<Utc>,
+    pub days_seen: Vec<Date>,
+    pub first_seen: Timestamp,
     /// A few transcribed utterances, for recognition.
     #[serde(default)]
     pub samples: Vec<String>,
@@ -136,7 +137,7 @@ impl CandidateStore {
         &mut self,
         embedding: Vec<f32>,
         clip: &[i16],
-        day: NaiveDate,
+        day: Date,
         speech_ms: u32,
         sample_text: &str,
     ) -> Result<String> {
@@ -149,7 +150,7 @@ impl CandidateStore {
         let stats = CandidateStats {
             speech_ms: speech_ms as u64,
             days_seen: vec![day],
-            first_seen: Utc::now(),
+            first_seen: Timestamp::now(),
             samples: sample_vec(sample_text),
             observations: 1,
             model_id: self.model_id.clone(),
@@ -172,7 +173,7 @@ impl CandidateStore {
         &mut self,
         id: &str,
         embedding: &[f32],
-        day: NaiveDate,
+        day: Date,
         speech_ms: u32,
         sample_text: &str,
     ) -> Result<()> {
@@ -412,10 +413,10 @@ fn write_wav(path: &Path, pcm: &[i16]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::NaiveDate;
+    use jiff::civil::Date;
 
-    fn day(d: u32) -> NaiveDate {
-        NaiveDate::from_ymd_opt(2026, 8, d).unwrap()
+    fn day(d: i8) -> Date {
+        jiff::civil::date(2026, 8, d)
     }
 
     fn store() -> (tempfile::TempDir, CandidateStore) {
