@@ -1,5 +1,6 @@
 pub mod discord;
 pub mod matrix;
+pub mod telegram;
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;

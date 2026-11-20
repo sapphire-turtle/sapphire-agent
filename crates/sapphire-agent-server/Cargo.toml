@@ -174,6 +174,14 @@ serenity = { version = "0.12", default-features = false, features = [
     "rustls_backend",
 ] }
 
+# Telegram bot (long polling + Bot API methods). `serde` enables the Bot API
+# types' serde representation used by the offline channel fixtures. rustls
+# matches the other channel HTTP clients without pulling in native-tls.
+telers = { version = "1.0.0-beta.10", default-features = false, features = [
+    "rustls-tls",
+    "serde",
+] }
+
 # Local STT + TTS via the official sherpa-onnx Rust crate (k2-fsa).
 # Statically links sherpa-onnx + ONNX runtime — no system install needed.
 # Optional, gated behind the `voice-sherpa` feature; the build is slow
