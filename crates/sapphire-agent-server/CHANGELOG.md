@@ -10,6 +10,71 @@ Changes up to `0.8.0`, when this crate was a binary of its own, are recorded in
 
 ## [Unreleased]
 
+## [0.14.0](https://github.com/sapphire-turtle/sapphire-agent/compare/sapphire-agent-server-v0.13.1...sapphire-agent-server-v0.14.0) - 2026-11-20
+
+### Added
+
+- *(mcp)* An rmcp transport that carries MCP over ACP mcp/message
+- *(mcp)* Run McpClient over ACP and classify its tools by annotations
+- *(acp)* Offer and run per-session tools in a turn
+- *(acp)* Accept client MCP servers over ACP (mcp/message)
+- *(acp)* Keep tool-list subscriptions alive; make client tool names collision-free
+- *(channel)* Cache attachment originals for seven days
+- *(tools)* Read local image files as multimodal results
+- *(tools)* Save conversation-owned attachment originals
+- *(channel)* Receive and cache non-image attachments
+- *(agent)* Scope attachment saving to channel conversations
+- *(config)* Add ToolGroup and the session/permission profile types
+- [**breaking**] *(tools)* Register by group, guard the definitions on the opened path
+- Let an unattended task declare its session profile
+- *(config)* Add per-room channel blocks
+- *(channel)* Telegram inbound topics as composite rooms
+- *(channel)* Telegram outbound — 4096-character chunking, topic-aware send
+- *(channel)* Telegram attachments and channel wiring; seed routing from per-room blocks
+
+### Changed
+
+- [**breaking**] *(config)* Bind session profiles on the declaration side
+- [**breaking**] *(policy)* Carry group and kind on the spec, decide with allow
+- [**breaking**] Let both turn loops decide through allow
+- Times are jiff's, not chrono's (RUSTSEC-2026-0543)
+
+### Documentation
+
+- *(acp)* Document tools a client provides over MCP over ACP
+- *(tools)* Document attachment retention and image reading
+- Telegram and per-room blocks in the example config and READMEs
+
+### Fixed
+
+- *(acp)* Wait for client MCP tools only before the first turn, install them once
+- *(channel)* Shrink oversized images and tell the model about dropped attachments
+- *(tools)* Make the image_read tilde check cross-platform
+- *(channel)* Scope the lossless-root test to the platform that can create it
+- *(config)* Preserve admin profile key and clarify migration
+- *(config)* Restore the duplicate room binding guard
+- *(policy)* Restore the lost coverage and kill the second kind source
+- Keep the room binding governing ordinary channel turns
+- Complete task 6 end-to-end coverage
+- The unattended turn's one resolved profile governs everything it touches
+- *(config)* Preserve room order and reject cross-channel duplicates
+- *(channel)* Validate Telegram tokens and advance past closed queues
+- *(channel)* Route Telegram media captions with drop notes
+- Carry telers dependency policy and validate Telegram user ids
+
+### Other
+
+- Clean the accumulated review residue
+
+### Testing
+
+- *(acp)* Round-trip a client-provided MCP tool
+- *(acp)* Wait for the initialize reply before sending the next request
+- *(acp)* Wait for the initialize reply in the load-then-prompt test too
+- *(provider)* Pin image tool-result serialization
+
+
+
 ### Changed
 
 - Times are jiff's, not chrono's, which is unmaintained (RUSTSEC-2026-0543). Session logs, transcripts and caches read and write as before (RFC 3339). chrono is left only where a dependency's API takes it: the `cron` crate's schedules (`HeartbeatTask::next_after` converts at the edge) and the A2A message timestamp.
