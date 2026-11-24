@@ -333,7 +333,8 @@ system_prompt = "You are a helpful personal assistant."
 # `SOUL.guest.md`, …); `agents_file`, `soul_file`, `identity_file`,
 # `user_file`, `tools_file` and `bootstrap_file` name an explicit
 # workspace-relative path instead (a missing one is warned about and read
-# as absent — there is no fallback to the convention). The layer is
+# as absent — there is no fallback to the convention; an absolute path or
+# one with `..` is refused at startup). The layer is
 # appended after the root file; a layer starting with
 #
 #     ---
@@ -341,7 +342,8 @@ system_prompt = "You are a helpful personal assistant."
 #     ---
 #
 # replaces the root file instead, and a `replace` layer with no body
-# drops that file for the profile.
+# drops that file for the profile. Any `merge:` value other than `append`
+# or `replace` is read as `replace`, so a typo never leaks the root file.
 #
 # These files shape behaviour only — they are not isolation. The `fs`
 # tools reach the whole workspace regardless of namespace or profile, so a

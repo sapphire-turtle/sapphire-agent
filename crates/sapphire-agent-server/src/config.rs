@@ -1867,6 +1867,17 @@ api_key = "test"
                     "session_profile '{rp_name}' references unknown memory_namespace '{ns}'"
                 ));
             }
+            for kind in PromptFileKind::ALL {
+                if let Some(path) = rp.prompt_file(kind)
+                    && !crate::workspace::is_workspace_relative(path)
+                {
+                    errors.push(format!(
+                        "session_profile '{rp_name}' {} '{path}' must be a workspace-relative \
+                         path (no leading '/', drive or '..')",
+                        kind.config_key()
+                    ));
+                }
+            }
         }
         let mut seen_rooms: HashMap<&str, &str> = HashMap::new();
         for (channel, room) in self.channels() {
@@ -3292,6 +3303,42 @@ fallback_provider = "ghost"
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("fallback"));
         assert!(errors[0].contains("ghost"));
+    }
+
+    #[test]
+    fn validate_refuses_prompt_file_paths_outside_the_workspace() {
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+
+[profiles.default]
+provider = "anthropic"
+
+[session_profile.guest]
+profile = "default"
+agents_file = "roles/front-desk.md"
+user_file = "/home/someone/.config/sapphire-agent/config.toml"
+soul_file = "../outside.md"
+"#,
+        );
+        let errors = cfg.validate_session_profiles();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("user_file") && e.contains("workspace-relative")),
+            "{errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("soul_file") && e.contains("workspace-relative")),
+            "{errors:?}"
+        );
+        assert!(
+            !errors.iter().any(|e| e.contains("agents_file")),
+            "{errors:?}"
+        );
     }
 
     #[test]

@@ -97,7 +97,14 @@ SOUL.guest.md          # merge: replace
 - An explicitly configured `<kind>_file` that does not exist: warn once at
   startup and treat the profile file as absent (no fallback to
   `AGENTS.<p>.md`, so a typo is noticed rather than masked).
-- An unknown `merge:` value: warn and treat as `append`.
+- An unknown `merge:` value: warn and treat as `replace` (fail closed, so a
+  typo never merges a root file into a profile meant to replace it); values
+  are case-insensitive and a leading BOM is ignored. *(Changed after the final
+  review; originally `append`.)*
+- Explicit `*_file` paths must be workspace-relative (no absolute path, drive
+  or `..`): startup refuses others, and the reader ignores them. The
+  workspace's own config layer may set these keys, so it must not be able to
+  pull host files into a prompt. *(Added after the final review.)*
 - `verify`'s workspace-file listing (`lib.rs`, `workspace_files`) gains a
   per-session-profile line showing which file it resolved and its merge mode.
 - Profile names are used verbatim in file names; names containing `/` or

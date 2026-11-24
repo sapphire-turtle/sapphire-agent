@@ -129,7 +129,9 @@ pub(crate) fn resolve_profile_layer(
     profile: PromptProfile<'_>,
 ) -> Option<(String, MergeMode)> {
     let path = match profile.config.prompt_file(kind) {
-        Some(path) => dir.join(path).is_file().then(|| path.to_string()),
+        Some(path) => {
+            (is_workspace_relative(path) && dir.join(path).is_file()).then(|| path.to_string())
+        }
         None => {
             let roots = WORKSPACE_FILES
                 .iter()
@@ -144,20 +146,52 @@ pub(crate) fn resolve_profile_layer(
     Some((path, split_merge_mode(&raw).0))
 }
 
+/// Whether `path` stays inside the workspace when joined onto its root: a
+/// non-empty relative path of plain components, never absolute and never
+/// stepping up with `..`. An explicit `agents_file` (…) may come from the
+/// workspace's own config layer, which must not reach the host's files.
+pub(crate) fn is_workspace_relative(path: &str) -> bool {
+    use std::path::Component;
+    let path = Path::new(path);
+    // `C:\x` is not absolute on Unix, but a drive prefix is never a
+    // workspace-relative spelling on any platform.
+    let looks_like_drive = path
+        .to_str()
+        .is_some_and(|p| p.as_bytes().get(1) == Some(&b':'));
+    !path.as_os_str().is_empty()
+        && !looks_like_drive
+        && path
+            .components()
+            .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+}
+
 /// Split a profile file into its merge mode and its body, frontmatter
-/// stripped. No frontmatter or no `merge:` key means `Append`; an unknown
-/// value is warned about and read as `Append`.
+/// stripped. No frontmatter or no `merge:` key means `Append`; values are
+/// case-insensitive, and an unknown one is warned about and read as
+/// `Replace` (fail closed).
 pub(crate) fn split_merge_mode(raw: &str) -> (MergeMode, String) {
+    // A BOM (as some Windows editors save) would otherwise hide the
+    // frontmatter, and with it a `merge: replace`.
+    let raw = raw.strip_prefix('\u{FEFF}').unwrap_or(raw);
     let Some((fm, body)) = crate::frontmatter::split(raw) else {
         return (MergeMode::Append, raw.to_string());
     };
     let mapping = crate::frontmatter::parse_mapping(fm);
-    let mode = match mapping.get("merge").and_then(|v| v.as_str()) {
+    let value = mapping
+        .get("merge")
+        .and_then(|v| v.as_str())
+        .map(str::to_ascii_lowercase);
+    let mode = match value.as_deref() {
         None | Some("append") => MergeMode::Append,
         Some("replace") => MergeMode::Replace,
+        // Fail closed: a typo must not merge a root file (the operator's
+        // USER.md, say) into a profile that meant to replace it.
         Some(other) => {
-            tracing::warn!("unknown `merge: {other}` in a profile prompt file; appending");
-            MergeMode::Append
+            tracing::warn!(
+                "unknown `merge: {other}` in a profile prompt file; replacing \
+                 (use `append` or `replace`)"
+            );
+            MergeMode::Replace
         }
     };
     (mode, body.to_string())
@@ -516,6 +550,11 @@ impl Workspace {
         profile: PromptProfile<'_>,
     ) -> Option<(String, String)> {
         if let Some(path) = profile.config.prompt_file(def.kind) {
+            // Refused at startup too; checked again so no read ever leaves
+            // the workspace.
+            if !is_workspace_relative(path) {
+                return None;
+            }
             return self
                 .read_file(path)
                 .await
@@ -1011,5 +1050,82 @@ mod tests {
             "{prompt}"
         );
         assert!(!prompt.contains(" — "), "{prompt}");
+    }
+
+    // -- final-review fixes --------------------------------------------------
+
+    #[tokio::test]
+    async fn explicit_path_outside_workspace_is_ignored() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(outside.path().join("secret.md"), "host secret").unwrap();
+        write(&dir, "AGENTS.md", "core");
+        let absolute = outside.path().join("secret.md").display().to_string();
+        let outside_name = outside.path().file_name().unwrap().to_string_lossy();
+        for path in [absolute, format!("../{outside_name}/secret.md")] {
+            let cfg = SessionProfileConfig {
+                agents_file: Some(path.clone()),
+                ..Default::default()
+            };
+            let prompt = prompt_for(&dir, profile("family", &cfg)).await;
+            assert!(!prompt.contains("host secret"), "{path}: {prompt}");
+            assert!(prompt.contains("core"), "{path}: {prompt}");
+        }
+    }
+
+    #[test]
+    fn workspace_relative_paths_are_recognised() {
+        for ok in ["AGENTS.md", "roles/x.md", "./roles/x.md"] {
+            assert!(is_workspace_relative(ok), "{ok}");
+        }
+        for bad in ["", "/etc/passwd", "../x.md", "roles/../../x.md", "C:\\x.md"] {
+            assert!(!is_workspace_relative(bad), "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_merge_value_fails_closed_to_replace() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write(&dir, "USER.md", "operator details");
+        for value in ["replaced", "Replace", "REPLACE"] {
+            write(
+                &dir,
+                "USER.guest.md",
+                &format!("---\nmerge: {value}\n---\nguest"),
+            );
+            let cfg = SessionProfileConfig::default();
+            let prompt = prompt_for(&dir, profile("guest", &cfg)).await;
+            assert!(!prompt.contains("operator details"), "{value}: {prompt}");
+            assert!(prompt.contains("guest"), "{value}: {prompt}");
+        }
+    }
+
+    #[tokio::test]
+    async fn append_is_case_insensitive() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write(&dir, "AGENTS.md", "core");
+        write(
+            &dir,
+            "AGENTS.family.md",
+            "---\nmerge: Append\n---\ntranslate",
+        );
+        let cfg = SessionProfileConfig::default();
+        let prompt = prompt_for(&dir, profile("family", &cfg)).await;
+        assert!(prompt.contains("core\n\ntranslate"), "{prompt}");
+    }
+
+    #[tokio::test]
+    async fn bom_before_frontmatter_is_tolerated() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write(&dir, "USER.md", "operator details");
+        write(
+            &dir,
+            "USER.guest.md",
+            "\u{FEFF}---\nmerge: replace\n---\nguest",
+        );
+        let cfg = SessionProfileConfig::default();
+        let prompt = prompt_for(&dir, profile("guest", &cfg)).await;
+        assert!(!prompt.contains("operator details"), "{prompt}");
+        assert!(!prompt.contains("merge:"), "{prompt}");
     }
 }
