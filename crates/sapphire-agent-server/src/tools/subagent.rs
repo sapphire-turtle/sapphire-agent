@@ -1436,7 +1436,8 @@ async fn scope_background<F: std::future::Future>(
     namespace: String,
     fut: F,
 ) -> F::Output {
-    let fut = crate::tools::workspace_tools::scope_memory_namespace(namespace, fut);
+    let chain = ctx.state.config.resolve_namespace_chain(&namespace);
+    let fut = crate::tools::workspace_tools::scope_memory_namespace(chain, fut);
     let fut =
         crate::tools::config_tools::scope_session_profile(Some(ctx.session_profile.clone()), fut);
     let origin = ctx.timer_origin.clone();

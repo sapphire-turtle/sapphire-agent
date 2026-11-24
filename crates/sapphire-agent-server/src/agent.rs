@@ -834,8 +834,7 @@ impl Agent {
                     let tools = self.tools.clone();
                     let ns = self
                         .config
-                        .namespace_for_session_profile(&profile_name)
-                        .to_string();
+                        .resolve_namespace_chain(self.config.namespace_for_session_profile(&profile_name));
                     let room_id_for_timer = incoming.room_id.clone();
                     // Permission gate for the channel path.
                     //

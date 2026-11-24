@@ -2952,7 +2952,7 @@ impl TurnLoop<'_> {
                     // memory tool writes under `memory/<namespace>/...`.
                     let tools = Arc::clone(&self.state.tools);
                     let session_tools = session_tools.clone();
-                    let ns = namespace.clone();
+                    let ns = self.state.config.resolve_namespace_chain(&namespace);
                     let timer_origin = self.timer_origin.clone();
                     let session_profile = self.session_profile.clone();
                     // Read once per turn, same as `timer_origin`: `None` on
