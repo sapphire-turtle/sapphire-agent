@@ -447,6 +447,12 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
                         errors.join("\n  - ")
                     );
                 }
+                for line in loaded
+                    .config
+                    .missing_prompt_file_overrides(&loaded.workspace_dir)
+                {
+                    tracing::warn!("{line}; the root file is used alone");
+                }
                 ProviderRegistry::from_config(&loaded.config)
                     .context("Failed to build provider registry")?;
             }
@@ -1688,6 +1694,28 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
                     Some(f) => println!("  {label:<28} found ({f})"),
                     None => println!("  {label:<28} -"),
                 }
+            }
+            let mut profile_names: Vec<&String> = config.session_profiles.keys().collect();
+            profile_names.sort();
+            for name in profile_names {
+                let profile = workspace::PromptProfile {
+                    name,
+                    config: &config.session_profiles[name],
+                };
+                for kind in config::PromptFileKind::ALL {
+                    if let Some((path, mode)) =
+                        workspace::resolve_profile_layer(&workspace_dir, kind, profile)
+                    {
+                        let mode = match mode {
+                            workspace::MergeMode::Append => "append",
+                            workspace::MergeMode::Replace => "replace",
+                        };
+                        println!("  {name}: {path} ({mode})");
+                    }
+                }
+            }
+            for line in config.missing_prompt_file_overrides(&workspace_dir) {
+                println!("  warning: {line}");
             }
         }
     }

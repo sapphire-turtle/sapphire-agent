@@ -111,6 +111,13 @@ into `IDENTITY.md` and `SOUL.md`, and then delete itself.
 `init` never overwrites, so it is safe to re-run — that is also how a workspace
 made by an older build picks up a file added since.
 
+Each session profile can layer its own version of these files over the root
+ones — `AGENTS.<profile>.md`, `SOUL.<profile>.md` and so on, appended after the
+root file unless the layer's frontmatter says `merge: replace` — so one agent
+can play a different role for each profile. That shapes behaviour only; keep a
+profile away from other profiles' data with its permission (see
+`config.example.toml`, "Per-profile prompt files").
+
 It writes nothing outside the workspace. API keys and other credentials are
 host-local, so rather than writing that file `init` prints it for you to place
 at `~/.config/sapphire-agent/config.toml` (on Linux). Everything else —

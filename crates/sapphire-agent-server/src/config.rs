@@ -1738,6 +1738,30 @@ api_key = "test"
         self.session_profiles.get(name)
     }
 
+    /// Explicit session-profile prompt-file paths (`agents_file`, …) that
+    /// name no file under `workspace_dir`, one line each, sorted by profile
+    /// then file. Such a layer is read as absent — no fallback to the
+    /// `AGENTS.<p>.md` convention — so `serve` warns and `verify` reports.
+    pub fn missing_prompt_file_overrides(&self, workspace_dir: &Path) -> Vec<String> {
+        let mut names: Vec<&String> = self.session_profiles.keys().collect();
+        names.sort();
+        let mut out = Vec::new();
+        for name in names {
+            let profile = &self.session_profiles[name];
+            for kind in PromptFileKind::ALL {
+                if let Some(path) = profile.prompt_file(kind)
+                    && !workspace_dir.join(path).is_file()
+                {
+                    out.push(format!(
+                        "session_profile '{name}' {} '{path}' does not exist",
+                        kind.config_key()
+                    ));
+                }
+            }
+        }
+        out
+    }
+
     /// Resolve the session policy for an already-resolved session profile,
     /// falling back to the global default when the profile sets none.
     pub fn session_policy_for_profile(&self, profile_name: &str) -> SessionPolicy {
@@ -3229,6 +3253,30 @@ fallback_provider = "ghost"
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("fallback"));
         assert!(errors[0].contains("ghost"));
+    }
+
+    #[test]
+    fn missing_prompt_file_overrides_names_only_absent_paths() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("a.md"), "x").unwrap();
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+
+[profiles.default]
+provider = "anthropic"
+
+[session_profile.family]
+profile = "default"
+agents_file = "a.md"
+soul_file = "s.md"
+"#,
+        );
+        assert_eq!(
+            cfg.missing_prompt_file_overrides(dir.path()),
+            vec!["session_profile 'family' soul_file 's.md' does not exist".to_string()]
+        );
     }
 
     #[test]

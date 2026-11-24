@@ -119,6 +119,31 @@ pub(crate) fn profile_file_candidates(roots: &[&str], profile_name: &str) -> Vec
         .collect()
 }
 
+/// Where `profile`'s layer of `kind` resolves under `dir`, and its merge
+/// mode — for `verify`'s report. Mirrors `Workspace::read_profile_layer`
+/// without the pinned cache: an explicit path is reported only when the
+/// file exists (no fallback), else the first existing convention file.
+pub(crate) fn resolve_profile_layer(
+    dir: &Path,
+    kind: PromptFileKind,
+    profile: PromptProfile<'_>,
+) -> Option<(String, MergeMode)> {
+    let path = match profile.config.prompt_file(kind) {
+        Some(path) => dir.join(path).is_file().then(|| path.to_string()),
+        None => {
+            let roots = WORKSPACE_FILES
+                .iter()
+                .find(|def| def.kind == kind)
+                .map_or(&[][..], |def| def.candidates);
+            profile_file_candidates(roots, profile.name)
+                .into_iter()
+                .find(|name| dir.join(name).is_file())
+        }
+    }?;
+    let raw = std::fs::read_to_string(dir.join(&path)).ok()?;
+    Some((path, split_merge_mode(&raw).0))
+}
+
 /// Split a profile file into its merge mode and its body, frontmatter
 /// stripped. No frontmatter or no `merge:` key means `Append`; an unknown
 /// value is warned about and read as `Append`.

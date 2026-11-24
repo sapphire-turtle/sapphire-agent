@@ -477,7 +477,12 @@ impl Agent {
                 // Matrix/Discord rooms have no client working directory —
                 // the block's absence there is the whole point of `None`.
                 None,
-                None,
+                self.config
+                    .session_profile(profile_name)
+                    .map(|config| crate::workspace::PromptProfile {
+                        name: profile_name,
+                        config,
+                    }),
             )
             .await;
 

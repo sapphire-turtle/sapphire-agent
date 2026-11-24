@@ -3357,7 +3357,13 @@ pub(crate) async fn run_llm_turn(
                 &namespace_chain,
                 room_info.as_ref(),
                 progress.cwd().as_deref(),
-                None,
+                state
+                    .config
+                    .session_profile(&session_profile)
+                    .map(|config| crate::workspace::PromptProfile {
+                        name: &session_profile,
+                        config,
+                    }),
             )
             .await;
         if sp.is_empty() { None } else { Some(sp) }

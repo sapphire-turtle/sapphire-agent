@@ -310,6 +310,34 @@ system_prompt = "You are a helpful personal assistant."
 # memory_namespace = "user_nsfw"
 # session_policy   = "compact"
 #
+# Per-profile prompt files: a session profile can layer its own version
+# of every workspace prompt file (AGENTS.md, SOUL.md, IDENTITY.md,
+# USER.md, TOOLS.md, BOOTSTRAP.md) over the root one. By convention the
+# layer is `<STEM>.<profile>.md` in the workspace root (`AGENTS.guest.md`,
+# `SOUL.guest.md`, …); `agents_file`, `soul_file`, `identity_file`,
+# `user_file`, `tools_file` and `bootstrap_file` name an explicit
+# workspace-relative path instead (a missing one is warned about and read
+# as absent — there is no fallback to the convention). The layer is
+# appended after the root file; a layer starting with
+#
+#     ---
+#     merge: replace
+#     ---
+#
+# replaces the root file instead, and a `replace` layer with no body
+# drops that file for the profile.
+#
+# These files shape behaviour only — they are not isolation. The `fs`
+# tools reach the whole workspace regardless of namespace or profile, so a
+# profile whose users must not see other profiles' data (website guests,
+# say) uses `permission = "chat"`, which offers no workspace tools at all.
+#
+# [session_profile.guest]
+# profile          = "default"
+# memory_namespace = "guest"
+# permission       = "chat"
+# agents_file      = "roles/front-desk.md"   # optional; else AGENTS.guest.md
+#
 # /rpc (sapphire-agent-desktop), A2A (Agent2Agent Protocol), `/acp`
 # and ambient ingest all reach a session_profile through the API key's
 # profile: an incoming `Authorization: Bearer <token>` resolves
