@@ -260,7 +260,8 @@ system_prompt = "You are a helpful personal assistant."
 # plus the daily/weekly/monthly/yearly logs and digests. Session profiles
 # pin their writes to one namespace; rooms reading the system prompt
 # also pull in parent namespaces declared via `include`. Reads chain
-# through the include DAG; writes go only to the leaf namespace.
+# through the include DAG; background writers (daily logs, digests,
+# compaction) write only to the leaf namespace.
 #
 # The `default` namespace is implicit (no need to declare it explicitly)
 # and is what every config without `[memory_namespace.*]` resolves to.
@@ -273,6 +274,7 @@ system_prompt = "You are a helpful personal assistant."
 #
 # [memory_namespace.user]
 # include = ["default"]
+# description = "the operator's everyday life and development work"
 #
 # [memory_namespace.user_nsfw]
 # include = ["user"]
@@ -283,6 +285,19 @@ system_prompt = "You are a helpful personal assistant."
 # # Resolution: this field > global [profiles.background] > plain
 # # Anthropic.
 # background_profile = "local"
+#
+# The memory tools (memory_add, memory_read, …) write to the session's own
+# namespace by default and take a `namespace` argument naming any other
+# namespace of its include chain, so a namespace that two others include
+# is where facts they share belong. `description` tells the model what each
+# namespace is for; the system prompt lists the chain with them.
+#
+# [memory_namespace.family]
+# description = "facts about the family, shared by the operator and family"
+#
+# [memory_namespace.translation]
+# include     = ["family"]
+# description = "a family member's confidential translation work"
 
 # ── Session profiles ───────────────────────────────────────────────────────
 # A session profile bundles an LLM profile, memory namespace and policy.

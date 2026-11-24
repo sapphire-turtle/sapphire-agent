@@ -3354,7 +3354,7 @@ pub(crate) async fn run_llm_turn(
             .build_system_prompt(
                 state.config.anthropic.system_prompt.as_deref(),
                 state.config.day_boundary_hour,
-                &namespace_chain,
+                &state.config.namespace_infos(&namespace_chain),
                 room_info.as_ref(),
                 progress.cwd().as_deref(),
                 state

@@ -684,8 +684,9 @@ pub struct ProfileConfig {
 /// Definition of a memory namespace — a subtree under `memory/<name>/`
 /// that owns its own MEMORY.md and periodic logs. The `include` list
 /// names parent namespaces whose memory should also be visible to
-/// rooms using this namespace; reads chain through the include DAG,
-/// writes go only to the leaf namespace.
+/// rooms using this namespace; reads chain through the include DAG.
+/// Background writers (logs, digests, compaction) write only to the leaf;
+/// the memory tools may write to any namespace of the chain.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct MemoryNamespaceConfig {
     /// Names of parent namespaces whose memory should be merged in
@@ -712,6 +713,29 @@ pub struct MemoryNamespaceConfig {
     /// right for development and wrong for an ordinary conversation.
     #[serde(default)]
     pub skills: bool,
+    /// What this namespace holds, in the operator's words. Shown to the
+    /// model next to the namespace's name in the `# Memory` block so it can
+    /// choose where a fact belongs.
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// A namespace of a session's include chain as the system prompt names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamespaceInfo {
+    pub name: String,
+    pub description: Option<String>,
+}
+
+#[cfg(test)]
+impl NamespaceInfo {
+    /// A namespace with no description.
+    pub fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            description: None,
+        }
+    }
 }
 
 /// Voice pipeline preset — references a named STT provider and TTS provider
@@ -2216,7 +2240,22 @@ api_key = "test"
     /// Resolve the memory namespace declared by a room profile (by
     /// name). Falls back to `"default"` if the room profile is unknown
     /// or doesn't set one.
-    pub fn namespace_for_session_profile(&self, name: &str) -> &str {
+/// `chain` (from `resolve_namespace_chain`) with each namespace's
+    /// configured description.
+    pub fn namespace_infos(&self, chain: &[String]) -> Vec<NamespaceInfo> {
+        chain
+            .iter()
+            .map(|name| NamespaceInfo {
+                name: name.clone(),
+                description: self
+                    .memory_namespaces
+                    .get(name)
+                    .and_then(|ns| ns.description.clone()),
+            })
+            .collect()
+    }
+
+        pub fn namespace_for_session_profile(&self, name: &str) -> &str {
         self.session_profiles
             .get(name)
             .and_then(|rp| rp.memory_namespace.as_deref())
@@ -3253,6 +3292,28 @@ fallback_provider = "ghost"
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("fallback"));
         assert!(errors[0].contains("ghost"));
+    }
+
+    #[test]
+    fn namespace_infos_reads_descriptions_and_defaults_missing() {
+        let cfg = parse(
+            r#"
+[memory_namespace.mom]
+include = ["family"]
+description = "translation work"
+
+[memory_namespace.family]
+"#,
+        );
+        let infos = cfg.namespace_infos(&cfg.resolve_namespace_chain("mom"));
+        let got: Vec<(&str, Option<&str>)> = infos
+            .iter()
+            .map(|i| (i.name.as_str(), i.description.as_deref()))
+            .collect();
+        assert_eq!(got, vec![("mom", Some("translation work")), ("family", None)]);
+        let default = cfg.namespace_infos(&["default".to_string()]);
+        assert_eq!(default[0].name, "default");
+        assert_eq!(default[0].description, None);
     }
 
     #[test]

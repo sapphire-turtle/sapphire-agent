@@ -1,5 +1,5 @@
 use crate::channel::RoomInfo;
-use crate::config::{DigestConfig, PromptFileKind, SessionProfileConfig};
+use crate::config::{DigestConfig, NamespaceInfo, PromptFileKind, SessionProfileConfig};
 use crate::periodic_log::{self, LogKind};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -206,14 +206,16 @@ impl Workspace {
     /// Build the full system prompt:
     /// 1. Base system_prompt from config (if any)
     /// 2. Each workspace file that exists, in openclaw order
-    /// 3. Chained MEMORY.md from the room's namespace and its includes
+    /// 3. The namespace list and chained MEMORY.md from the room's
+    ///    namespace and its includes
     /// 4. Previous day's daily log (if it exists)
     ///
-    /// `namespace_chain` is the DFS-pre-order list of namespaces this
-    /// room reads from — typically computed via
-    /// `Config::resolve_namespace_chain(Config::namespace_for_session(room_id))`.
+    /// `namespaces` is the DFS-pre-order list of namespaces this room
+    /// reads from, with their descriptions — typically computed via
+    /// `Config::namespace_infos(&Config::resolve_namespace_chain(ns))`.
     /// The first entry is the room's own namespace; later entries are
-    /// included parents.
+    /// included parents. `profile` is the session profile whose prompt
+    /// file layers apply, if any.
     ///
     /// `cwd`, when present, is this turn's ACP session working directory
     /// (see `TurnHost::cwd` in `serve`): an absolute path on the *client's*
@@ -224,11 +226,13 @@ impl Workspace {
         &self,
         base: Option<&str>,
         boundary_hour: u8,
-        namespace_chain: &[String],
+        namespaces: &[NamespaceInfo],
         room_info: Option<&RoomInfo>,
         cwd: Option<&str>,
         profile: Option<PromptProfile<'_>>,
     ) -> String {
+        let chain: Vec<String> = namespaces.iter().map(|ns| ns.name.clone()).collect();
+        let namespace_chain = chain.as_slice();
         let mut parts: Vec<String> = Vec::new();
 
         if let Some(b) = base.filter(|s| !s.is_empty()) {
@@ -265,7 +269,7 @@ impl Workspace {
         }
 
         // Per-namespace MEMORY.md, chained.
-        if let Some(block) = self.build_memory_block(namespace_chain).await {
+        if let Some(block) = self.build_memory_block(namespaces).await {
             parts.push(block);
         }
 
@@ -282,9 +286,9 @@ impl Workspace {
     /// concatenate as `## <namespace>` subsections under one combined
     /// `# Memory` heading. Namespaces with no MEMORY.md are skipped.
     /// Returns `None` if the entire chain has no MEMORY.md to inject.
-    async fn build_memory_block(&self, namespace_chain: &[String]) -> Option<String> {
+    async fn build_memory_block(&self, namespaces: &[NamespaceInfo]) -> Option<String> {
         let mut subsections = Vec::new();
-        for ns in namespace_chain {
+        for ns in namespaces.iter().map(|ns| &ns.name) {
             let rel = format!("memory/{ns}/MEMORY.md");
             if let Some(content) = self.read_file(&rel).await
                 && !content.trim().is_empty()
@@ -292,11 +296,29 @@ impl Workspace {
                 subsections.push(format!("## {ns}\n\n{content}"));
             }
         }
-        if subsections.is_empty() {
-            None
-        } else {
-            Some(format!("# Memory\n\n{}", subsections.join("\n\n")))
+        if namespaces.is_empty() {
+            return None;
         }
+        let mut block = String::from(
+            "# Memory\n\nNamespaces available to the memory tools (pass `namespace` to \
+             choose; default is this conversation's own):",
+        );
+        for (i, ns) in namespaces.iter().enumerate() {
+            block.push_str("\n- ");
+            block.push_str(&ns.name);
+            if i == 0 {
+                block.push_str(" (this conversation)");
+            }
+            if let Some(description) = ns.description.as_deref().filter(|d| !d.trim().is_empty()) {
+                block.push_str(" — ");
+                block.push_str(description.trim());
+            }
+        }
+        for subsection in subsections {
+            block.push_str("\n\n");
+            block.push_str(&subsection);
+        }
+        Some(block)
     }
 
     /// Append log injection blocks to `parts`: yesterday's full body
@@ -634,7 +656,7 @@ mod tests {
     async fn the_system_prompt_is_byte_identical_across_turns() {
         let dir = tempfile::TempDir::new().unwrap();
         let ws = workspace_with_agents_md(&dir);
-        let chain = ["default".to_string()];
+        let chain = [NamespaceInfo::new("default")];
 
         let first = ws
             .build_system_prompt(Some("base"), 4, &chain, None, None, None)
@@ -656,7 +678,7 @@ mod tests {
     async fn the_system_prompt_pins_edits_until_cleared() {
         let dir = tempfile::TempDir::new().unwrap();
         let ws = workspace_with_agents_md(&dir);
-        let chain = ["default".to_string()];
+        let chain = [NamespaceInfo::new("default")];
 
         let before = ws
             .build_system_prompt(Some("base"), 4, &chain, None, None, None)
@@ -691,7 +713,7 @@ mod tests {
     async fn newly_created_files_are_invisible_until_cleared() {
         let dir = tempfile::TempDir::new().unwrap();
         let ws = Workspace::new(dir.path().to_path_buf(), DigestConfig::default());
-        let chain = ["default".to_string()];
+        let chain = [NamespaceInfo::new("default")];
 
         let before = ws
             .build_system_prompt(Some("base"), 4, &chain, None, None, None)
@@ -714,7 +736,7 @@ mod tests {
     async fn a_cwd_reaches_the_prompt_as_its_own_block() {
         let dir = tempfile::TempDir::new().unwrap();
         let ws = Workspace::new(dir.path().to_path_buf(), DigestConfig::default());
-        let chain = ["default".to_string()];
+        let chain = [NamespaceInfo::new("default")];
         let prompt = ws
             .build_system_prompt(Some("base"), 4, &chain, None, Some("/work/proj"), None)
             .await;
@@ -728,7 +750,7 @@ mod tests {
     async fn the_cwd_block_precedes_the_workspace_files() {
         let dir = tempfile::TempDir::new().unwrap();
         let ws = workspace_with_agents_md(&dir);
-        let chain = ["default".to_string()];
+        let chain = [NamespaceInfo::new("default")];
         let prompt = ws
             .build_system_prompt(Some("base"), 4, &chain, None, Some("/work/proj"), None)
             .await;
@@ -746,7 +768,7 @@ mod tests {
     async fn no_cwd_adds_no_block() {
         let dir = tempfile::TempDir::new().unwrap();
         let ws = Workspace::new(dir.path().to_path_buf(), DigestConfig::default());
-        let chain = ["default".to_string()];
+        let chain = [NamespaceInfo::new("default")];
         let prompt = ws
             .build_system_prompt(Some("base"), 4, &chain, None, None, None)
             .await;
@@ -761,7 +783,7 @@ mod tests {
 
     async fn prompt_for(dir: &tempfile::TempDir, p: Option<PromptProfile<'_>>) -> String {
         let ws = Workspace::new(dir.path().to_path_buf(), DigestConfig::default());
-        ws.build_system_prompt(None, 4, &["default".to_string()], None, None, p)
+        ws.build_system_prompt(None, 4, &[NamespaceInfo::new("default")], None, None, p)
             .await
     }
 
@@ -898,7 +920,7 @@ mod tests {
         write(&dir, "AGENTS.family.md", "translate");
         let cfg = SessionProfileConfig::default();
         let ws = Workspace::new(dir.path().to_path_buf(), DigestConfig::default());
-        let chain = ["default".to_string()];
+        let chain = [NamespaceInfo::new("default")];
         let a = ws
             .build_system_prompt(None, 4, &chain, None, None, profile("family", &cfg))
             .await;
@@ -906,5 +928,64 @@ mod tests {
             .build_system_prompt(None, 4, &chain, None, None, profile("family", &cfg))
             .await;
         assert_eq!(a, b);
+    }
+
+    // -- namespace list in the memory block ----------------------------------
+
+    fn ns(name: &str, description: Option<&str>) -> NamespaceInfo {
+        NamespaceInfo {
+            name: name.to_string(),
+            description: description.map(str::to_string),
+        }
+    }
+
+    async fn prompt_with_namespaces(dir: &tempfile::TempDir, namespaces: &[NamespaceInfo]) -> String {
+        let ws = Workspace::new(dir.path().to_path_buf(), DigestConfig::default());
+        ws.build_system_prompt(None, 4, namespaces, None, None, None)
+            .await
+    }
+
+    #[tokio::test]
+    async fn memory_block_lists_namespaces_with_descriptions() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write(&dir, "memory/mom/MEMORY.md", "mom memory");
+        let prompt = prompt_with_namespaces(
+            &dir,
+            &[
+                ns("mom", Some("母の翻訳業務")),
+                ns("family", Some("家族に関する共有情報")),
+            ],
+        )
+        .await;
+        assert!(
+            prompt.contains(
+                "# Memory\n\n\
+                 Namespaces available to the memory tools (pass `namespace` to choose; \
+                 default is this conversation's own):\n\
+                 - mom (this conversation) — 母の翻訳業務\n\
+                 - family — 家族に関する共有情報\n\n\
+                 ## mom\n\nmom memory"
+            ),
+            "{prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_block_lists_namespaces_without_memory_md() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let prompt =
+            prompt_with_namespaces(&dir, &[ns("mom", None), ns("family", None)]).await;
+        assert!(prompt.contains("# Memory\n\nNamespaces available"), "{prompt}");
+        assert!(prompt.contains("- family"), "{prompt}");
+        assert!(!prompt.contains("## "), "{prompt}");
+    }
+
+    #[tokio::test]
+    async fn namespace_without_description_has_bare_name() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let prompt =
+            prompt_with_namespaces(&dir, &[ns("mom", None), ns("family", None)]).await;
+        assert!(prompt.contains("\n- mom (this conversation)\n- family"), "{prompt}");
+        assert!(!prompt.contains(" — "), "{prompt}");
     }
 }
