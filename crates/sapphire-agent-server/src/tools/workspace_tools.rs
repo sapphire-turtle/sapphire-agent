@@ -214,7 +214,7 @@ impl MemoryAddTool {
         let description = format!(
             "Create a new memory entry at memory/<category>/<slug>.md. \
              Fails if the file already exists (use memory_update to overwrite). \
-             Each file holds one self-contained entry retrievable via workspace_search. {MEMORY_CATEGORY_GUIDE}"
+             Each file holds one self-contained entry retrievable via workspace_search (when file tools are available). {MEMORY_CATEGORY_GUIDE}"
         );
         Self {
             state,
@@ -239,7 +239,8 @@ impl Tool for MemoryAddTool {
         let category = input["category"].as_str().context("missing 'category'")?;
         let slug = input["slug"].as_str().context("missing 'slug'")?;
         let content = input["content"].as_str().context("missing 'content'")?;
-        let (rel, abs) = memory_entry_path(&self.state, input["namespace"].as_str(), category, slug)?;
+        let (rel, abs) =
+            memory_entry_path(&self.state, input["namespace"].as_str(), category, slug)?;
         if abs.exists() {
             anyhow::bail!("{rel} already exists; use memory_update to overwrite");
         }
@@ -294,7 +295,8 @@ impl Tool for MemoryUpdateTool {
         let category = input["category"].as_str().context("missing 'category'")?;
         let slug = input["slug"].as_str().context("missing 'slug'")?;
         let content = input["content"].as_str().context("missing 'content'")?;
-        let (rel, abs) = memory_entry_path(&self.state, input["namespace"].as_str(), category, slug)?;
+        let (rel, abs) =
+            memory_entry_path(&self.state, input["namespace"].as_str(), category, slug)?;
         if !abs.exists() {
             anyhow::bail!("{rel} does not exist; use memory_add to create it");
         }
@@ -354,7 +356,8 @@ impl Tool for MemoryAppendTool {
         let category = input["category"].as_str().context("missing 'category'")?;
         let slug = input["slug"].as_str().context("missing 'slug'")?;
         let content = input["content"].as_str().context("missing 'content'")?;
-        let (rel, abs) = memory_entry_path(&self.state, input["namespace"].as_str(), category, slug)?;
+        let (rel, abs) =
+            memory_entry_path(&self.state, input["namespace"].as_str(), category, slug)?;
         let now = Timestamp::now();
 
         let (meta, new_body, created) = if abs.exists() {
@@ -431,7 +434,8 @@ impl Tool for MemoryReadTool {
     async fn execute(&self, input: &serde_json::Value) -> Result<String> {
         let category = input["category"].as_str().context("missing 'category'")?;
         let slug = input["slug"].as_str().context("missing 'slug'")?;
-        let (rel, abs) = memory_entry_path(&self.state, input["namespace"].as_str(), category, slug)?;
+        let (rel, abs) =
+            memory_entry_path(&self.state, input["namespace"].as_str(), category, slug)?;
         if !abs.exists() {
             anyhow::bail!("{rel} does not exist");
         }
@@ -479,7 +483,8 @@ impl Tool for MemoryRemoveTool {
     async fn execute(&self, input: &serde_json::Value) -> Result<String> {
         let category = input["category"].as_str().context("missing 'category'")?;
         let slug = input["slug"].as_str().context("missing 'slug'")?;
-        let (rel, abs) = memory_entry_path(&self.state, input["namespace"].as_str(), category, slug)?;
+        let (rel, abs) =
+            memory_entry_path(&self.state, input["namespace"].as_str(), category, slug)?;
         if !abs.exists() {
             anyhow::bail!("{rel} does not exist");
         }
@@ -504,7 +509,7 @@ impl WorkspaceSearchTool {
             state,
             spec: ToolSpec {
                 kind: ToolKind::Search,
-                group: None,
+                group: Some(crate::config::ToolGroup::Fs),
                 name: "workspace_search".into(),
                 description: "Search across all indexed files in the workspace. \
                     Two modes are available: \
@@ -607,7 +612,7 @@ impl WorkspaceSyncTool {
             state,
             spec: ToolSpec {
                 kind: ToolKind::Other,
-                group: None,
+                group: Some(crate::config::ToolGroup::Fs),
                 name: "workspace_sync".into(),
                 description: "Re-index the workspace so files changed outside \
                     the agent become searchable. Does not touch git."
@@ -677,7 +682,8 @@ mod tests {
     async fn memory_add_writes_to_included_namespace() {
         let state = test_state();
         let tool = MemoryAddTool::new(Arc::clone(&state));
-        let input = json!({"namespace": "family", "category": "knowledge", "slug": "x", "content": "hi"});
+        let input =
+            json!({"namespace": "family", "category": "knowledge", "slug": "x", "content": "hi"});
         let out = scope_memory_namespace(chain(&["mom", "family"]), tool.execute(&input))
             .await
             .unwrap();
@@ -704,7 +710,8 @@ mod tests {
     async fn out_of_chain_namespace_is_refused() {
         let state = test_state();
         let tool = MemoryAddTool::new(Arc::clone(&state));
-        let input = json!({"namespace": "admin", "category": "knowledge", "slug": "x", "content": "hi"});
+        let input =
+            json!({"namespace": "admin", "category": "knowledge", "slug": "x", "content": "hi"});
         let err = scope_memory_namespace(chain(&["mom", "family"]), tool.execute(&input))
             .await
             .unwrap_err()
@@ -718,7 +725,8 @@ mod tests {
         let state = test_state();
         let tool = MemoryAddTool::new(Arc::clone(&state));
         for bad in ["", "../default", "a/b"] {
-            let input = json!({"namespace": bad, "category": "knowledge", "slug": "x", "content": "hi"});
+            let input =
+                json!({"namespace": bad, "category": "knowledge", "slug": "x", "content": "hi"});
             let res = scope_memory_namespace(chain(&["mom", "family"]), tool.execute(&input)).await;
             assert!(res.is_err(), "{bad:?}");
         }
@@ -738,7 +746,11 @@ mod tests {
         scope_memory_namespace(cfg.resolve_namespace_chain("mom"), tool.execute(&input))
             .await
             .unwrap();
-        assert!(root(&state).join("memory/household/knowledge/x.md").is_file());
+        assert!(
+            root(&state)
+                .join("memory/household/knowledge/x.md")
+                .is_file()
+        );
     }
 
     #[tokio::test]

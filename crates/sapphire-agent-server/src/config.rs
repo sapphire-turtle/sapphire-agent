@@ -2240,7 +2240,7 @@ api_key = "test"
     /// Resolve the memory namespace declared by a room profile (by
     /// name). Falls back to `"default"` if the room profile is unknown
     /// or doesn't set one.
-/// `chain` (from `resolve_namespace_chain`) with each namespace's
+    /// `chain` (from `resolve_namespace_chain`) with each namespace's
     /// configured description.
     pub fn namespace_infos(&self, chain: &[String]) -> Vec<NamespaceInfo> {
         chain
@@ -2255,7 +2255,7 @@ api_key = "test"
             .collect()
     }
 
-        pub fn namespace_for_session_profile(&self, name: &str) -> &str {
+    pub fn namespace_for_session_profile(&self, name: &str) -> &str {
         self.session_profiles
             .get(name)
             .and_then(|rp| rp.memory_namespace.as_deref())
@@ -3310,7 +3310,10 @@ description = "translation work"
             .iter()
             .map(|i| (i.name.as_str(), i.description.as_deref()))
             .collect();
-        assert_eq!(got, vec![("mom", Some("translation work")), ("family", None)]);
+        assert_eq!(
+            got,
+            vec![("mom", Some("translation work")), ("family", None)]
+        );
         let default = cfg.namespace_infos(&["default".to_string()]);
         assert_eq!(default[0].name, "default");
         assert_eq!(default[0].description, None);

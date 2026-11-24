@@ -139,7 +139,8 @@ profile = "default"
 # description = "Development and autonomous sessions"
 
 # [permission_profile.chat]
-# tools = []
+# tools = []      # no workspace tools: not even workspace_search / workspace_sync,
+#                 # which are in the `fs` group (a hit names any file's path)
 # [tools.fs]
 # enabled = false
 # [tools.shell]

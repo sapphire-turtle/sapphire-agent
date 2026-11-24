@@ -806,17 +806,28 @@ mod tests {
             prompt.contains("# Agent Instructions\n\ncore\n\ntranslate"),
             "{prompt}"
         );
-        assert_eq!(prompt.matches("# Agent Instructions").count(), 1, "{prompt}");
+        assert_eq!(
+            prompt.matches("# Agent Instructions").count(),
+            1,
+            "{prompt}"
+        );
     }
 
     #[tokio::test]
     async fn replace_drops_root_and_strips_frontmatter() {
         let dir = tempfile::TempDir::new().unwrap();
         write(&dir, "AGENTS.md", "core");
-        write(&dir, "AGENTS.family.md", "---\nmerge: replace\n---\ntranslate");
+        write(
+            &dir,
+            "AGENTS.family.md",
+            "---\nmerge: replace\n---\ntranslate",
+        );
         let cfg = SessionProfileConfig::default();
         let prompt = prompt_for(&dir, profile("family", &cfg)).await;
-        assert!(prompt.contains("# Agent Instructions\n\ntranslate"), "{prompt}");
+        assert!(
+            prompt.contains("# Agent Instructions\n\ntranslate"),
+            "{prompt}"
+        );
         assert!(!prompt.contains("core"), "{prompt}");
         assert!(!prompt.contains("merge:"), "{prompt}");
     }
@@ -876,7 +887,10 @@ mod tests {
         write(&dir, "AGENT.family.md", "translate");
         let cfg = SessionProfileConfig::default();
         let prompt = prompt_for(&dir, profile("family", &cfg)).await;
-        assert!(prompt.contains("# Agent Instructions\n\ntranslate"), "{prompt}");
+        assert!(
+            prompt.contains("# Agent Instructions\n\ntranslate"),
+            "{prompt}"
+        );
     }
 
     #[test]
@@ -884,7 +898,10 @@ mod tests {
         let roots = ["AGENTS.md", "AGENT.md"];
         assert_eq!(
             profile_file_candidates(&roots, "family"),
-            vec!["AGENTS.family.md".to_string(), "AGENT.family.md".to_string()]
+            vec![
+                "AGENTS.family.md".to_string(),
+                "AGENT.family.md".to_string()
+            ]
         );
         for bad in ["", "../etc", "a/b", "a\\b", ".hidden", "a\0b"] {
             assert!(profile_file_candidates(&roots, bad).is_empty(), "{bad:?}");
@@ -939,7 +956,10 @@ mod tests {
         }
     }
 
-    async fn prompt_with_namespaces(dir: &tempfile::TempDir, namespaces: &[NamespaceInfo]) -> String {
+    async fn prompt_with_namespaces(
+        dir: &tempfile::TempDir,
+        namespaces: &[NamespaceInfo],
+    ) -> String {
         let ws = Workspace::new(dir.path().to_path_buf(), DigestConfig::default());
         ws.build_system_prompt(None, 4, namespaces, None, None, None)
             .await
@@ -973,9 +993,11 @@ mod tests {
     #[tokio::test]
     async fn memory_block_lists_namespaces_without_memory_md() {
         let dir = tempfile::TempDir::new().unwrap();
-        let prompt =
-            prompt_with_namespaces(&dir, &[ns("mom", None), ns("family", None)]).await;
-        assert!(prompt.contains("# Memory\n\nNamespaces available"), "{prompt}");
+        let prompt = prompt_with_namespaces(&dir, &[ns("mom", None), ns("family", None)]).await;
+        assert!(
+            prompt.contains("# Memory\n\nNamespaces available"),
+            "{prompt}"
+        );
         assert!(prompt.contains("- family"), "{prompt}");
         assert!(!prompt.contains("## "), "{prompt}");
     }
@@ -983,9 +1005,11 @@ mod tests {
     #[tokio::test]
     async fn namespace_without_description_has_bare_name() {
         let dir = tempfile::TempDir::new().unwrap();
-        let prompt =
-            prompt_with_namespaces(&dir, &[ns("mom", None), ns("family", None)]).await;
-        assert!(prompt.contains("\n- mom (this conversation)\n- family"), "{prompt}");
+        let prompt = prompt_with_namespaces(&dir, &[ns("mom", None), ns("family", None)]).await;
+        assert!(
+            prompt.contains("\n- mom (this conversation)\n- family"),
+            "{prompt}"
+        );
         assert!(!prompt.contains(" — "), "{prompt}");
     }
 }

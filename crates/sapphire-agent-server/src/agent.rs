@@ -477,12 +477,12 @@ impl Agent {
                 // Matrix/Discord rooms have no client working directory —
                 // the block's absence there is the whole point of `None`.
                 None,
-                self.config
-                    .session_profile(profile_name)
-                    .map(|config| crate::workspace::PromptProfile {
+                self.config.session_profile(profile_name).map(|config| {
+                    crate::workspace::PromptProfile {
                         name: profile_name,
                         config,
-                    }),
+                    }
+                }),
             )
             .await;
 
@@ -832,9 +832,9 @@ impl Agent {
                     // tokio::spawn does not propagate task_local, so we
                     // re-bind it inside each spawned future.
                     let tools = self.tools.clone();
-                    let ns = self
-                        .config
-                        .resolve_namespace_chain(self.config.namespace_for_session_profile(&profile_name));
+                    let ns = self.config.resolve_namespace_chain(
+                        self.config.namespace_for_session_profile(&profile_name),
+                    );
                     let room_id_for_timer = incoming.room_id.clone();
                     // Permission gate for the channel path.
                     //
@@ -1121,6 +1121,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_permission_has_no_workspace_search() {
+        use crate::tools::policy::{ResolvedPermission, ToolEntry};
+        let (_, specs) = channel_gate_test_calls().await;
+        let calls: Vec<ToolCall> = ["workspace_search", "workspace_sync", "memory_add"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| ToolCall {
+                id: format!("c{i}"),
+                name: (*name).to_string(),
+                input: serde_json::json!({}),
+            })
+            .collect();
+        let cfg = crate::config::Config::parse_for_test(
+            "[anthropic]\napi_key = \"test\"\n[tools.fs]\nenabled = true\n\
+             [profiles.default]\nprovider = \"anthropic\"\n\
+             [session_profile.guest]\nprofile = \"default\"\npermission = \"chat\"\n",
+        );
+        let profile = ResolvedPermission::resolve(
+            &cfg,
+            Origin::Channel {
+                session_profile: "guest".into(),
+            },
+        );
+        let entries: Vec<_> = specs
+            .iter()
+            .map(|spec| ToolEntry::from_spec(spec, &cfg))
+            .collect();
+        let (permitted, refused) = partition_without_asking(&profile, &calls, &entries);
+        assert_eq!(
+            permitted
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            ["memory_add"]
+        );
+        assert_eq!(
+            refused
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            ["c0", "c1"]
+        );
+    }
+
+    #[tokio::test]
     async fn channel_default_refuses_disabled_fs_even_when_listed() {
         use crate::tools::policy::{ResolvedPermission, ToolEntry};
         let (mut calls, specs) = channel_gate_test_calls().await;
@@ -1146,7 +1191,7 @@ mod tests {
                 .iter()
                 .map(|c| c.name.as_str())
                 .collect::<Vec<_>>(),
-            ["web_search", "memory_add", "workspace_sync"]
+            ["web_search", "memory_add"]
         );
         assert!(
             refused
