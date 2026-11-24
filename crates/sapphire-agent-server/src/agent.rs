@@ -477,6 +477,7 @@ impl Agent {
                 // Matrix/Discord rooms have no client working directory —
                 // the block's absence there is the whole point of `None`.
                 None,
+                None,
             )
             .await;
 

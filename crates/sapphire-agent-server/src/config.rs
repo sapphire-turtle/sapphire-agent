@@ -299,6 +299,74 @@ pub struct SessionProfileConfig {
     /// Replaced `api_keys`, which held raw tokens in this file.
     #[serde(default)]
     pub devices: Vec<String>,
+    /// Workspace-relative path of this profile's `AGENTS.md` layer.
+    /// Absent means the `AGENTS.<profile>.md` convention.
+    #[serde(default)]
+    pub agents_file: Option<String>,
+    /// Like `agents_file`, for `SOUL.md`.
+    #[serde(default)]
+    pub soul_file: Option<String>,
+    /// Like `agents_file`, for `IDENTITY.md`.
+    #[serde(default)]
+    pub identity_file: Option<String>,
+    /// Like `agents_file`, for `USER.md`.
+    #[serde(default)]
+    pub user_file: Option<String>,
+    /// Like `agents_file`, for `TOOLS.md`.
+    #[serde(default)]
+    pub tools_file: Option<String>,
+    /// Like `agents_file`, for `BOOTSTRAP.md`.
+    #[serde(default)]
+    pub bootstrap_file: Option<String>,
+}
+
+/// The workspace prompt files a session profile can layer over the root
+/// ones (`AGENTS.md`, `SOUL.md`, …).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptFileKind {
+    Agents,
+    Soul,
+    Identity,
+    User,
+    Tools,
+    Bootstrap,
+}
+
+impl PromptFileKind {
+    pub const ALL: [PromptFileKind; 6] = [
+        PromptFileKind::Agents,
+        PromptFileKind::Soul,
+        PromptFileKind::Identity,
+        PromptFileKind::User,
+        PromptFileKind::Tools,
+        PromptFileKind::Bootstrap,
+    ];
+
+    /// The `[session_profile.<p>]` key that overrides this file's path.
+    pub fn config_key(self) -> &'static str {
+        match self {
+            PromptFileKind::Agents => "agents_file",
+            PromptFileKind::Soul => "soul_file",
+            PromptFileKind::Identity => "identity_file",
+            PromptFileKind::User => "user_file",
+            PromptFileKind::Tools => "tools_file",
+            PromptFileKind::Bootstrap => "bootstrap_file",
+        }
+    }
+}
+
+impl SessionProfileConfig {
+    /// The explicitly configured path of this profile's layer of `kind`.
+    pub fn prompt_file(&self, kind: PromptFileKind) -> Option<&str> {
+        match kind {
+            PromptFileKind::Agents => self.agents_file.as_deref(),
+            PromptFileKind::Soul => self.soul_file.as_deref(),
+            PromptFileKind::Identity => self.identity_file.as_deref(),
+            PromptFileKind::User => self.user_file.as_deref(),
+            PromptFileKind::Tools => self.tools_file.as_deref(),
+            PromptFileKind::Bootstrap => self.bootstrap_file.as_deref(),
+        }
+    }
 }
 
 /// Retired section, retained only to name migration errors.

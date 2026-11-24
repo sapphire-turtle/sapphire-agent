@@ -3357,6 +3357,7 @@ pub(crate) async fn run_llm_turn(
                 &namespace_chain,
                 room_info.as_ref(),
                 progress.cwd().as_deref(),
+                None,
             )
             .await;
         if sp.is_empty() { None } else { Some(sp) }
@@ -4661,6 +4662,7 @@ mod tests {
                     voice_pipeline: None,
                     api_keys: vec![],
                     devices: vec![],
+                    ..Default::default()
                 },
             );
         }
