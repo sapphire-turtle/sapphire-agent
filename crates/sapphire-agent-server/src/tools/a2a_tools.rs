@@ -214,7 +214,10 @@ impl A2aSendTool {
         if let Some(err) = envelope.get("error") {
             let code = err["code"].as_i64().unwrap_or_default();
             let msg = err["message"].as_str().unwrap_or("(no message)");
-            return Err(format!("the remote returned error {code}: {}", cap(msg)));
+            return Err(format!(
+                "the remote returned error {code}{}",
+                untrusted_detail(name, msg)
+            ));
         }
         let result = envelope
             .get("result")
@@ -242,9 +245,9 @@ impl A2aSendTool {
             .unwrap_or_default();
         if task.status.state != TaskState::Completed {
             return Err(format!(
-                "the task ended in state {:?}: {}",
+                "the task ended in state {:?}{}",
                 task.status.state,
-                cap(&reply_text)
+                untrusted_detail(name, &reply_text)
             ));
         }
 
@@ -272,9 +275,12 @@ fn reqwest_error(what: &str, e: reqwest::Error) -> String {
     format!("{what}: {kind} ({e})")
 }
 
-/// Bound remote-supplied text echoed into an error.
-fn cap(s: &str) -> &str {
-    &s[..s.floor_char_boundary(ERROR_DETAIL_CAP)]
+/// Remote-supplied text echoed into an error, bounded and labelled the way a
+/// reply is: the model reads a tool error as input just like a result, so a
+/// peer must not be able to drop the label by failing on purpose.
+fn untrusted_detail(name: &str, s: &str) -> String {
+    let s = &s[..s.floor_char_boundary(ERROR_DETAIL_CAP)];
+    format!("\n[untrusted error text from remote agent '{name}']\n{s}")
 }
 
 #[async_trait]
@@ -483,7 +489,11 @@ mod tests {
             }))
             .unwrap(),
         });
-        let cases: Vec<(&str, Option<(StatusCode, Value)>)> = vec![
+        const LABEL: &str = "[untrusted error text from remote agent 'peer']\n";
+        // (case, stub answer or a closed port, what the error must say,
+        // whether it echoes remote text and so must carry the label)
+        type Case<'a> = (&'a str, Option<(StatusCode, Value)>, &'a str, bool);
+        let cases: Vec<Case> = vec![
             (
                 "jsonrpc error",
                 Some((
@@ -491,22 +501,33 @@ mod tests {
                     json!({"jsonrpc": "2.0", "id": "1",
                            "error": {"code": -32001, "message": "unknown or revoked bearer token"}}),
                 )),
+                "error -32001",
+                true,
             ),
-            ("message result", Some((StatusCode::OK, message_result))),
+            (
+                "message result",
+                Some((StatusCode::OK, message_result)),
+                "with a message, not a task",
+                false,
+            ),
             (
                 "failed task",
                 Some((
                     StatusCode::OK,
                     task_body(TaskState::Failed, "c", "agent failed to generate a reply"),
                 )),
+                "state Failed",
+                true,
             ),
             (
                 "http 401",
                 Some((StatusCode::UNAUTHORIZED, json!("missing bearer token"))),
+                "HTTP 401",
+                false,
             ),
-            ("connection refused", None),
+            ("connection refused", None, "could not connect", false),
         ];
-        for (label, case) in cases {
+        for (label, case, says, echoes) in cases {
             let endpoint = match case {
                 Some((status, body)) => stub(status, body).await.0,
                 None => closed.clone(),
@@ -518,6 +539,11 @@ mod tests {
             let text = format!("{err:#}");
             assert!(text.contains("peer"), "{label}: {text}");
             assert!(!text.contains(TOKEN), "{label}: {text}");
+            assert!(text.contains(says), "{label}: {text}");
+            if echoes {
+                let (before, remote) = text.split_once(LABEL).expect(label);
+                assert!(!before.is_empty() && !remote.is_empty(), "{label}: {text}");
+            }
         }
     }
 }
