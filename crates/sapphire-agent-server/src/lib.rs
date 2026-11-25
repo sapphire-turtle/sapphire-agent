@@ -312,15 +312,19 @@ fn verify_api_keys(
     };
     let live: Vec<_> = store.list().iter().filter(|k| !k.is_retired()).collect();
     println!("  API keys          : {} in {}", live.len(), dir.display());
+    let remote = config.remote_agent_profile_names();
     for key in &live {
         let profile = key.profile.as_str();
-        if auth.is_session_profile(profile) {
+        // The session profile this key's token drives, if any.
+        let bound = if auth.is_session_profile(profile) {
             println!(
                 "    {:<20} {} -> session_profile '{profile}'",
                 key.name, key.id
             );
+            Some(profile)
         } else if profile == MIGRATED {
-            match auth.legacy_binding(key.id.as_str(), &key.name) {
+            let rp = auth.legacy_binding(key.id.as_str(), &key.name);
+            match rp {
                 Some(rp) => println!(
                     "    {:<20} {} -> session_profile '{rp}' (by `devices`; re-issue it with \
                      `--profile {rp}`)",
@@ -332,26 +336,16 @@ fn verify_api_keys(
                     key.name, key.id
                 ),
             }
+            rp
         } else {
             println!(
                 "    {:<20} {} -> profile '{profile}' is no room profile: its token is refused (403)",
                 key.name, key.id
             );
-        }
-    }
-    let remote = config.remote_agent_profile_names();
-    for key in &live {
-        let profile = key.profile.as_str();
-        let bound = if auth.is_session_profile(profile) {
-            Some(profile.to_string())
-        } else if profile == MIGRATED {
-            auth.legacy_binding(key.id.as_str(), &key.name)
-                .map(str::to_string)
-        } else {
             None
         };
         if let Some(p) = bound
-            && remote.contains(&p)
+            && remote.iter().any(|r| r == p)
         {
             println!(
                 "    warning: key '{}' drives session_profile '{p}', which talks to remote agents",
@@ -1605,15 +1599,6 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
                     println!("    {key} (ignored)");
                 }
             }
-            // Where each API key goes — its profile, or for a key from
-            // before profiles the hand-written `devices` — needs somewhere
-            // to be checked.
-            match device_auth::DeviceAuth::workspace(&config.session_profiles) {
-                Ok(auth) => {
-                    verify_api_keys(&auth, selection.as_ref().map(|s| s.root.as_path()), &config)
-                }
-                Err(e) => println!("  Devices           : INVALID: {e:#}"),
-            }
             let mut remote_agents: Vec<_> = config.remote_agents.iter().collect();
             remote_agents.sort_by(|a, b| a.0.cmp(b.0));
             for (name, agent) in remote_agents {
@@ -1629,6 +1614,15 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
             }
             for line in config.remote_agent_warnings() {
                 println!("  warning: {line}");
+            }
+            // Where each API key goes — its profile, or for a key from
+            // before profiles the hand-written `devices` — needs somewhere
+            // to be checked.
+            match device_auth::DeviceAuth::workspace(&config.session_profiles) {
+                Ok(auth) => {
+                    verify_api_keys(&auth, selection.as_ref().map(|s| s.root.as_path()), &config)
+                }
+                Err(e) => println!("  Devices           : INVALID: {e:#}"),
             }
             match &workspace_path {
                 Some(p) => println!("  Workspace config  : {}", p.display()),
