@@ -3798,15 +3798,23 @@ include = ["public"]
             access(&cfg, "op"),
             pairs(&[("op", true), ("public", true), ("shared", false)])
         );
-        // The writable path is found after the read-only one: upgrade, once.
+    }
+
+    #[test]
+    fn writable_path_found_later_upgrades_namespace_and_children() {
+        // `p` is first reached read-only (op -> a -> import p), and only
+        // afterwards through an include-only path (op -> b -> p): the revisit
+        // must upgrade `p` and re-walk it so `deep` follows. First-seen order
+        // is kept and each name appears once.
         let cfg = parse(
             r#"
 [memory_namespace.op]
-import = ["shared"]
-include = ["public"]
-[memory_namespace.shared]
-include = ["public"]
-[memory_namespace.public]
+include = ["a", "b"]
+[memory_namespace.a]
+import = ["p"]
+[memory_namespace.b]
+include = ["p"]
+[memory_namespace.p]
 include = ["deep"]
 [memory_namespace.deep]
 "#,
@@ -3815,9 +3823,10 @@ include = ["deep"]
             access(&cfg, "op"),
             pairs(&[
                 ("op", true),
-                ("public", true),
+                ("a", true),
+                ("p", true),
                 ("deep", true),
-                ("shared", false)
+                ("b", true)
             ])
         );
     }
