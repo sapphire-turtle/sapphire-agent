@@ -123,11 +123,23 @@ fn memory_entry_path(
     slug: &str,
     write: bool,
 ) -> Result<(String, std::path::PathBuf)> {
+    memory_entry_target(state, namespace, category, slug, write).map(|(rel, abs, _)| (rel, abs))
+}
+
+/// `memory_entry_path`, plus whether the resolved namespace is writable
+/// here (always true when `write` is set, or the call fails).
+fn memory_entry_target(
+    state: &WorkspaceState,
+    namespace: Option<&str>,
+    category: &str,
+    slug: &str,
+    write: bool,
+) -> Result<(String, std::path::PathBuf, bool)> {
     validate_segment("category", category)?;
     validate_segment("slug", slug)?;
     let chain = current_memory_chain();
-    let namespace = match namespace {
-        None => chain[0].name.clone(),
+    let (namespace, writable) = match namespace {
+        None => (chain[0].name.clone(), chain[0].writable),
         Some(ns) => {
             validate_segment("namespace", ns)?;
             let Some(entry) = chain.iter().find(|c| c.name == ns) else {
@@ -140,15 +152,15 @@ fn memory_entry_path(
                         .join(", ")
                 );
             };
-            if write && !entry.writable {
-                anyhow::bail!("namespace '{ns}' is read-only here");
-            }
-            ns.to_string()
+            (ns.to_string(), entry.writable)
         }
     };
+    if write && !writable {
+        anyhow::bail!("namespace '{namespace}' is read-only here");
+    }
     let rel = format!("memory/{namespace}/{category}/{slug}.md");
     let abs = lock(state).workspace.root.join(&rel);
-    Ok((rel, abs))
+    Ok((rel, abs, writable))
 }
 
 /// YAML frontmatter tracked on each memory entry file.
@@ -441,7 +453,8 @@ impl MemoryReadTool {
                 description: "Read a memory entry at memory/<category>/<slug>.md \
                     and return its body. Side effect: updates the file's \
                     frontmatter (last_read_at = now, read_count += 1) so that \
-                    recency and frequency can inform future weighting. \
+                    recency and frequency can inform future weighting, \
+                    except in a namespace that is read-only here. \
                     Use file_read instead for a non-tracking read."
                     .into(),
                 input_schema: memory_entry_schema(false),
@@ -459,13 +472,18 @@ impl Tool for MemoryReadTool {
     async fn execute(&self, input: &serde_json::Value) -> Result<String> {
         let category = input["category"].as_str().context("missing 'category'")?;
         let slug = input["slug"].as_str().context("missing 'slug'")?;
-        let (rel, abs) =
-            memory_entry_path(&self.state, namespace_arg(input)?, category, slug, false)?;
+        let (rel, abs, writable) =
+            memory_entry_target(&self.state, namespace_arg(input)?, category, slug, false)?;
         if !abs.exists() {
             anyhow::bail!("{rel} does not exist");
         }
         let raw = std::fs::read_to_string(&abs).with_context(|| format!("Failed to read {rel}"))?;
         let (mut meta, body) = parse_memory_file(&raw);
+        // A namespace this turn may only read is never rewritten, not even
+        // for the read counters.
+        if !writable {
+            return Ok(body);
+        }
         meta.last_read_at = Some(Timestamp::now());
         meta.read_count = meta.read_count.saturating_add(1);
         let serialized = serialize_memory_file(&meta, &body)?;
@@ -869,5 +887,24 @@ mod tests {
             .await
             .unwrap();
         assert!(out.contains("public fact"), "{out}");
+        // A read-only namespace is not rewritten to bump the read counters.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "public fact");
+    }
+
+    #[tokio::test]
+    async fn memory_read_bumps_counters_in_writable_namespace() {
+        let state = test_state();
+        let path = root(&state).join("memory/mom/knowledge/x.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "own fact").unwrap();
+        let tool = MemoryReadTool::new(Arc::clone(&state));
+        let input = json!({"category": "knowledge", "slug": "x"});
+        let out = scope_memory_namespace(read_only_chain(), tool.execute(&input))
+            .await
+            .unwrap();
+        assert!(out.contains("own fact"), "{out}");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("read_count: 1"), "{raw}");
+        assert!(raw.contains("last_read_at:"), "{raw}");
     }
 }
