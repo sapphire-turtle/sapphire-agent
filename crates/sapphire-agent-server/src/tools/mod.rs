@@ -399,6 +399,26 @@ pub async fn default_tool_set(
     tool_set
 }
 
+/// Tools that reach out to the internet. Offered unless the session
+/// profile sets `outbound_tools = false`.
+pub(crate) const OUTBOUND_TOOLS: &[&str] =
+    &["web_search", "weather", "skill_install", "skill_update"];
+
+/// The tool that talks to a configured remote agent.
+pub(crate) const A2A_SEND_TOOL: &str = "a2a_send";
+
+/// Whether `session_profile` is offered `tool`, beyond the permission gate.
+pub(crate) fn profile_offers(config: &Config, session_profile: &str, tool: &str) -> bool {
+    let profile = config.session_profile(session_profile);
+    if tool == A2A_SEND_TOOL {
+        return profile.is_some_and(|p| !p.remote_agents.is_empty());
+    }
+    if OUTBOUND_TOOLS.contains(&tool) {
+        return profile.is_none_or(|p| p.outbound_tools != Some(false));
+    }
+    true
+}
+
 /// The cap shared by `truncate_output` (tool *results*) and
 /// `AcpSessionStore::store_part` (tool *inputs* — see Fix 4/#194): both
 /// bound what a single tool call can put into memory, the model's
@@ -473,6 +493,78 @@ mod tests {
         std::fs::create_dir_all(dir.path().join(".sapphire-agent")).unwrap();
         let ws = Workspace::from_root(&TEST_CTX, dir.path()).unwrap();
         Arc::new(WorkspaceState::open(ws).unwrap())
+    }
+
+    /// Every ungrouped, non-outbound tool the default set registers.
+    const LOCAL_UNGROUPED_TOOLS: &[&str] = &[
+        "current_time",
+        "memory_add",
+        "memory_read",
+        "memory_append",
+        "memory_update",
+        "memory_remove",
+        "shell_start",
+        "shell_output",
+        "shell_kill",
+        "skill",
+        "subagent",
+    ];
+
+    #[test]
+    fn profile_offers_hides_a2a_send_without_remote_agents() {
+        let cfg = Config::parse_for_test(
+            "[remote_agent.peer]\nendpoint = \"https://peer.example/a2a\"\ntoken_env = \"PEER_TOKEN\"\n\
+             [session_profile.liaison]\nprofile = \"default\"\nremote_agents = [\"peer\"]\n\
+             [session_profile.plain]\nprofile = \"default\"\n",
+        );
+        assert!(profile_offers(&cfg, "liaison", A2A_SEND_TOOL));
+        assert!(!profile_offers(&cfg, "plain", A2A_SEND_TOOL));
+        assert!(!profile_offers(&cfg, "missing", A2A_SEND_TOOL));
+        assert!(profile_offers(&cfg, "plain", "current_time"));
+    }
+
+    #[test]
+    fn profile_offers_hides_outbound_when_disabled() {
+        let cfg = Config::parse_for_test(
+            "[session_profile.off]\nprofile = \"default\"\noutbound_tools = false\n\
+             [session_profile.on]\nprofile = \"default\"\noutbound_tools = true\n\
+             [session_profile.unset]\nprofile = \"default\"\n",
+        );
+        for t in OUTBOUND_TOOLS {
+            assert!(!profile_offers(&cfg, "off", t), "{t}");
+            assert!(profile_offers(&cfg, "on", t), "{t}");
+            assert!(profile_offers(&cfg, "unset", t), "{t}");
+        }
+        assert!(profile_offers(&cfg, "off", "memory_add"));
+    }
+
+    #[tokio::test]
+    async fn every_ungrouped_tool_is_classified() {
+        let cfg = Config::parse_for_test(
+            "[tools.fs]\nenabled = true\n[tools.shell]\nenabled = true\n\
+             [tools.mcp]\nenabled = true\n[tools.admin]\nenabled = true\n\
+             [permission_profile.ops]\ntools = [\"fs\", \"shell\", \"mcp\", \"admin\"]\n\
+             [remote_agent.peer]\nendpoint = \"https://peer.example/a2a\"\ntoken_env = \"PEER_TOKEN\"\n",
+        );
+        let ws = test_workspace();
+        let tools = default_tool_set(Arc::clone(&ws), Some("k".to_string()), &[], 4, &cfg).await;
+        tools
+            .register_tool(Box::new(skill_tools::SkillTool::new()))
+            .await;
+        tools
+            .register_tool(Box::new(subagent::SubagentTool::new(vec![], false)))
+            .await;
+        for (name, entry) in tools.entries().await {
+            if entry.group.is_some() {
+                continue;
+            }
+            assert!(
+                OUTBOUND_TOOLS.contains(&name.as_str())
+                    || LOCAL_UNGROUPED_TOOLS.contains(&name.as_str())
+                    || name == A2A_SEND_TOOL,
+                "ungrouped tool `{name}` is neither outbound nor listed local; classify it"
+            );
+        }
     }
 
     fn all_groups_config() -> Config {

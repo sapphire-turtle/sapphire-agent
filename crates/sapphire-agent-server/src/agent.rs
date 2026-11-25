@@ -668,6 +668,7 @@ impl Agent {
                         crate::tools::policy::allow(&permission, entry)
                             != crate::tools::policy::Allow::Deny
                     })
+                    && crate::tools::profile_offers(&self.config, &profile_name, &spec.name)
             });
         }
 
@@ -1118,6 +1119,30 @@ mod tests {
         assert!(refused[0].1.contains("[tools.shell].enabled"));
         assert!(refused[1].1.contains("not available"));
         assert_eq!(permitted.len() + refused.len(), calls.len());
+    }
+
+    #[tokio::test]
+    async fn outbound_tools_off_hides_web_search_and_weather() {
+        let (_, specs) = channel_gate_test_calls().await;
+        let cfg = crate::config::Config::parse_for_test(
+            "[anthropic]\napi_key = \"test\"\n\
+             [profiles.default]\nprovider = \"anthropic\"\n\
+             [session_profile.sealed]\nprofile = \"default\"\noutbound_tools = false\n\
+             [session_profile.open]\nprofile = \"default\"\n",
+        );
+        let names = |profile: &str| -> Vec<String> {
+            specs
+                .iter()
+                .filter(|s| crate::tools::profile_offers(&cfg, profile, &s.name))
+                .map(|s| s.name.to_string())
+                .collect()
+        };
+        let open = names("open");
+        assert!(open.iter().any(|n| n == "web_search"));
+        assert!(open.iter().any(|n| n == "weather"));
+        let sealed = names("sealed");
+        assert!(!sealed.iter().any(|n| n == "web_search" || n == "weather"));
+        assert!(sealed.iter().any(|n| n == "memory_add"));
     }
 
     #[tokio::test]

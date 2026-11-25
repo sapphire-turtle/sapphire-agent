@@ -3471,6 +3471,7 @@ pub(crate) async fn run_llm_turn(
             .is_some_and(|(_, entry)| {
                 crate::tools::policy::allow(&permission, entry) != crate::tools::policy::Allow::Deny
             })
+            && crate::tools::profile_offers(&state.config, &session_profile, &spec.name)
     });
     crate::tools::avatar_tools::specialize_specs(
         &mut tool_specs,
