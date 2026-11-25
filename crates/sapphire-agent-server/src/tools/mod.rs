@@ -416,11 +416,21 @@ pub(crate) const OUTBOUND_TOOLS: &[&str] =
 /// The tool that talks to a configured remote agent.
 pub(crate) const A2A_SEND_TOOL: &str = "a2a_send";
 
+/// Ungrouped tools that read private household data (the ambient
+/// microphone's transcripts and speakers). Never offered to a session
+/// profile that talks to a remote agent, whatever its `outbound_tools`:
+/// whatever such a session reads can be sent on over `a2a_send`.
+pub(crate) const PRIVATE_READ_TOOLS: &[&str] =
+    &["transcript_read", "speaker_candidates", "speaker_promote"];
+
 /// Whether `session_profile` is offered `tool`, beyond the permission gate.
 pub(crate) fn profile_offers(config: &Config, session_profile: &str, tool: &str) -> bool {
     let profile = config.session_profile(session_profile);
     if tool == A2A_SEND_TOOL {
         return profile.is_some_and(|p| !p.remote_agents.is_empty());
+    }
+    if PRIVATE_READ_TOOLS.contains(&tool) {
+        return profile.is_none_or(|p| p.remote_agents.is_empty());
     }
     if OUTBOUND_TOOLS.contains(&tool) {
         return profile.is_none_or(|p| p.outbound_tools != Some(false));
@@ -504,7 +514,8 @@ mod tests {
         Arc::new(WorkspaceState::open(ws).unwrap())
     }
 
-    /// Every ungrouped, non-outbound tool the default set registers.
+    /// Every ungrouped tool that is neither outbound nor a private read,
+    /// among those the default set and `lib.rs` register.
     const LOCAL_UNGROUPED_TOOLS: &[&str] = &[
         "current_time",
         "memory_add",
@@ -516,6 +527,7 @@ mod tests {
         "shell_output",
         "shell_kill",
         "skill",
+        "skill_uninstall",
         "subagent",
     ];
 
@@ -547,6 +559,24 @@ mod tests {
         assert!(profile_offers(&cfg, "off", "memory_add"));
     }
 
+    #[test]
+    fn profile_offers_hides_private_reads_from_remote_agent_profiles() {
+        let cfg = Config::parse_for_test(
+            "[remote_agent.peer]\nendpoint = \"https://peer.example/a2a\"\ntoken_env = \"PEER_TOKEN\"\n\
+             [session_profile.liaison]\nprofile = \"default\"\nremote_agents = [\"peer\"]\n\
+             [session_profile.liaison_out]\nprofile = \"default\"\nremote_agents = [\"peer\"]\n\
+             outbound_tools = true\n\
+             [session_profile.plain]\nprofile = \"default\"\n",
+        );
+        for t in PRIVATE_READ_TOOLS {
+            assert!(!profile_offers(&cfg, "liaison", t), "{t}");
+            assert!(!profile_offers(&cfg, "liaison_out", t), "{t}");
+            assert!(profile_offers(&cfg, "plain", t), "{t}");
+            assert!(profile_offers(&cfg, "missing", t), "{t}");
+        }
+        assert!(profile_offers(&cfg, "liaison", "memory_read"));
+    }
+
     #[tokio::test]
     async fn every_ungrouped_tool_is_classified() {
         let cfg = Config::parse_for_test(
@@ -557,21 +587,69 @@ mod tests {
         );
         let ws = test_workspace();
         let tools = default_tool_set(Arc::clone(&ws), Some("k".to_string()), &[], 4, &cfg).await;
+        // The tools `lib.rs` registers outside `default_tool_set`, by hand.
+        let skill = Arc::new(skill_tools::SkillTool::new());
+        tools.register_tool(Box::new(Arc::clone(&skill))).await;
         tools
-            .register_tool(Box::new(skill_tools::SkillTool::new()))
+            .register_tool(Box::new(skill_tools::SkillInstallTool::new(Arc::clone(
+                &skill,
+            ))))
+            .await;
+        tools
+            .register_tool(Box::new(skill_tools::SkillUpdateTool::new(Arc::clone(
+                &skill,
+            ))))
+            .await;
+        tools
+            .register_tool(Box::new(skill_tools::SkillUninstallTool::new(skill)))
             .await;
         tools
             .register_tool(Box::new(subagent::SubagentTool::new(vec![], false)))
             .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let ambient = Arc::new(std::sync::Mutex::new(ambient_tools::AmbientToolState {
+            transcripts: crate::ambient::transcript::TranscriptStore::open(tmp.path().join("t"), 4)
+                .unwrap(),
+            candidates: Arc::new(std::sync::Mutex::new(
+                crate::ambient::speaker::candidates::CandidateStore::open(
+                    tmp.path().join("c"),
+                    "test-model".into(),
+                )
+                .unwrap(),
+            )),
+            voices_dir: tmp.path().join("voices"),
+        }));
+        tools
+            .register_tool(Box::new(ambient_tools::TranscriptReadTool::new(
+                Arc::clone(&ambient),
+            )))
+            .await;
+        tools
+            .register_tool(Box::new(ambient_tools::SpeakerCandidatesTool::new(
+                Arc::clone(&ambient),
+            )))
+            .await;
+        tools
+            .register_tool(Box::new(ambient_tools::SpeakerPromoteTool::new(ambient)))
+            .await;
+        let names: Vec<String> = tools.entries().await.into_iter().map(|(n, _)| n).collect();
+        for expected in PRIVATE_READ_TOOLS.iter().chain(["skill_uninstall"].iter()) {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "{expected} not registered"
+            );
+        }
         for (name, entry) in tools.entries().await {
             if entry.group.is_some() {
                 continue;
             }
             assert!(
                 OUTBOUND_TOOLS.contains(&name.as_str())
+                    || PRIVATE_READ_TOOLS.contains(&name.as_str())
                     || LOCAL_UNGROUPED_TOOLS.contains(&name.as_str())
                     || name == A2A_SEND_TOOL,
-                "ungrouped tool `{name}` is neither outbound nor listed local; classify it"
+                "ungrouped tool `{name}` is neither outbound, private-read nor listed local; \
+                 classify it"
             );
         }
     }
