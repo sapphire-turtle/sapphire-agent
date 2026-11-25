@@ -5216,19 +5216,17 @@ remote_agents = ["peer"]
         ))
     }
 
+    /// The two home namespaces, with no edges between them.
     const NS: &str = "[memory_namespace.liaison]\n[memory_namespace.op]\n";
 
-    /// The intended setup: no tools, no outbound tools.
-    fn liaison_config(extra: &str) -> Config {
-        liaison_with(
-            "",
-            "outbound_tools = false",
-            &format!("[memory_namespace.liaison]\n[memory_namespace.op]\n{extra}"),
-        )
-    }
-
+    /// The intended setup (no tools, no outbound tools) over `namespaces`.
     fn liaison_namespaces(namespaces: &str) -> Config {
         liaison_with("", "outbound_tools = false", namespaces)
+    }
+
+    /// The intended setup over [`NS`], plus `extra` top-level config.
+    fn liaison_config(extra: &str) -> Config {
+        liaison_namespaces(&format!("{NS}{extra}"))
     }
 
     fn assert_one_warning(cfg: &Config, keyword: &str) {
