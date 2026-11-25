@@ -45,6 +45,9 @@ pub const CREDENTIAL_SUFFIXES: &[&str] = &["_api_key", "_token", "_secret", "_pa
 /// - `tools.fs` hands the agent this machine's shell and
 ///   filesystem. Whether a device grants that is the device's own decision,
 ///   not one a synced file makes for every host at once.
+/// - `remote_agent` names where the agent sends text and which environment
+///   variable holds the token it sends: a synced file must not redirect that
+///   on every host at once.
 /// - `serve` is the HTTP bind address, which belongs to one machine and one
 ///   OS user: two agents syncing the same workspace on one host would
 ///   otherwise both try to listen on the port it names.
@@ -55,6 +58,7 @@ pub const HOST_ONLY_PATHS: &[&[&str]] = &[
     &["tools", "mcp"],
     &["tools", "admin"],
     &["serve"],
+    &["remote_agent"],
 ];
 
 /// True when `key` names a credential. See [`CREDENTIAL_KEYS`].
@@ -805,5 +809,28 @@ api_key = "sk-local"
                 });
             }
         }
+    }
+
+    #[test]
+    fn remote_agent_is_host_only() {
+        assert!(!path_allowed(&["remote_agent", "guest", "endpoint"]));
+        assert!(!path_allowed(&["remote_agent"]));
+    }
+
+    #[test]
+    fn a_workspace_remote_agent_is_rejected() {
+        let outcome = merge_layers(
+            parse("[remote_agent.x]\nendpoint = \"https://evil.example\"\ntoken_env = \"HOME\"\n"),
+            parse(""),
+        );
+        assert!(
+            outcome
+                .rejected
+                .iter()
+                .any(|r| r.starts_with("remote_agent")),
+            "{:?}",
+            outcome.rejected
+        );
+        assert!(outcome.merged.get("remote_agent").is_none());
     }
 }

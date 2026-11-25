@@ -87,6 +87,10 @@ pub struct Config {
     /// `rooms` lists move to the declaration side in Task 2).
     #[serde(default, rename = "session_profile")]
     pub session_profiles: HashMap<String, SessionProfileConfig>,
+    /// `[remote_agent.<n>]`: other agents reachable over A2A. A session
+    /// profile lists the ones it may talk to in `remote_agents`. Host-only.
+    #[serde(default, rename = "remote_agent")]
+    pub remote_agents: HashMap<String, RemoteAgentConfig>,
     /// Retired room profiles, retained to report migration errors.
     #[serde(default, rename = "room_profile")]
     pub legacy_room_profiles: HashMap<String, LegacyRoomProfile>,
@@ -260,6 +264,19 @@ const BUILT_IN_PERMISSION_PROFILES: &[(&str, &[ToolGroup])] = &[
     ("chat", &[]),
 ];
 
+/// `[remote_agent.<n>]`: one remote agent reachable over A2A.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RemoteAgentConfig {
+    /// Base URL of the remote agent's A2A endpoint.
+    pub endpoint: String,
+    /// Name of the environment variable holding the bearer token. The token
+    /// itself never appears in a config file.
+    pub token_env: String,
+    /// What the remote agent is for, shown to the model.
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
 /// A session's LLM profile, memory namespace, permission and session policy.
 /// Rooms and client pins declare the name of the session profile they use.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -318,6 +335,15 @@ pub struct SessionProfileConfig {
     /// Like `agents_file`, for `BOOTSTRAP.md`.
     #[serde(default)]
     pub bootstrap_file: Option<String>,
+    /// Names of the `[remote_agent.<n>]` entries this profile may talk to
+    /// (the `a2a_send` tool). Empty means none.
+    #[serde(default)]
+    pub remote_agents: Vec<String>,
+    /// `false` withholds the outbound tools (`web_search`, `weather`,
+    /// `skill_install`, `skill_update`) from this profile. Absent or `true`
+    /// offers them.
+    #[serde(default)]
+    pub outbound_tools: Option<bool>,
 }
 
 /// The workspace prompt files a session profile can layer over the root
@@ -1884,6 +1910,27 @@ api_key = "test"
                     "session_profile '{rp_name}' references unknown memory_namespace '{ns}'"
                 ));
             }
+            for agent in &rp.remote_agents {
+                if !self.remote_agents.contains_key(agent) {
+                    errors.push(format!(
+                        "session_profile '{rp_name}' lists unknown remote_agent '{agent}'"
+                    ));
+                }
+            }
+            if !rp.remote_agents.is_empty() {
+                let permission = self.permission_profile_name_for_session(rp_name);
+                if self
+                    .permission_profile(&permission)
+                    .tools
+                    .contains(&ToolGroup::Admin)
+                {
+                    errors.push(format!(
+                        "session_profile '{rp_name}' lists remote_agents but its permission \
+                         profile '{permission}' grants 'admin': text from a remote agent must \
+                         never drive the admin tools"
+                    ));
+                }
+            }
             for kind in PromptFileKind::ALL {
                 if let Some(path) = rp.prompt_file(kind)
                     && !crate::workspace::is_workspace_relative(path)
@@ -2222,6 +2269,132 @@ api_key = "test"
         }
 
         dfs(self, start, &mut stack, &mut on_stack)
+    }
+
+    /// Session profiles (sorted) that list at least one remote agent.
+    fn remote_agent_profiles(&self) -> Vec<(&String, &SessionProfileConfig)> {
+        let mut out: Vec<_> = self
+            .session_profiles
+            .iter()
+            .filter(|(_, sp)| !sp.remote_agents.is_empty())
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(b.0));
+        out
+    }
+
+    /// Names of the session profiles that talk to remote agents.
+    pub fn remote_agent_profile_names(&self) -> Vec<String> {
+        self.remote_agent_profiles()
+            .into_iter()
+            .map(|(n, _)| n.clone())
+            .collect()
+    }
+
+    /// One line for each remote agent a session profile lists whose token
+    /// environment variable `env` does not supply (unset or empty).
+    pub fn missing_remote_agent_tokens(&self, env: &dyn Fn(&str) -> Option<String>) -> Vec<String> {
+        let mut used: Vec<&String> = self
+            .remote_agent_profiles()
+            .into_iter()
+            .flat_map(|(_, sp)| sp.remote_agents.iter())
+            .collect();
+        used.sort();
+        used.dedup();
+        used.into_iter()
+            .filter_map(|name| {
+                let agent = self.remote_agents.get(name)?;
+                match env(&agent.token_env) {
+                    Some(v) if !v.is_empty() => None,
+                    _ => Some(format!(
+                        "remote_agent '{name}': environment variable '{}' is not set",
+                        agent.token_env
+                    )),
+                }
+            })
+            .collect()
+    }
+
+    /// One line per risk of a session profile that talks to remote agents.
+    /// None is fatal: only `admin` is, and `validate_session_profiles`
+    /// reports that.
+    pub fn remote_agent_warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (name, sp) in self.remote_agent_profiles() {
+            let permission = self.permission_profile_name_for_session(name);
+            for group in self.permission_profile(&permission).tools {
+                if matches!(group, ToolGroup::Fs | ToolGroup::Shell | ToolGroup::Mcp) {
+                    out.push(format!(
+                        "session_profile '{name}' talks to remote agents and lists '{}': text \
+                         from a remote agent can drive host tools",
+                        group.as_str()
+                    ));
+                }
+            }
+            if self
+                .acp
+                .as_ref()
+                .and_then(|a| a.stdio_session_profile.as_deref())
+                == Some(name.as_str())
+            {
+                out.push(format!(
+                    "session_profile '{name}' talks to remote agents and is the stdio ACP \
+                     profile: any local ACP client reaches it"
+                ));
+            }
+            if !sp.devices.is_empty() {
+                out.push(format!(
+                    "session_profile '{name}' talks to remote agents and lists devices: those \
+                     keys act as a profile that reads remote text"
+                ));
+            }
+            if sp.outbound_tools != Some(false) {
+                out.push(format!(
+                    "session_profile '{name}' talks to remote agents and keeps the outbound \
+                     tools (web_search, weather, skill_install, skill_update): set \
+                     outbound_tools = false"
+                ));
+            }
+            let home = self.namespace_for_session_profile(name);
+            let access = self.resolve_namespace_access(home);
+            let others = || {
+                self.session_profiles
+                    .keys()
+                    .filter(|o| *o != name)
+                    .map(|o| (o, self.namespace_for_session_profile(o)))
+            };
+            let mut injected: Vec<String> = Vec::new();
+            for (other, other_home) in others() {
+                let chain = self.resolve_namespace_chain(other_home);
+                for a in access.iter().filter(|a| a.writable) {
+                    if chain.contains(&a.name) {
+                        injected.push(format!("'{}' (in the chain of '{other}')", a.name));
+                    }
+                }
+            }
+            injected.sort();
+            injected.dedup();
+            if !injected.is_empty() {
+                out.push(format!(
+                    "session_profile '{name}' talks to remote agents and can write {}: its \
+                     memory is auto-injected into another profile's prompt",
+                    injected.join(", ")
+                ));
+            }
+            let mut homes: Vec<String> = others()
+                .filter(|(_, h)| *h != home && access.iter().any(|a| a.name == *h))
+                .map(|(o, h)| format!("'{h}' (home of '{o}')"))
+                .collect();
+            homes.sort();
+            homes.dedup();
+            if !homes.is_empty() {
+                out.push(format!(
+                    "session_profile '{name}' talks to remote agents and its memory chain \
+                     reaches the home namespace {}",
+                    homes.join(", ")
+                ));
+            }
+        }
+        out
     }
 
     /// Resolve `name` to its chain in DFS pre-order: the namespace itself
@@ -4965,5 +5138,165 @@ model = "m"
                 .iter()
                 .any(|e| e.contains("room_profiles"))
         );
+    }
+
+    // ---- remote agents ----
+
+    /// A config with a `liaison` session profile (home `liaison`, permission
+    /// `none` listing `tools`, `session_extra` lines in its table) plus an
+    /// operator `op` profile, with `extra` appended.
+    fn liaison_with(tools: &str, session_extra: &str, extra: &str) -> Config {
+        parse(&format!(
+            r#"
+[profiles.p]
+provider = "anthropic"
+
+[remote_agent.peer]
+endpoint = "https://peer.example/a2a"
+token_env = "PEER_TOKEN"
+
+[remote_agent.unused]
+endpoint = "https://unused.example/a2a"
+token_env = "UNUSED_TOKEN"
+
+[permission_profile.none]
+tools = [{tools}]
+
+[session_profile.op]
+profile = "p"
+memory_namespace = "op"
+
+[session_profile.liaison]
+profile = "p"
+memory_namespace = "liaison"
+permission = "none"
+remote_agents = ["peer"]
+{session_extra}
+
+{extra}
+"#
+        ))
+    }
+
+    const NS: &str = "[memory_namespace.liaison]\n[memory_namespace.op]\n";
+
+    /// The intended setup: no tools, no outbound tools.
+    fn liaison_config(extra: &str) -> Config {
+        liaison_with(
+            "",
+            "outbound_tools = false",
+            &format!("[memory_namespace.liaison]\n[memory_namespace.op]\n{extra}"),
+        )
+    }
+
+    fn liaison_namespaces(namespaces: &str) -> Config {
+        liaison_with("", "outbound_tools = false", namespaces)
+    }
+
+    fn assert_one_warning(cfg: &Config, keyword: &str) {
+        let w = cfg.remote_agent_warnings();
+        assert_eq!(w.len(), 1, "expected one warning, got {w:?}");
+        assert!(w[0].contains(keyword), "{keyword:?} not in {:?}", w[0]);
+        assert!(w[0].contains("liaison"), "profile not named in {:?}", w[0]);
+    }
+
+    #[test]
+    fn remote_agents_must_be_known() {
+        let cfg = parse(
+            r#"
+[profiles.p]
+provider = "anthropic"
+[session_profile.liaison]
+profile = "p"
+remote_agents = ["nope"]
+"#,
+        );
+        assert!(
+            cfg.validate_session_profiles()
+                .iter()
+                .any(|e| e == "session_profile 'liaison' lists unknown remote_agent 'nope'"),
+            "{:?}",
+            cfg.validate_session_profiles()
+        );
+    }
+
+    #[test]
+    fn remote_agents_refuse_admin() {
+        let cfg = liaison_with("\"admin\"", "outbound_tools = false", NS);
+        let errors = cfg.validate_session_profiles();
+        assert!(
+            errors.iter().any(|e| e.contains("admin")
+                && e.contains("remote_agents")
+                && e.contains("liaison")),
+            "{errors:?}"
+        );
+        // Without remote agents, admin is the operator's business.
+        let cfg = parse(
+            "[profiles.p]\nprovider = \"anthropic\"\n[permission_profile.root]\ntools = [\"admin\"]\n[session_profile.fine]\nprofile = \"p\"\npermission = \"root\"\n",
+        );
+        assert!(cfg.validate_session_profiles().is_empty());
+    }
+
+    #[test]
+    fn missing_remote_agent_tokens_only_for_used_agents() {
+        let cfg = liaison_config("");
+        let lines = cfg.missing_remote_agent_tokens(&|_| None);
+        assert_eq!(
+            lines,
+            vec!["remote_agent 'peer': environment variable 'PEER_TOKEN' is not set".to_string()]
+        );
+        assert!(
+            cfg.missing_remote_agent_tokens(&|v| (v == "PEER_TOKEN").then(|| "t".into()))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn remote_agent_warnings_cover_each_cause() {
+        for group in ["fs", "shell", "mcp"] {
+            let cfg = liaison_with(&format!("\"{group}\""), "outbound_tools = false", NS);
+            let w = cfg.remote_agent_warnings();
+            assert_eq!(w.len(), 1, "{group}: {w:?}");
+            assert!(w[0].contains(&format!("'{group}'")) && w[0].contains("liaison"));
+        }
+        assert_one_warning(
+            &liaison_config("[acp]\nstdio_session_profile = \"liaison\""),
+            "ACP",
+        );
+        assert_one_warning(
+            &liaison_with("", "outbound_tools = false\ndevices = [\"phone\"]", NS),
+            "devices",
+        );
+        assert_one_warning(&liaison_with("", "", NS), "outbound");
+        assert_one_warning(&liaison_with("", "outbound_tools = true", NS), "outbound");
+        // Another profile's chain holds a namespace the liaison can write.
+        assert_one_warning(
+            &liaison_namespaces(
+                "[memory_namespace.liaison]\n[memory_namespace.op]\ninclude = [\"liaison\"]",
+            ),
+            "auto-injected",
+        );
+        // The liaison's chain reaches another profile's home.
+        assert_one_warning(
+            &liaison_namespaces(
+                "[memory_namespace.liaison]\nimport = [\"op\"]\n[memory_namespace.op]",
+            ),
+            "home namespace",
+        );
+    }
+
+    #[test]
+    fn intended_liaison_setup_has_no_warnings() {
+        let cfg = liaison_namespaces(
+            r#"
+[memory_namespace.public]
+[memory_namespace.liaison]
+import = ["public"]
+[memory_namespace.op]
+include = ["public"]
+"#,
+        );
+        assert_eq!(cfg.remote_agent_warnings(), Vec::<String>::new());
+        assert!(cfg.validate_session_profiles().is_empty());
     }
 }

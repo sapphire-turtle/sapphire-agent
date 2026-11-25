@@ -274,7 +274,11 @@ fn consult_timeout(hours: u64) -> std::time::Duration {
 /// shows up before a request is. Also the `[session_profile.<n>].devices`
 /// fallback for keys from before profiles, and any entry of it naming no
 /// key. Reads the key files without changing them.
-fn verify_api_keys(auth: &device_auth::DeviceAuth, root: Option<&std::path::Path>) {
+fn verify_api_keys(
+    auth: &device_auth::DeviceAuth,
+    root: Option<&std::path::Path>,
+    config: &config::Config,
+) {
     use sapphire_framework::keys::{KeyStore, MIGRATED, store_dir};
 
     let bindings = auth.bindings();
@@ -332,6 +336,26 @@ fn verify_api_keys(auth: &device_auth::DeviceAuth, root: Option<&std::path::Path
             println!(
                 "    {:<20} {} -> profile '{profile}' is no room profile: its token is refused (403)",
                 key.name, key.id
+            );
+        }
+    }
+    let remote = config.remote_agent_profile_names();
+    for key in &live {
+        let profile = key.profile.as_str();
+        let bound = if auth.is_session_profile(profile) {
+            Some(profile.to_string())
+        } else if profile == MIGRATED {
+            auth.legacy_binding(key.id.as_str(), &key.name)
+                .map(str::to_string)
+        } else {
+            None
+        };
+        if let Some(p) = bound
+            && remote.contains(&p)
+        {
+            println!(
+                "    warning: key '{}' drives session_profile '{p}', which talks to remote agents",
+                key.name
             );
         }
     }
@@ -446,6 +470,18 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
                         "invalid session profile references:\n  - {}",
                         errors.join("\n  - ")
                     );
+                }
+                let tokens = loaded
+                    .config
+                    .missing_remote_agent_tokens(&|v| std::env::var(v).ok());
+                if !tokens.is_empty() {
+                    anyhow::bail!(
+                        "remote agent tokens missing:\n  - {}",
+                        tokens.join("\n  - ")
+                    );
+                }
+                for line in loaded.config.remote_agent_warnings() {
+                    tracing::warn!("{line}");
                 }
                 for line in loaded
                     .config
@@ -1573,8 +1609,26 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
             // before profiles the hand-written `devices` — needs somewhere
             // to be checked.
             match device_auth::DeviceAuth::workspace(&config.session_profiles) {
-                Ok(auth) => verify_api_keys(&auth, selection.as_ref().map(|s| s.root.as_path())),
+                Ok(auth) => {
+                    verify_api_keys(&auth, selection.as_ref().map(|s| s.root.as_path()), &config)
+                }
                 Err(e) => println!("  Devices           : INVALID: {e:#}"),
+            }
+            let mut remote_agents: Vec<_> = config.remote_agents.iter().collect();
+            remote_agents.sort_by(|a, b| a.0.cmp(b.0));
+            for (name, agent) in remote_agents {
+                let state = if std::env::var(&agent.token_env).is_ok_and(|v| !v.is_empty()) {
+                    "set"
+                } else {
+                    "unset"
+                };
+                println!(
+                    "  remote_agent {name}: {} (token env {}: {state})",
+                    agent.endpoint, agent.token_env
+                );
+            }
+            for line in config.remote_agent_warnings() {
+                println!("  warning: {line}");
             }
             match &workspace_path {
                 Some(p) => println!("  Workspace config  : {}", p.display()),
