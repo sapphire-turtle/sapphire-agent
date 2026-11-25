@@ -2952,7 +2952,7 @@ impl TurnLoop<'_> {
                     // memory tool writes under `memory/<namespace>/...`.
                     let tools = Arc::clone(&self.state.tools);
                     let session_tools = session_tools.clone();
-                    let ns = self.state.config.resolve_namespace_chain(&namespace);
+                    let ns = self.state.config.resolve_namespace_access(&namespace);
                     let timer_origin = self.timer_origin.clone();
                     let session_profile = self.session_profile.clone();
                     // Read once per turn, same as `timer_origin`: `None` on
@@ -3320,7 +3320,7 @@ pub(crate) async fn run_llm_turn(
         .config
         .namespace_for_session_profile(&session_profile)
         .to_string();
-    let namespace_chain = state.config.resolve_namespace_chain(&namespace);
+    let namespace_chain = state.config.resolve_namespace_access(&namespace);
 
     // 2b. Ensure JSONL file exists. If this session was deferred at initialize
     //     time, commit it now using the reserved public_id.

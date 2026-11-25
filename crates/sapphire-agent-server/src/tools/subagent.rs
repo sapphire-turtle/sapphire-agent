@@ -1436,7 +1436,7 @@ async fn scope_background<F: std::future::Future>(
     namespace: String,
     fut: F,
 ) -> F::Output {
-    let chain = ctx.state.config.resolve_namespace_chain(&namespace);
+    let chain = ctx.state.config.resolve_namespace_access(&namespace);
     let fut = crate::tools::workspace_tools::scope_memory_namespace(chain, fut);
     let fut =
         crate::tools::config_tools::scope_session_profile(Some(ctx.session_profile.clone()), fut);
@@ -2684,7 +2684,11 @@ mod tests {
             crate::tools::workspace_tools::current_memory_chain()
         })
         .await;
-        assert_eq!(seen, vec!["mom".to_string(), "family".to_string()]);
+        let seen: Vec<(String, bool)> = seen.into_iter().map(|a| (a.name, a.writable)).collect();
+        assert_eq!(
+            seen,
+            vec![("mom".to_string(), true), ("family".to_string(), true)]
+        );
     }
 
     /// A `TurnContext` built by hand rather than through a real parent

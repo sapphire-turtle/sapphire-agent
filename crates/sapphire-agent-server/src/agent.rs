@@ -463,7 +463,7 @@ impl Agent {
         }
 
         let namespace = self.config.namespace_for_session_profile(profile_name);
-        let chain = self.config.resolve_namespace_chain(namespace);
+        let chain = self.config.resolve_namespace_access(namespace);
         // Best-effort: a missing or unreachable RoomInfo just leaves the
         // "# Current Room" block out — never blocks the turn.
         let room_info = self.channels.room_info(&key.0).await;
@@ -832,7 +832,7 @@ impl Agent {
                     // tokio::spawn does not propagate task_local, so we
                     // re-bind it inside each spawned future.
                     let tools = self.tools.clone();
-                    let ns = self.config.resolve_namespace_chain(
+                    let ns = self.config.resolve_namespace_access(
                         self.config.namespace_for_session_profile(&profile_name),
                     );
                     let room_id_for_timer = incoming.room_id.clone();

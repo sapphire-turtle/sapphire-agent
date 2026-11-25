@@ -678,7 +678,10 @@ provider = "anthropic"
         );
 
         let from_work = crate::tools::workspace_tools::scope_memory_namespace(
-            vec!["work".to_string()],
+            vec![crate::config::NamespaceAccess {
+                name: "work".to_string(),
+                writable: true,
+            }],
             tool.execute(&json!({})),
         )
         .await

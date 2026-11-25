@@ -694,6 +694,12 @@ pub struct MemoryNamespaceConfig {
     /// DAG; cycles are rejected at startup.
     #[serde(default)]
     pub include: Vec<String>,
+    /// Names of namespaces readable from this one but never writable
+    /// through it: everything reachable only via an `import` edge is
+    /// read-only. Shares the DAG with `include`; cycles and unknown names
+    /// are rejected at startup.
+    #[serde(default)]
+    pub import: Vec<String>,
     /// Profile used by background tasks (daily-log generation, periodic
     /// digests, MEMORY.md compaction) when working under this
     /// namespace. Lets a per-namespace policy pick a permissive local
@@ -725,6 +731,16 @@ pub struct MemoryNamespaceConfig {
 pub struct NamespaceInfo {
     pub name: String,
     pub description: Option<String>,
+    /// Reachable only through an `import`: the memory tools refuse writes.
+    pub read_only: bool,
+}
+
+/// One namespace of a session's chain and whether the memory tools may
+/// write to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamespaceAccess {
+    pub name: String,
+    pub writable: bool,
 }
 
 #[cfg(test)]
@@ -734,6 +750,7 @@ impl NamespaceInfo {
         Self {
             name: name.to_string(),
             description: None,
+            read_only: false,
         }
     }
 }
@@ -1936,6 +1953,13 @@ api_key = "test"
                     ));
                 }
             }
+            for parent in &ns_cfg.import {
+                if !self.namespace_is_defined(parent) {
+                    errors.push(format!(
+                        "memory_namespace '{ns_name}' imports unknown namespace '{parent}'"
+                    ));
+                }
+            }
             if let Some(prof) = &ns_cfg.background_profile
                 && !self.profiles.contains_key(prof)
             {
@@ -2178,7 +2202,7 @@ api_key = "test"
             let parents: Vec<String> = cfg
                 .memory_namespaces
                 .get(node)
-                .map(|c| c.include.clone())
+                .map(|c| c.include.iter().chain(&c.import).cloned().collect())
                 .unwrap_or_default();
             for parent in parents {
                 if on_stack.contains(&parent) {
@@ -2200,31 +2224,48 @@ api_key = "test"
         dfs(self, start, &mut stack, &mut on_stack)
     }
 
-    /// Resolve `name` to its include-chain in DFS pre-order: the namespace
-    /// itself first, then each parent in include order, with parents'
-    /// parents flattened in. Duplicates are removed (first occurrence
+    /// Resolve `name` to its chain in DFS pre-order: the namespace itself
+    /// first, then each `include` parent, then each `import` parent, with
+    /// their parents flattened in. Duplicates are removed (first occurrence
     /// wins). The implicit `"default"` namespace, when not configured,
     /// resolves to a single-entry chain `["default"]`.
     pub fn resolve_namespace_chain(&self, name: &str) -> Vec<String> {
-        let mut out: Vec<String> = Vec::new();
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        self.namespace_chain_walk(name, &mut out, &mut seen);
+        self.resolve_namespace_access(name)
+            .into_iter()
+            .map(|a| a.name)
+            .collect()
+    }
+
+    /// The chain of `resolve_namespace_chain` with write access: the
+    /// namespace itself and everything reachable from it by `include` edges
+    /// alone is writable; anything reachable only through an `import` is
+    /// read-only. A namespace reached by both kinds of path is writable.
+    pub fn resolve_namespace_access(&self, name: &str) -> Vec<NamespaceAccess> {
+        let mut out: Vec<NamespaceAccess> = Vec::new();
+        self.namespace_chain_walk(name, true, &mut out);
         out
     }
 
-    fn namespace_chain_walk(
-        &self,
-        name: &str,
-        out: &mut Vec<String>,
-        seen: &mut std::collections::HashSet<String>,
-    ) {
-        if !seen.insert(name.to_string()) {
-            return;
+    fn namespace_chain_walk(&self, name: &str, writable: bool, out: &mut Vec<NamespaceAccess>) {
+        if let Some(entry) = out.iter_mut().find(|a| a.name == name) {
+            // Seen already. Only a writable path to a namespace first seen
+            // read-only changes anything, and then its children upgrade too.
+            if !writable || entry.writable {
+                return;
+            }
+            entry.writable = true;
+        } else {
+            out.push(NamespaceAccess {
+                name: name.to_string(),
+                writable,
+            });
         }
-        out.push(name.to_string());
         if let Some(cfg) = self.memory_namespaces.get(name) {
             for parent in &cfg.include {
-                self.namespace_chain_walk(parent, out, seen);
+                self.namespace_chain_walk(parent, writable, out);
+            }
+            for parent in &cfg.import {
+                self.namespace_chain_walk(parent, false, out);
             }
         }
     }
@@ -2248,17 +2289,18 @@ api_key = "test"
         None
     }
 
-    /// `chain` (from `resolve_namespace_chain`) with each namespace's
+    /// `access` (from `resolve_namespace_access`) with each namespace's
     /// configured description.
-    pub fn namespace_infos(&self, chain: &[String]) -> Vec<NamespaceInfo> {
-        chain
+    pub fn namespace_infos(&self, access: &[NamespaceAccess]) -> Vec<NamespaceInfo> {
+        access
             .iter()
-            .map(|name| NamespaceInfo {
-                name: name.clone(),
+            .map(|a| NamespaceInfo {
+                name: a.name.clone(),
                 description: self
                     .memory_namespaces
-                    .get(name)
+                    .get(&a.name)
                     .and_then(|ns| ns.description.clone()),
+                read_only: !a.writable,
             })
             .collect()
     }
@@ -3352,7 +3394,7 @@ description = "translation work"
 [memory_namespace.family]
 "#,
         );
-        let infos = cfg.namespace_infos(&cfg.resolve_namespace_chain("mom"));
+        let infos = cfg.namespace_infos(&cfg.resolve_namespace_access("mom"));
         let got: Vec<(&str, Option<&str>)> = infos
             .iter()
             .map(|i| (i.name.as_str(), i.description.as_deref()))
@@ -3361,7 +3403,10 @@ description = "translation work"
             got,
             vec![("mom", Some("translation work")), ("family", None)]
         );
-        let default = cfg.namespace_infos(&["default".to_string()]);
+        let default = cfg.namespace_infos(&[NamespaceAccess {
+            name: "default".to_string(),
+            writable: true,
+        }]);
         assert_eq!(default[0].name, "default");
         assert_eq!(default[0].description, None);
     }
@@ -3682,6 +3727,148 @@ include = ["a"]
             errors.iter().any(|e| e.contains("cycle")),
             "expected cycle error, got: {errors:?}"
         );
+    }
+
+    fn access(cfg: &Config, name: &str) -> Vec<(String, bool)> {
+        cfg.resolve_namespace_access(name)
+            .into_iter()
+            .map(|a| (a.name, a.writable))
+            .collect()
+    }
+
+    fn pairs(v: &[(&str, bool)]) -> Vec<(String, bool)> {
+        v.iter().map(|(n, w)| (n.to_string(), *w)).collect()
+    }
+
+    #[test]
+    fn import_chains_read_only() {
+        let cfg = parse(
+            r#"
+[memory_namespace.mom]
+include = ["family"]
+import = ["public"]
+[memory_namespace.family]
+[memory_namespace.public]
+"#,
+        );
+        assert_eq!(
+            access(&cfg, "mom"),
+            pairs(&[("mom", true), ("family", true), ("public", false)])
+        );
+        assert_eq!(
+            cfg.resolve_namespace_chain("mom"),
+            vec![
+                "mom".to_string(),
+                "family".to_string(),
+                "public".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn import_propagates_read_only() {
+        let cfg = parse(
+            r#"
+[memory_namespace.liaison]
+import = ["public"]
+[memory_namespace.public]
+include = ["news"]
+[memory_namespace.news]
+"#,
+        );
+        assert_eq!(
+            access(&cfg, "liaison"),
+            pairs(&[("liaison", true), ("public", false), ("news", false)])
+        );
+    }
+
+    #[test]
+    fn include_path_wins_over_import() {
+        let cfg = parse(
+            r#"
+[memory_namespace.op]
+include = ["public"]
+import = ["shared"]
+[memory_namespace.shared]
+include = ["public"]
+[memory_namespace.public]
+"#,
+        );
+        assert_eq!(
+            access(&cfg, "op"),
+            pairs(&[("op", true), ("public", true), ("shared", false)])
+        );
+        // The writable path is found after the read-only one: upgrade, once.
+        let cfg = parse(
+            r#"
+[memory_namespace.op]
+import = ["shared"]
+include = ["public"]
+[memory_namespace.shared]
+include = ["public"]
+[memory_namespace.public]
+include = ["deep"]
+[memory_namespace.deep]
+"#,
+        );
+        assert_eq!(
+            access(&cfg, "op"),
+            pairs(&[
+                ("op", true),
+                ("public", true),
+                ("deep", true),
+                ("shared", false)
+            ])
+        );
+    }
+
+    #[test]
+    fn import_unknown_and_cycle_are_errors() {
+        let cfg = parse(
+            r#"
+[memory_namespace.a]
+import = ["ghost"]
+"#,
+        );
+        let errors = cfg.validate_session_profiles();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("imports unknown namespace")),
+            "{errors:?}"
+        );
+        let cfg = parse(
+            r#"
+[memory_namespace.a]
+include = ["b"]
+[memory_namespace.b]
+import = ["a"]
+"#,
+        );
+        let errors = cfg.validate_session_profiles();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("memory_namespace cycle detected")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn namespace_infos_marks_read_only() {
+        let cfg = parse(
+            r#"
+[memory_namespace.mom]
+import = ["public"]
+[memory_namespace.public]
+"#,
+        );
+        let infos = cfg.namespace_infos(&cfg.resolve_namespace_access("mom"));
+        let got: Vec<(&str, bool)> = infos
+            .iter()
+            .map(|i| (i.name.as_str(), i.read_only))
+            .collect();
+        assert_eq!(got, vec![("mom", false), ("public", true)]);
     }
 
     #[test]
