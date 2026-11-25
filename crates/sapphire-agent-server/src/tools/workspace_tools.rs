@@ -102,9 +102,6 @@ const MEMORY_CATEGORY_GUIDE: &str = "Category is mandatory and free-form, but pr
      'knowledge' (longer-form facts, procedures, decisions, learnings — default when unsure). \
      Other categories (e.g. 'recipe', 'project') may be introduced freely.";
 
-/// `memory/<namespace>/<category>/<slug>.md`, relative and absolute.
-/// `namespace` absent means this turn's own; present, it must be one of
-/// `current_memory_chain()`, and with `write` set it must be writable.
 /// The optional `namespace` argument: absent or `null` means this
 /// conversation's own namespace; anything but a string is an error rather
 /// than a silent fall-back to the own namespace.
@@ -116,6 +113,9 @@ fn namespace_arg(input: &Value) -> Result<Option<&str>> {
     }
 }
 
+/// `memory/<namespace>/<category>/<slug>.md`, relative and absolute.
+/// `namespace` absent means this turn's own; present, it must be one of
+/// `current_memory_chain()`, and with `write` set it must be writable.
 fn memory_entry_path(
     state: &WorkspaceState,
     namespace: Option<&str>,
@@ -217,7 +217,7 @@ fn memory_entry_schema(include_content: bool) -> serde_json::Value {
         "namespace".into(),
         json!({
             "type": "string",
-            "description": "Memory namespace to use, from the list under # Memory. Omit for this conversation's own namespace."
+            "description": "Memory namespace to use, from the list under # Memory. Omit for this conversation's own namespace. Namespaces marked (read-only) there can be read but not written."
         }),
     );
     let mut required = vec!["category", "slug"];
