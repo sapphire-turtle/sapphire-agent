@@ -17,7 +17,7 @@ A personal AI assistant agent that works on file-based, local-first [`sapphire-f
 - **Channels**: Matrix (E2EE via `matrix-sdk`) Discord (`serenity`), and Telegram (`telers`), running concurrently. An empty `rooms` list means listen everywhere the bot can see.
 - **Providers**: Anthropic Messages API with SSE streaming and a multi-round tool-use loop, plus OpenAI-compatible backends (local LLMs, OpenRouter, …) selectable per room/session via the `[providers]` / `[profiles]` / `[session_profile]` schema.
 - **Workspace**: backed by [`sapphire-framework`](https://github.com/sapphire-turtle/sapphire-framework) — file index, full-text + vector search (redb + tantivy, plus LanceDB vectors by default).
-- **Built-in tools**: `file_read`, `file_write`, `file_append`, `file_delete`, `dir_list`, `dir_walk`, `shell`, plus workspace memory / search / sync tools. The seven that touch a filesystem or a shell (`file_read`, `file_write`, `file_append`, `file_delete`, `dir_list`, `dir_walk`, `shell`) plus `shell_start` / `shell_output` / `shell_kill` for long-running commands are **session-routed: which machine they reach is decided by the session, not by the name**. Inside an ACP session they act on the machine the connected editor is running on, over `/acp`'s `fs/*` and `terminal/*` requests, and only for the capabilities that editor declared at `initialize` — with no fallback to the agent's own disk when one is missing. Everywhere else (Matrix, Discord, Telegram, `/rpc`, voice, `/a2a`, heartbeat, autonomous, subagents) they act on this agent's own machine, and are opt-in: `[tools.fs] / [tools.shell] enabled = false` by default, for every origin. Turning that on is a deliberate act; running the agent in a container is the recommended way to do it once it is. See [Shell and file tools: whose machine](#shell-and-file-tools-whose-machine) below.
+- **Built-in tools**: `file_read`, `file_write`, `file_append`, `file_delete`, `dir_list`, `dir_walk`, `shell`, plus workspace memory tools and the `workspace_search` / `workspace_sync` index tools (the latter two in the `fs` group, since search reaches every file's path). The seven that touch a filesystem or a shell (`file_read`, `file_write`, `file_append`, `file_delete`, `dir_list`, `dir_walk`, `shell`) plus `shell_start` / `shell_output` / `shell_kill` for long-running commands are **session-routed: which machine they reach is decided by the session, not by the name**. Inside an ACP session they act on the machine the connected editor is running on, over `/acp`'s `fs/*` and `terminal/*` requests, and only for the capabilities that editor declared at `initialize` — with no fallback to the agent's own disk when one is missing. Everywhere else (Matrix, Discord, Telegram, `/rpc`, voice, `/a2a`, heartbeat, autonomous, subagents) they act on this agent's own machine, and are opt-in: `[tools.fs] / [tools.shell] enabled = false` by default, for every origin. Turning that on is a deliberate act; running the agent in a container is the recommended way to do it once it is. See [Shell and file tools: whose machine](#shell-and-file-tools-whose-machine) below.
 - **Sessions**: human-readable [`grain-id`](https://crates.io/crates/grain-id) aliases, auto-generated titles, history dump on resume.
 - **Background**: heartbeat cron tasks, periodic memory compaction, periodic workspace re-index, daily / weekly / monthly / yearly logs with catch-up.
 - **Voice**: a server-side STT → turn → TTS pipeline (`voice/*` on `/rpc`) with local STT/TTS via `sherpa-onnx`, for networked voice clients. The `sapphire-agent-cli voice` satellite and the desktop's voice input / spoken replies were dropped when the local clients moved to IPC ([#278](https://github.com/sapphire-turtle/sapphire-agent/issues/278)); the satellite role moves to wearable device firmware.
@@ -110,6 +110,13 @@ into `IDENTITY.md` and `SOUL.md`, and then delete itself.
 
 `init` never overwrites, so it is safe to re-run — that is also how a workspace
 made by an older build picks up a file added since.
+
+Each session profile can layer its own version of these files over the root
+ones — `AGENTS.<profile>.md`, `SOUL.<profile>.md` and so on, appended after the
+root file unless the layer's frontmatter says `merge: replace` — so one agent
+can play a different role for each profile. That shapes behaviour only; keep a
+profile away from other profiles' data with its permission (see
+`config.example.toml`, "Per-profile prompt files").
 
 It writes nothing outside the workspace. API keys and other credentials are
 host-local, so rather than writing that file `init` prints it for you to place
@@ -715,6 +722,9 @@ Outside an ACP session these tools reach the agent's own machine, and there they
 are opt-in: the seven file and shell tools (`file_read`, `file_write`,
 `file_append`, `file_delete`, `dir_list`, `dir_walk`, `shell`) require
 `[tools.fs] / [tools.shell] enabled = true`; the default is `false`, for every origin.
+`workspace_search` and `workspace_sync` belong to the `fs` group as well: they
+are not session-routed (they always search this agent's workspace), but a hit
+names any file's path, so they need the same switch and permission as reading it.
 Before this switch existed, `Origin::Channel` (Matrix/Discord/Telegram) refused only
 `Execute` and `Other` calls, so `file_write` (`Edit`) and `file_delete`
 (`Delete`) went through unconditionally — a Discord message asking to delete a

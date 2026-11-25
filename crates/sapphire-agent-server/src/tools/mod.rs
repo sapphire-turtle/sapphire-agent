@@ -347,8 +347,6 @@ pub async fn default_tool_set(
         Box::new(MemoryAppendTool::new(Arc::clone(&state))),
         Box::new(MemoryUpdateTool::new(Arc::clone(&state))),
         Box::new(MemoryRemoveTool::new(Arc::clone(&state))),
-        Box::new(WorkspaceSearchTool::new(Arc::clone(&state))),
-        Box::new(WorkspaceSyncTool::new(Arc::clone(&state))),
         Box::new(ClientShellStart::new()),
         Box::new(ClientShellOutput::new()),
         Box::new(ClientShellKill::new()),
@@ -364,6 +362,10 @@ pub async fn default_tool_set(
             Box::new(FileDeleteTool::new(Arc::clone(&state))),
             Box::new(DirListTool::new(Arc::clone(&state))),
             Box::new(DirWalkTool::new(Arc::clone(&state))),
+            // Search reaches every file's path, so it needs the same
+            // permission that reads them.
+            Box::new(WorkspaceSearchTool::new(Arc::clone(&state))),
+            Box::new(WorkspaceSyncTool::new(Arc::clone(&state))),
         ]);
     }
     if config.group_registered(ToolGroup::Shell) {
@@ -533,7 +535,8 @@ mod tests {
             ("task_test", ToolKind::Edit, Some(ToolGroup::Admin)),
             ("current_time", ToolKind::Read, None),
             ("memory_add", ToolKind::Edit, None),
-            ("workspace_search", ToolKind::Search, None),
+            ("workspace_search", ToolKind::Search, Some(ToolGroup::Fs)),
+            ("workspace_sync", ToolKind::Other, Some(ToolGroup::Fs)),
             ("skill", ToolKind::Read, None),
             ("subagent", ToolKind::Other, None),
         ];
@@ -576,7 +579,7 @@ mod tests {
                     .iter()
                     .filter(|(_, e)| e.group == Some(ToolGroup::Fs))
                     .count(),
-                if fs { 7 } else { 0 },
+                if fs { 9 } else { 0 },
                 "{toml}"
             );
             assert_eq!(

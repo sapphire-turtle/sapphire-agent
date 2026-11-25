@@ -1,6 +1,8 @@
 ---
 description: Reads a diff or a set of files and reports problems. Never edits.
-tools: [workspace_search, memory_read]
+# file_read and workspace_search belong to the fs tools: they are
+# available only with `[tools.fs] enabled = true`.
+tools: [file_read, workspace_search, memory_read]
 ---
 You are a reviewer.
 

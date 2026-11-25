@@ -299,6 +299,74 @@ pub struct SessionProfileConfig {
     /// Replaced `api_keys`, which held raw tokens in this file.
     #[serde(default)]
     pub devices: Vec<String>,
+    /// Workspace-relative path of this profile's `AGENTS.md` layer.
+    /// Absent means the `AGENTS.<profile>.md` convention.
+    #[serde(default)]
+    pub agents_file: Option<String>,
+    /// Like `agents_file`, for `SOUL.md`.
+    #[serde(default)]
+    pub soul_file: Option<String>,
+    /// Like `agents_file`, for `IDENTITY.md`.
+    #[serde(default)]
+    pub identity_file: Option<String>,
+    /// Like `agents_file`, for `USER.md`.
+    #[serde(default)]
+    pub user_file: Option<String>,
+    /// Like `agents_file`, for `TOOLS.md`.
+    #[serde(default)]
+    pub tools_file: Option<String>,
+    /// Like `agents_file`, for `BOOTSTRAP.md`.
+    #[serde(default)]
+    pub bootstrap_file: Option<String>,
+}
+
+/// The workspace prompt files a session profile can layer over the root
+/// ones (`AGENTS.md`, `SOUL.md`, …).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptFileKind {
+    Agents,
+    Soul,
+    Identity,
+    User,
+    Tools,
+    Bootstrap,
+}
+
+impl PromptFileKind {
+    pub const ALL: [PromptFileKind; 6] = [
+        PromptFileKind::Agents,
+        PromptFileKind::Soul,
+        PromptFileKind::Identity,
+        PromptFileKind::User,
+        PromptFileKind::Tools,
+        PromptFileKind::Bootstrap,
+    ];
+
+    /// The `[session_profile.<p>]` key that overrides this file's path.
+    pub fn config_key(self) -> &'static str {
+        match self {
+            PromptFileKind::Agents => "agents_file",
+            PromptFileKind::Soul => "soul_file",
+            PromptFileKind::Identity => "identity_file",
+            PromptFileKind::User => "user_file",
+            PromptFileKind::Tools => "tools_file",
+            PromptFileKind::Bootstrap => "bootstrap_file",
+        }
+    }
+}
+
+impl SessionProfileConfig {
+    /// The explicitly configured path of this profile's layer of `kind`.
+    pub fn prompt_file(&self, kind: PromptFileKind) -> Option<&str> {
+        match kind {
+            PromptFileKind::Agents => self.agents_file.as_deref(),
+            PromptFileKind::Soul => self.soul_file.as_deref(),
+            PromptFileKind::Identity => self.identity_file.as_deref(),
+            PromptFileKind::User => self.user_file.as_deref(),
+            PromptFileKind::Tools => self.tools_file.as_deref(),
+            PromptFileKind::Bootstrap => self.bootstrap_file.as_deref(),
+        }
+    }
 }
 
 /// Retired section, retained only to name migration errors.
@@ -616,8 +684,9 @@ pub struct ProfileConfig {
 /// Definition of a memory namespace — a subtree under `memory/<name>/`
 /// that owns its own MEMORY.md and periodic logs. The `include` list
 /// names parent namespaces whose memory should also be visible to
-/// rooms using this namespace; reads chain through the include DAG,
-/// writes go only to the leaf namespace.
+/// rooms using this namespace; reads chain through the include DAG.
+/// Background writers (logs, digests, compaction) write only to the leaf;
+/// the memory tools may write to any namespace of the chain.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct MemoryNamespaceConfig {
     /// Names of parent namespaces whose memory should be merged in
@@ -644,6 +713,29 @@ pub struct MemoryNamespaceConfig {
     /// right for development and wrong for an ordinary conversation.
     #[serde(default)]
     pub skills: bool,
+    /// What this namespace holds, in the operator's words. Shown to the
+    /// model next to the namespace's name in the `# Memory` block so it can
+    /// choose where a fact belongs.
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// A namespace of a session's include chain as the system prompt names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamespaceInfo {
+    pub name: String,
+    pub description: Option<String>,
+}
+
+#[cfg(test)]
+impl NamespaceInfo {
+    /// A namespace with no description.
+    pub fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            description: None,
+        }
+    }
 }
 
 /// Voice pipeline preset — references a named STT provider and TTS provider
@@ -1670,6 +1762,30 @@ api_key = "test"
         self.session_profiles.get(name)
     }
 
+    /// Explicit session-profile prompt-file paths (`agents_file`, …) that
+    /// name no file under `workspace_dir`, one line each, sorted by profile
+    /// then file. Such a layer is read as absent — no fallback to the
+    /// `AGENTS.<p>.md` convention — so `serve` warns and `verify` reports.
+    pub fn missing_prompt_file_overrides(&self, workspace_dir: &Path) -> Vec<String> {
+        let mut names: Vec<&String> = self.session_profiles.keys().collect();
+        names.sort();
+        let mut out = Vec::new();
+        for name in names {
+            let profile = &self.session_profiles[name];
+            for kind in PromptFileKind::ALL {
+                if let Some(path) = profile.prompt_file(kind)
+                    && !workspace_dir.join(path).is_file()
+                {
+                    out.push(format!(
+                        "session_profile '{name}' {} '{path}' does not exist",
+                        kind.config_key()
+                    ));
+                }
+            }
+        }
+        out
+    }
+
     /// Resolve the session policy for an already-resolved session profile,
     /// falling back to the global default when the profile sets none.
     pub fn session_policy_for_profile(&self, profile_name: &str) -> SessionPolicy {
@@ -1750,6 +1866,17 @@ api_key = "test"
                 errors.push(format!(
                     "session_profile '{rp_name}' references unknown memory_namespace '{ns}'"
                 ));
+            }
+            for kind in PromptFileKind::ALL {
+                if let Some(path) = rp.prompt_file(kind)
+                    && !crate::workspace::is_workspace_relative(path)
+                {
+                    errors.push(format!(
+                        "session_profile '{rp_name}' {} '{path}' must be a workspace-relative \
+                         path (no leading '/', drive or '..')",
+                        kind.config_key()
+                    ));
+                }
             }
         }
         let mut seen_rooms: HashMap<&str, &str> = HashMap::new();
@@ -2119,6 +2246,21 @@ api_key = "test"
             return Some(BACKGROUND_PROFILE_NAME);
         }
         None
+    }
+
+    /// `chain` (from `resolve_namespace_chain`) with each namespace's
+    /// configured description.
+    pub fn namespace_infos(&self, chain: &[String]) -> Vec<NamespaceInfo> {
+        chain
+            .iter()
+            .map(|name| NamespaceInfo {
+                name: name.clone(),
+                description: self
+                    .memory_namespaces
+                    .get(name)
+                    .and_then(|ns| ns.description.clone()),
+            })
+            .collect()
     }
 
     /// Resolve the memory namespace declared by a room profile (by
@@ -3161,6 +3303,91 @@ fallback_provider = "ghost"
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("fallback"));
         assert!(errors[0].contains("ghost"));
+    }
+
+    #[test]
+    fn validate_refuses_prompt_file_paths_outside_the_workspace() {
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+
+[profiles.default]
+provider = "anthropic"
+
+[session_profile.guest]
+profile = "default"
+agents_file = "roles/front-desk.md"
+user_file = "/home/someone/.config/sapphire-agent/config.toml"
+soul_file = "../outside.md"
+"#,
+        );
+        let errors = cfg.validate_session_profiles();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("user_file") && e.contains("workspace-relative")),
+            "{errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("soul_file") && e.contains("workspace-relative")),
+            "{errors:?}"
+        );
+        assert!(
+            !errors.iter().any(|e| e.contains("agents_file")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn namespace_infos_reads_descriptions_and_defaults_missing() {
+        let cfg = parse(
+            r#"
+[memory_namespace.mom]
+include = ["family"]
+description = "translation work"
+
+[memory_namespace.family]
+"#,
+        );
+        let infos = cfg.namespace_infos(&cfg.resolve_namespace_chain("mom"));
+        let got: Vec<(&str, Option<&str>)> = infos
+            .iter()
+            .map(|i| (i.name.as_str(), i.description.as_deref()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![("mom", Some("translation work")), ("family", None)]
+        );
+        let default = cfg.namespace_infos(&["default".to_string()]);
+        assert_eq!(default[0].name, "default");
+        assert_eq!(default[0].description, None);
+    }
+
+    #[test]
+    fn missing_prompt_file_overrides_names_only_absent_paths() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("a.md"), "x").unwrap();
+        let cfg = parse(
+            r#"
+[anthropic]
+api_key = "test"
+
+[profiles.default]
+provider = "anthropic"
+
+[session_profile.family]
+profile = "default"
+agents_file = "a.md"
+soul_file = "s.md"
+"#,
+        );
+        assert_eq!(
+            cfg.missing_prompt_file_overrides(dir.path()),
+            vec!["session_profile 'family' soul_file 's.md' does not exist".to_string()]
+        );
     }
 
     #[test]

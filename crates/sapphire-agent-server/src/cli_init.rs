@@ -371,7 +371,14 @@ mod tests {
 
         let ws = crate::workspace::Workspace::new(d.path().to_path_buf(), digest);
         let prompt = ws
-            .build_system_prompt(None, 4, &["default".to_string()], None, None)
+            .build_system_prompt(
+                None,
+                4,
+                &[crate::config::NamespaceInfo::new("default")],
+                None,
+                None,
+                None,
+            )
             .await;
 
         for heading in [

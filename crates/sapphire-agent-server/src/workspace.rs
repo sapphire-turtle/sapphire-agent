@@ -1,5 +1,5 @@
 use crate::channel::RoomInfo;
-use crate::config::DigestConfig;
+use crate::config::{DigestConfig, NamespaceInfo, PromptFileKind, SessionProfileConfig};
 use crate::periodic_log::{self, LogKind};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -32,6 +32,8 @@ pub fn slash_path(path: &Path) -> String {
 /// order), plus the Markdown heading to use when injecting into the system
 /// prompt.
 struct WorkspaceFileDef {
+    /// Which session-profile override key this file answers to.
+    kind: PromptFileKind,
     /// Candidate filenames tried in order; the first one found is used.
     candidates: &'static [&'static str],
     /// Heading inserted above the file content (e.g. "# Agent Instructions").
@@ -47,30 +49,166 @@ static WORKSPACE_FILES: &[WorkspaceFileDef] = &[
     // openclaw uses "AGENTS.md" (plural); we also accept "AGENT.md" for
     // users who create the file without the trailing 's'.
     WorkspaceFileDef {
+        kind: PromptFileKind::Agents,
         candidates: &["AGENTS.md", "AGENT.md"],
         heading: "# Agent Instructions",
     },
     WorkspaceFileDef {
+        kind: PromptFileKind::Soul,
         candidates: &["SOUL.md"],
         heading: "# Soul",
     },
     WorkspaceFileDef {
+        kind: PromptFileKind::Identity,
         candidates: &["IDENTITY.md"],
         heading: "# Identity",
     },
     WorkspaceFileDef {
+        kind: PromptFileKind::User,
         candidates: &["USER.md"],
         heading: "# User",
     },
     WorkspaceFileDef {
+        kind: PromptFileKind::Tools,
         candidates: &["TOOLS.md"],
         heading: "# Tools",
     },
     WorkspaceFileDef {
+        kind: PromptFileKind::Bootstrap,
         candidates: &["BOOTSTRAP.md"],
         heading: "# Bootstrap",
     },
 ];
+
+// ---------------------------------------------------------------------------
+// Per-session-profile prompt files
+// ---------------------------------------------------------------------------
+
+/// The session profile a prompt is built for: its name (for the
+/// `AGENTS.<name>.md` convention) and its config (for explicit paths).
+#[derive(Debug, Clone, Copy)]
+pub struct PromptProfile<'a> {
+    pub name: &'a str,
+    pub config: &'a SessionProfileConfig,
+}
+
+/// How a profile's layer combines with the root file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MergeMode {
+    /// Root body, then the profile body (the default).
+    Append,
+    /// The profile body alone; an empty body drops the file.
+    Replace,
+}
+
+/// The convention file names of `profile_name`'s layer for a file whose
+/// root candidates are `roots` (`AGENTS.md` → `AGENTS.<p>.md`). Empty for a
+/// name that could step outside the workspace root or hide the file: such a
+/// profile gets no convention file, though an explicit path still works.
+pub(crate) fn profile_file_candidates(roots: &[&str], profile_name: &str) -> Vec<String> {
+    let unsafe_name = profile_name.is_empty()
+        || profile_name.starts_with('.')
+        || profile_name.contains(['/', '\\', '\0']);
+    if unsafe_name {
+        return Vec::new();
+    }
+    roots
+        .iter()
+        .filter_map(|root| root.strip_suffix(".md"))
+        .map(|stem| format!("{stem}.{profile_name}.md"))
+        .collect()
+}
+
+/// Where `profile`'s layer of `kind` resolves under `dir`, and its merge
+/// mode — for `verify`'s report. Mirrors `Workspace::read_profile_layer`
+/// without the pinned cache: an explicit path is reported only when the
+/// file exists (no fallback), else the first existing convention file.
+pub(crate) fn resolve_profile_layer(
+    dir: &Path,
+    kind: PromptFileKind,
+    profile: PromptProfile<'_>,
+) -> Option<(String, MergeMode)> {
+    let path = match profile.config.prompt_file(kind) {
+        Some(path) => {
+            (is_workspace_relative(path) && dir.join(path).is_file()).then(|| path.to_string())
+        }
+        None => {
+            let roots = WORKSPACE_FILES
+                .iter()
+                .find(|def| def.kind == kind)
+                .map_or(&[][..], |def| def.candidates);
+            profile_file_candidates(roots, profile.name)
+                .into_iter()
+                .find(|name| dir.join(name).is_file())
+        }
+    }?;
+    let raw = std::fs::read_to_string(dir.join(&path)).ok()?;
+    Some((path, split_merge_mode(&raw).0))
+}
+
+/// Whether `path` stays inside the workspace when joined onto its root: a
+/// non-empty relative path of plain components, never absolute and never
+/// stepping up with `..`. An explicit `agents_file` (…) may come from the
+/// workspace's own config layer, which must not reach the host's files.
+pub(crate) fn is_workspace_relative(path: &str) -> bool {
+    use std::path::Component;
+    let path = Path::new(path);
+    // `C:\x` is not absolute on Unix, but a drive prefix is never a
+    // workspace-relative spelling on any platform.
+    let looks_like_drive = path
+        .to_str()
+        .is_some_and(|p| p.as_bytes().get(1) == Some(&b':'));
+    !path.as_os_str().is_empty()
+        && !looks_like_drive
+        && path
+            .components()
+            .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+}
+
+/// Split a profile file into its merge mode and its body, frontmatter
+/// stripped. No frontmatter or no `merge:` key means `Append`; values are
+/// case-insensitive, and an unknown one is warned about and read as
+/// `Replace` (fail closed).
+pub(crate) fn split_merge_mode(raw: &str) -> (MergeMode, String) {
+    // A BOM (as some Windows editors save) would otherwise hide the
+    // frontmatter, and with it a `merge: replace`.
+    let raw = raw.strip_prefix('\u{FEFF}').unwrap_or(raw);
+    let Some((fm, body)) = crate::frontmatter::split(raw) else {
+        return (MergeMode::Append, raw.to_string());
+    };
+    let mapping = crate::frontmatter::parse_mapping(fm);
+    let value = mapping
+        .get("merge")
+        .and_then(|v| v.as_str())
+        .map(str::to_ascii_lowercase);
+    let mode = match value.as_deref() {
+        None | Some("append") => MergeMode::Append,
+        Some("replace") => MergeMode::Replace,
+        // Fail closed: a typo must not merge a root file (the operator's
+        // USER.md, say) into a profile that meant to replace it.
+        Some(other) => {
+            if first_merge_warning(other) {
+                tracing::warn!(
+                    "unknown `merge: {other}` in a profile prompt file; replacing \
+                     (use `append` or `replace`)"
+                );
+            }
+            MergeMode::Replace
+        }
+    };
+    (mode, body.to_string())
+}
+
+/// Whether `value` is the first unknown `merge:` value seen by this
+/// process. Profile files are re-read every RPC turn, so without this the
+/// same warning would repeat on each one.
+fn first_merge_warning(value: &str) -> bool {
+    static SEEN: std::sync::Mutex<std::collections::BTreeSet<String>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    SEEN.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(value.to_string())
+}
 
 // ---------------------------------------------------------------------------
 // Pinned file cache
@@ -115,14 +253,16 @@ impl Workspace {
     /// Build the full system prompt:
     /// 1. Base system_prompt from config (if any)
     /// 2. Each workspace file that exists, in openclaw order
-    /// 3. Chained MEMORY.md from the room's namespace and its includes
+    /// 3. The namespace list and chained MEMORY.md from the room's
+    ///    namespace and its includes
     /// 4. Previous day's daily log (if it exists)
     ///
-    /// `namespace_chain` is the DFS-pre-order list of namespaces this
-    /// room reads from — typically computed via
-    /// `Config::resolve_namespace_chain(Config::namespace_for_session(room_id))`.
+    /// `namespaces` is the DFS-pre-order list of namespaces this room
+    /// reads from, with their descriptions — typically computed via
+    /// `Config::namespace_infos(&Config::resolve_namespace_chain(ns))`.
     /// The first entry is the room's own namespace; later entries are
-    /// included parents.
+    /// included parents. `profile` is the session profile whose prompt
+    /// file layers apply, if any.
     ///
     /// `cwd`, when present, is this turn's ACP session working directory
     /// (see `TurnHost::cwd` in `serve`): an absolute path on the *client's*
@@ -133,10 +273,13 @@ impl Workspace {
         &self,
         base: Option<&str>,
         boundary_hour: u8,
-        namespace_chain: &[String],
+        namespaces: &[NamespaceInfo],
         room_info: Option<&RoomInfo>,
         cwd: Option<&str>,
+        profile: Option<PromptProfile<'_>>,
     ) -> String {
+        let chain: Vec<String> = namespaces.iter().map(|ns| ns.name.clone()).collect();
+        let namespace_chain = chain.as_slice();
         let mut parts: Vec<String> = Vec::new();
 
         if let Some(b) = base.filter(|s| !s.is_empty()) {
@@ -167,14 +310,13 @@ impl Workspace {
         }
 
         for def in WORKSPACE_FILES {
-            if let Some((filename, content)) = self.read_first_existing(def.candidates).await {
-                debug!("Injecting workspace file: {filename}");
-                parts.push(format!("{}\n\n{content}", def.heading));
+            if let Some(body) = self.workspace_file_body(def, profile).await {
+                parts.push(format!("{}\n\n{body}", def.heading));
             }
         }
 
         // Per-namespace MEMORY.md, chained.
-        if let Some(block) = self.build_memory_block(namespace_chain).await {
+        if let Some(block) = self.build_memory_block(namespaces).await {
             parts.push(block);
         }
 
@@ -191,9 +333,9 @@ impl Workspace {
     /// concatenate as `## <namespace>` subsections under one combined
     /// `# Memory` heading. Namespaces with no MEMORY.md are skipped.
     /// Returns `None` if the entire chain has no MEMORY.md to inject.
-    async fn build_memory_block(&self, namespace_chain: &[String]) -> Option<String> {
+    async fn build_memory_block(&self, namespaces: &[NamespaceInfo]) -> Option<String> {
         let mut subsections = Vec::new();
-        for ns in namespace_chain {
+        for ns in namespaces.iter().map(|ns| &ns.name) {
             let rel = format!("memory/{ns}/MEMORY.md");
             if let Some(content) = self.read_file(&rel).await
                 && !content.trim().is_empty()
@@ -201,11 +343,29 @@ impl Workspace {
                 subsections.push(format!("## {ns}\n\n{content}"));
             }
         }
-        if subsections.is_empty() {
-            None
-        } else {
-            Some(format!("# Memory\n\n{}", subsections.join("\n\n")))
+        if namespaces.is_empty() {
+            return None;
         }
+        let mut block = String::from(
+            "# Memory\n\nNamespaces available to the memory tools (pass `namespace` to \
+             choose; default is this conversation's own):",
+        );
+        for (i, ns) in namespaces.iter().enumerate() {
+            block.push_str("\n- ");
+            block.push_str(&ns.name);
+            if i == 0 {
+                block.push_str(" (this conversation)");
+            }
+            if let Some(description) = ns.description.as_deref().filter(|d| !d.trim().is_empty()) {
+                block.push_str(" — ");
+                block.push_str(description.trim());
+            }
+        }
+        for subsection in subsections {
+            block.push_str("\n\n");
+            block.push_str(&subsection);
+        }
+        Some(block)
     }
 
     /// Append log injection blocks to `parts`: yesterday's full body
@@ -363,6 +523,60 @@ impl Workspace {
         self.cache.lock().await.clear();
     }
 
+    /// The injected body of `def`: the root file, merged with `profile`'s
+    /// layer when it has one. `None` when nothing non-blank is left.
+    async fn workspace_file_body(
+        &self,
+        def: &WorkspaceFileDef,
+        profile: Option<PromptProfile<'_>>,
+    ) -> Option<String> {
+        let root = self.read_first_existing(def.candidates).await;
+        if let Some((filename, _)) = &root {
+            debug!("Injecting workspace file: {filename}");
+        }
+        let root = root.map(|(_, content)| content);
+        let layer = match profile {
+            Some(p) => self.read_profile_layer(def, p).await,
+            None => None,
+        };
+        let Some((filename, raw)) = layer else {
+            return root;
+        };
+        debug!("Injecting profile workspace file: {filename}");
+        let (mode, body) = split_merge_mode(&raw);
+        let body = body.trim();
+        let merged = match (mode, root) {
+            (MergeMode::Replace, _) | (MergeMode::Append, None) => body.to_string(),
+            (MergeMode::Append, Some(root)) if body.is_empty() => root,
+            (MergeMode::Append, Some(root)) => format!("{}\n\n{body}", root.trim_end()),
+        };
+        (!merged.trim().is_empty()).then_some(merged)
+    }
+
+    /// `profile`'s layer of `def`: its explicit path when configured
+    /// (no fallback when that file is missing), else the first existing
+    /// convention file.
+    async fn read_profile_layer(
+        &self,
+        def: &WorkspaceFileDef,
+        profile: PromptProfile<'_>,
+    ) -> Option<(String, String)> {
+        if let Some(path) = profile.config.prompt_file(def.kind) {
+            // Refused at startup too; checked again so no read ever leaves
+            // the workspace.
+            if !is_workspace_relative(path) {
+                return None;
+            }
+            return self
+                .read_file(path)
+                .await
+                .map(|content| (path.to_string(), content));
+        }
+        let candidates = profile_file_candidates(def.candidates, profile.name);
+        let candidates: Vec<&str> = candidates.iter().map(String::as_str).collect();
+        self.read_first_existing(&candidates).await
+    }
+
     /// Try each candidate filename in order; return the first one found.
     async fn read_first_existing(&self, candidates: &[&str]) -> Option<(String, String)> {
         for &filename in candidates {
@@ -494,13 +708,13 @@ mod tests {
     async fn the_system_prompt_is_byte_identical_across_turns() {
         let dir = tempfile::TempDir::new().unwrap();
         let ws = workspace_with_agents_md(&dir);
-        let chain = ["default".to_string()];
+        let chain = [NamespaceInfo::new("default")];
 
         let first = ws
-            .build_system_prompt(Some("base"), 4, &chain, None, None)
+            .build_system_prompt(Some("base"), 4, &chain, None, None, None)
             .await;
         let second = ws
-            .build_system_prompt(Some("base"), 4, &chain, None, None)
+            .build_system_prompt(Some("base"), 4, &chain, None, None, None)
             .await;
 
         assert_eq!(first, second);
@@ -516,10 +730,10 @@ mod tests {
     async fn the_system_prompt_pins_edits_until_cleared() {
         let dir = tempfile::TempDir::new().unwrap();
         let ws = workspace_with_agents_md(&dir);
-        let chain = ["default".to_string()];
+        let chain = [NamespaceInfo::new("default")];
 
         let before = ws
-            .build_system_prompt(Some("base"), 4, &chain, None, None)
+            .build_system_prompt(Some("base"), 4, &chain, None, None, None)
             .await;
 
         // 編集する（mtime が変わる）
@@ -531,14 +745,14 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
 
         let pinned = ws
-            .build_system_prompt(Some("base"), 4, &chain, None, None)
+            .build_system_prompt(Some("base"), 4, &chain, None, None, None)
             .await;
         assert_eq!(before, pinned, "ピン留め中は編集が反映されない");
         assert!(!pinned.contains("edited content."));
 
         ws.clear_pinned_cache().await;
         let refreshed = ws
-            .build_system_prompt(Some("base"), 4, &chain, None, None)
+            .build_system_prompt(Some("base"), 4, &chain, None, None, None)
             .await;
         assert!(
             refreshed.contains("edited content."),
@@ -551,21 +765,21 @@ mod tests {
     async fn newly_created_files_are_invisible_until_cleared() {
         let dir = tempfile::TempDir::new().unwrap();
         let ws = Workspace::new(dir.path().to_path_buf(), DigestConfig::default());
-        let chain = ["default".to_string()];
+        let chain = [NamespaceInfo::new("default")];
 
         let before = ws
-            .build_system_prompt(Some("base"), 4, &chain, None, None)
+            .build_system_prompt(Some("base"), 4, &chain, None, None, None)
             .await;
         std::fs::write(dir.path().join("SOUL.md"), "# Soul\n\nnew soul.\n").unwrap();
 
         let pinned = ws
-            .build_system_prompt(Some("base"), 4, &chain, None, None)
+            .build_system_prompt(Some("base"), 4, &chain, None, None, None)
             .await;
         assert_eq!(before, pinned, "新規ファイルはクリアまで見えない");
 
         ws.clear_pinned_cache().await;
         let refreshed = ws
-            .build_system_prompt(Some("base"), 4, &chain, None, None)
+            .build_system_prompt(Some("base"), 4, &chain, None, None, None)
             .await;
         assert!(refreshed.contains("new soul."));
     }
@@ -574,9 +788,9 @@ mod tests {
     async fn a_cwd_reaches_the_prompt_as_its_own_block() {
         let dir = tempfile::TempDir::new().unwrap();
         let ws = Workspace::new(dir.path().to_path_buf(), DigestConfig::default());
-        let chain = ["default".to_string()];
+        let chain = [NamespaceInfo::new("default")];
         let prompt = ws
-            .build_system_prompt(Some("base"), 4, &chain, None, Some("/work/proj"))
+            .build_system_prompt(Some("base"), 4, &chain, None, Some("/work/proj"), None)
             .await;
         assert!(
             prompt.contains("# Current Workspace\n\n- Working directory: /work/proj"),
@@ -588,9 +802,9 @@ mod tests {
     async fn the_cwd_block_precedes_the_workspace_files() {
         let dir = tempfile::TempDir::new().unwrap();
         let ws = workspace_with_agents_md(&dir);
-        let chain = ["default".to_string()];
+        let chain = [NamespaceInfo::new("default")];
         let prompt = ws
-            .build_system_prompt(Some("base"), 4, &chain, None, Some("/work/proj"))
+            .build_system_prompt(Some("base"), 4, &chain, None, Some("/work/proj"), None)
             .await;
         let cwd_at = prompt.find("# Current Workspace").expect("cwd block");
         let files_at = prompt
@@ -606,10 +820,332 @@ mod tests {
     async fn no_cwd_adds_no_block() {
         let dir = tempfile::TempDir::new().unwrap();
         let ws = Workspace::new(dir.path().to_path_buf(), DigestConfig::default());
-        let chain = ["default".to_string()];
+        let chain = [NamespaceInfo::new("default")];
         let prompt = ws
-            .build_system_prompt(Some("base"), 4, &chain, None, None)
+            .build_system_prompt(Some("base"), 4, &chain, None, None, None)
             .await;
         assert!(!prompt.contains("# Current Workspace"), "{prompt}");
+    }
+
+    // -- per-session-profile prompt files ------------------------------------
+
+    fn profile<'a>(name: &'a str, cfg: &'a SessionProfileConfig) -> Option<PromptProfile<'a>> {
+        Some(PromptProfile { name, config: cfg })
+    }
+
+    async fn prompt_for(dir: &tempfile::TempDir, p: Option<PromptProfile<'_>>) -> String {
+        let ws = Workspace::new(dir.path().to_path_buf(), DigestConfig::default());
+        ws.build_system_prompt(None, 4, &[NamespaceInfo::new("default")], None, None, p)
+            .await
+    }
+
+    fn write(dir: &tempfile::TempDir, rel: &str, body: &str) {
+        let path = dir.path().join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, body).unwrap();
+    }
+
+    #[tokio::test]
+    async fn profile_file_is_appended_after_root() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write(&dir, "AGENTS.md", "core");
+        write(&dir, "AGENTS.family.md", "translate");
+        let cfg = SessionProfileConfig::default();
+        let prompt = prompt_for(&dir, profile("family", &cfg)).await;
+        assert!(
+            prompt.contains("# Agent Instructions\n\ncore\n\ntranslate"),
+            "{prompt}"
+        );
+        assert_eq!(
+            prompt.matches("# Agent Instructions").count(),
+            1,
+            "{prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_drops_root_and_strips_frontmatter() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write(&dir, "AGENTS.md", "core");
+        write(
+            &dir,
+            "AGENTS.family.md",
+            "---\nmerge: replace\n---\ntranslate",
+        );
+        let cfg = SessionProfileConfig::default();
+        let prompt = prompt_for(&dir, profile("family", &cfg)).await;
+        assert!(
+            prompt.contains("# Agent Instructions\n\ntranslate"),
+            "{prompt}"
+        );
+        assert!(!prompt.contains("core"), "{prompt}");
+        assert!(!prompt.contains("merge:"), "{prompt}");
+    }
+
+    #[tokio::test]
+    async fn empty_replace_omits_the_section() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write(&dir, "SOUL.md", "root soul");
+        write(&dir, "SOUL.guest.md", "---\nmerge: replace\n---\n");
+        let cfg = SessionProfileConfig::default();
+        let prompt = prompt_for(&dir, profile("guest", &cfg)).await;
+        assert!(!prompt.contains("# Soul"), "{prompt}");
+        assert!(!prompt.contains("root soul"), "{prompt}");
+    }
+
+    #[tokio::test]
+    async fn explicit_path_wins_over_convention() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write(&dir, "roles/x.md", "explicit");
+        write(&dir, "AGENTS.family.md", "convention");
+        let cfg = SessionProfileConfig {
+            agents_file: Some("roles/x.md".into()),
+            ..Default::default()
+        };
+        let prompt = prompt_for(&dir, profile("family", &cfg)).await;
+        assert!(prompt.contains("explicit"), "{prompt}");
+        assert!(!prompt.contains("convention"), "{prompt}");
+    }
+
+    #[tokio::test]
+    async fn missing_explicit_path_does_not_fall_back() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write(&dir, "AGENTS.md", "core");
+        write(&dir, "AGENTS.family.md", "convention");
+        let cfg = SessionProfileConfig {
+            agents_file: Some("missing.md".into()),
+            ..Default::default()
+        };
+        let prompt = prompt_for(&dir, profile("family", &cfg)).await;
+        assert!(prompt.contains("core"), "{prompt}");
+        assert!(!prompt.contains("convention"), "{prompt}");
+    }
+
+    #[tokio::test]
+    async fn no_profile_uses_root_only() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write(&dir, "AGENTS.md", "core");
+        write(&dir, "AGENTS.family.md", "translate");
+        let prompt = prompt_for(&dir, None).await;
+        assert!(prompt.contains("core"), "{prompt}");
+        assert!(!prompt.contains("translate"), "{prompt}");
+    }
+
+    #[tokio::test]
+    async fn singular_agent_profile_file_is_found() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write(&dir, "AGENT.family.md", "translate");
+        let cfg = SessionProfileConfig::default();
+        let prompt = prompt_for(&dir, profile("family", &cfg)).await;
+        assert!(
+            prompt.contains("# Agent Instructions\n\ntranslate"),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn unsafe_profile_names_get_no_convention_file() {
+        let roots = ["AGENTS.md", "AGENT.md"];
+        assert_eq!(
+            profile_file_candidates(&roots, "family"),
+            vec![
+                "AGENTS.family.md".to_string(),
+                "AGENT.family.md".to_string()
+            ]
+        );
+        for bad in ["", "../etc", "a/b", "a\\b", ".hidden", "a\0b"] {
+            assert!(profile_file_candidates(&roots, bad).is_empty(), "{bad:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn frontmatter_without_merge_key_appends() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write(&dir, "AGENTS.md", "core");
+        write(&dir, "AGENTS.family.md", "---\ntitle: x\n---\nbody");
+        let cfg = SessionProfileConfig::default();
+        let prompt = prompt_for(&dir, profile("family", &cfg)).await;
+        assert!(prompt.contains("core\n\nbody"), "{prompt}");
+        assert!(!prompt.contains("title:"), "{prompt}");
+    }
+
+    #[tokio::test]
+    async fn whitespace_profile_file_adds_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write(&dir, "AGENTS.md", "core\n");
+        write(&dir, "AGENTS.family.md", "   \n");
+        let cfg = SessionProfileConfig::default();
+        let with_blank = prompt_for(&dir, profile("family", &cfg)).await;
+        let root_only = prompt_for(&dir, None).await;
+        assert_eq!(root_only, with_blank);
+    }
+
+    #[tokio::test]
+    async fn profile_prompt_is_byte_identical_across_turns() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write(&dir, "AGENTS.md", "core");
+        write(&dir, "AGENTS.family.md", "translate");
+        let cfg = SessionProfileConfig::default();
+        let ws = Workspace::new(dir.path().to_path_buf(), DigestConfig::default());
+        let chain = [NamespaceInfo::new("default")];
+        let a = ws
+            .build_system_prompt(None, 4, &chain, None, None, profile("family", &cfg))
+            .await;
+        let b = ws
+            .build_system_prompt(None, 4, &chain, None, None, profile("family", &cfg))
+            .await;
+        assert_eq!(a, b);
+    }
+
+    // -- namespace list in the memory block ----------------------------------
+
+    fn ns(name: &str, description: Option<&str>) -> NamespaceInfo {
+        NamespaceInfo {
+            name: name.to_string(),
+            description: description.map(str::to_string),
+        }
+    }
+
+    async fn prompt_with_namespaces(
+        dir: &tempfile::TempDir,
+        namespaces: &[NamespaceInfo],
+    ) -> String {
+        let ws = Workspace::new(dir.path().to_path_buf(), DigestConfig::default());
+        ws.build_system_prompt(None, 4, namespaces, None, None, None)
+            .await
+    }
+
+    #[tokio::test]
+    async fn memory_block_lists_namespaces_with_descriptions() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write(&dir, "memory/mom/MEMORY.md", "mom memory");
+        let prompt = prompt_with_namespaces(
+            &dir,
+            &[
+                ns("mom", Some("母の翻訳業務")),
+                ns("family", Some("家族に関する共有情報")),
+            ],
+        )
+        .await;
+        assert!(
+            prompt.contains(
+                "# Memory\n\n\
+                 Namespaces available to the memory tools (pass `namespace` to choose; \
+                 default is this conversation's own):\n\
+                 - mom (this conversation) — 母の翻訳業務\n\
+                 - family — 家族に関する共有情報\n\n\
+                 ## mom\n\nmom memory"
+            ),
+            "{prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_block_lists_namespaces_without_memory_md() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let prompt = prompt_with_namespaces(&dir, &[ns("mom", None), ns("family", None)]).await;
+        assert!(
+            prompt.contains("# Memory\n\nNamespaces available"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("- family"), "{prompt}");
+        assert!(!prompt.contains("## "), "{prompt}");
+    }
+
+    #[tokio::test]
+    async fn namespace_without_description_has_bare_name() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let prompt = prompt_with_namespaces(&dir, &[ns("mom", None), ns("family", None)]).await;
+        assert!(
+            prompt.contains("\n- mom (this conversation)\n- family"),
+            "{prompt}"
+        );
+        assert!(!prompt.contains(" — "), "{prompt}");
+    }
+
+    // -- final-review fixes --------------------------------------------------
+
+    #[tokio::test]
+    async fn explicit_path_outside_workspace_is_ignored() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(outside.path().join("secret.md"), "host secret").unwrap();
+        write(&dir, "AGENTS.md", "core");
+        let absolute = outside.path().join("secret.md").display().to_string();
+        let outside_name = outside.path().file_name().unwrap().to_string_lossy();
+        for path in [absolute, format!("../{outside_name}/secret.md")] {
+            let cfg = SessionProfileConfig {
+                agents_file: Some(path.clone()),
+                ..Default::default()
+            };
+            let prompt = prompt_for(&dir, profile("family", &cfg)).await;
+            assert!(!prompt.contains("host secret"), "{path}: {prompt}");
+            assert!(prompt.contains("core"), "{path}: {prompt}");
+        }
+    }
+
+    #[test]
+    fn workspace_relative_paths_are_recognised() {
+        for ok in ["AGENTS.md", "roles/x.md", "./roles/x.md"] {
+            assert!(is_workspace_relative(ok), "{ok}");
+        }
+        for bad in ["", "/etc/passwd", "../x.md", "roles/../../x.md", "C:\\x.md"] {
+            assert!(!is_workspace_relative(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_merge_warning_is_reported_once_per_value() {
+        assert!(first_merge_warning("relpace-once-test"));
+        assert!(!first_merge_warning("relpace-once-test"));
+        assert!(first_merge_warning("other-once-test"));
+    }
+
+    #[tokio::test]
+    async fn unknown_merge_value_fails_closed_to_replace() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write(&dir, "USER.md", "operator details");
+        for value in ["replaced", "Replace", "REPLACE"] {
+            write(
+                &dir,
+                "USER.guest.md",
+                &format!("---\nmerge: {value}\n---\nguest"),
+            );
+            let cfg = SessionProfileConfig::default();
+            let prompt = prompt_for(&dir, profile("guest", &cfg)).await;
+            assert!(!prompt.contains("operator details"), "{value}: {prompt}");
+            assert!(prompt.contains("guest"), "{value}: {prompt}");
+        }
+    }
+
+    #[tokio::test]
+    async fn append_is_case_insensitive() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write(&dir, "AGENTS.md", "core");
+        write(
+            &dir,
+            "AGENTS.family.md",
+            "---\nmerge: Append\n---\ntranslate",
+        );
+        let cfg = SessionProfileConfig::default();
+        let prompt = prompt_for(&dir, profile("family", &cfg)).await;
+        assert!(prompt.contains("core\n\ntranslate"), "{prompt}");
+    }
+
+    #[tokio::test]
+    async fn bom_before_frontmatter_is_tolerated() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write(&dir, "USER.md", "operator details");
+        write(
+            &dir,
+            "USER.guest.md",
+            "\u{FEFF}---\nmerge: replace\n---\nguest",
+        );
+        let cfg = SessionProfileConfig::default();
+        let prompt = prompt_for(&dir, profile("guest", &cfg)).await;
+        assert!(!prompt.contains("operator details"), "{prompt}");
+        assert!(!prompt.contains("merge:"), "{prompt}");
     }
 }

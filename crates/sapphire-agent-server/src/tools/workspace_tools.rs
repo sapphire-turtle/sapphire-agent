@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use jiff::Timestamp;
 use sapphire_framework::workspace::{FtsQuery, VectorQuery, WorkspaceState};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -31,17 +31,30 @@ fn lock(state: &WorkspaceState) -> &WorkspaceState {
 // caller that forgets to scope.
 
 tokio::task_local! {
-    static MEMORY_NAMESPACE_TL: String;
+    static MEMORY_NAMESPACE_TL: Vec<String>;
 }
 
-/// Run `fut` with `MEMORY_NAMESPACE_TL` set to `namespace`. Used by the
-/// agent / API serve loops to scope per-turn tool executions to the
-/// caller's namespace.
+/// Run `fut` with `MEMORY_NAMESPACE_TL` set to `chain`: the caller's
+/// namespace first, then every namespace it reaches through `include`
+/// (`Config::resolve_namespace_chain`). Used by the agent / API serve
+/// loops to scope per-turn tool executions. The memory tools default to
+/// the first entry and may be pointed at any other.
 pub fn scope_memory_namespace<F: std::future::Future>(
-    namespace: String,
+    chain: Vec<String>,
     fut: F,
 ) -> impl std::future::Future<Output = F::Output> {
-    MEMORY_NAMESPACE_TL.scope(namespace, fut)
+    MEMORY_NAMESPACE_TL.scope(chain, fut)
+}
+
+/// The namespaces this turn's memory tools may use, own first. Falls back
+/// to `["default"]` outside a `scope_memory_namespace` (or for an empty
+/// scope).
+pub(crate) fn current_memory_chain() -> Vec<String> {
+    MEMORY_NAMESPACE_TL
+        .try_with(|chain| chain.clone())
+        .ok()
+        .filter(|chain| !chain.is_empty())
+        .unwrap_or_else(|| vec![crate::config::DEFAULT_NAMESPACE_NAME.to_string()])
 }
 
 /// The namespace this turn's tool calls should read/write under. Falls
@@ -52,9 +65,7 @@ pub fn scope_memory_namespace<F: std::future::Future>(
 /// conversation that delegated to it, the same way `scope_memory_namespace`
 /// already scopes every other tool call in a turn.
 pub(crate) fn current_memory_namespace() -> String {
-    MEMORY_NAMESPACE_TL
-        .try_with(|s| s.clone())
-        .unwrap_or_else(|_| crate::config::DEFAULT_NAMESPACE_NAME.to_string())
+    current_memory_chain().swap_remove(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -85,14 +96,42 @@ const MEMORY_CATEGORY_GUIDE: &str = "Category is mandatory and free-form, but pr
      'knowledge' (longer-form facts, procedures, decisions, learnings — default when unsure). \
      Other categories (e.g. 'recipe', 'project') may be introduced freely.";
 
+/// `memory/<namespace>/<category>/<slug>.md`, relative and absolute.
+/// `namespace` absent means this turn's own; present, it must be one of
+/// `current_memory_chain()`.
+/// The optional `namespace` argument: absent or `null` means this
+/// conversation's own namespace; anything but a string is an error rather
+/// than a silent fall-back to the own namespace.
+fn namespace_arg(input: &Value) -> Result<Option<&str>> {
+    match input.get("namespace") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(ns)) => Ok(Some(ns)),
+        Some(other) => anyhow::bail!("namespace must be a string, got {other}"),
+    }
+}
+
 fn memory_entry_path(
     state: &WorkspaceState,
+    namespace: Option<&str>,
     category: &str,
     slug: &str,
 ) -> Result<(String, std::path::PathBuf)> {
     validate_segment("category", category)?;
     validate_segment("slug", slug)?;
-    let namespace = current_memory_namespace();
+    let chain = current_memory_chain();
+    let namespace = match namespace {
+        None => chain[0].clone(),
+        Some(ns) => {
+            validate_segment("namespace", ns)?;
+            if !chain.iter().any(|c| c == ns) {
+                anyhow::bail!(
+                    "namespace '{ns}' is not available here; choose one of: {}",
+                    chain.join(", ")
+                );
+            }
+            ns.to_string()
+        }
+    };
     let rel = format!("memory/{namespace}/{category}/{slug}.md");
     let abs = lock(state).workspace.root.join(&rel);
     Ok((rel, abs))
@@ -148,6 +187,13 @@ fn memory_entry_schema(include_content: bool) -> serde_json::Value {
             "description": "File stem (without .md), e.g. \"sapphire-agent-memory-design\" or \"2026-04-10\"."
         }),
     );
+    props.insert(
+        "namespace".into(),
+        json!({
+            "type": "string",
+            "description": "Memory namespace to use, from the list under # Memory. Omit for this conversation's own namespace."
+        }),
+    );
     let mut required = vec!["category", "slug"];
     if include_content {
         props.insert(
@@ -179,7 +225,7 @@ impl MemoryAddTool {
         let description = format!(
             "Create a new memory entry at memory/<category>/<slug>.md. \
              Fails if the file already exists (use memory_update to overwrite). \
-             Each file holds one self-contained entry retrievable via workspace_search. {MEMORY_CATEGORY_GUIDE}"
+             Each file holds one self-contained entry retrievable via workspace_search (when file tools are available). {MEMORY_CATEGORY_GUIDE}"
         );
         Self {
             state,
@@ -204,7 +250,7 @@ impl Tool for MemoryAddTool {
         let category = input["category"].as_str().context("missing 'category'")?;
         let slug = input["slug"].as_str().context("missing 'slug'")?;
         let content = input["content"].as_str().context("missing 'content'")?;
-        let (rel, abs) = memory_entry_path(&self.state, category, slug)?;
+        let (rel, abs) = memory_entry_path(&self.state, namespace_arg(input)?, category, slug)?;
         if abs.exists() {
             anyhow::bail!("{rel} already exists; use memory_update to overwrite");
         }
@@ -259,7 +305,7 @@ impl Tool for MemoryUpdateTool {
         let category = input["category"].as_str().context("missing 'category'")?;
         let slug = input["slug"].as_str().context("missing 'slug'")?;
         let content = input["content"].as_str().context("missing 'content'")?;
-        let (rel, abs) = memory_entry_path(&self.state, category, slug)?;
+        let (rel, abs) = memory_entry_path(&self.state, namespace_arg(input)?, category, slug)?;
         if !abs.exists() {
             anyhow::bail!("{rel} does not exist; use memory_add to create it");
         }
@@ -319,7 +365,7 @@ impl Tool for MemoryAppendTool {
         let category = input["category"].as_str().context("missing 'category'")?;
         let slug = input["slug"].as_str().context("missing 'slug'")?;
         let content = input["content"].as_str().context("missing 'content'")?;
-        let (rel, abs) = memory_entry_path(&self.state, category, slug)?;
+        let (rel, abs) = memory_entry_path(&self.state, namespace_arg(input)?, category, slug)?;
         let now = Timestamp::now();
 
         let (meta, new_body, created) = if abs.exists() {
@@ -396,7 +442,7 @@ impl Tool for MemoryReadTool {
     async fn execute(&self, input: &serde_json::Value) -> Result<String> {
         let category = input["category"].as_str().context("missing 'category'")?;
         let slug = input["slug"].as_str().context("missing 'slug'")?;
-        let (rel, abs) = memory_entry_path(&self.state, category, slug)?;
+        let (rel, abs) = memory_entry_path(&self.state, namespace_arg(input)?, category, slug)?;
         if !abs.exists() {
             anyhow::bail!("{rel} does not exist");
         }
@@ -444,7 +490,7 @@ impl Tool for MemoryRemoveTool {
     async fn execute(&self, input: &serde_json::Value) -> Result<String> {
         let category = input["category"].as_str().context("missing 'category'")?;
         let slug = input["slug"].as_str().context("missing 'slug'")?;
-        let (rel, abs) = memory_entry_path(&self.state, category, slug)?;
+        let (rel, abs) = memory_entry_path(&self.state, namespace_arg(input)?, category, slug)?;
         if !abs.exists() {
             anyhow::bail!("{rel} does not exist");
         }
@@ -469,7 +515,7 @@ impl WorkspaceSearchTool {
             state,
             spec: ToolSpec {
                 kind: ToolKind::Search,
-                group: None,
+                group: Some(crate::config::ToolGroup::Fs),
                 name: "workspace_search".into(),
                 description: "Search across all indexed files in the workspace. \
                     Two modes are available: \
@@ -572,7 +618,7 @@ impl WorkspaceSyncTool {
             state,
             spec: ToolSpec {
                 kind: ToolKind::Other,
-                group: None,
+                group: Some(crate::config::ToolGroup::Fs),
                 name: "workspace_sync".into(),
                 description: "Re-index the workspace so files changed outside \
                     the agent become searchable. Does not touch git."
@@ -601,5 +647,148 @@ impl Tool for WorkspaceSyncTool {
         Ok(format!(
             "Synced: {upserted} files indexed, {removed} removed."
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sapphire_framework::workspace::{AppContext, Workspace};
+
+    static TEST_CTX: AppContext = AppContext::new("sapphire-agent").allow_external_paths();
+
+    fn test_state() -> Arc<WorkspaceState> {
+        TEST_CTX.set_cache_dir(std::env::temp_dir().join("sapphire-agent-tools-test-cache"));
+        let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+        std::fs::create_dir_all(dir.path().join(".sapphire-agent")).unwrap();
+        let ws = Workspace::from_root(&TEST_CTX, dir.path()).unwrap();
+        Arc::new(WorkspaceState::open(ws).unwrap())
+    }
+
+    fn chain(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[tokio::test]
+    async fn non_string_namespace_is_refused() {
+        let state = test_state();
+        let tool = MemoryAddTool::new(Arc::clone(&state));
+        let input = json!({"namespace": 7, "category": "knowledge", "slug": "x", "content": "hi"});
+        let err = scope_memory_namespace(chain(&["mom", "family"]), tool.execute(&input))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("namespace"), "{err}");
+        assert!(!root(&state).join("memory/mom/knowledge/x.md").exists());
+    }
+
+    #[test]
+    fn null_namespace_means_own() {
+        assert_eq!(namespace_arg(&json!({"namespace": null})).unwrap(), None);
+        assert_eq!(namespace_arg(&json!({})).unwrap(), None);
+        assert_eq!(
+            namespace_arg(&json!({"namespace": "family"})).unwrap(),
+            Some("family")
+        );
+    }
+
+    fn root(state: &WorkspaceState) -> std::path::PathBuf {
+        lock(state).workspace.root.clone()
+    }
+
+    #[tokio::test]
+    async fn memory_add_defaults_to_own_namespace() {
+        let state = test_state();
+        let tool = MemoryAddTool::new(Arc::clone(&state));
+        let input = json!({"category": "knowledge", "slug": "x", "content": "hi"});
+        scope_memory_namespace(chain(&["mom", "family"]), tool.execute(&input))
+            .await
+            .unwrap();
+        assert!(root(&state).join("memory/mom/knowledge/x.md").is_file());
+    }
+
+    #[tokio::test]
+    async fn memory_add_writes_to_included_namespace() {
+        let state = test_state();
+        let tool = MemoryAddTool::new(Arc::clone(&state));
+        let input =
+            json!({"namespace": "family", "category": "knowledge", "slug": "x", "content": "hi"});
+        let out = scope_memory_namespace(chain(&["mom", "family"]), tool.execute(&input))
+            .await
+            .unwrap();
+        assert!(out.contains("memory/family/"), "{out}");
+        assert!(root(&state).join("memory/family/knowledge/x.md").is_file());
+        assert!(!root(&state).join("memory/mom/knowledge/x.md").exists());
+    }
+
+    #[tokio::test]
+    async fn memory_read_reads_included_namespace() {
+        let state = test_state();
+        let path = root(&state).join("memory/family/knowledge/x.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "shared fact").unwrap();
+        let tool = MemoryReadTool::new(Arc::clone(&state));
+        let input = json!({"namespace": "family", "category": "knowledge", "slug": "x"});
+        let out = scope_memory_namespace(chain(&["mom", "family"]), tool.execute(&input))
+            .await
+            .unwrap();
+        assert!(out.contains("shared fact"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn out_of_chain_namespace_is_refused() {
+        let state = test_state();
+        let tool = MemoryAddTool::new(Arc::clone(&state));
+        let input =
+            json!({"namespace": "admin", "category": "knowledge", "slug": "x", "content": "hi"});
+        let err = scope_memory_namespace(chain(&["mom", "family"]), tool.execute(&input))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("mom, family"), "{err}");
+        assert!(!root(&state).join("memory/admin").exists());
+    }
+
+    #[tokio::test]
+    async fn invalid_namespace_segment_is_refused() {
+        let state = test_state();
+        let tool = MemoryAddTool::new(Arc::clone(&state));
+        for bad in ["", "../default", "a/b"] {
+            let input =
+                json!({"namespace": bad, "category": "knowledge", "slug": "x", "content": "hi"});
+            let res = scope_memory_namespace(chain(&["mom", "family"]), tool.execute(&input)).await;
+            assert!(res.is_err(), "{bad:?}");
+        }
+        assert!(!root(&state).join("memory").exists());
+    }
+
+    #[tokio::test]
+    async fn transitive_include_is_reachable() {
+        let cfg = crate::config::Config::parse_for_test(
+            "[memory_namespace.mom]\ninclude = [\"family\"]\n\
+             [memory_namespace.family]\ninclude = [\"household\"]\n\
+             [memory_namespace.household]\n",
+        );
+        let state = test_state();
+        let tool = MemoryAddTool::new(Arc::clone(&state));
+        let input = json!({"namespace": "household", "category": "knowledge", "slug": "x", "content": "hi"});
+        scope_memory_namespace(cfg.resolve_namespace_chain("mom"), tool.execute(&input))
+            .await
+            .unwrap();
+        assert!(
+            root(&state)
+                .join("memory/household/knowledge/x.md")
+                .is_file()
+        );
+    }
+
+    #[tokio::test]
+    async fn current_memory_chain_defaults_outside_scope() {
+        assert_eq!(current_memory_chain(), chain(&["default"]));
+        let inner = scope_memory_namespace(chain(&["mom", "family"]), async {
+            (current_memory_namespace(), current_memory_chain())
+        })
+        .await;
+        assert_eq!(inner, ("mom".to_string(), chain(&["mom", "family"])));
     }
 }

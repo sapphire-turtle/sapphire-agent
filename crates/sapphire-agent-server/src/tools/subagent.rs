@@ -1436,7 +1436,8 @@ async fn scope_background<F: std::future::Future>(
     namespace: String,
     fut: F,
 ) -> F::Output {
-    let fut = crate::tools::workspace_tools::scope_memory_namespace(namespace, fut);
+    let chain = ctx.state.config.resolve_namespace_chain(&namespace);
+    let fut = crate::tools::workspace_tools::scope_memory_namespace(chain, fut);
     let fut =
         crate::tools::config_tools::scope_session_profile(Some(ctx.session_profile.clone()), fut);
     let origin = ctx.timer_origin.clone();
@@ -2657,6 +2658,33 @@ mod tests {
         })
         .await;
         assert_eq!(current_attachment_owner(), None);
+    }
+
+    /// A background child scopes the memory tools to its namespace's
+    /// whole include chain, not the bare namespace, so it reaches a
+    /// shared namespace the way a foreground turn does.
+    #[tokio::test]
+    async fn background_scope_carries_the_include_chain() {
+        let mut state = crate::serve::ServeState::for_test(false);
+        let config = &mut std::sync::Arc::get_mut(&mut state)
+            .expect("a fresh state has one owner")
+            .config;
+        config.memory_namespaces.insert(
+            "mom".into(),
+            crate::config::MemoryNamespaceConfig {
+                include: vec!["family".into()],
+                ..Default::default()
+            },
+        );
+        config
+            .memory_namespaces
+            .insert("family".into(), Default::default());
+        let ctx = turn_context(state, ScriptedProvider::new(Vec::new()), Vec::new());
+        let seen = scope_background(ctx, "mom".into(), async {
+            crate::tools::workspace_tools::current_memory_chain()
+        })
+        .await;
+        assert_eq!(seen, vec!["mom".to_string(), "family".to_string()]);
     }
 
     /// A `TurnContext` built by hand rather than through a real parent

@@ -2952,7 +2952,7 @@ impl TurnLoop<'_> {
                     // memory tool writes under `memory/<namespace>/...`.
                     let tools = Arc::clone(&self.state.tools);
                     let session_tools = session_tools.clone();
-                    let ns = namespace.clone();
+                    let ns = self.state.config.resolve_namespace_chain(&namespace);
                     let timer_origin = self.timer_origin.clone();
                     let session_profile = self.session_profile.clone();
                     // Read once per turn, same as `timer_origin`: `None` on
@@ -3354,9 +3354,16 @@ pub(crate) async fn run_llm_turn(
             .build_system_prompt(
                 state.config.anthropic.system_prompt.as_deref(),
                 state.config.day_boundary_hour,
-                &namespace_chain,
+                &state.config.namespace_infos(&namespace_chain),
                 room_info.as_ref(),
                 progress.cwd().as_deref(),
+                state
+                    .config
+                    .session_profile(&session_profile)
+                    .map(|config| crate::workspace::PromptProfile {
+                        name: &session_profile,
+                        config,
+                    }),
             )
             .await;
         if sp.is_empty() { None } else { Some(sp) }
@@ -4661,6 +4668,7 @@ mod tests {
                     voice_pipeline: None,
                     api_keys: vec![],
                     devices: vec![],
+                    ..Default::default()
                 },
             );
         }
