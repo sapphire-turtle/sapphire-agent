@@ -127,6 +127,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_shipped_reviewer_template_parses_with_its_tools() {
+        let def = parse_definition(
+            "example-reviewer",
+            include_str!("../templates/workspace/example-reviewer.md"),
+        )
+        .unwrap();
+        assert_eq!(
+            def.tools.as_deref(),
+            Some(
+                &[
+                    "file_read".to_string(),
+                    "workspace_search".into(),
+                    "memory_read".into()
+                ][..]
+            )
+        );
+    }
+
+    #[test]
     fn parse_definition_reports_what_the_loader_would_skip() {
         assert!(parse_definition("reviewer", "---\ntools: []\n---\nReview.\n").is_err()); // no description
         let def =
