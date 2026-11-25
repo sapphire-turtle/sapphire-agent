@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use jiff::Timestamp;
 use sapphire_framework::workspace::{FtsQuery, VectorQuery, WorkspaceState};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -99,6 +99,17 @@ const MEMORY_CATEGORY_GUIDE: &str = "Category is mandatory and free-form, but pr
 /// `memory/<namespace>/<category>/<slug>.md`, relative and absolute.
 /// `namespace` absent means this turn's own; present, it must be one of
 /// `current_memory_chain()`.
+/// The optional `namespace` argument: absent or `null` means this
+/// conversation's own namespace; anything but a string is an error rather
+/// than a silent fall-back to the own namespace.
+fn namespace_arg(input: &Value) -> Result<Option<&str>> {
+    match input.get("namespace") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(ns)) => Ok(Some(ns)),
+        Some(other) => anyhow::bail!("namespace must be a string, got {other}"),
+    }
+}
+
 fn memory_entry_path(
     state: &WorkspaceState,
     namespace: Option<&str>,
@@ -239,8 +250,7 @@ impl Tool for MemoryAddTool {
         let category = input["category"].as_str().context("missing 'category'")?;
         let slug = input["slug"].as_str().context("missing 'slug'")?;
         let content = input["content"].as_str().context("missing 'content'")?;
-        let (rel, abs) =
-            memory_entry_path(&self.state, input["namespace"].as_str(), category, slug)?;
+        let (rel, abs) = memory_entry_path(&self.state, namespace_arg(input)?, category, slug)?;
         if abs.exists() {
             anyhow::bail!("{rel} already exists; use memory_update to overwrite");
         }
@@ -295,8 +305,7 @@ impl Tool for MemoryUpdateTool {
         let category = input["category"].as_str().context("missing 'category'")?;
         let slug = input["slug"].as_str().context("missing 'slug'")?;
         let content = input["content"].as_str().context("missing 'content'")?;
-        let (rel, abs) =
-            memory_entry_path(&self.state, input["namespace"].as_str(), category, slug)?;
+        let (rel, abs) = memory_entry_path(&self.state, namespace_arg(input)?, category, slug)?;
         if !abs.exists() {
             anyhow::bail!("{rel} does not exist; use memory_add to create it");
         }
@@ -356,8 +365,7 @@ impl Tool for MemoryAppendTool {
         let category = input["category"].as_str().context("missing 'category'")?;
         let slug = input["slug"].as_str().context("missing 'slug'")?;
         let content = input["content"].as_str().context("missing 'content'")?;
-        let (rel, abs) =
-            memory_entry_path(&self.state, input["namespace"].as_str(), category, slug)?;
+        let (rel, abs) = memory_entry_path(&self.state, namespace_arg(input)?, category, slug)?;
         let now = Timestamp::now();
 
         let (meta, new_body, created) = if abs.exists() {
@@ -434,8 +442,7 @@ impl Tool for MemoryReadTool {
     async fn execute(&self, input: &serde_json::Value) -> Result<String> {
         let category = input["category"].as_str().context("missing 'category'")?;
         let slug = input["slug"].as_str().context("missing 'slug'")?;
-        let (rel, abs) =
-            memory_entry_path(&self.state, input["namespace"].as_str(), category, slug)?;
+        let (rel, abs) = memory_entry_path(&self.state, namespace_arg(input)?, category, slug)?;
         if !abs.exists() {
             anyhow::bail!("{rel} does not exist");
         }
@@ -483,8 +490,7 @@ impl Tool for MemoryRemoveTool {
     async fn execute(&self, input: &serde_json::Value) -> Result<String> {
         let category = input["category"].as_str().context("missing 'category'")?;
         let slug = input["slug"].as_str().context("missing 'slug'")?;
-        let (rel, abs) =
-            memory_entry_path(&self.state, input["namespace"].as_str(), category, slug)?;
+        let (rel, abs) = memory_entry_path(&self.state, namespace_arg(input)?, category, slug)?;
         if !abs.exists() {
             anyhow::bail!("{rel} does not exist");
         }
@@ -661,6 +667,29 @@ mod tests {
 
     fn chain(names: &[&str]) -> Vec<String> {
         names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[tokio::test]
+    async fn non_string_namespace_is_refused() {
+        let state = test_state();
+        let tool = MemoryAddTool::new(Arc::clone(&state));
+        let input = json!({"namespace": 7, "category": "knowledge", "slug": "x", "content": "hi"});
+        let err = scope_memory_namespace(chain(&["mom", "family"]), tool.execute(&input))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("namespace"), "{err}");
+        assert!(!root(&state).join("memory/mom/knowledge/x.md").exists());
+    }
+
+    #[test]
+    fn null_namespace_means_own() {
+        assert_eq!(namespace_arg(&json!({"namespace": null})).unwrap(), None);
+        assert_eq!(namespace_arg(&json!({})).unwrap(), None);
+        assert_eq!(
+            namespace_arg(&json!({"namespace": "family"})).unwrap(),
+            Some("family")
+        );
     }
 
     fn root(state: &WorkspaceState) -> std::path::PathBuf {
