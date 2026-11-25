@@ -10,6 +10,29 @@ Changes up to `0.8.0`, when this crate was a binary of its own, are recorded in
 
 ## [Unreleased]
 
+## [0.14.1](https://github.com/sapphire-turtle/sapphire-agent/compare/sapphire-agent-server-v0.14.0...sapphire-agent-server-v0.14.1) - 2026-11-25
+
+### Added
+
+- *(workspace)* Per-session-profile prompt files merged over the root ones
+- *(agent)* Load session-profile prompt files in chat and RPC turns
+- *(memory)* Memory tools reach namespaces in the include chain
+- *(memory)* Describe the include chain's namespaces in the prompt
+
+### Fixed
+
+- *(tools)* Workspace_search and workspace_sync need the fs group
+- *(workspace)* Confine profile prompt paths and fail closed on unknown merge
+- *(memory)* Refuse a non-string namespace argument instead of using the own one
+- *(workspace)* Warn once per unknown merge value; slash paths in verify
+- *(workspace)* Note that the example reviewer's file tools need [tools.fs]
+
+### Testing
+
+- *(memory)* Background subagents scope the whole include chain
+
+
+
 ## [0.14.0](https://github.com/sapphire-turtle/sapphire-agent/compare/sapphire-agent-server-v0.13.1...sapphire-agent-server-v0.14.0) - 2026-11-20
 
 ### Added
