@@ -661,14 +661,13 @@ impl Agent {
 
         if let Some(specs) = &mut tool_specs {
             specs.retain(|spec| {
-                entries
-                    .iter()
-                    .find(|e| e.name == spec.name)
-                    .is_some_and(|entry| {
-                        crate::tools::policy::allow(&permission, entry)
-                            != crate::tools::policy::Allow::Deny
-                    })
-                    && crate::tools::profile_offers(&self.config, &profile_name, &spec.name)
+                crate::tools::turn_offers(
+                    &self.config,
+                    &permission,
+                    &profile_name,
+                    entries.iter().find(|e| e.name == spec.name),
+                    &spec.name,
+                )
             });
         }
 
@@ -1130,10 +1129,20 @@ mod tests {
              [session_profile.sealed]\nprofile = \"default\"\noutbound_tools = false\n\
              [session_profile.open]\nprofile = \"default\"\n",
         );
+        // Through `turn_offers`, the check both turn paths' spec filters call.
         let names = |profile: &str| -> Vec<String> {
+            let permission = crate::tools::policy::ResolvedPermission::resolve(
+                &cfg,
+                Origin::Channel {
+                    session_profile: profile.into(),
+                },
+            );
             specs
                 .iter()
-                .filter(|s| crate::tools::profile_offers(&cfg, profile, &s.name))
+                .filter(|s| {
+                    let entry = crate::tools::policy::ToolEntry::from_spec(s, &cfg);
+                    crate::tools::turn_offers(&cfg, &permission, profile, Some(&entry), &s.name)
+                })
                 .map(|s| s.name.to_string())
                 .collect()
         };
@@ -1143,6 +1152,26 @@ mod tests {
         let sealed = names("sealed");
         assert!(!sealed.iter().any(|n| n == "web_search" || n == "weather"));
         assert!(sealed.iter().any(|n| n == "memory_add"));
+        // The permission gate still applies: shell is off in this config.
+        assert!(!open.iter().any(|n| n == "shell"));
+    }
+
+    #[test]
+    fn turn_offers_refuses_an_unregistered_tool() {
+        let cfg = crate::config::Config::parse_for_test("[anthropic]\napi_key = \"test\"\n");
+        let permission = crate::tools::policy::ResolvedPermission::resolve(
+            &cfg,
+            Origin::Channel {
+                session_profile: "default".into(),
+            },
+        );
+        assert!(!crate::tools::turn_offers(
+            &cfg,
+            &permission,
+            "default",
+            None,
+            "memory_add"
+        ));
     }
 
     #[tokio::test]

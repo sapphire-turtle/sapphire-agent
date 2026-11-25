@@ -438,6 +438,21 @@ pub(crate) fn profile_offers(config: &Config, session_profile: &str, tool: &str)
     true
 }
 
+/// Whether a turn offers `tool`: it is registered (`entry`), the permission
+/// profile does not deny it, and the session profile offers it
+/// ([`profile_offers`]). Both turn paths — channel turns in `agent.rs` and
+/// the serve loop — filter their specs through this one check.
+pub(crate) fn turn_offers(
+    config: &Config,
+    permission: &policy::ResolvedPermission,
+    session_profile: &str,
+    entry: Option<&ToolEntry>,
+    tool: &str,
+) -> bool {
+    entry.is_some_and(|e| policy::allow(permission, e) != policy::Allow::Deny)
+        && profile_offers(config, session_profile, tool)
+}
+
 /// The cap shared by `truncate_output` (tool *results*) and
 /// `AcpSessionStore::store_part` (tool *inputs* — see Fix 4/#194): both
 /// bound what a single tool call can put into memory, the model's

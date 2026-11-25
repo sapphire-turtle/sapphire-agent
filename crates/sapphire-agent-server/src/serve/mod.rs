@@ -3465,13 +3465,16 @@ pub(crate) async fn run_llm_turn(
     let permission = crate::tools::policy::ResolvedPermission::resolve(&state.config, origin);
     let entries = state.tools.entries().await;
     tool_specs.retain(|spec| {
-        entries
-            .iter()
-            .find(|(name, _)| name == &spec.name)
-            .is_some_and(|(_, entry)| {
-                crate::tools::policy::allow(&permission, entry) != crate::tools::policy::Allow::Deny
-            })
-            && crate::tools::profile_offers(&state.config, &session_profile, &spec.name)
+        crate::tools::turn_offers(
+            &state.config,
+            &permission,
+            &session_profile,
+            entries
+                .iter()
+                .find(|(name, _)| name == &spec.name)
+                .map(|(_, entry)| entry),
+            &spec.name,
+        )
     });
     crate::tools::avatar_tools::specialize_specs(
         &mut tool_specs,
