@@ -4730,6 +4730,44 @@ reasoning_effort = "low"
     }
 
     #[test]
+    fn a_workspace_layer_giving_an_admin_profile_remote_agents_falls_back_to_the_host_layer() {
+        // The host grants `ops` the admin group and defines a remote agent;
+        // the workspace (which may not define `remote_agent` itself) points
+        // `ops` at it. Each layer is fine alone, the merge is not: an admin
+        // session that talks to another agent. The workspace layer is dropped.
+        let dir = tempfile::tempdir().unwrap();
+        let host_path = dir.path().join("config.toml");
+        std::fs::write(
+            &host_path,
+            "[anthropic]\napi_key = \"sk-test\"\n\
+             [profiles.p]\nprovider = \"anthropic\"\n\
+             [tools.admin]\nenabled = true\n\
+             [remote_agent.guest]\nendpoint = \"https://guest.example/a2a\"\n\
+             token_env = \"GUEST_TOKEN\"\n\
+             [permission_profile.root]\ntools = [\"admin\"]\n\
+             [session_profile.ops]\nprofile = \"p\"\npermission = \"root\"\n",
+        )
+        .unwrap();
+        let marker = dir.path().join(".sapphire-agent");
+        std::fs::create_dir_all(&marker).unwrap();
+        std::fs::write(
+            marker.join("config.toml"),
+            "[session_profile.ops]\nremote_agents = [\"guest\"]\n",
+        )
+        .unwrap();
+
+        let loaded = Config::load_layered(&host_path).unwrap();
+        let ops = loaded.config.session_profile("ops").expect("ops survives");
+        assert_eq!(ops.permission.as_deref(), Some("root"));
+        assert!(ops.remote_agents.is_empty(), "{:?}", ops.remote_agents);
+        assert!(
+            loaded.config.validate_session_profiles().is_empty(),
+            "{:?}",
+            loaded.config.validate_session_profiles()
+        );
+    }
+
+    #[test]
     fn a_host_config_that_fails_validation_is_fatal_and_blames_the_host_file() {
         // The bad profile reference is the *host's*, and the workspace file is
         // innocent — it only sets an unrelated key. Falling back would return a
