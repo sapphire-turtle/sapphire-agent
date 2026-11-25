@@ -1,3 +1,4 @@
+pub(crate) mod a2a_tools;
 pub mod acp_client;
 pub mod ambient_tools;
 pub mod ask_human;
@@ -376,6 +377,14 @@ pub async fn default_tool_set(
         tools.push(Box::new(WebSearchTool::new(key)));
     }
 
+    // Ungrouped: who may use it is the session profile's `remote_agents`
+    // (`profile_offers`), checked again by the tool at execute time.
+    if !config.remote_agents.is_empty() {
+        tools.push(Box::new(a2a_tools::A2aSendTool::new(config, &|k| {
+            std::env::var(k).ok()
+        })));
+    }
+
     // External MCP server tools
     let mut mcp_clients = Vec::new();
     if config.group_registered(ToolGroup::Mcp) && !mcp_servers.is_empty() {
@@ -565,6 +574,26 @@ mod tests {
                 "ungrouped tool `{name}` is neither outbound nor listed local; classify it"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a2a_send_is_registered_only_with_remote_agents() {
+        let names = |cfg: Config| async move {
+            default_tool_set(test_workspace(), None, &[], 4, &cfg)
+                .await
+                .entries()
+                .await
+                .into_iter()
+                .map(|(n, e)| (n, e.group))
+                .collect::<Vec<_>>()
+        };
+        let without = names(Config::parse_for_test("")).await;
+        assert!(without.iter().all(|(n, _)| n != A2A_SEND_TOOL));
+        let with = names(Config::parse_for_test(
+            "[remote_agent.peer]\nendpoint = \"https://peer.example/a2a\"\ntoken_env = \"PEER_TOKEN\"\n",
+        ))
+        .await;
+        assert!(with.contains(&(A2A_SEND_TOOL.to_string(), None)));
     }
 
     fn all_groups_config() -> Config {
