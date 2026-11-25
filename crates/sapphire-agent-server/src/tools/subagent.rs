@@ -2660,6 +2660,33 @@ mod tests {
         assert_eq!(current_attachment_owner(), None);
     }
 
+    /// A background child scopes the memory tools to its namespace's
+    /// whole include chain, not the bare namespace, so it reaches a
+    /// shared namespace the way a foreground turn does.
+    #[tokio::test]
+    async fn background_scope_carries_the_include_chain() {
+        let mut state = crate::serve::ServeState::for_test(false);
+        let config = &mut std::sync::Arc::get_mut(&mut state)
+            .expect("a fresh state has one owner")
+            .config;
+        config.memory_namespaces.insert(
+            "mom".into(),
+            crate::config::MemoryNamespaceConfig {
+                include: vec!["family".into()],
+                ..Default::default()
+            },
+        );
+        config
+            .memory_namespaces
+            .insert("family".into(), Default::default());
+        let ctx = turn_context(state, ScriptedProvider::new(Vec::new()), Vec::new());
+        let seen = scope_background(ctx, "mom".into(), async {
+            crate::tools::workspace_tools::current_memory_chain()
+        })
+        .await;
+        assert_eq!(seen, vec!["mom".to_string(), "family".to_string()]);
+    }
+
     /// A `TurnContext` built by hand rather than through a real parent
     /// turn — `SubagentTool::execute` only ever reads it through
     /// `current_turn_context()`, so scoping one directly around the call
