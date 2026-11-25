@@ -2952,7 +2952,7 @@ impl TurnLoop<'_> {
                     // memory tool writes under `memory/<namespace>/...`.
                     let tools = Arc::clone(&self.state.tools);
                     let session_tools = session_tools.clone();
-                    let ns = self.state.config.resolve_namespace_chain(&namespace);
+                    let ns = self.state.config.resolve_namespace_access(&namespace);
                     let timer_origin = self.timer_origin.clone();
                     let session_profile = self.session_profile.clone();
                     // Read once per turn, same as `timer_origin`: `None` on
@@ -3320,7 +3320,7 @@ pub(crate) async fn run_llm_turn(
         .config
         .namespace_for_session_profile(&session_profile)
         .to_string();
-    let namespace_chain = state.config.resolve_namespace_chain(&namespace);
+    let namespace_chain = state.config.resolve_namespace_access(&namespace);
 
     // 2b. Ensure JSONL file exists. If this session was deferred at initialize
     //     time, commit it now using the reserved public_id.
@@ -3465,12 +3465,16 @@ pub(crate) async fn run_llm_turn(
     let permission = crate::tools::policy::ResolvedPermission::resolve(&state.config, origin);
     let entries = state.tools.entries().await;
     tool_specs.retain(|spec| {
-        entries
-            .iter()
-            .find(|(name, _)| name == &spec.name)
-            .is_some_and(|(_, entry)| {
-                crate::tools::policy::allow(&permission, entry) != crate::tools::policy::Allow::Deny
-            })
+        crate::tools::turn_offers(
+            &state.config,
+            &permission,
+            &session_profile,
+            entries
+                .iter()
+                .find(|(name, _)| name == &spec.name)
+                .map(|(_, entry)| entry),
+            &spec.name,
+        )
     });
     crate::tools::avatar_tools::specialize_specs(
         &mut tool_specs,

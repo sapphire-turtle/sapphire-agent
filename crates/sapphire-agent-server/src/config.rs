@@ -87,6 +87,10 @@ pub struct Config {
     /// `rooms` lists move to the declaration side in Task 2).
     #[serde(default, rename = "session_profile")]
     pub session_profiles: HashMap<String, SessionProfileConfig>,
+    /// `[remote_agent.<n>]`: other agents reachable over A2A. A session
+    /// profile lists the ones it may talk to in `remote_agents`. Host-only.
+    #[serde(default, rename = "remote_agent")]
+    pub remote_agents: HashMap<String, RemoteAgentConfig>,
     /// Retired room profiles, retained to report migration errors.
     #[serde(default, rename = "room_profile")]
     pub legacy_room_profiles: HashMap<String, LegacyRoomProfile>,
@@ -260,6 +264,19 @@ const BUILT_IN_PERMISSION_PROFILES: &[(&str, &[ToolGroup])] = &[
     ("chat", &[]),
 ];
 
+/// `[remote_agent.<n>]`: one remote agent reachable over A2A.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RemoteAgentConfig {
+    /// Base URL of the remote agent's A2A endpoint.
+    pub endpoint: String,
+    /// Name of the environment variable holding the bearer token. The token
+    /// itself never appears in a config file.
+    pub token_env: String,
+    /// What the remote agent is for, shown to the model.
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
 /// A session's LLM profile, memory namespace, permission and session policy.
 /// Rooms and client pins declare the name of the session profile they use.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -318,6 +335,15 @@ pub struct SessionProfileConfig {
     /// Like `agents_file`, for `BOOTSTRAP.md`.
     #[serde(default)]
     pub bootstrap_file: Option<String>,
+    /// Names of the `[remote_agent.<n>]` entries this profile may talk to
+    /// (the `a2a_send` tool). Empty means none.
+    #[serde(default)]
+    pub remote_agents: Vec<String>,
+    /// `false` withholds the outbound tools (`web_search`, `weather`,
+    /// `skill_install`, `skill_update`) from this profile. Absent or `true`
+    /// offers them.
+    #[serde(default)]
+    pub outbound_tools: Option<bool>,
 }
 
 /// The workspace prompt files a session profile can layer over the root
@@ -694,6 +720,12 @@ pub struct MemoryNamespaceConfig {
     /// DAG; cycles are rejected at startup.
     #[serde(default)]
     pub include: Vec<String>,
+    /// Names of namespaces readable from this one but never writable
+    /// through it: everything reachable only via an `import` edge is
+    /// read-only. Shares the DAG with `include`; cycles and unknown names
+    /// are rejected at startup.
+    #[serde(default)]
+    pub import: Vec<String>,
     /// Profile used by background tasks (daily-log generation, periodic
     /// digests, MEMORY.md compaction) when working under this
     /// namespace. Lets a per-namespace policy pick a permissive local
@@ -725,6 +757,16 @@ pub struct MemoryNamespaceConfig {
 pub struct NamespaceInfo {
     pub name: String,
     pub description: Option<String>,
+    /// Reachable only through an `import`: the memory tools refuse writes.
+    pub read_only: bool,
+}
+
+/// One namespace of a session's chain and whether the memory tools may
+/// write to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamespaceAccess {
+    pub name: String,
+    pub writable: bool,
 }
 
 #[cfg(test)]
@@ -734,6 +776,7 @@ impl NamespaceInfo {
         Self {
             name: name.to_string(),
             description: None,
+            read_only: false,
         }
     }
 }
@@ -1867,6 +1910,27 @@ api_key = "test"
                     "session_profile '{rp_name}' references unknown memory_namespace '{ns}'"
                 ));
             }
+            for agent in &rp.remote_agents {
+                if !self.remote_agents.contains_key(agent) {
+                    errors.push(format!(
+                        "session_profile '{rp_name}' lists unknown remote_agent '{agent}'"
+                    ));
+                }
+            }
+            if !rp.remote_agents.is_empty() {
+                let permission = self.permission_profile_name_for_session(rp_name);
+                if self
+                    .permission_profile(&permission)
+                    .tools
+                    .contains(&ToolGroup::Admin)
+                {
+                    errors.push(format!(
+                        "session_profile '{rp_name}' lists remote_agents but its permission \
+                         profile '{permission}' grants 'admin': text from a remote agent must \
+                         never drive the admin tools"
+                    ));
+                }
+            }
             for kind in PromptFileKind::ALL {
                 if let Some(path) = rp.prompt_file(kind)
                     && !crate::workspace::is_workspace_relative(path)
@@ -1933,6 +1997,13 @@ api_key = "test"
                 if !self.namespace_is_defined(parent) {
                     errors.push(format!(
                         "memory_namespace '{ns_name}' includes unknown namespace '{parent}'"
+                    ));
+                }
+            }
+            for parent in &ns_cfg.import {
+                if !self.namespace_is_defined(parent) {
+                    errors.push(format!(
+                        "memory_namespace '{ns_name}' imports unknown namespace '{parent}'"
                     ));
                 }
             }
@@ -2178,7 +2249,7 @@ api_key = "test"
             let parents: Vec<String> = cfg
                 .memory_namespaces
                 .get(node)
-                .map(|c| c.include.clone())
+                .map(|c| c.include.iter().chain(&c.import).cloned().collect())
                 .unwrap_or_default();
             for parent in parents {
                 if on_stack.contains(&parent) {
@@ -2200,31 +2271,174 @@ api_key = "test"
         dfs(self, start, &mut stack, &mut on_stack)
     }
 
-    /// Resolve `name` to its include-chain in DFS pre-order: the namespace
-    /// itself first, then each parent in include order, with parents'
-    /// parents flattened in. Duplicates are removed (first occurrence
-    /// wins). The implicit `"default"` namespace, when not configured,
-    /// resolves to a single-entry chain `["default"]`.
-    pub fn resolve_namespace_chain(&self, name: &str) -> Vec<String> {
-        let mut out: Vec<String> = Vec::new();
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        self.namespace_chain_walk(name, &mut out, &mut seen);
+    /// Session profiles (sorted) that list at least one remote agent.
+    fn remote_agent_profiles(&self) -> Vec<(&String, &SessionProfileConfig)> {
+        let mut out: Vec<_> = self
+            .session_profiles
+            .iter()
+            .filter(|(_, sp)| !sp.remote_agents.is_empty())
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(b.0));
         out
     }
 
-    fn namespace_chain_walk(
-        &self,
-        name: &str,
-        out: &mut Vec<String>,
-        seen: &mut std::collections::HashSet<String>,
-    ) {
-        if !seen.insert(name.to_string()) {
-            return;
+    /// Names of the session profiles that talk to remote agents.
+    pub fn remote_agent_profile_names(&self) -> Vec<String> {
+        self.remote_agent_profiles()
+            .into_iter()
+            .map(|(n, _)| n.clone())
+            .collect()
+    }
+
+    /// One line for each remote agent a session profile lists whose token
+    /// environment variable `env` does not supply (unset or empty).
+    pub fn missing_remote_agent_tokens(&self, env: &dyn Fn(&str) -> Option<String>) -> Vec<String> {
+        let mut used: Vec<&String> = self
+            .remote_agent_profiles()
+            .into_iter()
+            .flat_map(|(_, sp)| sp.remote_agents.iter())
+            .collect();
+        used.sort();
+        used.dedup();
+        used.into_iter()
+            .filter_map(|name| {
+                let agent = self.remote_agents.get(name)?;
+                match env(&agent.token_env) {
+                    Some(v) if !v.is_empty() => None,
+                    _ => Some(format!(
+                        "remote_agent '{name}': environment variable '{}' is not set",
+                        agent.token_env
+                    )),
+                }
+            })
+            .collect()
+    }
+
+    /// One line per risk of a session profile that talks to remote agents.
+    /// None is fatal: only `admin` is, and `validate_session_profiles`
+    /// reports that.
+    pub fn remote_agent_warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (name, sp) in self.remote_agent_profiles() {
+            let permission = self.permission_profile_name_for_session(name);
+            for group in self.permission_profile(&permission).tools {
+                if matches!(group, ToolGroup::Fs | ToolGroup::Shell | ToolGroup::Mcp) {
+                    out.push(format!(
+                        "session_profile '{name}' talks to remote agents and lists '{}': text \
+                         from a remote agent can drive host tools",
+                        group.as_str()
+                    ));
+                }
+            }
+            if self
+                .acp
+                .as_ref()
+                .and_then(|a| a.stdio_session_profile.as_deref())
+                == Some(name.as_str())
+            {
+                out.push(format!(
+                    "session_profile '{name}' talks to remote agents and is the stdio ACP \
+                     profile: any local ACP client reaches it"
+                ));
+            }
+            if !sp.devices.is_empty() {
+                out.push(format!(
+                    "session_profile '{name}' talks to remote agents and lists devices: those \
+                     keys act as a profile that reads remote text"
+                ));
+            }
+            if sp.outbound_tools != Some(false) {
+                out.push(format!(
+                    "session_profile '{name}' talks to remote agents and keeps the outbound \
+                     tools (web_search, weather, skill_install, skill_update): set \
+                     outbound_tools = false"
+                ));
+            }
+            let home = self.namespace_for_session_profile(name);
+            let access = self.resolve_namespace_access(home);
+            let others = || {
+                self.session_profiles
+                    .keys()
+                    .filter(|o| *o != name)
+                    .map(|o| (o, self.namespace_for_session_profile(o)))
+            };
+            let mut injected: Vec<String> = Vec::new();
+            for (other, other_home) in others() {
+                let chain = self.resolve_namespace_chain(other_home);
+                for a in access.iter().filter(|a| a.writable) {
+                    if chain.contains(&a.name) {
+                        injected.push(format!("'{}' (in the chain of '{other}')", a.name));
+                    }
+                }
+            }
+            injected.sort();
+            injected.dedup();
+            if !injected.is_empty() {
+                out.push(format!(
+                    "session_profile '{name}' talks to remote agents and can write {}: its \
+                     memory is auto-injected into another profile's prompt",
+                    injected.join(", ")
+                ));
+            }
+            let mut homes: Vec<String> = others()
+                .filter(|(_, h)| *h != home && access.iter().any(|a| a.name == *h))
+                .map(|(o, h)| format!("'{h}' (home of '{o}')"))
+                .collect();
+            homes.sort();
+            homes.dedup();
+            if !homes.is_empty() {
+                out.push(format!(
+                    "session_profile '{name}' talks to remote agents and its memory chain \
+                     reaches the home namespace {}",
+                    homes.join(", ")
+                ));
+            }
         }
-        out.push(name.to_string());
+        out
+    }
+
+    /// Resolve `name` to its chain in DFS pre-order: the namespace itself
+    /// first, then each `include` parent, then each `import` parent, with
+    /// their parents flattened in. Duplicates are removed (first occurrence
+    /// wins). The implicit `"default"` namespace, when not configured,
+    /// resolves to a single-entry chain `["default"]`.
+    pub fn resolve_namespace_chain(&self, name: &str) -> Vec<String> {
+        self.resolve_namespace_access(name)
+            .into_iter()
+            .map(|a| a.name)
+            .collect()
+    }
+
+    /// The chain of `resolve_namespace_chain` with write access: the
+    /// namespace itself and everything reachable from it by `include` edges
+    /// alone is writable; anything reachable only through an `import` is
+    /// read-only. A namespace reached by both kinds of path is writable.
+    pub fn resolve_namespace_access(&self, name: &str) -> Vec<NamespaceAccess> {
+        let mut out: Vec<NamespaceAccess> = Vec::new();
+        self.namespace_chain_walk(name, true, &mut out);
+        out
+    }
+
+    fn namespace_chain_walk(&self, name: &str, writable: bool, out: &mut Vec<NamespaceAccess>) {
+        if let Some(entry) = out.iter_mut().find(|a| a.name == name) {
+            // Seen already. Only a writable path to a namespace first seen
+            // read-only changes anything, and then its children upgrade too.
+            if !writable || entry.writable {
+                return;
+            }
+            entry.writable = true;
+        } else {
+            out.push(NamespaceAccess {
+                name: name.to_string(),
+                writable,
+            });
+        }
         if let Some(cfg) = self.memory_namespaces.get(name) {
             for parent in &cfg.include {
-                self.namespace_chain_walk(parent, out, seen);
+                self.namespace_chain_walk(parent, writable, out);
+            }
+            for parent in &cfg.import {
+                self.namespace_chain_walk(parent, false, out);
             }
         }
     }
@@ -2248,17 +2462,18 @@ api_key = "test"
         None
     }
 
-    /// `chain` (from `resolve_namespace_chain`) with each namespace's
+    /// `access` (from `resolve_namespace_access`) with each namespace's
     /// configured description.
-    pub fn namespace_infos(&self, chain: &[String]) -> Vec<NamespaceInfo> {
-        chain
+    pub fn namespace_infos(&self, access: &[NamespaceAccess]) -> Vec<NamespaceInfo> {
+        access
             .iter()
-            .map(|name| NamespaceInfo {
-                name: name.clone(),
+            .map(|a| NamespaceInfo {
+                name: a.name.clone(),
                 description: self
                     .memory_namespaces
-                    .get(name)
+                    .get(&a.name)
                     .and_then(|ns| ns.description.clone()),
+                read_only: !a.writable,
             })
             .collect()
     }
@@ -3352,7 +3567,7 @@ description = "translation work"
 [memory_namespace.family]
 "#,
         );
-        let infos = cfg.namespace_infos(&cfg.resolve_namespace_chain("mom"));
+        let infos = cfg.namespace_infos(&cfg.resolve_namespace_access("mom"));
         let got: Vec<(&str, Option<&str>)> = infos
             .iter()
             .map(|i| (i.name.as_str(), i.description.as_deref()))
@@ -3361,7 +3576,10 @@ description = "translation work"
             got,
             vec![("mom", Some("translation work")), ("family", None)]
         );
-        let default = cfg.namespace_infos(&["default".to_string()]);
+        let default = cfg.namespace_infos(&[NamespaceAccess {
+            name: "default".to_string(),
+            writable: true,
+        }]);
         assert_eq!(default[0].name, "default");
         assert_eq!(default[0].description, None);
     }
@@ -3682,6 +3900,157 @@ include = ["a"]
             errors.iter().any(|e| e.contains("cycle")),
             "expected cycle error, got: {errors:?}"
         );
+    }
+
+    fn access(cfg: &Config, name: &str) -> Vec<(String, bool)> {
+        cfg.resolve_namespace_access(name)
+            .into_iter()
+            .map(|a| (a.name, a.writable))
+            .collect()
+    }
+
+    fn pairs(v: &[(&str, bool)]) -> Vec<(String, bool)> {
+        v.iter().map(|(n, w)| (n.to_string(), *w)).collect()
+    }
+
+    #[test]
+    fn import_chains_read_only() {
+        let cfg = parse(
+            r#"
+[memory_namespace.mom]
+include = ["family"]
+import = ["public"]
+[memory_namespace.family]
+[memory_namespace.public]
+"#,
+        );
+        assert_eq!(
+            access(&cfg, "mom"),
+            pairs(&[("mom", true), ("family", true), ("public", false)])
+        );
+        assert_eq!(
+            cfg.resolve_namespace_chain("mom"),
+            vec![
+                "mom".to_string(),
+                "family".to_string(),
+                "public".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn import_propagates_read_only() {
+        let cfg = parse(
+            r#"
+[memory_namespace.liaison]
+import = ["public"]
+[memory_namespace.public]
+include = ["news"]
+[memory_namespace.news]
+"#,
+        );
+        assert_eq!(
+            access(&cfg, "liaison"),
+            pairs(&[("liaison", true), ("public", false), ("news", false)])
+        );
+    }
+
+    #[test]
+    fn include_path_wins_over_import() {
+        let cfg = parse(
+            r#"
+[memory_namespace.op]
+include = ["public"]
+import = ["shared"]
+[memory_namespace.shared]
+include = ["public"]
+[memory_namespace.public]
+"#,
+        );
+        assert_eq!(
+            access(&cfg, "op"),
+            pairs(&[("op", true), ("public", true), ("shared", false)])
+        );
+    }
+
+    #[test]
+    fn writable_path_found_later_upgrades_namespace_and_children() {
+        // `p` is first reached read-only (op -> a -> import p), and only
+        // afterwards through an include-only path (op -> b -> p): the revisit
+        // must upgrade `p` and re-walk it so `deep` follows. First-seen order
+        // is kept and each name appears once.
+        let cfg = parse(
+            r#"
+[memory_namespace.op]
+include = ["a", "b"]
+[memory_namespace.a]
+import = ["p"]
+[memory_namespace.b]
+include = ["p"]
+[memory_namespace.p]
+include = ["deep"]
+[memory_namespace.deep]
+"#,
+        );
+        assert_eq!(
+            access(&cfg, "op"),
+            pairs(&[
+                ("op", true),
+                ("a", true),
+                ("p", true),
+                ("deep", true),
+                ("b", true)
+            ])
+        );
+    }
+
+    #[test]
+    fn import_unknown_and_cycle_are_errors() {
+        let cfg = parse(
+            r#"
+[memory_namespace.a]
+import = ["ghost"]
+"#,
+        );
+        let errors = cfg.validate_session_profiles();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("imports unknown namespace")),
+            "{errors:?}"
+        );
+        let cfg = parse(
+            r#"
+[memory_namespace.a]
+include = ["b"]
+[memory_namespace.b]
+import = ["a"]
+"#,
+        );
+        let errors = cfg.validate_session_profiles();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("memory_namespace cycle detected")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn namespace_infos_marks_read_only() {
+        let cfg = parse(
+            r#"
+[memory_namespace.mom]
+import = ["public"]
+[memory_namespace.public]
+"#,
+        );
+        let infos = cfg.namespace_infos(&cfg.resolve_namespace_access("mom"));
+        let got: Vec<(&str, bool)> = infos
+            .iter()
+            .map(|i| (i.name.as_str(), i.read_only))
+            .collect();
+        assert_eq!(got, vec![("mom", false), ("public", true)]);
     }
 
     #[test]
@@ -4361,6 +4730,44 @@ reasoning_effort = "low"
     }
 
     #[test]
+    fn a_workspace_layer_giving_an_admin_profile_remote_agents_falls_back_to_the_host_layer() {
+        // The host grants `ops` the admin group and defines a remote agent;
+        // the workspace (which may not define `remote_agent` itself) points
+        // `ops` at it. Each layer is fine alone, the merge is not: an admin
+        // session that talks to another agent. The workspace layer is dropped.
+        let dir = tempfile::tempdir().unwrap();
+        let host_path = dir.path().join("config.toml");
+        std::fs::write(
+            &host_path,
+            "[anthropic]\napi_key = \"sk-test\"\n\
+             [profiles.p]\nprovider = \"anthropic\"\n\
+             [tools.admin]\nenabled = true\n\
+             [remote_agent.guest]\nendpoint = \"https://guest.example/a2a\"\n\
+             token_env = \"GUEST_TOKEN\"\n\
+             [permission_profile.root]\ntools = [\"admin\"]\n\
+             [session_profile.ops]\nprofile = \"p\"\npermission = \"root\"\n",
+        )
+        .unwrap();
+        let marker = dir.path().join(".sapphire-agent");
+        std::fs::create_dir_all(&marker).unwrap();
+        std::fs::write(
+            marker.join("config.toml"),
+            "[session_profile.ops]\nremote_agents = [\"guest\"]\n",
+        )
+        .unwrap();
+
+        let loaded = Config::load_layered(&host_path).unwrap();
+        let ops = loaded.config.session_profile("ops").expect("ops survives");
+        assert_eq!(ops.permission.as_deref(), Some("root"));
+        assert!(ops.remote_agents.is_empty(), "{:?}", ops.remote_agents);
+        assert!(
+            loaded.config.validate_session_profiles().is_empty(),
+            "{:?}",
+            loaded.config.validate_session_profiles()
+        );
+    }
+
+    #[test]
     fn a_host_config_that_fails_validation_is_fatal_and_blames_the_host_file() {
         // The bad profile reference is the *host's*, and the workspace file is
         // innocent — it only sets an unrelated key. Falling back would return a
@@ -4769,5 +5176,163 @@ model = "m"
                 .iter()
                 .any(|e| e.contains("room_profiles"))
         );
+    }
+
+    // ---- remote agents ----
+
+    /// A config with a `liaison` session profile (home `liaison`, permission
+    /// `none` listing `tools`, `session_extra` lines in its table) plus an
+    /// operator `op` profile, with `extra` appended.
+    fn liaison_with(tools: &str, session_extra: &str, extra: &str) -> Config {
+        parse(&format!(
+            r#"
+[profiles.p]
+provider = "anthropic"
+
+[remote_agent.peer]
+endpoint = "https://peer.example/a2a"
+token_env = "PEER_TOKEN"
+
+[remote_agent.unused]
+endpoint = "https://unused.example/a2a"
+token_env = "UNUSED_TOKEN"
+
+[permission_profile.none]
+tools = [{tools}]
+
+[session_profile.op]
+profile = "p"
+memory_namespace = "op"
+
+[session_profile.liaison]
+profile = "p"
+memory_namespace = "liaison"
+permission = "none"
+remote_agents = ["peer"]
+{session_extra}
+
+{extra}
+"#
+        ))
+    }
+
+    /// The two home namespaces, with no edges between them.
+    const NS: &str = "[memory_namespace.liaison]\n[memory_namespace.op]\n";
+
+    /// The intended setup (no tools, no outbound tools) over `namespaces`.
+    fn liaison_namespaces(namespaces: &str) -> Config {
+        liaison_with("", "outbound_tools = false", namespaces)
+    }
+
+    /// The intended setup over [`NS`], plus `extra` top-level config.
+    fn liaison_config(extra: &str) -> Config {
+        liaison_namespaces(&format!("{NS}{extra}"))
+    }
+
+    fn assert_one_warning(cfg: &Config, keyword: &str) {
+        let w = cfg.remote_agent_warnings();
+        assert_eq!(w.len(), 1, "expected one warning, got {w:?}");
+        assert!(w[0].contains(keyword), "{keyword:?} not in {:?}", w[0]);
+        assert!(w[0].contains("liaison"), "profile not named in {:?}", w[0]);
+    }
+
+    #[test]
+    fn remote_agents_must_be_known() {
+        let cfg = parse(
+            r#"
+[profiles.p]
+provider = "anthropic"
+[session_profile.liaison]
+profile = "p"
+remote_agents = ["nope"]
+"#,
+        );
+        assert!(
+            cfg.validate_session_profiles()
+                .iter()
+                .any(|e| e == "session_profile 'liaison' lists unknown remote_agent 'nope'"),
+            "{:?}",
+            cfg.validate_session_profiles()
+        );
+    }
+
+    #[test]
+    fn remote_agents_refuse_admin() {
+        let cfg = liaison_with("\"admin\"", "outbound_tools = false", NS);
+        let errors = cfg.validate_session_profiles();
+        assert!(
+            errors.iter().any(|e| e.contains("admin")
+                && e.contains("remote_agents")
+                && e.contains("liaison")),
+            "{errors:?}"
+        );
+        // Without remote agents, admin is the operator's business.
+        let cfg = parse(
+            "[profiles.p]\nprovider = \"anthropic\"\n[permission_profile.root]\ntools = [\"admin\"]\n[session_profile.fine]\nprofile = \"p\"\npermission = \"root\"\n",
+        );
+        assert!(cfg.validate_session_profiles().is_empty());
+    }
+
+    #[test]
+    fn missing_remote_agent_tokens_only_for_used_agents() {
+        let cfg = liaison_config("");
+        let lines = cfg.missing_remote_agent_tokens(&|_| None);
+        assert_eq!(
+            lines,
+            vec!["remote_agent 'peer': environment variable 'PEER_TOKEN' is not set".to_string()]
+        );
+        assert!(
+            cfg.missing_remote_agent_tokens(&|v| (v == "PEER_TOKEN").then(|| "t".into()))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn remote_agent_warnings_cover_each_cause() {
+        for group in ["fs", "shell", "mcp"] {
+            let cfg = liaison_with(&format!("\"{group}\""), "outbound_tools = false", NS);
+            let w = cfg.remote_agent_warnings();
+            assert_eq!(w.len(), 1, "{group}: {w:?}");
+            assert!(w[0].contains(&format!("'{group}'")) && w[0].contains("liaison"));
+        }
+        assert_one_warning(
+            &liaison_config("[acp]\nstdio_session_profile = \"liaison\""),
+            "ACP",
+        );
+        assert_one_warning(
+            &liaison_with("", "outbound_tools = false\ndevices = [\"phone\"]", NS),
+            "devices",
+        );
+        assert_one_warning(&liaison_with("", "", NS), "outbound");
+        assert_one_warning(&liaison_with("", "outbound_tools = true", NS), "outbound");
+        // Another profile's chain holds a namespace the liaison can write.
+        assert_one_warning(
+            &liaison_namespaces(
+                "[memory_namespace.liaison]\n[memory_namespace.op]\ninclude = [\"liaison\"]",
+            ),
+            "auto-injected",
+        );
+        // The liaison's chain reaches another profile's home.
+        assert_one_warning(
+            &liaison_namespaces(
+                "[memory_namespace.liaison]\nimport = [\"op\"]\n[memory_namespace.op]",
+            ),
+            "home namespace",
+        );
+    }
+
+    #[test]
+    fn intended_liaison_setup_has_no_warnings() {
+        let cfg = liaison_namespaces(
+            r#"
+[memory_namespace.public]
+[memory_namespace.liaison]
+import = ["public"]
+[memory_namespace.op]
+include = ["public"]
+"#,
+        );
+        assert_eq!(cfg.remote_agent_warnings(), Vec::<String>::new());
+        assert!(cfg.validate_session_profiles().is_empty());
     }
 }

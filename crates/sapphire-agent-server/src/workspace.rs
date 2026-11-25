@@ -259,7 +259,7 @@ impl Workspace {
     ///
     /// `namespaces` is the DFS-pre-order list of namespaces this room
     /// reads from, with their descriptions — typically computed via
-    /// `Config::namespace_infos(&Config::resolve_namespace_chain(ns))`.
+    /// `Config::namespace_infos(&Config::resolve_namespace_access(ns))`.
     /// The first entry is the room's own namespace; later entries are
     /// included parents. `profile` is the session profile whose prompt
     /// file layers apply, if any.
@@ -355,6 +355,9 @@ impl Workspace {
             block.push_str(&ns.name);
             if i == 0 {
                 block.push_str(" (this conversation)");
+            }
+            if ns.read_only {
+                block.push_str(" (read-only)");
             }
             if let Some(description) = ns.description.as_deref().filter(|d| !d.trim().is_empty()) {
                 block.push_str(" — ");
@@ -1005,6 +1008,7 @@ mod tests {
         NamespaceInfo {
             name: name.to_string(),
             description: description.map(str::to_string),
+            read_only: false,
         }
     }
 
@@ -1015,6 +1019,18 @@ mod tests {
         let ws = Workspace::new(dir.path().to_path_buf(), DigestConfig::default());
         ws.build_system_prompt(None, 4, namespaces, None, None, None)
             .await
+    }
+
+    #[tokio::test]
+    async fn memory_block_marks_read_only() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut public = ns("public", Some("shared notes"));
+        public.read_only = true;
+        let prompt = prompt_with_namespaces(&dir, &[ns("mom", None), public]).await;
+        assert!(
+            prompt.contains("- mom (this conversation)\n- public (read-only) — shared notes"),
+            "{prompt}"
+        );
     }
 
     #[tokio::test]

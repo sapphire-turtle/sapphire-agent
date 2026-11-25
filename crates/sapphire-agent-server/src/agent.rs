@@ -463,7 +463,7 @@ impl Agent {
         }
 
         let namespace = self.config.namespace_for_session_profile(profile_name);
-        let chain = self.config.resolve_namespace_chain(namespace);
+        let chain = self.config.resolve_namespace_access(namespace);
         // Best-effort: a missing or unreachable RoomInfo just leaves the
         // "# Current Room" block out — never blocks the turn.
         let room_info = self.channels.room_info(&key.0).await;
@@ -661,13 +661,13 @@ impl Agent {
 
         if let Some(specs) = &mut tool_specs {
             specs.retain(|spec| {
-                entries
-                    .iter()
-                    .find(|e| e.name == spec.name)
-                    .is_some_and(|entry| {
-                        crate::tools::policy::allow(&permission, entry)
-                            != crate::tools::policy::Allow::Deny
-                    })
+                crate::tools::turn_offers(
+                    &self.config,
+                    &permission,
+                    &profile_name,
+                    entries.iter().find(|e| e.name == spec.name),
+                    &spec.name,
+                )
             });
         }
 
@@ -832,7 +832,7 @@ impl Agent {
                     // tokio::spawn does not propagate task_local, so we
                     // re-bind it inside each spawned future.
                     let tools = self.tools.clone();
-                    let ns = self.config.resolve_namespace_chain(
+                    let ns = self.config.resolve_namespace_access(
                         self.config.namespace_for_session_profile(&profile_name),
                     );
                     let room_id_for_timer = incoming.room_id.clone();
@@ -1118,6 +1118,60 @@ mod tests {
         assert!(refused[0].1.contains("[tools.shell].enabled"));
         assert!(refused[1].1.contains("not available"));
         assert_eq!(permitted.len() + refused.len(), calls.len());
+    }
+
+    #[tokio::test]
+    async fn outbound_tools_off_hides_web_search_and_weather() {
+        let (_, specs) = channel_gate_test_calls().await;
+        let cfg = crate::config::Config::parse_for_test(
+            "[anthropic]\napi_key = \"test\"\n\
+             [profiles.default]\nprovider = \"anthropic\"\n\
+             [session_profile.sealed]\nprofile = \"default\"\noutbound_tools = false\n\
+             [session_profile.open]\nprofile = \"default\"\n",
+        );
+        // Through `turn_offers`, the check both turn paths' spec filters call.
+        let names = |profile: &str| -> Vec<String> {
+            let permission = crate::tools::policy::ResolvedPermission::resolve(
+                &cfg,
+                Origin::Channel {
+                    session_profile: profile.into(),
+                },
+            );
+            specs
+                .iter()
+                .filter(|s| {
+                    let entry = crate::tools::policy::ToolEntry::from_spec(s, &cfg);
+                    crate::tools::turn_offers(&cfg, &permission, profile, Some(&entry), &s.name)
+                })
+                .map(|s| s.name.to_string())
+                .collect()
+        };
+        let open = names("open");
+        assert!(open.iter().any(|n| n == "web_search"));
+        assert!(open.iter().any(|n| n == "weather"));
+        let sealed = names("sealed");
+        assert!(!sealed.iter().any(|n| n == "web_search" || n == "weather"));
+        assert!(sealed.iter().any(|n| n == "memory_add"));
+        // The permission gate still applies: shell is off in this config.
+        assert!(!open.iter().any(|n| n == "shell"));
+    }
+
+    #[test]
+    fn turn_offers_refuses_an_unregistered_tool() {
+        let cfg = crate::config::Config::parse_for_test("[anthropic]\napi_key = \"test\"\n");
+        let permission = crate::tools::policy::ResolvedPermission::resolve(
+            &cfg,
+            Origin::Channel {
+                session_profile: "default".into(),
+            },
+        );
+        assert!(!crate::tools::turn_offers(
+            &cfg,
+            &permission,
+            "default",
+            None,
+            "memory_add"
+        ));
     }
 
     #[tokio::test]

@@ -1,3 +1,4 @@
+use crate::config::NamespaceAccess;
 use crate::provider::ToolSpec;
 use crate::tools::{Tool, ToolKind};
 use anyhow::{Context, Result};
@@ -31,30 +32,35 @@ fn lock(state: &WorkspaceState) -> &WorkspaceState {
 // caller that forgets to scope.
 
 tokio::task_local! {
-    static MEMORY_NAMESPACE_TL: Vec<String>;
+    static MEMORY_NAMESPACE_TL: Vec<NamespaceAccess>;
 }
 
 /// Run `fut` with `MEMORY_NAMESPACE_TL` set to `chain`: the caller's
 /// namespace first, then every namespace it reaches through `include`
-/// (`Config::resolve_namespace_chain`). Used by the agent / API serve
+/// (`Config::resolve_namespace_access`). Used by the agent / API serve
 /// loops to scope per-turn tool executions. The memory tools default to
 /// the first entry and may be pointed at any other.
 pub fn scope_memory_namespace<F: std::future::Future>(
-    chain: Vec<String>,
+    chain: Vec<NamespaceAccess>,
     fut: F,
 ) -> impl std::future::Future<Output = F::Output> {
     MEMORY_NAMESPACE_TL.scope(chain, fut)
 }
 
-/// The namespaces this turn's memory tools may use, own first. Falls back
-/// to `["default"]` outside a `scope_memory_namespace` (or for an empty
-/// scope).
-pub(crate) fn current_memory_chain() -> Vec<String> {
+/// The namespaces this turn's memory tools may use, own first, with whether
+/// each is writable. Falls back to `[default, writable]` outside a
+/// `scope_memory_namespace` (or for an empty scope).
+pub(crate) fn current_memory_chain() -> Vec<NamespaceAccess> {
     MEMORY_NAMESPACE_TL
         .try_with(|chain| chain.clone())
         .ok()
         .filter(|chain| !chain.is_empty())
-        .unwrap_or_else(|| vec![crate::config::DEFAULT_NAMESPACE_NAME.to_string()])
+        .unwrap_or_else(|| {
+            vec![NamespaceAccess {
+                name: crate::config::DEFAULT_NAMESPACE_NAME.to_string(),
+                writable: true,
+            }]
+        })
 }
 
 /// The namespace this turn's tool calls should read/write under. Falls
@@ -65,7 +71,7 @@ pub(crate) fn current_memory_chain() -> Vec<String> {
 /// conversation that delegated to it, the same way `scope_memory_namespace`
 /// already scopes every other tool call in a turn.
 pub(crate) fn current_memory_namespace() -> String {
-    current_memory_chain().swap_remove(0)
+    current_memory_chain().swap_remove(0).name
 }
 
 // ---------------------------------------------------------------------------
@@ -96,9 +102,6 @@ const MEMORY_CATEGORY_GUIDE: &str = "Category is mandatory and free-form, but pr
      'knowledge' (longer-form facts, procedures, decisions, learnings — default when unsure). \
      Other categories (e.g. 'recipe', 'project') may be introduced freely.";
 
-/// `memory/<namespace>/<category>/<slug>.md`, relative and absolute.
-/// `namespace` absent means this turn's own; present, it must be one of
-/// `current_memory_chain()`.
 /// The optional `namespace` argument: absent or `null` means this
 /// conversation's own namespace; anything but a string is an error rather
 /// than a silent fall-back to the own namespace.
@@ -110,31 +113,54 @@ fn namespace_arg(input: &Value) -> Result<Option<&str>> {
     }
 }
 
+/// `memory/<namespace>/<category>/<slug>.md`, relative and absolute.
+/// `namespace` absent means this turn's own; present, it must be one of
+/// `current_memory_chain()`, and with `write` set it must be writable.
 fn memory_entry_path(
     state: &WorkspaceState,
     namespace: Option<&str>,
     category: &str,
     slug: &str,
+    write: bool,
 ) -> Result<(String, std::path::PathBuf)> {
+    memory_entry_target(state, namespace, category, slug, write).map(|(rel, abs, _)| (rel, abs))
+}
+
+/// `memory_entry_path`, plus whether the resolved namespace is writable
+/// here (always true when `write` is set, or the call fails).
+fn memory_entry_target(
+    state: &WorkspaceState,
+    namespace: Option<&str>,
+    category: &str,
+    slug: &str,
+    write: bool,
+) -> Result<(String, std::path::PathBuf, bool)> {
     validate_segment("category", category)?;
     validate_segment("slug", slug)?;
     let chain = current_memory_chain();
-    let namespace = match namespace {
-        None => chain[0].clone(),
+    let (namespace, writable) = match namespace {
+        None => (chain[0].name.clone(), chain[0].writable),
         Some(ns) => {
             validate_segment("namespace", ns)?;
-            if !chain.iter().any(|c| c == ns) {
+            let Some(entry) = chain.iter().find(|c| c.name == ns) else {
                 anyhow::bail!(
                     "namespace '{ns}' is not available here; choose one of: {}",
-                    chain.join(", ")
+                    chain
+                        .iter()
+                        .map(|c| c.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 );
-            }
-            ns.to_string()
+            };
+            (ns.to_string(), entry.writable)
         }
     };
+    if write && !writable {
+        anyhow::bail!("namespace '{namespace}' is read-only here");
+    }
     let rel = format!("memory/{namespace}/{category}/{slug}.md");
     let abs = lock(state).workspace.root.join(&rel);
-    Ok((rel, abs))
+    Ok((rel, abs, writable))
 }
 
 /// YAML frontmatter tracked on each memory entry file.
@@ -191,7 +217,7 @@ fn memory_entry_schema(include_content: bool) -> serde_json::Value {
         "namespace".into(),
         json!({
             "type": "string",
-            "description": "Memory namespace to use, from the list under # Memory. Omit for this conversation's own namespace."
+            "description": "Memory namespace to use, from the list under # Memory. Omit for this conversation's own namespace. Namespaces marked (read-only) there can be read but not written."
         }),
     );
     let mut required = vec!["category", "slug"];
@@ -250,7 +276,8 @@ impl Tool for MemoryAddTool {
         let category = input["category"].as_str().context("missing 'category'")?;
         let slug = input["slug"].as_str().context("missing 'slug'")?;
         let content = input["content"].as_str().context("missing 'content'")?;
-        let (rel, abs) = memory_entry_path(&self.state, namespace_arg(input)?, category, slug)?;
+        let (rel, abs) =
+            memory_entry_path(&self.state, namespace_arg(input)?, category, slug, true)?;
         if abs.exists() {
             anyhow::bail!("{rel} already exists; use memory_update to overwrite");
         }
@@ -305,7 +332,8 @@ impl Tool for MemoryUpdateTool {
         let category = input["category"].as_str().context("missing 'category'")?;
         let slug = input["slug"].as_str().context("missing 'slug'")?;
         let content = input["content"].as_str().context("missing 'content'")?;
-        let (rel, abs) = memory_entry_path(&self.state, namespace_arg(input)?, category, slug)?;
+        let (rel, abs) =
+            memory_entry_path(&self.state, namespace_arg(input)?, category, slug, true)?;
         if !abs.exists() {
             anyhow::bail!("{rel} does not exist; use memory_add to create it");
         }
@@ -365,7 +393,8 @@ impl Tool for MemoryAppendTool {
         let category = input["category"].as_str().context("missing 'category'")?;
         let slug = input["slug"].as_str().context("missing 'slug'")?;
         let content = input["content"].as_str().context("missing 'content'")?;
-        let (rel, abs) = memory_entry_path(&self.state, namespace_arg(input)?, category, slug)?;
+        let (rel, abs) =
+            memory_entry_path(&self.state, namespace_arg(input)?, category, slug, true)?;
         let now = Timestamp::now();
 
         let (meta, new_body, created) = if abs.exists() {
@@ -424,7 +453,8 @@ impl MemoryReadTool {
                 description: "Read a memory entry at memory/<category>/<slug>.md \
                     and return its body. Side effect: updates the file's \
                     frontmatter (last_read_at = now, read_count += 1) so that \
-                    recency and frequency can inform future weighting. \
+                    recency and frequency can inform future weighting, \
+                    except in a namespace that is read-only here. \
                     Use file_read instead for a non-tracking read."
                     .into(),
                 input_schema: memory_entry_schema(false),
@@ -442,12 +472,18 @@ impl Tool for MemoryReadTool {
     async fn execute(&self, input: &serde_json::Value) -> Result<String> {
         let category = input["category"].as_str().context("missing 'category'")?;
         let slug = input["slug"].as_str().context("missing 'slug'")?;
-        let (rel, abs) = memory_entry_path(&self.state, namespace_arg(input)?, category, slug)?;
+        let (rel, abs, writable) =
+            memory_entry_target(&self.state, namespace_arg(input)?, category, slug, false)?;
         if !abs.exists() {
             anyhow::bail!("{rel} does not exist");
         }
         let raw = std::fs::read_to_string(&abs).with_context(|| format!("Failed to read {rel}"))?;
         let (mut meta, body) = parse_memory_file(&raw);
+        // A namespace this turn may only read is never rewritten, not even
+        // for the read counters.
+        if !writable {
+            return Ok(body);
+        }
         meta.last_read_at = Some(Timestamp::now());
         meta.read_count = meta.read_count.saturating_add(1);
         let serialized = serialize_memory_file(&meta, &body)?;
@@ -490,7 +526,8 @@ impl Tool for MemoryRemoveTool {
     async fn execute(&self, input: &serde_json::Value) -> Result<String> {
         let category = input["category"].as_str().context("missing 'category'")?;
         let slug = input["slug"].as_str().context("missing 'slug'")?;
-        let (rel, abs) = memory_entry_path(&self.state, namespace_arg(input)?, category, slug)?;
+        let (rel, abs) =
+            memory_entry_path(&self.state, namespace_arg(input)?, category, slug, true)?;
         if !abs.exists() {
             anyhow::bail!("{rel} does not exist");
         }
@@ -665,8 +702,21 @@ mod tests {
         Arc::new(WorkspaceState::open(ws).unwrap())
     }
 
-    fn chain(names: &[&str]) -> Vec<String> {
-        names.iter().map(|s| s.to_string()).collect()
+    fn chain(names: &[&str]) -> Vec<NamespaceAccess> {
+        names
+            .iter()
+            .map(|s| NamespaceAccess {
+                name: s.to_string(),
+                writable: true,
+            })
+            .collect()
+    }
+
+    /// `mom` writable, `public` read-only.
+    fn read_only_chain() -> Vec<NamespaceAccess> {
+        let mut c = chain(&["mom", "public"]);
+        c[1].writable = false;
+        c
     }
 
     #[tokio::test]
@@ -772,7 +822,7 @@ mod tests {
         let state = test_state();
         let tool = MemoryAddTool::new(Arc::clone(&state));
         let input = json!({"namespace": "household", "category": "knowledge", "slug": "x", "content": "hi"});
-        scope_memory_namespace(cfg.resolve_namespace_chain("mom"), tool.execute(&input))
+        scope_memory_namespace(cfg.resolve_namespace_access("mom"), tool.execute(&input))
             .await
             .unwrap();
         assert!(
@@ -790,5 +840,71 @@ mod tests {
         })
         .await;
         assert_eq!(inner, ("mom".to_string(), chain(&["mom", "family"])));
+    }
+
+    #[tokio::test]
+    async fn memory_writes_refuse_read_only_namespace() {
+        let state = test_state();
+        let path = root(&state).join("memory/public/knowledge/x.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "original").unwrap();
+        let base =
+            json!({"namespace": "public", "category": "knowledge", "slug": "x", "content": "new"});
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(MemoryAddTool::new(Arc::clone(&state))),
+            Box::new(MemoryUpdateTool::new(Arc::clone(&state))),
+            Box::new(MemoryAppendTool::new(Arc::clone(&state))),
+            Box::new(MemoryRemoveTool::new(Arc::clone(&state))),
+        ];
+        for tool in &tools {
+            let mut input = base.clone();
+            if tool.spec().name == "memory_add" {
+                input["slug"] = json!("fresh");
+            }
+            let err = scope_memory_namespace(read_only_chain(), tool.execute(&input))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("read-only"), "{}: {err}", tool.spec().name);
+        }
+        assert!(
+            !root(&state)
+                .join("memory/public/knowledge/fresh.md")
+                .exists()
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "original");
+    }
+
+    #[tokio::test]
+    async fn memory_read_reads_read_only_namespace() {
+        let state = test_state();
+        let path = root(&state).join("memory/public/knowledge/x.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "public fact").unwrap();
+        let tool = MemoryReadTool::new(Arc::clone(&state));
+        let input = json!({"namespace": "public", "category": "knowledge", "slug": "x"});
+        let out = scope_memory_namespace(read_only_chain(), tool.execute(&input))
+            .await
+            .unwrap();
+        assert!(out.contains("public fact"), "{out}");
+        // A read-only namespace is not rewritten to bump the read counters.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "public fact");
+    }
+
+    #[tokio::test]
+    async fn memory_read_bumps_counters_in_writable_namespace() {
+        let state = test_state();
+        let path = root(&state).join("memory/mom/knowledge/x.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "own fact").unwrap();
+        let tool = MemoryReadTool::new(Arc::clone(&state));
+        let input = json!({"category": "knowledge", "slug": "x"});
+        let out = scope_memory_namespace(read_only_chain(), tool.execute(&input))
+            .await
+            .unwrap();
+        assert!(out.contains("own fact"), "{out}");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("read_count: 1"), "{raw}");
+        assert!(raw.contains("last_read_at:"), "{raw}");
     }
 }

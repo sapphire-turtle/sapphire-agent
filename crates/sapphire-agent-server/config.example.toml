@@ -299,6 +299,21 @@ system_prompt = "You are a helpful personal assistant."
 # [memory_namespace.translation]
 # include     = ["family"]
 # description = "a family member's confidential translation work"
+#
+# `import` chains a namespace like `include` (the system prompt, the
+# memory tools' reads, the `# Memory` list) but read-only: the memory
+# tools refuse to write it, and the list marks it `(read-only)`. Everything
+# reachable only through an `import` is read-only; a namespace stays
+# writable when some path to it uses `include` edges alone. `import` and
+# `include` share one DAG, so an unknown name or a cycle across either is
+# an error. Background writers still write only the home namespace.
+#
+# [memory_namespace.public]
+# description = "information the operator has cleared for outsiders"
+#
+# [memory_namespace.liaison]
+# import      = ["public"]     # readable here, never writable from here
+# description = "the private agent's dealings with the guest agent"
 
 # ── Session profiles ───────────────────────────────────────────────────────
 # A session profile bundles an LLM profile, memory namespace and policy.
@@ -376,6 +391,68 @@ system_prompt = "You are a helpful personal assistant."
 # memory_namespace = "sapphire_world"
 # # its client's key: `api-key add a2a-client --profile sapphire_world`
 #
+# ── Liaison between instances (A2A client) ───────────────────────────────
+# A private instance can talk to another agent instance (typically a
+# stranger-facing guest instance) over A2A, in a session of its own, so the
+# operator reads the guest's inquiries and drives the answers.
+# Nothing is shared between the instances but the messages.
+#
+# `[remote_agent.<n>]` is host-only (the workspace config may not set it).
+# `token_env` names an environment variable holding the bearer token; the
+# token never appears in a config file, and `serve` refuses to start when
+# the variable of an agent some profile uses is unset. `endpoint` is the
+# guest's `/a2a` URL; plain `http://` is allowed (transport security, e.g. a
+# Tailscale path, is yours).
+#
+# [remote_agent.guest]
+# endpoint    = "http://guest.tailnet.example:8080/a2a"
+# token_env   = "GUEST_A2A_TOKEN"
+# description = "the website-facing guest agent; reports the day's inquiries"
+#
+# A profile that lists `remote_agents` gets the `a2a_send(agent, message,
+# context_id?)` tool, for those agents only (about 120 s timeout, no
+# retries; the reply is labelled as untrusted text, and `context_id` from a
+# reply continues the conversation). `outbound_tools = false` withholds
+# the tools that send model-chosen data off the host: `web_search`,
+# `weather`, `skill_install` and `skill_update`.
+#
+# [session_profile.liaison]
+# profile          = "default"
+# memory_namespace = "liaison"
+# permission       = "chat"            # no tools at all
+# remote_agents    = ["guest"]
+# outbound_tools   = false
+#
+# Why this shape: a guest-side reply is influenced by strangers and may
+# carry prompt injection, and summarizing it is not a defence. What bounds
+# a successful injection is what the liaison session can do and see, so keep
+# it to no tool groups, no outbound tools, and a memory chain of operator-
+# curated public information (`import`, read-only) plus its own namespace,
+# which no other profile may chain. Startup checks enforce this: `admin`
+# in the permission profile of a profile with `remote_agents` is an error;
+# `fs`, `shell` or `mcp` there, being the stdio ACP profile or having bound
+# devices, keeping outbound tools, writing a namespace another profile's
+# chain contains, or reaching another profile's home namespace are
+# warnings, one line each (also printed by `verify`). The setup above
+# produces none. The ambient tools (`transcript_read`, `speaker_candidates`,
+# `speaker_promote`) are never offered to a profile with `remote_agents`.
+# No check reads memory content: whatever the liaison's chain includes or
+# imports is visible to the remote agent, so import only namespaces meant
+# to be public; importing a private one (e.g. `family`) leaks it with no
+# warning. Drive the liaison from a room bound to it
+# (`[[matrix.rooms]]` etc. with `profile = "liaison"`) and/or from a
+# timer.
+#
+# The guest instance needs no new code. On it: enable `[a2a]`, mint a key
+# with `sapphire-agent api-key add owner-liaison --profile owner_liaison`
+# (put its token in the private host's `GUEST_A2A_TOKEN`), define
+# `[session_profile.owner_liaison]` with its own namespace and the guest's
+# ordinary memory, and write `AGENTS.owner_liaison.md` saying that this
+# caller is the owner's agent, that its answers may be used for guest
+# replies, and what to report when asked for the day's inquiries. Reach the
+# guest's `/a2a` only from the private instance's network path, separate
+# from the public form's.
+
 # Caveat: workspace retrieve (FTS / vector search) currently spans every
 # namespace because the agent's retrieve tools don't yet set the
 # framework's path_prefix filter.

@@ -1,3 +1,4 @@
+pub(crate) mod a2a_tools;
 pub mod acp_client;
 pub mod ambient_tools;
 pub mod ask_human;
@@ -376,6 +377,14 @@ pub async fn default_tool_set(
         tools.push(Box::new(WebSearchTool::new(key)));
     }
 
+    // Ungrouped: who may use it is the session profile's `remote_agents`
+    // (`profile_offers`), checked again by the tool at execute time.
+    if !config.remote_agents.is_empty() {
+        tools.push(Box::new(a2a_tools::A2aSendTool::new(config, &|k| {
+            std::env::var(k).ok()
+        })));
+    }
+
     // External MCP server tools
     let mut mcp_clients = Vec::new();
     if config.group_registered(ToolGroup::Mcp) && !mcp_servers.is_empty() {
@@ -397,6 +406,51 @@ pub async fn default_tool_set(
     }
 
     tool_set
+}
+
+/// Tools that reach out to the internet. Offered unless the session
+/// profile sets `outbound_tools = false`.
+pub(crate) const OUTBOUND_TOOLS: &[&str] =
+    &["web_search", "weather", "skill_install", "skill_update"];
+
+/// The tool that talks to a configured remote agent.
+pub(crate) const A2A_SEND_TOOL: &str = "a2a_send";
+
+/// Ungrouped tools that read private household data (the ambient
+/// microphone's transcripts and speakers). Never offered to a session
+/// profile that talks to a remote agent, whatever its `outbound_tools`:
+/// whatever such a session reads can be sent on over `a2a_send`.
+pub(crate) const PRIVATE_READ_TOOLS: &[&str] =
+    &["transcript_read", "speaker_candidates", "speaker_promote"];
+
+/// Whether `session_profile` is offered `tool`, beyond the permission gate.
+pub(crate) fn profile_offers(config: &Config, session_profile: &str, tool: &str) -> bool {
+    let profile = config.session_profile(session_profile);
+    if tool == A2A_SEND_TOOL {
+        return profile.is_some_and(|p| !p.remote_agents.is_empty());
+    }
+    if PRIVATE_READ_TOOLS.contains(&tool) {
+        return profile.is_none_or(|p| p.remote_agents.is_empty());
+    }
+    if OUTBOUND_TOOLS.contains(&tool) {
+        return profile.is_none_or(|p| p.outbound_tools != Some(false));
+    }
+    true
+}
+
+/// Whether a turn offers `tool`: it is registered (`entry`), the permission
+/// profile does not deny it, and the session profile offers it
+/// ([`profile_offers`]). Both turn paths — channel turns in `agent.rs` and
+/// the serve loop — filter their specs through this one check.
+pub(crate) fn turn_offers(
+    config: &Config,
+    permission: &policy::ResolvedPermission,
+    session_profile: &str,
+    entry: Option<&ToolEntry>,
+    tool: &str,
+) -> bool {
+    entry.is_some_and(|e| policy::allow(permission, e) != policy::Allow::Deny)
+        && profile_offers(config, session_profile, tool)
 }
 
 /// The cap shared by `truncate_output` (tool *results*) and
@@ -473,6 +527,166 @@ mod tests {
         std::fs::create_dir_all(dir.path().join(".sapphire-agent")).unwrap();
         let ws = Workspace::from_root(&TEST_CTX, dir.path()).unwrap();
         Arc::new(WorkspaceState::open(ws).unwrap())
+    }
+
+    /// Every ungrouped tool that is neither outbound nor a private read,
+    /// among those the default set and `lib.rs` register.
+    const LOCAL_UNGROUPED_TOOLS: &[&str] = &[
+        "current_time",
+        "memory_add",
+        "memory_read",
+        "memory_append",
+        "memory_update",
+        "memory_remove",
+        "shell_start",
+        "shell_output",
+        "shell_kill",
+        "skill",
+        "skill_uninstall",
+        "subagent",
+    ];
+
+    #[test]
+    fn profile_offers_hides_a2a_send_without_remote_agents() {
+        let cfg = Config::parse_for_test(
+            "[remote_agent.peer]\nendpoint = \"https://peer.example/a2a\"\ntoken_env = \"PEER_TOKEN\"\n\
+             [session_profile.liaison]\nprofile = \"default\"\nremote_agents = [\"peer\"]\n\
+             [session_profile.plain]\nprofile = \"default\"\n",
+        );
+        assert!(profile_offers(&cfg, "liaison", A2A_SEND_TOOL));
+        assert!(!profile_offers(&cfg, "plain", A2A_SEND_TOOL));
+        assert!(!profile_offers(&cfg, "missing", A2A_SEND_TOOL));
+        assert!(profile_offers(&cfg, "plain", "current_time"));
+    }
+
+    #[test]
+    fn profile_offers_hides_outbound_when_disabled() {
+        let cfg = Config::parse_for_test(
+            "[session_profile.off]\nprofile = \"default\"\noutbound_tools = false\n\
+             [session_profile.on]\nprofile = \"default\"\noutbound_tools = true\n\
+             [session_profile.unset]\nprofile = \"default\"\n",
+        );
+        for t in OUTBOUND_TOOLS {
+            assert!(!profile_offers(&cfg, "off", t), "{t}");
+            assert!(profile_offers(&cfg, "on", t), "{t}");
+            assert!(profile_offers(&cfg, "unset", t), "{t}");
+        }
+        assert!(profile_offers(&cfg, "off", "memory_add"));
+    }
+
+    #[test]
+    fn profile_offers_hides_private_reads_from_remote_agent_profiles() {
+        let cfg = Config::parse_for_test(
+            "[remote_agent.peer]\nendpoint = \"https://peer.example/a2a\"\ntoken_env = \"PEER_TOKEN\"\n\
+             [session_profile.liaison]\nprofile = \"default\"\nremote_agents = [\"peer\"]\n\
+             [session_profile.liaison_out]\nprofile = \"default\"\nremote_agents = [\"peer\"]\n\
+             outbound_tools = true\n\
+             [session_profile.plain]\nprofile = \"default\"\n",
+        );
+        for t in PRIVATE_READ_TOOLS {
+            assert!(!profile_offers(&cfg, "liaison", t), "{t}");
+            assert!(!profile_offers(&cfg, "liaison_out", t), "{t}");
+            assert!(profile_offers(&cfg, "plain", t), "{t}");
+            assert!(profile_offers(&cfg, "missing", t), "{t}");
+        }
+        assert!(profile_offers(&cfg, "liaison", "memory_read"));
+    }
+
+    #[tokio::test]
+    async fn every_ungrouped_tool_is_classified() {
+        let cfg = Config::parse_for_test(
+            "[tools.fs]\nenabled = true\n[tools.shell]\nenabled = true\n\
+             [tools.mcp]\nenabled = true\n[tools.admin]\nenabled = true\n\
+             [permission_profile.ops]\ntools = [\"fs\", \"shell\", \"mcp\", \"admin\"]\n\
+             [remote_agent.peer]\nendpoint = \"https://peer.example/a2a\"\ntoken_env = \"PEER_TOKEN\"\n",
+        );
+        let ws = test_workspace();
+        let tools = default_tool_set(Arc::clone(&ws), Some("k".to_string()), &[], 4, &cfg).await;
+        // The tools `lib.rs` registers outside `default_tool_set`, by hand.
+        let skill = Arc::new(skill_tools::SkillTool::new());
+        tools.register_tool(Box::new(Arc::clone(&skill))).await;
+        tools
+            .register_tool(Box::new(skill_tools::SkillInstallTool::new(Arc::clone(
+                &skill,
+            ))))
+            .await;
+        tools
+            .register_tool(Box::new(skill_tools::SkillUpdateTool::new(Arc::clone(
+                &skill,
+            ))))
+            .await;
+        tools
+            .register_tool(Box::new(skill_tools::SkillUninstallTool::new(skill)))
+            .await;
+        tools
+            .register_tool(Box::new(subagent::SubagentTool::new(vec![], false)))
+            .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let ambient = Arc::new(std::sync::Mutex::new(ambient_tools::AmbientToolState {
+            transcripts: crate::ambient::transcript::TranscriptStore::open(tmp.path().join("t"), 4)
+                .unwrap(),
+            candidates: Arc::new(std::sync::Mutex::new(
+                crate::ambient::speaker::candidates::CandidateStore::open(
+                    tmp.path().join("c"),
+                    "test-model".into(),
+                )
+                .unwrap(),
+            )),
+            voices_dir: tmp.path().join("voices"),
+        }));
+        tools
+            .register_tool(Box::new(ambient_tools::TranscriptReadTool::new(
+                Arc::clone(&ambient),
+            )))
+            .await;
+        tools
+            .register_tool(Box::new(ambient_tools::SpeakerCandidatesTool::new(
+                Arc::clone(&ambient),
+            )))
+            .await;
+        tools
+            .register_tool(Box::new(ambient_tools::SpeakerPromoteTool::new(ambient)))
+            .await;
+        let names: Vec<String> = tools.entries().await.into_iter().map(|(n, _)| n).collect();
+        for expected in PRIVATE_READ_TOOLS.iter().chain(["skill_uninstall"].iter()) {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "{expected} not registered"
+            );
+        }
+        for (name, entry) in tools.entries().await {
+            if entry.group.is_some() {
+                continue;
+            }
+            assert!(
+                OUTBOUND_TOOLS.contains(&name.as_str())
+                    || PRIVATE_READ_TOOLS.contains(&name.as_str())
+                    || LOCAL_UNGROUPED_TOOLS.contains(&name.as_str())
+                    || name == A2A_SEND_TOOL,
+                "ungrouped tool `{name}` is neither outbound, private-read nor listed local; \
+                 classify it"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a2a_send_is_registered_only_with_remote_agents() {
+        let names = |cfg: Config| async move {
+            default_tool_set(test_workspace(), None, &[], 4, &cfg)
+                .await
+                .entries()
+                .await
+                .into_iter()
+                .map(|(n, e)| (n, e.group))
+                .collect::<Vec<_>>()
+        };
+        let without = names(Config::parse_for_test("")).await;
+        assert!(without.iter().all(|(n, _)| n != A2A_SEND_TOOL));
+        let with = names(Config::parse_for_test(
+            "[remote_agent.peer]\nendpoint = \"https://peer.example/a2a\"\ntoken_env = \"PEER_TOKEN\"\n",
+        ))
+        .await;
+        assert!(with.contains(&(A2A_SEND_TOOL.to_string(), None)));
     }
 
     fn all_groups_config() -> Config {
