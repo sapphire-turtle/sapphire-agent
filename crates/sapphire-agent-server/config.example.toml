@@ -434,7 +434,12 @@ system_prompt = "You are a helpful personal assistant."
 # devices, keeping outbound tools, writing a namespace another profile's
 # chain contains, or reaching another profile's home namespace are
 # warnings, one line each (also printed by `verify`). The setup above
-# produces none. Drive the liaison from a room bound to it
+# produces none. The ambient tools (`transcript_read`, `speaker_candidates`,
+# `speaker_promote`) are never offered to a profile with `remote_agents`.
+# No check reads memory content: whatever the liaison's chain includes or
+# imports is visible to the remote agent, so import only namespaces meant
+# to be public; importing a private one (e.g. `family`) leaks it with no
+# warning. Drive the liaison from a room bound to it
 # (`[[matrix.rooms]]` etc. with `profile = "liaison"`) and/or from a
 # timer.
 #
