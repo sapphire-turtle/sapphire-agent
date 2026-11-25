@@ -30,6 +30,11 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// Cap on remote-supplied text echoed into an error.
 const ERROR_DETAIL_CAP: usize = 500;
 
+/// Largest response body read from a remote agent. A reply is one turn's
+/// text, so this is generous; a peer that sends more is refused rather than
+/// read into memory without bound.
+const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+
 /// Longest remote-supplied `context_id` accepted. The model passes it back
 /// verbatim, so it is bounded and must hold no control characters.
 const MAX_CONTEXT_ID_LEN: usize = 256;
@@ -215,10 +220,9 @@ impl A2aSendTool {
         if !status.is_success() {
             return Err(format!("the remote answered HTTP {status}"));
         }
-        let envelope: Value = resp
-            .json()
-            .await
-            .map_err(|e| reqwest_error("unreadable response", e))?;
+        let body = read_capped(resp).await?;
+        let envelope: Value = serde_json::from_slice(&body)
+            .map_err(|_| "unreadable response: the body is not JSON".to_string())?;
 
         if let Some(err) = envelope.get("error") {
             let code = err["code"].as_i64().unwrap_or_default();
@@ -291,6 +295,30 @@ fn reqwest_error(what: &str, e: reqwest::Error) -> String {
     };
     let e = e.without_url();
     format!("{what}: {kind} ({e})")
+}
+
+/// Read a response body, refusing one over [`MAX_RESPONSE_BYTES`] as soon
+/// as it is announced or received.
+async fn read_capped(mut resp: reqwest::Response) -> Result<Vec<u8>, String> {
+    let too_large = || format!("the response is larger than {MAX_RESPONSE_BYTES} bytes");
+    if resp
+        .content_length()
+        .is_some_and(|n| n > MAX_RESPONSE_BYTES as u64)
+    {
+        return Err(too_large());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| reqwest_error("unreadable response", e))?
+    {
+        if body.len() + chunk.len() > MAX_RESPONSE_BYTES {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 /// Scrub the bearer token from remote-supplied text. Done before any
@@ -588,6 +616,25 @@ mod tests {
             .to_string();
         assert!(!err.contains(&TOKEN[..10]), "{err}");
         assert!(err.contains("[redacted]"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn refuses_an_oversized_response_body() {
+        let (endpoint, _) = stub(
+            StatusCode::OK,
+            task_body(
+                TaskState::Completed,
+                "ctx-1",
+                &"x".repeat(MAX_RESPONSE_BYTES + 1),
+            ),
+        )
+        .await;
+        let t = tool(&endpoint);
+        let err = run(&t, "liaison", json!({"agent": "peer", "message": "hi"}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("larger than"), "{err}");
     }
 
     #[tokio::test]
