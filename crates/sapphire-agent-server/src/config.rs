@@ -2248,9 +2248,6 @@ api_key = "test"
         None
     }
 
-    /// Resolve the memory namespace declared by a room profile (by
-    /// name). Falls back to `"default"` if the room profile is unknown
-    /// or doesn't set one.
     /// `chain` (from `resolve_namespace_chain`) with each namespace's
     /// configured description.
     pub fn namespace_infos(&self, chain: &[String]) -> Vec<NamespaceInfo> {
@@ -2266,6 +2263,9 @@ api_key = "test"
             .collect()
     }
 
+    /// Resolve the memory namespace declared by a room profile (by
+    /// name). Falls back to `"default"` if the room profile is unknown
+    /// or doesn't set one.
     pub fn namespace_for_session_profile(&self, name: &str) -> &str {
         self.session_profiles
             .get(name)

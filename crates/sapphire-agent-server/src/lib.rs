@@ -120,7 +120,7 @@ pub fn init_app_ctx() {
     );
 }
 use session::SessionStore;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio_util::sync::CancellationToken;
@@ -1710,7 +1710,10 @@ async fn run(config: Option<PathBuf>, mode: Mode) -> Result<()> {
                             workspace::MergeMode::Append => "append",
                             workspace::MergeMode::Replace => "replace",
                         };
-                        println!("  {name}: {path} ({mode})");
+                        println!(
+                            "  {name}: {} ({mode})",
+                            workspace::slash_path(Path::new(&path))
+                        );
                     }
                 }
             }

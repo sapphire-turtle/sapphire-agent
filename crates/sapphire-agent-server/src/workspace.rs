@@ -187,14 +187,27 @@ pub(crate) fn split_merge_mode(raw: &str) -> (MergeMode, String) {
         // Fail closed: a typo must not merge a root file (the operator's
         // USER.md, say) into a profile that meant to replace it.
         Some(other) => {
-            tracing::warn!(
-                "unknown `merge: {other}` in a profile prompt file; replacing \
-                 (use `append` or `replace`)"
-            );
+            if first_merge_warning(other) {
+                tracing::warn!(
+                    "unknown `merge: {other}` in a profile prompt file; replacing \
+                     (use `append` or `replace`)"
+                );
+            }
             MergeMode::Replace
         }
     };
     (mode, body.to_string())
+}
+
+/// Whether `value` is the first unknown `merge:` value seen by this
+/// process. Profile files are re-read every RPC turn, so without this the
+/// same warning would repeat on each one.
+fn first_merge_warning(value: &str) -> bool {
+    static SEEN: std::sync::Mutex<std::collections::BTreeSet<String>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    SEEN.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(value.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -510,7 +523,6 @@ impl Workspace {
         self.cache.lock().await.clear();
     }
 
-    /// Try each candidate filename in order; return the first one found.
     /// The injected body of `def`: the root file, merged with `profile`'s
     /// layer when it has one. `None` when nothing non-blank is left.
     async fn workspace_file_body(
@@ -565,6 +577,7 @@ impl Workspace {
         self.read_first_existing(&candidates).await
     }
 
+    /// Try each candidate filename in order; return the first one found.
     async fn read_first_existing(&self, candidates: &[&str]) -> Option<(String, String)> {
         for &filename in candidates {
             if let Some(content) = self.read_file(filename).await {
@@ -1081,6 +1094,13 @@ mod tests {
         for bad in ["", "/etc/passwd", "../x.md", "roles/../../x.md", "C:\\x.md"] {
             assert!(!is_workspace_relative(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_merge_warning_is_reported_once_per_value() {
+        assert!(first_merge_warning("relpace-once-test"));
+        assert!(!first_merge_warning("relpace-once-test"));
+        assert!(first_merge_warning("other-once-test"));
     }
 
     #[tokio::test]
