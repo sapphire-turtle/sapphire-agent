@@ -435,7 +435,7 @@ system_prompt = "You are a helpful personal assistant."
 # chain contains, or reaching another profile's home namespace are
 # warnings, one line each (also printed by `verify`). The setup above
 # produces none. Drive the liaison from a room bound to it
-# (`[[matrix.rooms]]` etc. with `session_profile = "liaison"`) and/or from a
+# (`[[matrix.rooms]]` etc. with `profile = "liaison"`) and/or from a
 # timer.
 #
 # The guest instance needs no new code. On it: enable `[a2a]`, mint a key
